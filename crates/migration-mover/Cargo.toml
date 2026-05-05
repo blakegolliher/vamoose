@@ -1,0 +1,26 @@
+[package]
+name        = "migration-mover"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "Wire-rate file mover: libnfs (user-space NFS) + io_uring, with NFSv4.2 server-side COPY fast path"
+links       = "nfs"   # tells cargo this crate links libnfs
+
+[dependencies]
+migration-core = { workspace = true }
+
+tokio    = { workspace = true }
+anyhow   = { workspace = true }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+bytes    = { workspace = true }
+libc     = { workspace = true }
+io-uring = { workspace = true }
+async-trait = { workspace = true }
+base64     = { workspace = true }
+serde_json = { workspace = true }
+chrono     = { workspace = true }
+
+[build-dependencies]
+pkg-config = "0.3"

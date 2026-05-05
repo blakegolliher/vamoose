@@ -1,0 +1,336 @@
+//! libnfs FFI surface and a safe `NfsContext` newtype.
+//!
+//! IMPORTANT: parameter order in this file MUST match the linked
+//! libnfs binary at runtime, NOT the system header at
+//! `/usr/include/nfsc/libnfs.h`. Multiple libnfs versions can coexist
+//! on the same host with different declarations for the same symbol;
+//! verify with `objdump -T` of the linked `.so`. See
+//! `docs/CORRECTNESS_RULES.md` "Cross-check C library FFI" and
+//! `M2_NOTES.md` "M2/M3 verification incidents" for the failure
+//! mode (silent zero-byte data loss).
+//!
+//! Smoke test (must run as root — VAST export's libnfs auth path
+//! requires UID 0, same as the production worker under sudo):
+//!   cargo build -p migration-mover --tests
+//!   sudo -E target/debug/deps/libnfs_ffi_smoke-*  --ignored --nocapture
+//!
+//! **Vendored from `nfs-walker`** (https://github.com/blakegolliher/nfs-walker, MIT)
+//! and extended for the mover's WRITE / SETATTR / RENAME / LINK /
+//! SYMLINK / READLINK / UTIMES / MKDIR ops.
+//!
+//! Preserve the original MIT copyright header on any code copied
+//! verbatim. Net-new code carries the workspace's MIT header.
+//!
+//! ## Why libnfs (user-space)
+//!
+//! See DESIGN.md "Why libnfs (user-space) instead of a kernel NFS
+//! mount". Short version: predictable per-connection concurrency, no
+//! kernel mount tuning, same code path as the scanner that built the
+//! index.
+//!
+//! ## Concurrency model
+//!
+//! libnfs contexts are **not** thread-safe. The mover keeps a pool of
+//! contexts (one per fiber/task) and pipelines requests within each
+//! context up to `pipeline_depth`. M2 has a single pre-mounted pair
+//! held behind a mutex; M3 reshapes the pool to N pairs.
+
+#![allow(non_camel_case_types, dead_code)]
+
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int, c_void};
+
+pub mod ops;
+pub mod pool;
+
+pub use pool::{ContextPair, LibnfsContextPool, MultiPool, SimplePool};
+
+// =============================================================================
+// Opaque types — defined in libnfs C headers.
+// =============================================================================
+
+#[repr(C)]
+pub struct nfs_context {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct nfsfh {
+    _private: [u8; 0],
+}
+
+// =============================================================================
+// Bindings the mover needs.
+// =============================================================================
+
+extern "C" {
+    pub fn nfs_init_context() -> *mut nfs_context;
+    pub fn nfs_destroy_context(nfs: *mut nfs_context);
+
+    pub fn nfs_mount(nfs: *mut nfs_context, server: *const c_char, export: *const c_char) -> c_int;
+    pub fn nfs_get_error(nfs: *mut nfs_context) -> *const c_char;
+
+    /// Pin the NFS protocol version on a freshly-initialized context.
+    /// Returns 0 on success, negative on invalid version. Must be
+    /// called before `nfs_mount`. Project mandate is v3 (see
+    /// `docs/CORRECTNESS_RULES.md` "NFSv3 is the protocol baseline");
+    /// `mount_url` always passes 3.
+    pub fn nfs_set_version(nfs: *mut nfs_context, version: c_int) -> c_int;
+
+    pub fn nfs_set_uid(nfs: *mut nfs_context, uid: c_int);
+    pub fn nfs_set_gid(nfs: *mut nfs_context, gid: c_int);
+
+    // Read / write
+    pub fn nfs_open(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        flags: c_int,
+        fh: *mut *mut nfsfh,
+    ) -> c_int;
+    pub fn nfs_close(nfs: *mut nfs_context, fh: *mut nfsfh) -> c_int;
+    pub fn nfs_pread(
+        nfs: *mut nfs_context,
+        fh: *mut nfsfh,
+        buf: *mut c_void,
+        count: usize,
+        offset: u64,
+    ) -> c_int;
+    pub fn nfs_pwrite(
+        nfs: *mut nfs_context,
+        fh: *mut nfsfh,
+        buf: *const c_void,
+        count: usize,
+        offset: u64,
+    ) -> c_int;
+    /// Open-or-create with both flags and mode. We use `nfs_open2`
+    /// rather than `nfs_create` because some libnfs builds (including
+    /// the one we link against in dev) export only `nfs_creat` (which
+    /// drops the `flags` argument). `nfs_open2` is the supported
+    /// way to combine `O_WRONLY|O_CREAT|O_TRUNC` with an explicit mode.
+    pub fn nfs_open2(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        flags: c_int,
+        mode: c_int,
+        fh: *mut *mut nfsfh,
+    ) -> c_int;
+    pub fn nfs_unlink(nfs: *mut nfs_context, path: *const c_char) -> c_int;
+    pub fn nfs_rename(
+        nfs: *mut nfs_context,
+        oldpath: *const c_char,
+        newpath: *const c_char,
+    ) -> c_int;
+    pub fn nfs_mkdir2(nfs: *mut nfs_context, path: *const c_char, mode: c_int) -> c_int;
+
+    // Links
+    pub fn nfs_link(
+        nfs: *mut nfs_context,
+        oldpath: *const c_char,
+        newpath: *const c_char,
+    ) -> c_int;
+    pub fn nfs_symlink(
+        nfs: *mut nfs_context,
+        target: *const c_char,
+        linkpath: *const c_char,
+    ) -> c_int;
+    pub fn nfs_readlink(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        buf: *mut c_char,
+        bufsize: c_int,
+    ) -> c_int;
+
+    // Attributes
+    pub fn nfs_chmod(nfs: *mut nfs_context, path: *const c_char, mode: c_int) -> c_int;
+    pub fn nfs_chown(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        uid: c_int,
+        gid: c_int,
+    ) -> c_int;
+    /// `times` points to an array of two `struct timeval` —
+    /// `[atime, mtime]`. Sub-second precision is microseconds; the
+    /// nanosecond columns in the index are truncated and the precision
+    /// loss is documented in `M2_NOTES.md`.
+    pub fn nfs_utimes(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        times: *mut libc::timeval,
+    ) -> c_int;
+}
+
+/// Last error string from a context, as a borrowed `&str`.
+pub fn last_error<'a>(ctx: *mut nfs_context) -> &'a str {
+    if ctx.is_null() {
+        return "<null context>";
+    }
+    unsafe {
+        let p = nfs_get_error(ctx);
+        if p.is_null() {
+            "<no error>"
+        } else {
+            CStr::from_ptr(p).to_str().unwrap_or("<non-utf8>")
+        }
+    }
+}
+
+// =============================================================================
+// NfsContext — owned, Send, single-threaded use enforced by &mut.
+// =============================================================================
+
+/// An owned libnfs context. `Send` because libnfs contexts can be moved
+/// between threads as long as no two threads use one *concurrently*.
+/// Single-threaded use is enforced by callers taking `&mut NfsContext`.
+pub struct NfsContext {
+    raw: *mut nfs_context,
+}
+
+unsafe impl Send for NfsContext {}
+
+impl NfsContext {
+    /// Build and mount a new context against `nfs://server/export`.
+    /// Pins NFSv3 unconditionally (`docs/CORRECTNESS_RULES.md`
+    /// "NFSv3 is the protocol baseline") — without this, the libnfs build at
+    /// `/usr/local/lib/libnfs.so.16` negotiates v4 by default on a
+    /// bare URL and crashes in `nfs4_mount_1_cb` against VAST.
+    /// Failure to init, set version, or mount returns an error
+    /// containing the libnfs error string.
+    pub fn mount_url(url: &str) -> anyhow::Result<Self> {
+        let (server, export) = parse_nfs_url(url)?;
+        let raw = unsafe { nfs_init_context() };
+        if raw.is_null() {
+            anyhow::bail!("nfs_init_context returned null for {url}");
+        }
+        let me = Self { raw };
+        let rc = unsafe { nfs_set_version(me.raw, 3) };
+        if rc < 0 {
+            let err = last_error(me.raw).to_string();
+            anyhow::bail!("nfs_set_version(3) for {url} failed (rc={rc}): {err}");
+        }
+        let server_c = std::ffi::CString::new(server.clone())
+            .map_err(|_| anyhow::anyhow!("server has interior NUL: {server}"))?;
+        let export_c = std::ffi::CString::new(export.clone())
+            .map_err(|_| anyhow::anyhow!("export has interior NUL: {export}"))?;
+        let rc = unsafe { nfs_mount(me.raw, server_c.as_ptr(), export_c.as_ptr()) };
+        if rc < 0 {
+            let err = last_error(me.raw).to_string();
+            anyhow::bail!("nfs_mount {url} failed (rc={rc}): {err}");
+        }
+        Ok(me)
+    }
+
+    /// Raw pointer for FFI calls. Caller must not call concurrently
+    /// from another thread.
+    #[inline]
+    pub fn raw(&mut self) -> *mut nfs_context {
+        self.raw
+    }
+}
+
+impl Drop for NfsContext {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { nfs_destroy_context(self.raw) };
+            self.raw = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Parse an `nfs://server/export[/...]` URL into (server, export).
+/// The export keeps its leading slash so it can be passed to
+/// `nfs_mount` directly.
+pub fn parse_nfs_url(url: &str) -> anyhow::Result<(String, String)> {
+    let rest = url
+        .strip_prefix("nfs://")
+        .ok_or_else(|| anyhow::anyhow!("nfs URL must start with nfs://: {url}"))?;
+    let slash = rest
+        .find('/')
+        .ok_or_else(|| anyhow::anyhow!("nfs URL must include export path: {url}"))?;
+    let server = rest[..slash].to_string();
+    let export = rest[slash..].to_string();
+    if server.is_empty() {
+        anyhow::bail!("nfs URL has empty server: {url}");
+    }
+    if export == "/" || export.is_empty() {
+        // libnfs accepts "/" for some servers but most VAST exports
+        // look like "/exportname". Allow but warn.
+        tracing::warn!(url, "nfs URL export path is '/'; this may not be what you meant");
+    }
+    Ok((server, export))
+}
+
+// =============================================================================
+// Errno → name mapping. Used by ops::* to populate MoveError.error with
+// stable strings the failure log + retry tooling can match on.
+// =============================================================================
+
+/// Convert a positive errno to its conventional name. Falls back to
+/// `errno=<n>` for codes the mover hasn't seen before, so the failure
+/// log is never lossy.
+pub fn errno_name(err: i32) -> String {
+    let s = match err {
+        libc::EPERM => "EPERM",
+        libc::ENOENT => "ENOENT",
+        libc::EIO => "EIO",
+        libc::EBADF => "EBADF",
+        libc::EACCES => "EACCES",
+        libc::EEXIST => "EEXIST",
+        libc::EXDEV => "EXDEV",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::EISDIR => "EISDIR",
+        libc::EINVAL => "EINVAL",
+        libc::ENFILE => "ENFILE",
+        libc::EMFILE => "EMFILE",
+        libc::EFBIG => "EFBIG",
+        libc::ENOSPC => "ENOSPC",
+        libc::EROFS => "EROFS",
+        libc::EMLINK => "EMLINK",
+        libc::EPIPE => "EPIPE",
+        libc::ENAMETOOLONG => "ENAMETOOLONG",
+        libc::ENOSYS => "ENOSYS",
+        libc::ENOTEMPTY => "ENOTEMPTY",
+        libc::ELOOP => "ELOOP",
+        libc::ESTALE => "ESTALE",
+        libc::EDQUOT => "EDQUOT",
+        _ => return format!("errno={err}"),
+    };
+    s.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_nfs_url_ok() {
+        let (s, e) = parse_nfs_url("nfs://10.0.0.1/export/data").unwrap();
+        assert_eq!(s, "10.0.0.1");
+        assert_eq!(e, "/export/data");
+    }
+
+    #[test]
+    fn parse_nfs_url_rejects_non_nfs_scheme() {
+        assert!(parse_nfs_url("https://example/").is_err());
+    }
+
+    #[test]
+    fn parse_nfs_url_rejects_empty_server() {
+        assert!(parse_nfs_url("nfs:///export").is_err());
+    }
+
+    #[test]
+    fn parse_nfs_url_rejects_no_export() {
+        assert!(parse_nfs_url("nfs://server").is_err());
+    }
+
+    #[test]
+    fn errno_name_known() {
+        assert_eq!(errno_name(libc::ENOSPC), "ENOSPC");
+        assert_eq!(errno_name(libc::EPERM), "EPERM");
+    }
+
+    #[test]
+    fn errno_name_unknown() {
+        assert_eq!(errno_name(9999), "errno=9999");
+    }
+}

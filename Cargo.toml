@@ -1,0 +1,106 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/migration-core",
+    "crates/migration-mover",
+    "crates/migration-worker",
+    "crates/migration-aggr",
+    "crates/mig-walker-rewrite",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Blake Golliher"]
+license = "AGPL-3.0-only"
+rust-version = "1.75"
+repository = "https://github.com/blakegolliher/vamoose"
+description = "Distributed NFS-to-NFS migration with S3-based coordination"
+readme = "README.md"
+
+[workspace.dependencies]
+# Internal
+migration-core  = { path = "crates/migration-core" }
+migration-mover = { path = "crates/migration-mover" }
+
+# AWS / S3
+aws-sdk-s3   = "1"
+aws-config   = "1"
+aws-smithy-types-convert = { version = "0.60", features = ["convert-chrono"] }
+# Used only on the `verify_tls = false` path to wire a custom rustls
+# ClientConfig into the SDK. The smithy 1.x TLS context has no public
+# "skip cert verification" knob, so we route through the deprecated-
+# but-public hyper_014 builder. Remove when smithy exposes a danger
+# knob upstream and we can drop the legacy path.
+aws-smithy-http-client = { version = "1", default-features = false, features = ["hyper-014", "legacy-rustls-ring"] }
+hyper-rustls = { version = "0.24", default-features = false, features = ["http1", "http2", "tls12", "tokio-runtime", "logging"] }
+rustls       = { version = "0.21", features = ["dangerous_configuration"] }
+
+# Parquet / Arrow (match nfs-walker's version family)
+arrow   = { version = "54", default-features = false, features = ["ipc"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "sync", "time", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Serde
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+anyhow    = "1"
+thiserror = "1"
+
+# Tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+
+# Utilities
+chrono     = { version = "0.4", features = ["serde"] }
+base64     = "0.22"
+bytes      = "1"
+humansize  = "2"
+uuid       = { version = "1", features = ["v4"] }
+hex        = "0.4"
+toml       = "0.8"
+hostname   = "0.4"
+getrandom  = "0.2"
+futures    = "0.3"
+
+# Concurrency primitives (same as nfs-walker)
+crossbeam-channel = "0.5"
+crossbeam-deque   = "0.8"
+
+# memory-mapped parquet
+memmap2 = "0.9"
+
+# TUI
+ratatui = "0.28"
+crossterm = "0.28"
+
+# Prometheus exporter
+prometheus = "0.13"
+hyper      = { version = "1", features = ["server", "http1"] }
+
+# libnfs FFI (see migration-mover/build.rs)
+libc = "0.2"
+
+# io_uring
+io-uring = "0.6"
+
+# trait async fns over dyn
+async-trait = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

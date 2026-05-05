@@ -1,0 +1,823 @@
+//! The `Mover` orchestrates one file copy from start to finish:
+//! strategy selection → data movement → attribute application → atomic
+//! rename. The shard processor calls `move_one` per row (and
+//! `move_hardlink` for rows that have already been copied earlier in
+//! the shard).
+//!
+//! ## Threading model (M3)
+//!
+//! libnfs is a userspace transport whose ops *block* the calling
+//! thread on the network socket. The mover's public `move_*` entry
+//! points are therefore split:
+//!
+//! 1. **Async prologue** — pick the strategy (cheap, sync) and
+//!    `pool.acquire().await` (channel recv, properly async).
+//! 2. **Blocking body** — `tokio::task::spawn_blocking` runs the
+//!    libnfs work on the runtime's blocking pool so the worker
+//!    threads stay free for other tasks.
+//!
+//! This is what makes the M3 concurrent shard dispatch viable. With
+//! M2's "everything async" shape, N concurrent libnfs copies would
+//! pin N tokio workers; routing through the blocking pool removes
+//! that ceiling.
+//!
+//! ## Order on commit (R4)
+//!
+//! 1. data WRITE
+//! 2. close write fh
+//! 3. chmod (mode)
+//! 4. chown (uid/gid) — skipped or downgraded if `require_chown`
+//!    not set and EPERM is observed
+//! 5. utimes (atime/mtime) — last, because some servers update mtime
+//!    as a side effect of mode/owner changes
+//! 6. rename `.partial` → final — **commit point**
+
+use crate::attrs::{self, AttrPolicy};
+use crate::batch::InflightProfile;
+use crate::downgrade::DowngradeSink;
+use crate::error::MoveError;
+use crate::libnfs::{ops, ContextPair, LibnfsContextPool, NfsContext};
+use crate::paths::{join_root, partial_path};
+use crate::strategy::{self, Strategy, StrategyContext};
+use crate::uring::{FixedBufferPool, UringConfig};
+use migration_core::records::{DowngradeKind, FailurePhase, MigrationOptions, ServerSideCopy};
+use migration_core::shard::RowView;
+use std::sync::Arc;
+
+/// Conventional symlink mode on POSIX (`rwxrwxrwx`). When source
+/// reports this, no mode-on-symlink work is needed — that's already
+/// what `nfs_symlink` produces.
+const SYMLINK_DEFAULT_MODE: u32 = 0o0777;
+
+/// Streaming buffer size for the libnfs READ→WRITE path. Per-task
+/// allocation is a few microseconds; keeping this simple while M3 is
+/// new (true fixed-buffer registration is M3.5+ — see `M3_NOTES.md`).
+const STREAM_BUF_SIZE: usize = 1 << 20; // 1 MiB
+
+/// Outcome of attempting to move one file.
+#[derive(Debug, Clone)]
+pub struct MoveOutcome {
+    pub row_id: u64,
+    pub strategy: Strategy,
+    pub bytes_moved: u64,
+    pub result: Result<(), MoveError>,
+}
+
+pub struct MoverConfig {
+    pub source_url: String,
+    pub dest_url: String,
+    /// `endpoint.root` from the manifest's `source` block. Joined with
+    /// `row.path` via [`join_root`] to produce the absolute path used
+    /// by every source-side libnfs op. See SCHEMA_CONTRACT.md "Path
+    /// encoding" and BUGFIX_PLAN.md.
+    pub source_root: String,
+    /// `endpoint.root` from the manifest's `dest` block. Joined with
+    /// `row.path` via [`join_root`] for every dest-side libnfs op.
+    pub dest_root: String,
+    /// **Currently unused.** Strategy selection in this build never
+    /// returns `Strategy::ServerSideCopy` because the system targets
+    /// NFSv3 as the protocol baseline; see `strategy.rs`. Kept on the
+    /// struct for forward compatibility — when an NFSv4.2 fast path
+    /// is reintroduced it will read this flag again.
+    pub same_server_v42: bool,
+    pub policy: AttrPolicy,
+    pub server_side_copy: ServerSideCopy,
+    pub server_side_copy_min_bytes: u64,
+    pub uring: UringConfig,
+    pub inflight: InflightProfile,
+    /// True if the worker has CAP_CHOWN (or `require_chown_capability`
+    /// is set). Controls whether `chown` EPERM is fatal or degraded
+    /// to a recorded warning.
+    pub require_chown: bool,
+    /// When true, verify the bytes written equal `row.size` and fail
+    /// the row with `SIZE_CHANGED` on mismatch. See
+    /// `SCHEMA_CONTRACT.md` "Size semantics". Default false: source
+    /// truth wins over walker's stale `size`.
+    pub require_unchanged_size: bool,
+}
+
+impl MoverConfig {
+    pub fn from_options(
+        source_url: String,
+        dest_url: String,
+        source_root: String,
+        dest_root: String,
+        same_server_v42: bool,
+        opts: &MigrationOptions,
+    ) -> Self {
+        Self {
+            source_url,
+            dest_url,
+            source_root,
+            dest_root,
+            same_server_v42,
+            policy: AttrPolicy::from_options(opts),
+            server_side_copy: opts.server_side_copy,
+            server_side_copy_min_bytes: 64 * 1024,
+            uring: UringConfig::default(),
+            inflight: InflightProfile::default(),
+            require_chown: true,
+            require_unchanged_size: false,
+        }
+    }
+}
+
+/// The mover. Holds long-lived resources: libnfs context pool, the
+/// host id and pid (used to construct `.partial` names), the buffer
+/// pool placeholder (M3.5 wires it in), the downgrade sink, and
+/// policy. Cloning is cheap (Arc inside) and required because
+/// concurrent shard dispatch hands a clone to each spawned task.
+#[derive(Clone)]
+pub struct Mover {
+    cfg: Arc<MoverConfig>,
+    pool: Arc<dyn LibnfsContextPool>,
+    host_id: Arc<str>,
+    pid: u32,
+    downgrades: DowngradeSink,
+    _buffers: Arc<FixedBufferPool>,
+}
+
+impl Mover {
+    pub fn new(
+        cfg: MoverConfig,
+        pool: Arc<dyn LibnfsContextPool>,
+        host_id: impl Into<Arc<str>>,
+        downgrades: DowngradeSink,
+    ) -> Self {
+        let buffers = FixedBufferPool::new(cfg.uring);
+        Self {
+            cfg: Arc::new(cfg),
+            pool,
+            host_id: host_id.into(),
+            pid: std::process::id(),
+            downgrades,
+            _buffers: buffers,
+        }
+    }
+
+    /// Borrow the downgrade sink. Used by the orchestrator to drain
+    /// JSONL between shards and to update the current shard name, and
+    /// by the processor to record FsidUngrouped fallbacks.
+    pub fn downgrade_sink(&self) -> &DowngradeSink {
+        &self.downgrades
+    }
+
+    // =========================================================================
+    // Public entry points used by the shard processor.
+    // =========================================================================
+
+    /// Move a single file. Picks a strategy from `(row, ctx)`, executes
+    /// it, and returns the outcome. Hardlinks-to-already-copied-inodes
+    /// are *not* dispatched here — call [`Self::move_hardlink`] for
+    /// those (the shard processor's per-group logic is the authority).
+    pub async fn move_one(&self, row: &RowView) -> MoveOutcome {
+        let strat_ctx = StrategyContext {
+            server_side_copy_policy: self.cfg.server_side_copy,
+            same_server_v42: self.cfg.same_server_v42,
+            server_side_copy_min_bytes: self.cfg.server_side_copy_min_bytes,
+            already_copied_inode: false,
+        };
+        let strategy = strategy::pick(row, &strat_ctx);
+        let row_owned = row.clone();
+        self.run_with_pair(row, strategy, move |me, pair| {
+            me.execute(pair, &row_owned, strategy)
+        })
+        .await
+    }
+
+    /// Hardlink an already-copied dest path to a new linkpath. Caller
+    /// (the shard processor) holds the per-group "first path" state
+    /// and is responsible for passing the *final* (post-rename) path
+    /// — see R5.
+    pub async fn move_hardlink(&self, row: &RowView, link_target: &[u8]) -> MoveOutcome {
+        let target = link_target.to_vec();
+        let path = row.path.clone();
+        self.run_with_pair(row, Strategy::HardlinkExisting, move |me, pair| {
+            me.do_hardlink(pair, &target, &path)
+        })
+        .await
+    }
+
+    /// Common framing: pick-strategy → acquire-pair → spawn_blocking →
+    /// build MoveOutcome. The closure receives the cloned mover and a
+    /// mutable borrow of the pair so it can drive any of the
+    /// strategy-specific sync paths.
+    async fn run_with_pair<F>(&self, row: &RowView, strategy: Strategy, work: F) -> MoveOutcome
+    where
+        F: FnOnce(&Mover, &mut ContextPair) -> Result<(), MoveError> + Send + 'static,
+    {
+        let row_id = row.row_id;
+        let bytes = row.size;
+
+        let pair = match self.pool.acquire().await {
+            Ok(p) => p,
+            Err(e) => {
+                return MoveOutcome {
+                    row_id,
+                    strategy,
+                    bytes_moved: 0,
+                    result: Err(MoveError::new(
+                        FailurePhase::Open,
+                        format!("pool: {e}"),
+                    )),
+                };
+            }
+        };
+
+        // Move-into-blocking. The pair must live for the whole sync
+        // body; on completion (or panic) it Drops, which sends the
+        // contexts back to the pool.
+        let me = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut pair = pair;
+            work(&me, &mut pair)
+        })
+        .await
+        .unwrap_or_else(|join_err| {
+            Err(MoveError::new(
+                FailurePhase::Open,
+                format!("spawn_blocking join: {join_err}"),
+            ))
+        });
+
+        MoveOutcome {
+            row_id,
+            strategy,
+            bytes_moved: if result.is_ok() { bytes } else { 0 },
+            result,
+        }
+    }
+
+    // =========================================================================
+    // Sync strategy dispatch (called from inside spawn_blocking).
+    // =========================================================================
+
+    fn execute(
+        &self,
+        pair: &mut ContextPair,
+        row: &RowView,
+        strategy: Strategy,
+    ) -> Result<(), MoveError> {
+        match strategy {
+            Strategy::ServerSideCopy => self.do_server_side_copy(pair, row),
+            Strategy::LibnfsIoUring => self.do_libnfs_copy(pair, row),
+            Strategy::KernelCopyFileRange => self.do_kernel_cfr(pair, row),
+            Strategy::Symlink => self.do_symlink(pair, row),
+            Strategy::HardlinkExisting => Err(MoveError::new(FailurePhase::Hardlink, "EINVAL")),
+            Strategy::Empty => self.do_empty(pair, row),
+            Strategy::DirAttrs => self.do_dir_attrs(pair, row),
+            Strategy::Skip => Ok(()),
+        }
+    }
+
+    /// Apply mode/owner/mtime to a directory whose row appeared in
+    /// the index. Ensures the dir exists first (mkdir-on-demand may
+    /// not have created it if no child file landed in it). Caller
+    /// (the shard processor) MUST schedule this strategy after all
+    /// non-dir rows in the same shard are committed, otherwise file
+    /// commits inside the dir will restamp its mtime.
+    ///
+    /// Cross-shard caveat: if a child file's row lands in a later
+    /// shard than its parent dir's row, that child's commit will
+    /// still restamp the parent's mtime. Documented in M3_NOTES.md.
+    fn do_dir_attrs(&self, pair: &mut ContextPair, row: &RowView) -> Result<(), MoveError> {
+        let dst = self.dst_path(row);
+        ops::mkdir_p(pair.dst(), &dst)?;
+        self.apply_attrs(pair.dst(), &dst, row)?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Strategy implementations (all sync, all called from inside
+    // spawn_blocking with an owned ContextPair).
+    // =========================================================================
+
+    /// Compose the source-side absolute path for `row.path`. Source
+    /// libnfs ops MUST go through this — never `&row.path` directly.
+    /// See BUGFIX_PLAN.md and SCHEMA_CONTRACT.md "Path encoding".
+    fn src_path(&self, row: &RowView) -> Vec<u8> {
+        join_root(self.cfg.source_root.as_bytes(), &row.path)
+    }
+
+    /// Compose the destination-side absolute path for `row.path`.
+    /// All dest libnfs ops MUST go through this.
+    fn dst_path(&self, row: &RowView) -> Vec<u8> {
+        join_root(self.cfg.dest_root.as_bytes(), &row.path)
+    }
+
+    /// Per-file self-target check (Fix 2). Refuses to write when the
+    /// computed dest path would collide with the source — either
+    /// directly (same path) or through the `.partial` sibling living
+    /// next to the source file. Both forms can zero a source file
+    /// when `nfs_create` opens with `O_TRUNC`.
+    ///
+    /// Returns Err with tag `SELF_TARGET` on collision. Only meaningful
+    /// when source and dest URLs match — different servers can never
+    /// collide regardless of path. Belt-and-suspenders against the
+    /// startup overlap guard in the worker; either alone is
+    /// insufficient.
+    fn check_self_target(
+        &self,
+        src: &[u8],
+        dst: &[u8],
+        dst_partial: &[u8],
+    ) -> Result<(), MoveError> {
+        check_self_target(
+            &self.cfg.source_url,
+            &self.cfg.dest_url,
+            src,
+            dst,
+            dst_partial,
+        )
+    }
+
+    /// **M4** — NFSv4.2 server-side COPY. Stubbed.
+    fn do_server_side_copy(
+        &self,
+        _pair: &mut ContextPair,
+        _row: &RowView,
+    ) -> Result<(), MoveError> {
+        Err(MoveError::new(FailurePhase::ServerSideCopy, "ENOSYS"))
+    }
+
+    /// **Escape hatch** — kernel `copy_file_range` over already-mounted
+    /// kernel NFS. Stubbed.
+    fn do_kernel_cfr(&self, _pair: &mut ContextPair, _row: &RowView) -> Result<(), MoveError> {
+        Err(MoveError::new(FailurePhase::Write, "ENOSYS"))
+    }
+
+    /// Symlink — preserve `target` byte-for-byte from the index column
+    /// if present (R8), otherwise readlink from the source.
+    ///
+    /// Per SCHEMA_CONTRACT.md "Symlink mode preservation": NFSv3 has
+    /// no lchmod-equivalent (`nfs_chmod` follows symlinks), so when
+    /// `preserve_mode = true` and the source mode bits differ from
+    /// the conventional `0o0777`, the mover writes a
+    /// `SYMLINK_MODE_NFSV3` downgrade record and counts the row as
+    /// success. The destination symlink ends up with whatever default
+    /// mode the server assigns. See BUGFIX_PLAN.md "Fix 5".
+    fn do_symlink(&self, pair: &mut ContextPair, row: &RowView) -> Result<(), MoveError> {
+        let src = self.src_path(row);
+        let dst = self.dst_path(row);
+
+        let target = match &row.symlink_target {
+            Some(t) => t.clone(),
+            None => ops::readlink(pair.src(), &src)?,
+        };
+
+        if let Err(e) = ops::mkdir_p_for_file(pair.dst(), &dst) {
+            return Err(MoveError::new(FailurePhase::Symlink, e.error));
+        }
+        ops::symlink(pair.dst(), &target, &dst)?;
+
+        if self.cfg.policy.preserve_mode {
+            let link_mode = row.mode & 0o7777;
+            if link_mode != SYMLINK_DEFAULT_MODE {
+                self.downgrades
+                    .record(row.row_id, &row.path, DowngradeKind::SymlinkModeNfsV3);
+            }
+        }
+
+        // NFSv3 has no lutimes-equivalent. nfs_utimes follows symlinks
+        // and would clobber the target's mtime, so we don't call it
+        // here at all — but if the source row had a real mtime we
+        // owe the operator a downgrade record so the gap is visible
+        // (`docs/CORRECTNESS_RULES.md` "NFSv3 is the protocol baseline" + post-M2 fix 5).
+        if self.cfg.policy.preserve_times && row.mtime_sec.is_some() {
+            self.downgrades
+                .record(row.row_id, &row.path, DowngradeKind::SymlinkTimeNfsV3);
+        }
+
+        Ok(())
+    }
+
+    /// Hardlink — link an already-copied final path to a new path
+    /// within the same shard. Both `target` and `linkpath` are
+    /// `row.path`-style (relative to the export root); the mover
+    /// composes the absolute dest paths via [`Self::dst_path`].
+    fn do_hardlink(
+        &self,
+        pair: &mut ContextPair,
+        target: &[u8],
+        linkpath: &[u8],
+    ) -> Result<(), MoveError> {
+        let target_abs = join_root(self.cfg.dest_root.as_bytes(), target);
+        let linkpath_abs = join_root(self.cfg.dest_root.as_bytes(), linkpath);
+
+        if let Err(e) = ops::mkdir_p_for_file(pair.dst(), &linkpath_abs) {
+            return Err(MoveError::new(FailurePhase::Hardlink, e.error));
+        }
+        ops::link(pair.dst(), &target_abs, &linkpath_abs)?;
+        Ok(())
+    }
+
+    /// Empty file (`size == 0`) — no read/write loop, just CREATE +
+    /// attrs + rename. R7: keeps the data-loop entirely off the
+    /// zero-byte path.
+    fn do_empty(&self, pair: &mut ContextPair, row: &RowView) -> Result<(), MoveError> {
+        let src = self.src_path(row);
+        let dst = self.dst_path(row);
+        let dst_partial = partial_path(&dst, &self.host_id, self.pid)?;
+        self.check_self_target(&src, &dst, &dst_partial)?;
+
+        ops::mkdir_p_for_file(pair.dst(), &dst)?;
+
+        let fh = ops::create_write(pair.dst(), &dst_partial, 0o600)?;
+        ops::close_fh(pair.dst(), fh, FailurePhase::Write)?;
+
+        self.apply_attrs(pair.dst(), &dst_partial, row)?;
+        tracing::debug!(
+            dest = %String::from_utf8_lossy(&dst),
+            host = %self.host_id,
+            pid = self.pid,
+            row_id = row.row_id,
+            "commit: rename .partial → final",
+        );
+        ops::rename(pair.dst(), &dst_partial, &dst)?;
+        Ok(())
+    }
+
+    /// Default path: libnfs READ → libnfs WRITE through a 1 MiB
+    /// streaming buffer, single-fiber within the call. Concurrency
+    /// across files comes from the shard processor's JoinSet.
+    fn do_libnfs_copy(&self, pair: &mut ContextPair, row: &RowView) -> Result<(), MoveError> {
+        let src = self.src_path(row);
+        let dst = self.dst_path(row);
+        let dst_partial = partial_path(&dst, &self.host_id, self.pid)?;
+        self.check_self_target(&src, &dst, &dst_partial)?;
+
+        ops::mkdir_p_for_file(pair.dst(), &dst)?;
+
+        let src_fh = ops::open_read(pair.src(), &src)?;
+        let dst_fh = match ops::create_write(pair.dst(), &dst_partial, 0o600) {
+            Ok(fh) => fh,
+            Err(e) => {
+                ops::close_quietly(pair.src(), src_fh);
+                return Err(e);
+            }
+        };
+
+        let result = stream_copy(pair, &src_fh, &dst_fh, row.row_id, row.size);
+
+        let close_src = ops::close_fh(pair.src(), src_fh, FailurePhase::Read);
+        let close_dst = ops::close_fh(pair.dst(), dst_fh, FailurePhase::Write);
+
+        let written = result?;
+        close_src?;
+        close_dst?;
+
+        if self.cfg.require_unchanged_size && written != row.size {
+            return Err(MoveError::new(FailurePhase::Open, "SIZE_CHANGED"));
+        }
+
+        // Per SCHEMA_CONTRACT.md "Size semantics" / decision #11, a
+        // short read is *not* a failure on the default path — the
+        // file is committed. But surface the discrepancy so the
+        // operator sees that actual bytes copied differ from the
+        // indexed size. (If we'd had this in place during the M2 FFI
+        // verification incident, every non-empty regular file would
+        // have produced an EARLY_EOF record; see M2_NOTES.md
+        // "M2/M3 verification incidents".)
+        if written < row.size {
+            self.downgrades
+                .record(row.row_id, &row.path, DowngradeKind::EarlyEof);
+        }
+
+        self.apply_attrs(pair.dst(), &dst_partial, row)?;
+        tracing::debug!(
+            dest = %String::from_utf8_lossy(&dst),
+            host = %self.host_id,
+            pid = self.pid,
+            row_id = row.row_id,
+            "commit: rename .partial → final",
+        );
+        ops::rename(pair.dst(), &dst_partial, &dst)?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Helpers.
+    // =========================================================================
+
+    /// Apply mode + uid/gid + atime/mtime on the still-`.partial`
+    /// destination. Strict order per R4. Honors `cfg.policy` and
+    /// `cfg.require_chown`. Records downgrades for null source attrs
+    /// the user asked to preserve, per SCHEMA_CONTRACT.md "Null
+    /// attribute semantics".
+    fn apply_attrs(
+        &self,
+        ctx: &mut NfsContext,
+        dst_partial: &[u8],
+        row: &RowView,
+    ) -> Result<(), MoveError> {
+        let attrs = attrs::build(row, self.cfg.policy);
+        let policy = self.cfg.policy;
+
+        if policy.preserve_owner && (row.uid.is_none() || row.gid.is_none()) {
+            self.downgrades
+                .record(row.row_id, &row.path, DowngradeKind::NullOwner);
+        }
+        if policy.preserve_times && row.mtime_sec.is_none() {
+            self.downgrades
+                .record(row.row_id, &row.path, DowngradeKind::NullMtime);
+        }
+        if policy.preserve_times && row.mtime_sec.is_some() && row.atime_sec.is_none() {
+            self.downgrades
+                .record(row.row_id, &row.path, DowngradeKind::NullAtime);
+        }
+
+        if let Some(mode) = attrs.mode {
+            ops::chmod(ctx, dst_partial, mode)?;
+        }
+
+        if let (Some(uid), Some(gid)) = (attrs.uid, attrs.gid) {
+            match ops::chown(ctx, dst_partial, uid, gid) {
+                Ok(()) => {}
+                Err(e) if e.error == "EPERM" && !self.cfg.require_chown => {
+                    tracing::debug!(uid, gid, "chown EPERM in degraded mode; skipping");
+                    self.downgrades
+                        .record(row.row_id, &row.path, DowngradeKind::NullOwner);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if let Some((mt_s, mt_n)) = attrs.mtime {
+            let (at_s, at_n) = attrs.atime.unwrap_or((mt_s, mt_n));
+            ops::utimes(ctx, dst_partial, at_s, at_n, mt_s, mt_n)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Return the parent directory portion of an absolute byte path,
+/// keeping the trailing slash so two parents compare equal even when
+/// only one originally had a slash. Empty input maps to empty.
+fn parent_dir(p: &[u8]) -> &[u8] {
+    match p.iter().rposition(|&b| b == b'/') {
+        Some(0) => b"/",
+        Some(i) => &p[..i],
+        None => &[],
+    }
+}
+
+/// Free-function form of the per-file self-target check, factored out
+/// of `Mover` so it's unit-testable without spinning up a libnfs pool.
+/// See `Mover::check_self_target` for behavior; this is the body.
+fn check_self_target(
+    source_url: &str,
+    dest_url: &str,
+    src: &[u8],
+    dst: &[u8],
+    dst_partial: &[u8],
+) -> Result<(), MoveError> {
+    if source_url != dest_url {
+        return Ok(());
+    }
+    if src == dst {
+        return Err(MoveError::new(FailurePhase::Open, "SELF_TARGET"));
+    }
+    if parent_dir(src) == parent_dir(dst_partial) {
+        return Err(MoveError::new(FailurePhase::Open, "SELF_TARGET"));
+    }
+    Ok(())
+}
+
+/// The READ→WRITE loop. Sync; runs inside `spawn_blocking`. Returns
+/// the total bytes written. EOF before `size` is *not* an error in
+/// the default mode — `size` is advisory per SCHEMA_CONTRACT.md —
+/// but is surfaced as a tracing warning so the operator can spot a
+/// short copy without grep'ing for downgrade records. The caller
+/// (`do_libnfs_copy`) writes the corresponding `EARLY_EOF` downgrade
+/// record after this returns.
+///
+/// `row_id` is threaded through purely for the warning's structured
+/// fields.
+fn stream_copy(
+    pair: &mut ContextPair,
+    src_fh: &ops::NfsFh,
+    dst_fh: &ops::NfsFh,
+    row_id: u64,
+    size: u64,
+) -> Result<u64, MoveError> {
+    let (src_ctx, dst_ctx) = pair.split();
+    stream_copy_inner(
+        size,
+        |off, buf| ops::pread(src_ctx, src_fh, off, buf),
+        |off, buf| ops::pwrite(dst_ctx, dst_fh, off, buf),
+        |off, remaining| {
+            tracing::warn!(
+                row_id,
+                indexed_size = size,
+                actual_size = off,
+                short = remaining,
+                "pread returned 0 with remaining bytes; treating as EOF \
+                 (contract: size is advisory)",
+            );
+        },
+    )
+}
+
+/// Loop body of `stream_copy`, factored out so it can be exercised
+/// against in-memory closures (no libnfs context, no real fhs).
+/// Production calls it from `stream_copy` with closures that hit the
+/// libnfs FFI; the unit tests below call it with closures that drive
+/// pre-canned read returns to reproduce the FFI-bug failure mode
+/// (silent zero-byte reads).
+fn stream_copy_inner<R, W, S>(
+    size: u64,
+    mut read_at: R,
+    mut write_at: W,
+    mut on_short_eof: S,
+) -> Result<u64, MoveError>
+where
+    R: FnMut(u64, &mut [u8]) -> Result<usize, MoveError>,
+    W: FnMut(u64, &[u8]) -> Result<usize, MoveError>,
+    S: FnMut(u64, u64),
+{
+    if size == 0 {
+        return Ok(0);
+    }
+
+    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+    let mut off = 0u64;
+    let mut remaining = size;
+
+    while remaining > 0 {
+        let want = remaining.min(STREAM_BUF_SIZE as u64) as usize;
+        let n = read_at(off, &mut buf[..want])?;
+        if n == 0 {
+            on_short_eof(off, remaining);
+            break;
+        }
+        let mut written_in_chunk = 0;
+        while written_in_chunk < n {
+            let w = write_at(
+                off + written_in_chunk as u64,
+                &buf[written_in_chunk..n],
+            )?;
+            if w == 0 {
+                return Err(MoveError::new(FailurePhase::Write, "EIO"));
+            }
+            written_in_chunk += w;
+        }
+        off += n as u64;
+        remaining -= n as u64;
+    }
+    Ok(off)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parent_dir ----------------------------------------------
+
+    #[test]
+    fn parent_dir_root_level_file() {
+        assert_eq!(parent_dir(b"/foo.txt"), b"/");
+    }
+
+    #[test]
+    fn parent_dir_nested() {
+        assert_eq!(parent_dir(b"/a/b/c"), b"/a/b");
+    }
+
+    #[test]
+    fn parent_dir_no_slash() {
+        assert_eq!(parent_dir(b"foo"), b"");
+    }
+
+    // ---- self-target check ---------------------------------------
+    //
+    // Belt-and-suspenders against the startup overlap guard. These
+    // tests are the regression test for the data-loss bug
+    // recovered in M2 verification.
+
+    #[test]
+    fn self_target_check_blocks_same_path() {
+        let url = "nfs://host/exp";
+        let r = check_self_target(url, url, b"/foo/bar", b"/foo/bar", b"/foo/.bar.h.1.partial");
+        let e = r.expect_err("identical src and dst must fail SELF_TARGET");
+        assert_eq!(e.error, "SELF_TARGET");
+        assert_eq!(e.phase, FailurePhase::Open);
+    }
+
+    #[test]
+    fn self_target_check_blocks_same_parent_dir() {
+        // dst path differs but its .partial parent equals src parent —
+        // create-with-O_TRUNC would still trash the source file.
+        let url = "nfs://host/exp";
+        let r = check_self_target(url, url, b"/foo/bar", b"/foo/baz", b"/foo/.bar.h.1.partial");
+        assert_eq!(r.unwrap_err().error, "SELF_TARGET");
+    }
+
+    #[test]
+    fn self_target_check_allows_different_url() {
+        // Different servers — paths can collide all they want.
+        let r = check_self_target(
+            "nfs://srcA/exp",
+            "nfs://srcB/exp",
+            b"/foo/bar",
+            b"/foo/bar",
+            b"/foo/.bar.h.1.partial",
+        );
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn self_target_check_allows_disjoint_dirs() {
+        let url = "nfs://host/exp";
+        let r = check_self_target(
+            url,
+            url,
+            b"/src/file",
+            b"/dst/file",
+            b"/dst/.file.h.1.partial",
+        );
+        assert!(r.is_ok());
+    }
+
+    // ---- stream_copy_inner: short-read behavior ------------------
+    //
+    // Regression coverage for the M2 libnfs FFI bug. The buggy FFI
+    // signature caused pread to return 0 on every call against a
+    // real export, but the stream_copy loop used to swallow that
+    // silently and report success. The contract still says "size is
+    // advisory" so the loop must NOT fail — it must return Ok(off)
+    // with off == bytes-actually-read, leaving the caller to record
+    // the EARLY_EOF downgrade. These tests pin that behavior so the
+    // surface can't regress.
+
+    #[test]
+    fn stream_copy_short_read_returns_ok_with_partial_off() {
+        // Mock pread that always returns 0 — the exact failure mode
+        // of the M2 libnfs FFI bug. write should never be called.
+        let size: u64 = 4096;
+        let mut on_short_called = false;
+        let result = stream_copy_inner(
+            size,
+            |_off, _buf| Ok(0usize),
+            |_off, _buf| -> Result<usize, MoveError> {
+                panic!("write_at must not be called when read returns 0");
+            },
+            |off, remaining| {
+                on_short_called = true;
+                assert_eq!(off, 0);
+                assert_eq!(remaining, size);
+            },
+        );
+
+        let off = result.expect("short read is not an error in default mode");
+        assert_eq!(off, 0, "off must equal bytes-actually-read");
+        assert!(off < size, "off ({off}) must be < indexed size ({size})");
+        assert!(on_short_called, "on_short_eof must fire so caller can record EARLY_EOF");
+    }
+
+    #[test]
+    fn stream_copy_short_read_after_partial_progress() {
+        // Variant: pread returns one full chunk then 0. off should
+        // equal the chunk that did land; the loop still returns Ok.
+        let size: u64 = (STREAM_BUF_SIZE as u64) * 4;
+        let mut reads = 0;
+        let mut writes = 0;
+        let result = stream_copy_inner(
+            size,
+            |_off, buf| {
+                reads += 1;
+                if reads == 1 {
+                    Ok(buf.len())  // first chunk: full read
+                } else {
+                    Ok(0)          // then EOF
+                }
+            },
+            |_off, buf| {
+                writes += 1;
+                Ok(buf.len())
+            },
+            |_off, _remaining| {},
+        );
+
+        let off = result.expect("short read after progress is not an error");
+        assert_eq!(off as usize, STREAM_BUF_SIZE);
+        assert!(off < size);
+        assert_eq!(reads, 2, "expected one full read then one short read");
+        assert_eq!(writes, 1);
+    }
+
+    #[test]
+    fn stream_copy_size_zero_is_no_op() {
+        let result = stream_copy_inner(
+            0,
+            |_, _| -> Result<usize, MoveError> {
+                panic!("read_at must not be called for size 0");
+            },
+            |_, _| -> Result<usize, MoveError> {
+                panic!("write_at must not be called for size 0");
+            },
+            |_, _| panic!("on_short_eof must not fire for size 0"),
+        );
+        assert_eq!(result.unwrap(), 0);
+    }
+}

@@ -1,0 +1,61 @@
+# Example mig-worker config. See DESIGN.md "Configuration" for full
+# semantics. Values shown are starting points; tune in M6.
+
+[run]
+bucket     = "vamoose"
+endpoint   = "https://main.selab-var204.selab.vastdata.com"
+region     = "us-east-1"
+profile    = "var204"      # named ~/.aws/credentials profile; omit to use the default chain
+verify_tls = false         # set true outside of lab/dev (default). false skips cert verification entirely.
+
+[worker]
+# host_id = "worker-07"     # auto-generated if omitted
+heartbeat_sec     = 30
+lease_timeout_sec = 180     # 3 min, 6× heartbeat
+
+[shard]
+local_scratch  = "/var/lib/mig/scratch"   # tmpfs strongly preferred
+max_in_flight  = 1                         # shards concurrently in this worker
+
+[mover]
+strategy_default     = "libnfs_io_uring"   # libnfs_io_uring | nfs42_copy | kernel_cfr
+src_url              = "nfs://src-server/source-export"
+dst_url              = "nfs://dst-server/dest-export"
+# Source and destination MUST be distinct exports OR distinct roots
+# on the same export. The worker refuses to start if they overlap.
+nfs_connections      = 16
+pipeline_depth       = 8
+io_uring_queue_depth = 256
+fixed_buffer_count   = 256
+fixed_buffer_size    = "1 MiB"
+
+[batch]
+bytes_budget       = "8 GiB"
+files_budget       = 100000
+inflight_small     = 256       # files < 1 MiB
+inflight_medium    = 16        # 1 MiB – 1 GiB
+inflight_large     = 4         # > 1 GiB
+large_stripe_size  = "4 MiB"
+large_stripe_depth = 32
+
+[copy]
+preserve_owner            = true
+preserve_mode             = true
+preserve_times            = true
+preserve_xattr            = true   # honored when walker emits xattr_blob; no-op until then
+server_side_copy          = "off"  # NFSv3 baseline; NFSv4.2 COPY not used.
+                                    # Field is informational under NFSv3 — strategy
+                                    # selection never picks server-side COPY regardless.
+require_chown_capability  = true   # default; refuse to start if preserve_owner=true
+                                    # but the worker doesn't hold CAP_CHOWN.
+                                    # Set false to downgrade chown EPERM to a per-file
+                                    # warning (recorded to failures/).
+require_unchanged_size    = false  # default; treat row.size as advisory.
+                                    # Set true to fail any file whose post-copy byte
+                                    # count differs from the indexed size
+                                    # (FailurePhase::Open, error tag SIZE_CHANGED).
+
+[backpressure]
+failure_pct_window_sec = 60
+failure_pct_threshold  = 5.0
+throughput_floor_mb_s  = 100

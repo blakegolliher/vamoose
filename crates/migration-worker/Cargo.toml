@@ -1,0 +1,32 @@
+[package]
+name        = "migration-worker"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "Migration worker binary (mig-worker)"
+
+[[bin]]
+name = "mig-worker"
+path = "src/main.rs"
+
+[dependencies]
+migration-core  = { workspace = true }
+migration-mover = { workspace = true }
+
+tokio    = { workspace = true }
+tokio-util = { workspace = true }
+serde    = { workspace = true }
+serde_json = { workspace = true }
+anyhow   = { workspace = true }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap     = { workspace = true }
+chrono   = { workspace = true }
+crossbeam-channel = { workspace = true }
+hex      = { workspace = true }
+toml     = { workspace = true }
+hostname = { workspace = true }
+getrandom = { workspace = true }
+libc     = { workspace = true }

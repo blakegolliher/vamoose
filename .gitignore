@@ -1,0 +1,30 @@
+# Build artifacts
+/target
+**/*.rs.bk
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Backup/probe files
+*.bak
+*.tmp
+
+# Run artifacts (M5 harness, scratch space, ad-hoc logs)
+/m5/run/
+/scratch/
+*.log
+
+# Local environment / secrets
+.env
+.env.local
+
+# Sandbox dirs
+/tmp/
+/private/
+
+# Per-session tool state
+.claude/

@@ -1,0 +1,21 @@
+[package]
+name        = "mig-walker-rewrite"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "Throwaway shim: nfs-walker parquet → canonical migration schema"
+
+[[bin]]
+name = "mig-walker-rewrite"
+path = "src/main.rs"
+
+[dependencies]
+migration-core     = { workspace = true }
+arrow              = { workspace = true }
+parquet            = { workspace = true }
+clap               = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+libc               = { workspace = true }

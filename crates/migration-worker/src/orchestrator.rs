@@ -1,0 +1,666 @@
+//! Worker orchestrator — top-level loop for the M1 worker.
+//!
+//! Sequence:
+//!
+//! 1. Load manifest, verify format version.
+//! 2. Build the mover (no-op data path in M1) and a shared
+//!    `ProgressState`.
+//! 3. Spawn the heartbeat task.
+//! 4. Reconcile any self-owned claims left behind by a previous run
+//!    (logged, not resumed in M1 — see DESIGN.md "Future work:
+//!    resume-after-restart").
+//! 5. Loop:
+//!    a. Scan `shards/` for a claimable shard (free or stale-leased).
+//!    b. Try to acquire via `If-None-Match: *` or reclaim via
+//!       `If-Match: <stale-etag>`.
+//!    c. Download the parquet index shard to local scratch.
+//!    d. Run the shard processor; update HeldClaim + ProgressState.
+//!    e. On clean completion: mark the claim `Completed`.
+//!    f. On fence trip: leave the claim where it is and exit.
+//! 6. Exit cleanly when every shard is Completed/Failed or the worker
+//!    is fenced.
+
+use crate::backpressure::Backpressure;
+use crate::caps;
+use crate::config::Config;
+use crate::fence::Fence;
+use crate::heartbeat::{HeartbeatTask, HeldClaim, ProgressState};
+use crate::shard_processor::{ProcessOutcome, ShardProcessor};
+use crate::throughput::ThroughputCounter;
+
+use migration_core::claim::{
+    self, AcquireOutcome, ClaimStore, CompleteOutcome, ListEntry, ReclaimOutcome,
+};
+use migration_core::layout;
+use migration_core::overlap;
+use migration_core::records::{
+    ClaimRecord, ClaimState, Manifest, MigrationOptions, ServerSideCopy, ShardEntry,
+    RUN_FORMAT_VERSION,
+};
+use migration_core::s3::S3Client;
+use migration_core::time::UtcTime;
+use migration_mover::batch::{BatchBudget, InflightLimiter, InflightProfile};
+use migration_mover::{
+    DowngradeSink, FailureSink, LibnfsContextPool, MultiPool, Mover, MoverConfig,
+};
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock};
+
+pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
+    // ---- 1. S3 client + manifest -----------------------------------
+    let s3 = S3Client::from_config(
+        &cfg.run.endpoint,
+        &cfg.run.region,
+        &cfg.run.bucket,
+        cfg.run.profile.as_deref(),
+        cfg.run.verify_tls,
+    )
+    .await?;
+    let s3 = Arc::new(s3);
+
+    let manifest = load_manifest(&s3).await?;
+    if manifest.format_version != RUN_FORMAT_VERSION {
+        anyhow::bail!(
+            "manifest format_version {} does not match worker {}",
+            manifest.format_version,
+            RUN_FORMAT_VERSION,
+        );
+    }
+    tracing::info!(
+        run_id = %manifest.run_id,
+        shards = manifest.shards.len(),
+        total_rows = manifest.total_rows,
+        "manifest loaded",
+    );
+
+    // Source/dest overlap guard — refuses to start before mounting
+    // libnfs or claiming any shard. See BUGFIX_PLAN.md "Fix 3" and
+    // `migration_core::overlap`.
+    overlap::check(&manifest.source, &manifest.dest)?;
+
+    // Local scratch.
+    tokio::fs::create_dir_all(&cfg.shard.local_scratch).await?;
+
+    // ---- 2. Capability check ---------------------------------------
+    // Failing fast at startup beats burning a shard on per-file EPERM.
+    let opts = effective_options(&manifest.options, &cfg);
+    let cap_chown = caps::has_cap_chown();
+    let require_chown = cfg.copy.require_chown_capability;
+    if opts.preserve_owner && require_chown && !cap_chown {
+        anyhow::bail!(
+            "preserve_owner=true requires CAP_CHOWN; \
+             grant the capability or set [copy].require_chown_capability=false to downgrade",
+        );
+    }
+    if opts.preserve_owner && !cap_chown {
+        tracing::warn!(
+            "preserve_owner=true but CAP_CHOWN not held; running in degraded mode \
+             (chown EPERM will be recorded as warnings, not failures)",
+        );
+    }
+
+    // ---- 3. Mount libnfs pool + build mover -----------------------
+    // M3: pre-mount cfg.mover.nfs_connections context pairs so
+    // concurrent shard dispatch has distinct contexts to draw from.
+    let pool_size = cfg.mover.nfs_connections.max(1) as usize;
+    let pool: Arc<dyn LibnfsContextPool> = MultiPool::build(
+        &manifest.source.url,
+        &manifest.dest.url,
+        pool_size,
+    )?;
+    tracing::info!(
+        pool_size,
+        src = %manifest.source.url,
+        dst = %manifest.dest.url,
+        "libnfs pool mounted",
+    );
+
+    let mut mover_cfg = MoverConfig::from_options(
+        manifest.source.url.clone(),
+        manifest.dest.url.clone(),
+        manifest.source.root.clone(),
+        manifest.dest.root.clone(),
+        false, // same_server_v42 detection lands in M4
+        &opts,
+    );
+    mover_cfg.require_chown = require_chown && cap_chown;
+    mover_cfg.require_unchanged_size = cfg.copy.require_unchanged_size;
+    // Apply the [batch].inflight_* profile so the mover and the
+    // shard processor share the same view of size-class concurrency.
+    mover_cfg.inflight = InflightProfile {
+        small: cfg.batch.inflight_small,
+        medium: cfg.batch.inflight_medium,
+        large: cfg.batch.inflight_large,
+        large_stripe_size: parse_size(&cfg.batch.large_stripe_size).unwrap_or(4 * 1024 * 1024),
+        large_stripe_depth: cfg.batch.large_stripe_depth,
+    };
+    let downgrades = DowngradeSink::new();
+    let failures = FailureSink::new();
+    let mover = Mover::new(mover_cfg, pool, host_id.clone(), downgrades.clone());
+
+    // ---- 4. Shared progress + heartbeat ----------------------------
+    let progress = Arc::new(RwLock::new(ProgressState::new()));
+    let current = Arc::new(Mutex::new(None::<HeldClaim>));
+    let fence = Fence::new();
+    let throughput = ThroughputCounter::new();
+    let inflight = InflightLimiter::new(&InflightProfile {
+        small: cfg.batch.inflight_small,
+        medium: cfg.batch.inflight_medium,
+        large: cfg.batch.inflight_large,
+        large_stripe_size: 0,
+        large_stripe_depth: 0,
+    });
+
+    let hb = HeartbeatTask {
+        store: s3.clone() as Arc<dyn ClaimStore>,
+        fence: fence.clone(),
+        host_id: host_id.clone(),
+        interval: Duration::from_secs(cfg.worker.heartbeat_sec),
+        current: current.clone(),
+        progress: progress.clone(),
+        throughput: throughput.clone(),
+        throughput_window_secs: 60,
+    };
+    let hb_handle = tokio::spawn(async move { hb.run().await });
+
+    // ---- 5. Reconcile self-owned claims ----------------------------
+    if let Err(e) = log_self_owned_claims(&s3, &host_id).await {
+        tracing::warn!(error = ?e, "self-claim reconcile scan failed (continuing)");
+    }
+
+    // ---- 6. Main shard loop ----------------------------------------
+    let lease = Duration::from_secs(cfg.worker.lease_timeout_sec);
+    let budget = parse_batch_budget(&cfg).unwrap_or_default();
+    let mut backpressure = Backpressure::new(
+        cfg.backpressure.failure_pct_threshold,
+        cfg.backpressure.throughput_floor_mb_s,
+    );
+
+    loop {
+        if !fence.is_valid() {
+            tracing::warn!(reason = ?fence.reason(), "worker fenced; exiting main loop");
+            break;
+        }
+
+        // Backpressure gate per DESIGN.md "Backpressure": if the last
+        // shard ended in poor shape, don't pile onto a struggling
+        // dest. Sleep one heartbeat interval and re-check.
+        if let Some(reason) = backpressure.degraded() {
+            {
+                let mut p = progress.write().await;
+                p.status = format!("degraded:{}", reason.as_str());
+            }
+            tracing::warn!(
+                reason = reason.as_str(),
+                last_failure_pct = backpressure.last_failure_pct(),
+                last_throughput_mb_s = backpressure.last_throughput_mb_s(),
+                "worker degraded; sleeping before next claim",
+            );
+            tokio::time::sleep(Duration::from_secs(cfg.worker.heartbeat_sec)).await;
+            // Don't continue around — keep evaluating, but don't spin
+            // claims if still degraded after sleep.
+            continue;
+        }
+
+        let scan = scan_shards(&s3, &manifest, lease).await?;
+        if scan.all_terminal {
+            tracing::info!("all shards terminal; worker exiting");
+            break;
+        }
+        let Some(target) = scan.next_target else {
+            // Everything's Active and live with someone else. Idle a
+            // bit and re-scan; this is a soft backoff so we don't burn
+            // S3 LIST quota.
+            tracing::debug!("no claimable shards this pass; idling");
+            tokio::time::sleep(Duration::from_secs(cfg.worker.heartbeat_sec)).await;
+            continue;
+        };
+
+        let (etag, record) = match target {
+            ClaimTarget::Free { shard } => {
+                match claim::try_acquire(&*s3, &shard, &host_id).await? {
+                    AcquireOutcome::Acquired { etag, record } => (etag, record),
+                    AcquireOutcome::Contended { existing, .. } => {
+                        tracing::debug!(
+                            existing_host = %existing.host,
+                            "shard contended; trying another",
+                        );
+                        continue;
+                    }
+                }
+            }
+            ClaimTarget::Stale { shard, stale_etag, prior_epoch } => {
+                let new_epoch = prior_epoch + 1;
+                match claim::reclaim(&*s3, &shard, &stale_etag, &host_id, new_epoch).await? {
+                    ReclaimOutcome::Won { etag, record } => (etag, record),
+                    ReclaimOutcome::LostRace => {
+                        tracing::debug!(
+                            shard = %shard,
+                            "reclaim lost race; trying another",
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let shard_filename = current_shard_filename(&record, &scan.last_target_filename);
+        tracing::info!(shard = %shard_filename, etag = %etag, "shard claimed");
+
+        // Update shared state so the heartbeat reflects the new shard.
+        {
+            let mut g = current.lock().await;
+            *g = Some(HeldClaim {
+                shard: shard_filename.clone(),
+                etag: etag.clone(),
+                epoch: record.epoch,
+            });
+            let mut p = progress.write().await;
+            p.current_shard = Some(shard_filename.clone());
+            p.shard_rows_total = 0;
+            p.shard_rows_done = 0;
+            p.shard_bytes_done = 0;
+            p.status = "active".into();
+        }
+
+        // Download the parquet shard to scratch.
+        let scratch = cfg.shard.local_scratch.join(&shard_filename);
+        let download_etag = s3.download_to(&layout::index_key(&shard_filename), &scratch).await?;
+        verify_shard_etag(&manifest, &shard_filename, &download_etag)?;
+
+        // Stamp the current shard onto both sinks so records carry
+        // the right shard name (the mover doesn't otherwise know).
+        downgrades.set_current_shard(shard_filename.clone());
+        failures.set_current_shard(shard_filename.clone());
+
+        // M3: spawn a fresh processor with the worker's shared
+        // limiter/sinks/throughput so all shards report into one
+        // throughput counter and one failure log per host.
+        let mut processor = ShardProcessor {
+            mover: mover.clone(),
+            fence: fence.clone(),
+            budget,
+            inflight: inflight.clone(),
+            failures: failures.clone(),
+            throughput: throughput.clone(),
+            fsid_fallback_warned: false,
+        };
+        let outcome = processor.process(&scratch).await?;
+
+        // Push final per-shard counters into the shared progress.
+        {
+            let mut p = progress.write().await;
+            p.shard_rows_total = outcome.rows_total;
+            p.shard_rows_done = outcome.files_ok + outcome.files_failed;
+            p.shard_bytes_done = p.shard_bytes_done.saturating_add(outcome.bytes_moved);
+            p.files_ok = p.files_ok.saturating_add(outcome.files_ok);
+            p.files_failed = p.files_failed.saturating_add(outcome.files_failed);
+        }
+
+        // Flush downgrade + failure JSONL produced this shard. PUTs
+        // are unconditional (one object per host, one PUT per
+        // non-empty shard); the aggregator stitches the JSONL back
+        // together. Shard names on each record were stamped at the
+        // start of this shard.
+        let drained = downgrades.drain_jsonl();
+        downgrades.set_current_shard("");
+        if !drained.is_empty() {
+            let key = layout::downgrades_key(&host_id);
+            if let Err(e) = s3.put(&key, drained).await {
+                tracing::warn!(
+                    error = ?e,
+                    shard = %shard_filename,
+                    "downgrade flush failed (records lost; copy itself succeeded)",
+                );
+            }
+        }
+        let drained_failures = failures.drain_jsonl();
+        failures.set_current_shard("");
+        if !drained_failures.is_empty() {
+            let key = layout::failures_key(&host_id);
+            if let Err(e) = s3.put(&key, drained_failures).await {
+                tracing::warn!(
+                    error = ?e,
+                    shard = %shard_filename,
+                    "failure flush failed (failure records lost)",
+                );
+            }
+        }
+
+        // Update the backpressure gate with this shard's stats and
+        // the latest throughput sample. The throughput sample here
+        // races slightly with the heartbeat, but both pull from the
+        // same atomic counter so values are at most one sample apart.
+        let throughput_now = throughput.sample_mb_s(60);
+        backpressure.update(outcome.files_ok, outcome.files_failed, throughput_now);
+
+        // Tear down the local scratch copy as soon as we're done.
+        if let Err(e) = tokio::fs::remove_file(&scratch).await {
+            tracing::warn!(error = ?e, scratch = %scratch.display(), "scratch cleanup failed");
+        }
+
+        if outcome.fenced {
+            tracing::warn!(shard = %shard_filename, "shard processing fenced");
+            // Don't mark complete — leave the claim where it is so the
+            // next worker can reclaim after lease timeout.
+            break;
+        }
+
+        // Re-read the latest etag from the shared cell — heartbeat may
+        // have refreshed it during processing.
+        let (final_etag, final_epoch) = {
+            let g = current.lock().await;
+            match g.as_ref() {
+                Some(c) if c.shard == shard_filename => (c.etag.clone(), c.epoch),
+                _ => (etag.clone(), record.epoch),
+            }
+        };
+
+        match claim::complete(&*s3, &shard_filename, &final_etag, &host_id, final_epoch).await {
+            Ok(CompleteOutcome::Completed { .. }) => { /* terminal-state written */ }
+            Ok(CompleteOutcome::Lost) => {
+                // Claim was reclaimed at some point during this shard
+                // — treat as "we don't hold it anymore", same as a
+                // mid-shard fence trip from the operator's POV. The
+                // shard processor's row-level fence checks should have
+                // already prevented further writes; here we just
+                // surface the fact and stop trying to finalize.
+                tracing::warn!(
+                    shard = %shard_filename,
+                    "claim lost during shard; not marking complete (another worker now owns it)",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, shard = %shard_filename, "claim complete write failed");
+            }
+        }
+
+        // Release the held claim so the heartbeat stops refreshing it.
+        {
+            let mut g = current.lock().await;
+            *g = None;
+        }
+    }
+
+    // ---- 7. Shutdown -----------------------------------------------
+    eprintln!("[shutdown] section 7 entered");
+    {
+        eprintln!("[shutdown] acquiring progress write lock");
+        let mut p = progress.write().await;
+        eprintln!("[shutdown] got progress write lock");
+        p.status = "exiting".into();
+    }
+    eprintln!("[shutdown] released progress write lock");
+    // Drop the held claim so the heartbeat stops refreshing.
+    {
+        eprintln!("[shutdown] acquiring current lock");
+        let mut g = current.lock().await;
+        eprintln!("[shutdown] got current lock");
+        *g = None;
+    }
+    eprintln!("[shutdown] released current lock");
+    // Best-effort: trip fence to wake the heartbeat loop out of its tick.
+    fence.trip("worker shutting down");
+    eprintln!("[shutdown] fence tripped");
+    // Bound the heartbeat-join. If the heartbeat task is wedged (e.g.
+    // a stale S3 connection-pool entry blocking write_progress),
+    // hb_handle.await would hang the worker process forever. Abort on
+    // timeout; the runtime drop reaps the task on its own schedule.
+    let mut hb_handle = hb_handle;
+    eprintln!("[shutdown] awaiting hb_handle with 5s timeout");
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        &mut hb_handle,
+    )
+    .await
+    .is_err()
+    {
+        eprintln!("[shutdown] hb_handle timeout - aborting");
+        tracing::warn!(
+            "heartbeat task did not exit within 5s of shutdown; aborting it",
+        );
+        hb_handle.abort();
+    }
+    eprintln!("[shutdown] hb_handle done");
+
+    // Hard-exit deadline. libnfs's nfs_destroy_context (called from
+    // NfsContext::Drop) can block indefinitely on RPC traffic after
+    // a long SIGSTOP/SIGCONT cycle wedges the underlying TCP socket.
+    // All durable state has been committed to S3 by this point — the
+    // claim has been released, the heartbeat has stopped, the shard
+    // processor has terminated — so it's safe to bypass Drop chains
+    // if they don't complete promptly. Use a std::thread (not a tokio
+    // task) because the tokio runtime itself is what we're trying to
+    // get past; tokio task scheduling can't help during runtime
+    // shutdown when a Drop is blocking the executor.
+    eprintln!("[shutdown] spawning hard-exit watchdog");
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        // Direct kernel syscalls — bypass Rust stdio (which can be
+        // buffered or wedged during shutdown) and std::process::exit
+        // (which runs atexit handlers that may touch the same C
+        // library state that's hanging us). _exit(2) terminates the
+        // process at kernel level immediately.
+        let msg: &[u8] = b"watchdog: forcing process exit (shutdown took >5s)\n";
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            libc::_exit(0);
+        }
+    });
+    eprintln!("[shutdown] watchdog spawned, returning Ok(())");
+
+    Ok(())
+}
+
+// =============================================================================
+// Manifest + shard discovery helpers
+// =============================================================================
+
+async fn load_manifest(s3: &S3Client) -> anyhow::Result<Manifest> {
+    let (body, _etag) = s3
+        .get(layout::MANIFEST_KEY)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("manifest.json not found in bucket {}", s3.bucket()))?;
+    let m: Manifest = serde_json::from_slice(&body)?;
+    Ok(m)
+}
+
+/// Effective copy options = manifest defaults overlaid with worker
+/// config. Worker config wins because operators sometimes need to
+/// disable e.g. xattr preservation per-host without re-uploading the
+/// manifest.
+fn effective_options(manifest_opts: &MigrationOptions, cfg: &Config) -> MigrationOptions {
+    MigrationOptions {
+        preserve_owner: cfg.copy.preserve_owner && manifest_opts.preserve_owner,
+        preserve_mode: cfg.copy.preserve_mode && manifest_opts.preserve_mode,
+        preserve_times: cfg.copy.preserve_times && manifest_opts.preserve_times,
+        preserve_xattr: cfg.copy.preserve_xattr && manifest_opts.preserve_xattr,
+        server_side_copy: parse_ssc(&cfg.copy.server_side_copy)
+            .unwrap_or(manifest_opts.server_side_copy),
+    }
+}
+
+fn parse_ssc(s: &str) -> Option<ServerSideCopy> {
+    match s {
+        "auto" => Some(ServerSideCopy::Auto),
+        "force" => Some(ServerSideCopy::Force),
+        "off" => Some(ServerSideCopy::Off),
+        _ => None,
+    }
+}
+
+fn verify_shard_etag(manifest: &Manifest, shard_filename: &str, actual_etag: &str) -> anyhow::Result<()> {
+    let expected = manifest
+        .shards
+        .iter()
+        .find(|s| key_basename(&s.key) == shard_filename)
+        .ok_or_else(|| anyhow::anyhow!("shard {shard_filename} not in manifest"))?;
+    if expected.etag.is_empty() || actual_etag.is_empty() {
+        // Best-effort: some test fixtures don't fill etags.
+        return Ok(());
+    }
+    if expected.etag != actual_etag {
+        return Err(migration_core::Error::ManifestChanged {
+            expected: expected.etag.clone(),
+            actual: actual_etag.to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn key_basename(k: &str) -> &str {
+    k.rsplit('/').next().unwrap_or(k)
+}
+
+#[derive(Debug)]
+enum ClaimTarget {
+    Free { shard: String },
+    Stale { shard: String, stale_etag: String, prior_epoch: u64 },
+}
+
+#[derive(Debug, Default)]
+struct ScanResult {
+    next_target: Option<ClaimTarget>,
+    /// True iff every shard in the manifest is in a terminal state
+    /// (Completed or Failed). Worker exits when this flips.
+    all_terminal: bool,
+    last_target_filename: String,
+}
+
+async fn scan_shards(
+    s3: &S3Client,
+    manifest: &Manifest,
+    lease: Duration,
+) -> anyhow::Result<ScanResult> {
+    let entries = s3.list(layout::SHARDS_PREFIX).await?;
+    let by_key: HashMap<String, &ListEntry> = entries.iter().map(|e| (e.key.clone(), e)).collect();
+
+    let now = chrono::Utc::now();
+    let mut all_terminal = true;
+    let mut next: Option<ClaimTarget> = None;
+    let mut next_name = String::new();
+
+    for shard in &manifest.shards {
+        let shard_filename = key_basename(&shard.key).to_string();
+        let claim_key = layout::claim_key(&shard_filename);
+
+        let entry = by_key.get(claim_key.as_str()).copied();
+
+        match entry {
+            None => {
+                all_terminal = false;
+                if next.is_none() {
+                    next = Some(ClaimTarget::Free { shard: shard_filename.clone() });
+                    next_name = shard_filename;
+                }
+            }
+            Some(e) => {
+                // Need to peek at the body to read state.
+                let Some((body, _)) = s3.get(&claim_key).await? else {
+                    all_terminal = false;
+                    if next.is_none() {
+                        next = Some(ClaimTarget::Free { shard: shard_filename.clone() });
+                        next_name = shard_filename;
+                    }
+                    continue;
+                };
+                let Ok(record) = serde_json::from_slice::<ClaimRecord>(&body) else {
+                    tracing::warn!(claim = %claim_key, "unparseable claim record; treating as terminal-failed");
+                    continue;
+                };
+                match record.state {
+                    ClaimState::Completed | ClaimState::Failed => { /* terminal */ }
+                    ClaimState::Active => {
+                        all_terminal = false;
+                        let age = now.signed_duration_since(record.claimed_utc.0);
+                        let stale = age.to_std().map(|d| d > lease).unwrap_or(false);
+                        if stale && next.is_none() {
+                            next = Some(ClaimTarget::Stale {
+                                shard: shard_filename.clone(),
+                                stale_etag: e.etag.clone(),
+                                prior_epoch: record.epoch,
+                            });
+                            next_name = shard_filename;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ScanResult {
+        next_target: next,
+        all_terminal,
+        last_target_filename: next_name,
+    })
+}
+
+/// Log (don't resume) any claims still owned by this host_id. The
+/// design intentionally leaves resume-after-restart for a future
+/// milestone; M1 just surfaces the situation so an operator notices.
+async fn log_self_owned_claims(s3: &S3Client, host_id: &str) -> anyhow::Result<()> {
+    let entries = s3.list(layout::SHARDS_PREFIX).await?;
+    for e in entries {
+        let Some(shard) = layout::shard_from_claim_key(&e.key) else { continue };
+        let Some((body, _)) = s3.get(&e.key).await? else { continue };
+        let Ok(record) = serde_json::from_slice::<ClaimRecord>(&body) else { continue };
+        if record.host == host_id && matches!(record.state, ClaimState::Active) {
+            tracing::warn!(
+                shard = %shard,
+                epoch = record.epoch,
+                "found self-owned active claim from previous run; not resumed in M1",
+            );
+        }
+    }
+    Ok(())
+}
+
+// `record.host` already carries our identity; this helper exists so
+// callers don't need to pass the shard name twice when the acquire
+// outcome and the target are still in scope together.
+fn current_shard_filename(_record: &ClaimRecord, fallback: &str) -> String {
+    fallback.to_string()
+}
+
+/// Parse a TOML size string like `"8 GiB"` or `"4 MiB"` into bytes.
+/// Accepts decimal multipliers (KB, MB, GB, TB) and binary
+/// multipliers (KiB, MiB, GiB, TiB). Returns `None` on parse error
+/// so callers can fall back to a sensible default.
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, unit) = match s.find(|c: char| c.is_alphabetic()) {
+        Some(i) => (s[..i].trim(), s[i..].trim()),
+        None => (s, ""),
+    };
+    let n: u64 = num.parse().ok()?;
+    let mult: u64 = match unit {
+        "" | "B" => 1,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        "TiB" => 1 << 40,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
+fn parse_batch_budget(cfg: &Config) -> Option<BatchBudget> {
+    let bytes = parse_size(&cfg.batch.bytes_budget)?;
+    Some(BatchBudget {
+        bytes,
+        files: cfg.batch.files_budget,
+    })
+}
+
+// Touch the imported types so cargo doesn't warn about unused names
+// when the code paths above evolve.
+#[allow(dead_code)]
+fn _types_anchor(_o: ProcessOutcome, _u: UtcTime, _s: ShardEntry) {}

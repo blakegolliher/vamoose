@@ -1,0 +1,902 @@
+//! Throwaway pre-flight shim: read a directory of nfs-walker parquet
+//! shards, write canonical-schema parquet shards. See `README.md` and
+//! `migration/SHIM_PLAN.md` for scope and the loud limitation around
+//! file-type tag synthesis.
+
+use anyhow::{anyhow, bail, Context, Result};
+use arrow::array::{
+    Array, ArrayRef, BinaryBuilder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray,
+    UInt16Array, UInt32Array, UInt64Array, UInt64Builder, UInt8Builder,
+};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::record_batch::RecordBatch;
+use clap::Parser;
+use migration_core::schema::{
+    self, FileTypeTag, KV_CONTRACT_VERSION, KV_FORMAT_VERSION, KV_ROW_COUNT, KV_SHARD_INDEX,
+    KV_WALKER_VERSION,
+};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
+use parquet::format::KeyValue;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+// =============================================================================
+// CLI
+// =============================================================================
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "mig-walker-rewrite",
+    about = "Translate nfs-walker parquet shards to the canonical migration schema."
+)]
+struct Cli {
+    /// Directory containing walker parquet shards.
+    #[arg(short = 'i', long)]
+    input: PathBuf,
+
+    /// Directory to write canonical shards into. Created if absent;
+    /// refuses to clobber non-empty.
+    #[arg(short = 'o', long)]
+    output: PathBuf,
+
+    /// Export root prefix to strip from absolute walker paths.
+    /// Example: --source-root /bgolliher/vamoose-source.
+    #[arg(long)]
+    source_root: String,
+
+    /// Walker version string for parquet KV metadata.
+    #[arg(long, default_value = "shim-via-unknown")]
+    walker_version: String,
+
+    /// Per-row trace logging.
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+fn main() -> Result<()> {
+    let args = Cli::parse();
+
+    let level = if args.verbose { "trace" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
+        )
+        .init();
+
+    let mut inputs: Vec<PathBuf> = std::fs::read_dir(&args.input)
+        .with_context(|| format!("reading input dir {}", args.input.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("parquet"))
+        .collect();
+    inputs.sort();
+
+    if inputs.is_empty() {
+        bail!("no parquet files found in {}", args.input.display());
+    }
+
+    std::fs::create_dir_all(&args.output)
+        .with_context(|| format!("creating output dir {}", args.output.display()))?;
+    if std::fs::read_dir(&args.output)?.next().is_some() {
+        bail!("output directory not empty: {}", args.output.display());
+    }
+
+    let source_root = args.source_root.as_bytes();
+
+    for (shard_idx, input) in inputs.iter().enumerate() {
+        let output = args.output.join(input.file_name().unwrap());
+        let rows = rewrite_shard(
+            input,
+            &output,
+            shard_idx as u32,
+            source_root,
+            &args.walker_version,
+        )
+        .with_context(|| format!("rewriting shard {}", input.display()))?;
+        tracing::info!(
+            input = %input.display(),
+            output = %output.display(),
+            shard_idx,
+            rows,
+            "shard rewritten",
+        );
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Shard-level driver
+// =============================================================================
+
+/// Rewrite one walker shard into one canonical shard. Returns the row
+/// count that was written.
+fn rewrite_shard(
+    input: &Path,
+    output: &Path,
+    shard_idx: u32,
+    source_root: &[u8],
+    walker_version: &str,
+) -> Result<u64> {
+    let file = File::open(input).with_context(|| format!("opening {}", input.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+
+    let mut output_batches: Vec<RecordBatch> = Vec::new();
+    let mut output_schema: Option<Arc<ArrowSchema>> = None;
+    let mut row_offset_in_shard: u64 = 0;
+
+    for batch in reader {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let translated = translate_batch(&batch, shard_idx, row_offset_in_shard, source_root)?;
+        row_offset_in_shard += batch.num_rows() as u64;
+        output_schema.get_or_insert_with(|| translated.schema());
+        output_batches.push(translated);
+    }
+
+    // If the input was empty we still emit an empty canonical shard so
+    // the downstream view is consistent with the input shard set.
+    let schema = match output_schema {
+        Some(s) => s,
+        None => Arc::new(canonical_plus_legacy_schema(&[])),
+    };
+
+    write_shard(
+        output,
+        schema,
+        &output_batches,
+        shard_idx,
+        walker_version,
+        row_offset_in_shard,
+    )?;
+
+    Ok(row_offset_in_shard)
+}
+
+fn write_shard(
+    output: &Path,
+    schema: Arc<ArrowSchema>,
+    batches: &[RecordBatch],
+    shard_idx: u32,
+    walker_version: &str,
+    row_count: u64,
+) -> Result<()> {
+    let kv = vec![
+        KeyValue {
+            key: KV_FORMAT_VERSION.into(),
+            value: Some(schema::FORMAT_VERSION.to_string()),
+        },
+        KeyValue {
+            key: KV_CONTRACT_VERSION.into(),
+            value: Some(schema::CONTRACT_VERSION.to_string()),
+        },
+        KeyValue {
+            key: KV_SHARD_INDEX.into(),
+            value: Some(shard_idx.to_string()),
+        },
+        KeyValue {
+            key: KV_WALKER_VERSION.into(),
+            value: Some(walker_version.to_string()),
+        },
+        KeyValue {
+            key: KV_ROW_COUNT.into(),
+            value: Some(row_count.to_string()),
+        },
+    ];
+    let props = WriterProperties::builder()
+        .set_key_value_metadata(Some(kv))
+        .build();
+
+    let file =
+        File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    for batch in batches {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+    Ok(())
+}
+
+// =============================================================================
+// Translation
+// =============================================================================
+
+/// Translate one walker `RecordBatch` into one canonical `RecordBatch`.
+///
+/// `row_offset_in_shard` is the running row count within this shard
+/// before this batch — the new batch's first row gets `row_id =
+/// make_row_id(shard_idx, row_offset_in_shard)`.
+fn translate_batch(
+    input: &RecordBatch,
+    shard_idx: u32,
+    row_offset_in_shard: u64,
+    source_root: &[u8],
+) -> Result<RecordBatch> {
+    let n = input.num_rows();
+
+    // Required walker columns. Pluck them up front; clear errors if
+    // absent or wrong type.
+    let walker_path = req_string(input, "path")?;
+    let walker_file_type = req_string(input, "file_type")?;
+    let walker_permissions = req_u16(input, "permissions")?;
+    let walker_mtime_us = opt_int64_required_col(input, "mtime_us")?;
+    let walker_atime_us = opt_int64_optional_col(input, "atime_us");
+    // High-precision time columns (walker schema, post-2026-05-04).
+    // When present, prefer these over splitting `*_us` because they
+    // preserve full nanosecond precision. When absent, fall back to
+    // splitting the `*_us` value via split_us.
+    let walker_mtime_sec = opt_int64_optional_col(input, "mtime_sec");
+    let walker_mtime_nsec = opt_int32_optional_col(input, "mtime_nsec");
+    let walker_atime_sec = opt_int64_optional_col(input, "atime_sec");
+    let walker_atime_nsec = opt_int32_optional_col(input, "atime_nsec");
+    let walker_inode = req_u64(input, "inode")?;
+    let walker_nlink = req_u32(input, "nlink")?;
+    let walker_uid = req_u32(input, "uid")?;
+    let walker_gid = req_u32(input, "gid")?;
+    let walker_size = req_u64(input, "size")?;
+
+    // ----- canonical builders -----
+    let mut row_id_b = UInt64Builder::with_capacity(n);
+    let mut path_b = BinaryBuilder::with_capacity(n, n * 64);
+    let mut mode_b = arrow::array::UInt32Builder::with_capacity(n);
+    let mut file_type_b = UInt8Builder::with_capacity(n);
+    let mut mtime_sec_b = Int64Builder::with_capacity(n);
+    let mut mtime_nsec_b = Int32Builder::with_capacity(n);
+    let mut atime_sec_b = Int64Builder::with_capacity(n);
+    let mut atime_nsec_b = Int32Builder::with_capacity(n);
+    let mut fsid_b = UInt64Builder::with_capacity(n);
+    let mut symt_b = BinaryBuilder::with_capacity(n, 0);
+    let mut xattr_b = BinaryBuilder::with_capacity(n, 0);
+
+    for i in 0..n {
+        let row_in_shard = row_offset_in_shard + i as u64;
+        row_id_b.append_value(schema::make_row_id(shard_idx, row_in_shard));
+
+        let raw_path = walker_path.value(i).as_bytes();
+        let translated_path = strip_source_root(raw_path, source_root)?;
+        path_b.append_value(&translated_path);
+
+        let mime = walker_file_type.value(i);
+        let tag = file_type_tag_from_mime(mime);
+        file_type_b.append_value(tag as u8);
+
+        let s_ifmt = match tag {
+            FileTypeTag::Dir => libc::S_IFDIR,
+            FileTypeTag::Symlink => libc::S_IFLNK,
+            _ => libc::S_IFREG,
+        } as u32;
+        mode_b.append_value((walker_permissions.value(i) as u32) | s_ifmt);
+
+        match (walker_mtime_sec, walker_mtime_nsec) {
+            (Some(sec_arr), Some(nsec_arr))
+                if !sec_arr.is_null(i) && !nsec_arr.is_null(i) =>
+            {
+                // High-precision path — full nanosecond fidelity from libnfs.
+                mtime_sec_b.append_value(sec_arr.value(i));
+                mtime_nsec_b.append_value(nsec_arr.value(i));
+            }
+            _ if walker_mtime_us.is_null(i) => {
+                mtime_sec_b.append_null();
+                mtime_nsec_b.append_null();
+            }
+            _ => {
+                // Legacy fallback: split mtime_us into (sec, nsec).
+                // Loses precision below microseconds.
+                let (sec_v, nsec_v) = split_us(walker_mtime_us.value(i));
+                mtime_sec_b.append_value(sec_v);
+                mtime_nsec_b.append_value(nsec_v);
+            }
+        }
+
+        match (walker_atime_sec, walker_atime_nsec) {
+            (Some(sec_arr), Some(nsec_arr))
+                if !sec_arr.is_null(i) && !nsec_arr.is_null(i) =>
+            {
+                // High-precision path.
+                atime_sec_b.append_value(sec_arr.value(i));
+                atime_nsec_b.append_value(nsec_arr.value(i));
+            }
+            _ => match walker_atime_us {
+                Some(arr) if !arr.is_null(i) => {
+                    // Legacy fallback: split atime_us.
+                    let (sec_v, nsec_v) = split_us(arr.value(i));
+                    atime_sec_b.append_value(sec_v);
+                    atime_nsec_b.append_value(nsec_v);
+                }
+                _ => {
+                    atime_sec_b.append_null();
+                    atime_nsec_b.append_null();
+                }
+            },
+        }
+
+        // Walker doesn't capture fsid, symlink_target, or xattr_blob.
+        // Mover handles null fsid with a one-time WARN; missing
+        // symlink_target falls back to nfs_readlink at the destination.
+        fsid_b.append_null();
+        symt_b.append_null();
+        xattr_b.append_null();
+    }
+
+    let canonical_arrays: Vec<(Field, ArrayRef)> = vec![
+        (
+            Field::new(schema::COL_ROW_ID, DataType::UInt64, false),
+            Arc::new(row_id_b.finish()),
+        ),
+        (
+            Field::new(schema::COL_PATH, DataType::Binary, false),
+            Arc::new(path_b.finish()),
+        ),
+        // Pulled directly from walker: same name and width.
+        (
+            Field::new(schema::COL_SIZE, DataType::UInt64, false),
+            Arc::new(walker_size.clone()) as ArrayRef,
+        ),
+        (
+            Field::new(schema::COL_MODE, DataType::UInt32, false),
+            Arc::new(mode_b.finish()),
+        ),
+        (
+            Field::new(schema::COL_FILE_TYPE, DataType::UInt8, false),
+            Arc::new(file_type_b.finish()),
+        ),
+        (
+            Field::new(schema::COL_MTIME_SEC, DataType::Int64, true),
+            Arc::new(mtime_sec_b.finish()),
+        ),
+        (
+            Field::new(schema::COL_MTIME_NSEC, DataType::Int32, true),
+            Arc::new(mtime_nsec_b.finish()),
+        ),
+        (
+            Field::new(schema::COL_ATIME_SEC, DataType::Int64, true),
+            Arc::new(atime_sec_b.finish()),
+        ),
+        (
+            Field::new(schema::COL_ATIME_NSEC, DataType::Int32, true),
+            Arc::new(atime_nsec_b.finish()),
+        ),
+        (
+            Field::new(schema::COL_UID, DataType::UInt32, true),
+            Arc::new(walker_uid.clone()) as ArrayRef,
+        ),
+        (
+            Field::new(schema::COL_GID, DataType::UInt32, true),
+            Arc::new(walker_gid.clone()) as ArrayRef,
+        ),
+        (
+            Field::new(schema::COL_NLINK, DataType::UInt32, true),
+            Arc::new(walker_nlink.clone()) as ArrayRef,
+        ),
+        (
+            Field::new(schema::COL_INODE, DataType::UInt64, true),
+            Arc::new(walker_inode.clone()) as ArrayRef,
+        ),
+        (
+            Field::new(schema::COL_FSID, DataType::UInt64, true),
+            Arc::new(fsid_b.finish()),
+        ),
+        (
+            Field::new(schema::COL_XATTR_BLOB, DataType::Binary, true),
+            Arc::new(xattr_b.finish()),
+        ),
+        (
+            Field::new(schema::COL_SYMLINK_TARGET, DataType::Binary, true),
+            Arc::new(symt_b.finish()),
+        ),
+    ];
+
+    // Legacy passthrough: copy every input column we haven't already
+    // consumed as a canonical column (size/uid/gid/nlink/inode share
+    // the canonical name). Renames per SCHEMA_CONTRACT.md.
+    let mut legacy: Vec<(Field, ArrayRef)> = Vec::new();
+    for (idx, field) in input.schema().fields().iter().enumerate() {
+        let new_name: &str = match field.name().as_str() {
+            // Renames defined by the contract.
+            "path" => "path_legacy",
+            "file_type" => "file_type_mime",
+            // Already covered by canonical columns of the same name.
+            "size" | "uid" | "gid" | "nlink" | "inode" => continue,
+            other => other,
+        };
+        let array = input.column(idx).clone();
+        legacy.push((
+            Field::new(new_name, field.data_type().clone(), field.is_nullable()),
+            array,
+        ));
+    }
+
+    let mut all_fields: Vec<Field> = Vec::with_capacity(canonical_arrays.len() + legacy.len());
+    let mut all_arrays: Vec<ArrayRef> = Vec::with_capacity(canonical_arrays.len() + legacy.len());
+    for (f, a) in canonical_arrays.into_iter().chain(legacy.into_iter()) {
+        all_fields.push(f);
+        all_arrays.push(a);
+    }
+    let schema = Arc::new(ArrowSchema::new(all_fields));
+    let batch = RecordBatch::try_new(schema, all_arrays)?;
+    Ok(batch)
+}
+
+/// Build the output schema for an input we never got to inspect (zero
+/// batches). Canonical columns only; legacy passthrough is per-batch
+/// data so we can't synthesize it without rows. Used for empty input
+/// shards.
+fn canonical_plus_legacy_schema(_legacy_fields: &[Field]) -> ArrowSchema {
+    ArrowSchema::new(vec![
+        Field::new(schema::COL_ROW_ID, DataType::UInt64, false),
+        Field::new(schema::COL_PATH, DataType::Binary, false),
+        Field::new(schema::COL_SIZE, DataType::UInt64, false),
+        Field::new(schema::COL_MODE, DataType::UInt32, false),
+        Field::new(schema::COL_FILE_TYPE, DataType::UInt8, false),
+        Field::new(schema::COL_MTIME_SEC, DataType::Int64, true),
+        Field::new(schema::COL_MTIME_NSEC, DataType::Int32, true),
+        Field::new(schema::COL_ATIME_SEC, DataType::Int64, true),
+        Field::new(schema::COL_ATIME_NSEC, DataType::Int32, true),
+        Field::new(schema::COL_UID, DataType::UInt32, true),
+        Field::new(schema::COL_GID, DataType::UInt32, true),
+        Field::new(schema::COL_NLINK, DataType::UInt32, true),
+        Field::new(schema::COL_INODE, DataType::UInt64, true),
+        Field::new(schema::COL_FSID, DataType::UInt64, true),
+        Field::new(schema::COL_XATTR_BLOB, DataType::Binary, true),
+        Field::new(schema::COL_SYMLINK_TARGET, DataType::Binary, true),
+    ])
+}
+
+// =============================================================================
+// Pure helpers (heavily unit-tested)
+// =============================================================================
+
+/// Split microseconds-since-epoch into `(seconds, nanoseconds)` with
+/// `nsec ∈ [0, 1_000_000_000)` even for negative inputs. The contract
+/// forbids negative `mtime_nsec`; integer `/` and `%` would produce
+/// them for pre-epoch timestamps, so use Euclidean division.
+pub fn split_us(us: i64) -> (i64, i32) {
+    let sec = us.div_euclid(1_000_000);
+    let rem = us.rem_euclid(1_000_000) as i32;
+    (sec, rem * 1000)
+}
+
+/// Strip the export-root prefix from a walker absolute path, leaving
+/// the export-relative path with leading slash.
+///
+/// - `path == source_root` yields `b"/"`.
+/// - `path == source_root + "/<rest>"` yields `b"/<rest>"`.
+/// - anything else is an error: walker scanned outside the declared
+///   export and we'd produce a corrupted path.
+pub fn strip_source_root(path: &[u8], source_root: &[u8]) -> Result<Vec<u8>> {
+    if path == source_root {
+        return Ok(b"/".to_vec());
+    }
+    // Build "<source_root>/" and require the input to start with it.
+    let mut prefix = source_root.to_vec();
+    if !prefix.ends_with(b"/") {
+        prefix.push(b'/');
+    }
+    if let Some(rest) = path.strip_prefix(prefix.as_slice()) {
+        let mut out = Vec::with_capacity(rest.len() + 1);
+        out.push(b'/');
+        out.extend_from_slice(rest);
+        Ok(out)
+    } else {
+        Err(anyhow!(
+            "walker path does not start with --source-root: path={:?}, source_root={:?}",
+            String::from_utf8_lossy(path),
+            String::from_utf8_lossy(source_root),
+        ))
+    }
+}
+
+/// Map walker's MIME-style `file_type` string to a canonical
+/// `FileTypeTag`. Walker only ever distinguishes "directory" and
+/// "symlink" explicitly — every other entry is bucketed as Regular,
+/// which is the limitation called out in `README.md`.
+pub fn file_type_tag_from_mime(mime: &str) -> FileTypeTag {
+    match mime {
+        "directory" => FileTypeTag::Dir,
+        "symlink" => FileTypeTag::Symlink,
+        _ => FileTypeTag::Regular,
+    }
+}
+
+// =============================================================================
+// Column-pluck helpers — produce typed views with clear errors.
+// =============================================================================
+
+fn req_string<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    let arr = b
+        .column_by_name(name)
+        .ok_or_else(|| anyhow!("walker shard missing required column `{name}`"))?;
+    arr.as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow!("walker column `{name}` is not Utf8"))
+}
+
+fn req_u16<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a UInt16Array> {
+    let arr = b
+        .column_by_name(name)
+        .ok_or_else(|| anyhow!("walker shard missing required column `{name}`"))?;
+    arr.as_any()
+        .downcast_ref::<UInt16Array>()
+        .ok_or_else(|| anyhow!("walker column `{name}` is not UInt16"))
+}
+
+fn req_u32<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a UInt32Array> {
+    let arr = b
+        .column_by_name(name)
+        .ok_or_else(|| anyhow!("walker shard missing required column `{name}`"))?;
+    arr.as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| anyhow!("walker column `{name}` is not UInt32"))
+}
+
+fn req_u64<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
+    let arr = b
+        .column_by_name(name)
+        .ok_or_else(|| anyhow!("walker shard missing required column `{name}`"))?;
+    arr.as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| anyhow!("walker column `{name}` is not UInt64"))
+}
+
+/// Required column — must be present, may carry nulls.
+fn opt_int64_required_col<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+    let arr = b
+        .column_by_name(name)
+        .ok_or_else(|| anyhow!("walker shard missing required column `{name}`"))?;
+    arr.as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("walker column `{name}` is not Int64"))
+}
+
+/// Optional column — absence returns None, type mismatch is silently
+/// ignored (treated as absent). Walker is the only writer today and its
+/// shape is known.
+fn opt_int64_optional_col<'a>(b: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
+    b.column_by_name(name)
+        .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+}
+
+/// Sibling of `opt_int64_optional_col` for Int32 columns. Used for the
+/// nanosecond-component columns walker emits alongside the legacy
+/// microsecond-encoded `*_us` columns.
+fn opt_int32_optional_col<'a>(b: &'a RecordBatch, name: &str) -> Option<&'a Int32Array> {
+    b.column_by_name(name)
+        .and_then(|a| a.as_any().downcast_ref::<Int32Array>())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{StringArray, UInt16Builder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder};
+    use migration_core::shard::ShardReader;
+    use std::path::PathBuf;
+
+    // ---------------- pure helpers ----------------
+
+    #[test]
+    fn split_us_positive_round_numbers() {
+        assert_eq!(split_us(0), (0, 0));
+        assert_eq!(split_us(1_000_000), (1, 0));
+        assert_eq!(split_us(1_500_000), (1, 500_000_000));
+    }
+
+    #[test]
+    fn split_us_handles_negative_correctly() {
+        // (-1500 us) is 1500 us before epoch = 0 sec − 1500 us.
+        // Per `struct timespec`, that's (-1, 998_500_000), NOT
+        // (-1, -1_500_000) and NOT (0, -1_500_000).
+        let (s, ns) = split_us(-1500);
+        assert_eq!(s, -1);
+        assert_eq!(ns, 998_500_000);
+        assert!((0..1_000_000_000).contains(&ns));
+
+        let (s, ns) = split_us(-1_000_000);
+        assert_eq!((s, ns), (-1, 0));
+
+        let (s, ns) = split_us(-1_000_001);
+        assert_eq!(s, -2);
+        assert_eq!(ns, 999_999_000);
+    }
+
+    #[test]
+    fn strip_source_root_basic_cases() {
+        let sr = b"/src-test";
+        assert_eq!(
+            strip_source_root(b"/src-test", sr).unwrap(),
+            b"/".to_vec(),
+            "path == source_root should yield /",
+        );
+        assert_eq!(
+            strip_source_root(b"/src-test/m2-verify", sr).unwrap(),
+            b"/m2-verify".to_vec(),
+        );
+        assert_eq!(
+            strip_source_root(b"/src-test/m2-verify/empty.bin", sr).unwrap(),
+            b"/m2-verify/empty.bin".to_vec(),
+        );
+    }
+
+    #[test]
+    fn strip_source_root_rejects_non_prefix() {
+        // `/src-testing` shares a prefix but isn't under `/src-test`.
+        // Without the `+ "/"` guard this would silently produce
+        // `/ing/foo`.
+        let err = strip_source_root(b"/src-testing/foo", b"/src-test").unwrap_err();
+        assert!(
+            err.to_string().contains("does not start with --source-root"),
+            "{err}"
+        );
+
+        let err = strip_source_root(b"/elsewhere", b"/src-test").unwrap_err();
+        assert!(err.to_string().contains("does not start with"));
+    }
+
+    #[test]
+    fn strip_source_root_tolerates_trailing_slash_on_root() {
+        let sr = b"/src-test/";
+        assert_eq!(
+            strip_source_root(b"/src-test/foo", sr).unwrap(),
+            b"/foo".to_vec(),
+        );
+    }
+
+    #[test]
+    fn file_type_tag_translation_table() {
+        assert_eq!(file_type_tag_from_mime("directory"), FileTypeTag::Dir);
+        assert_eq!(file_type_tag_from_mime("symlink"), FileTypeTag::Symlink);
+        // Walker actually emits "file" for regular files; spec table
+        // says "anything else" -> Regular.
+        assert_eq!(file_type_tag_from_mime("file"), FileTypeTag::Regular);
+        assert_eq!(
+            file_type_tag_from_mime("application/pdf"),
+            FileTypeTag::Regular,
+        );
+        assert_eq!(file_type_tag_from_mime("text/plain"), FileTypeTag::Regular);
+        assert_eq!(file_type_tag_from_mime(""), FileTypeTag::Regular);
+    }
+
+    #[test]
+    fn row_id_matches_make_row_id() {
+        // Sanity: the formula in translate_batch must agree with the
+        // canonical helper. If make_row_id ever changes, this catches
+        // the drift.
+        for shard in [0u32, 5, 1234] {
+            for offset in [0u64, 1, 999_999, (1 << 20)] {
+                assert_eq!(
+                    schema::make_row_id(shard, offset),
+                    ((shard as u64) << 40) | offset,
+                );
+            }
+        }
+    }
+
+    // ---------------- integration: walker batch → parquet → ShardReader ----------------
+
+    /// Build a minimal walker-shape batch with three rows: a directory
+    /// (which should map to the export root after stripping), a
+    /// regular file, and a symlink. Only the columns the shim consumes
+    /// or passes through need to be present.
+    fn synthetic_walker_batch(source_root: &str) -> RecordBatch {
+        let dir_path = source_root.to_string();
+        let file_path = format!("{source_root}/file.bin");
+        let link_path = format!("{source_root}/link");
+
+        let path = StringArray::from(vec![
+            dir_path.as_str(),
+            file_path.as_str(),
+            link_path.as_str(),
+        ]);
+        let file_type = StringArray::from(vec!["directory", "file", "symlink"]);
+        let mut perms = UInt16Builder::new();
+        perms.append_value(0o755);
+        perms.append_value(0o644);
+        perms.append_value(0o777);
+        let perms = perms.finish();
+
+        let mut mtime = arrow::array::Int64Builder::new();
+        mtime.append_value(1_700_000_000_000_001);
+        mtime.append_value(1_700_000_000_000_002);
+        mtime.append_null();
+        let mtime = mtime.finish();
+
+        let mut atime = arrow::array::Int64Builder::new();
+        atime.append_value(1_700_000_000_000_010);
+        atime.append_null();
+        atime.append_value(-1500); // negative atime — exercises split_us euclidean math
+        let atime = atime.finish();
+
+        let mut inode = UInt64Builder::new();
+        inode.append_value(100);
+        inode.append_value(101);
+        inode.append_value(102);
+        let inode = inode.finish();
+
+        let mut nlink = UInt32Builder::new();
+        nlink.append_value(2);
+        nlink.append_value(1);
+        nlink.append_value(1);
+        let nlink = nlink.finish();
+
+        let uid = UInt32Array::from(vec![1000u32, 1000, 1000]);
+        let gid = UInt32Array::from(vec![1000u32, 1000, 1000]);
+        let size = UInt64Array::from(vec![4096u64, 1234, 0]);
+
+        // A couple of legacy passthrough columns to verify they survive.
+        let filename = StringArray::from(vec!["", "file.bin", "link"]);
+        let parent_path = StringArray::from(vec!["/", source_root, source_root]);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("file_type", DataType::Utf8, false),
+            Field::new("permissions", DataType::UInt16, false),
+            Field::new("mtime_us", DataType::Int64, true),
+            Field::new("atime_us", DataType::Int64, true),
+            Field::new("inode", DataType::UInt64, false),
+            Field::new("nlink", DataType::UInt32, false),
+            Field::new("uid", DataType::UInt32, false),
+            Field::new("gid", DataType::UInt32, false),
+            Field::new("size", DataType::UInt64, false),
+            Field::new("filename", DataType::Utf8, false),
+            Field::new("parent_path", DataType::Utf8, false),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(path) as ArrayRef,
+                Arc::new(file_type),
+                Arc::new(perms),
+                Arc::new(mtime),
+                Arc::new(atime),
+                Arc::new(inode),
+                Arc::new(nlink),
+                Arc::new(uid),
+                Arc::new(gid),
+                Arc::new(size),
+                Arc::new(filename),
+                Arc::new(parent_path),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "mig-walker-rewrite-{tag}-{}-{nanos:08x}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// End-to-end: build a walker-shape parquet, run the shim,
+    /// open the result with `ShardReader::open`, walk it.
+    ///
+    /// This is the contract conformance check for the shim per
+    /// SHIM_PLAN.md "Tests / Integration test".
+    #[test]
+    fn round_trip_through_shard_reader() {
+        let source_root = "/src-test";
+        let work = tempdir("rt");
+        let in_dir = work.join("in");
+        let out_dir = work.join("out");
+        std::fs::create_dir_all(&in_dir).unwrap();
+
+        // Write the synthetic walker shard to disk under the name the
+        // shim will see.
+        let in_path = in_dir.join("part-r00-00000.parquet");
+        let batch = synthetic_walker_batch(source_root);
+        let file = File::create(&in_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Drive rewrite_shard directly (skipping the CLI parser).
+        let out_path = out_dir.join("part-r00-00000.parquet");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let rows = rewrite_shard(&in_path, &out_path, 0, source_root.as_bytes(), "test")
+            .expect("rewrite_shard");
+        assert_eq!(rows, 3);
+
+        // Open with the production reader. This exercises:
+        //   - REQUIRED_COLUMNS validation
+        //   - KV footer parsing (format/contract/shard_index/walker_version/row_count)
+        //   - first-row shard_index high-bits cross-check
+        //   - per-row file_type range check (1..=7)
+        let reader = ShardReader::open(&out_path).expect("ShardReader::open");
+        assert_eq!(reader.rows(), 3);
+        assert_eq!(reader.shard_index(), Some(0));
+
+        let rows: Vec<_> = reader
+            .into_rows()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("iterate rows");
+        assert_eq!(rows.len(), 3);
+
+        // Row 0: directory at the export root.
+        assert_eq!(rows[0].path, b"/", "dir at root strips to /");
+        assert_eq!(rows[0].file_type, FileTypeTag::Dir);
+        assert_eq!(rows[0].mode & libc::S_IFMT as u32, libc::S_IFDIR as u32);
+        assert_eq!(rows[0].mode & 0o7777, 0o755);
+        assert_eq!(rows[0].mtime_sec, Some(1_700_000_000));
+        assert_eq!(rows[0].mtime_nsec, Some(1000)); // 1 us = 1000 ns
+
+        // Row 1: regular file under root.
+        assert_eq!(rows[1].path, b"/file.bin");
+        assert_eq!(rows[1].file_type, FileTypeTag::Regular);
+        assert_eq!(rows[1].mode & libc::S_IFMT as u32, libc::S_IFREG as u32);
+        assert_eq!(rows[1].mode & 0o7777, 0o644);
+        assert_eq!(rows[1].size, 1234);
+        assert_eq!(rows[1].atime_sec, None, "null mtime/atime preserved");
+        assert_eq!(rows[1].atime_nsec, None);
+
+        // Row 2: symlink, with a *negative* atime to exercise the
+        // euclidean split.
+        assert_eq!(rows[2].path, b"/link");
+        assert_eq!(rows[2].file_type, FileTypeTag::Symlink);
+        assert_eq!(rows[2].mode & libc::S_IFMT as u32, libc::S_IFLNK as u32);
+        assert_eq!(rows[2].mode & 0o7777, 0o777);
+        assert_eq!(rows[2].atime_sec, Some(-1));
+        assert_eq!(rows[2].atime_nsec, Some(998_500_000));
+
+        // row_id high bits == shard_index for every row.
+        for r in &rows {
+            assert_eq!((r.row_id >> 40) as u32, 0);
+        }
+        // row_id low bits cover the shard sequentially.
+        assert_eq!(rows[0].row_id & ((1 << 40) - 1), 0);
+        assert_eq!(rows[1].row_id & ((1 << 40) - 1), 1);
+        assert_eq!(rows[2].row_id & ((1 << 40) - 1), 2);
+
+        // fsid/symlink_target/xattr_blob are nulled by the shim — the
+        // mover handles each gracefully (WARN, readlink fallback,
+        // null-safe respectively). See SHIM_PLAN.md.
+        for r in &rows {
+            assert_eq!(r.fsid, None);
+            assert_eq!(r.xattr_blob, None);
+            assert_eq!(r.symlink_target, None);
+        }
+    }
+
+    #[test]
+    fn rejects_path_outside_source_root() {
+        let work = tempdir("oob");
+        let in_dir = work.join("in");
+        let out_dir = work.join("out");
+        std::fs::create_dir_all(&in_dir).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // Build a walker batch where one path is *not* under
+        // `--source-root` — the shim should refuse rather than emit a
+        // garbage path.
+        let batch = synthetic_walker_batch("/src-test");
+        let in_path = in_dir.join("part-r00-00000.parquet");
+        let file = File::create(&in_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let out_path = out_dir.join("part-r00-00000.parquet");
+        let err = rewrite_shard(&in_path, &out_path, 0, b"/wrong-root", "test")
+            .expect_err("must reject wrong --source-root");
+        assert!(
+            format!("{err:#}").contains("does not start with --source-root"),
+            "unexpected error: {err:#}"
+        );
+    }
+}
