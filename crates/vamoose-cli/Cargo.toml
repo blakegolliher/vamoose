@@ -1,0 +1,29 @@
+[package]
+name        = "vamoose-cli"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "Unified vamoose CLI: composes migration-core, migration-mover, migration-worker, migration-aggr into a single binary"
+
+[[bin]]
+name = "vamoose"
+path = "src/main.rs"
+
+[dependencies]
+migration-core   = { workspace = true }
+migration-mover  = { workspace = true }
+migration-worker = { path = "../migration-worker" }
+# migration-aggr is binary-only today; add it back when the `vamoose
+# aggr` subcommand drops the stub and calls into a (future) lib.
+
+clap               = { workspace = true }
+tokio              = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+toml               = { workspace = true }
+hostname           = { workspace = true }
+chrono             = { workspace = true }

@@ -6,6 +6,10 @@ authors     = { workspace = true }
 license     = { workspace = true }
 description = "Migration worker binary (mig-worker)"
 
+[lib]
+name = "migration_worker"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mig-worker"
 path = "src/main.rs"

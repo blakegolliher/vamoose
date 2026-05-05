@@ -6,6 +6,7 @@ members = [
     "crates/migration-worker",
     "crates/migration-aggr",
     "crates/mig-walker-rewrite",
+    "crates/vamoose-cli",
 ]
 
 [workspace.package]
