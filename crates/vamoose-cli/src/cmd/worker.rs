@@ -5,6 +5,7 @@
 //! `serde(default)` handlers).
 
 use crate::config::Config;
+use anyhow::Context;
 use clap::Args as ClapArgs;
 use migration_worker::config as wcfg;
 use std::path::PathBuf;
@@ -17,20 +18,48 @@ pub struct Args {
 }
 
 pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
-    let cfg = Config::load(config_path)?;
+    let path = config_path.unwrap_or_else(|| PathBuf::from("vamoose.toml"));
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading config from {}", path.display()))?;
 
-    let host_id = args
-        .id
-        .or_else(|| cfg.worker.as_ref().and_then(|w| w.host_id.clone()))
-        .unwrap_or_else(|| {
-            let host = hostname::get()
-                .ok()
-                .and_then(|s| s.into_string().ok())
-                .unwrap_or_else(|| "unknown".to_string());
-            format!("{}-{}", host, std::process::id())
-        });
+    // Dual-format parse: try the unified vamoose schema first; if that
+    // fails, fall back to the legacy migration-worker schema. The M5
+    // harness still emits the legacy format because it needs to set
+    // concurrency-bounding knobs ([shard].max_in_flight, [mover].
+    // nfs_connections, [batch].inflight_*) that the unified Config
+    // doesn't yet surface.
+    let (worker_cfg, host_id_from_cfg) = match toml::from_str::<Config>(&text) {
+        Ok(unified) => {
+            tracing::debug!("config: unified format detected");
+            let cfg_host = unified.worker.as_ref().and_then(|w| w.host_id.clone());
+            (build_worker_config(&unified)?, cfg_host)
+        }
+        Err(unified_err) => match toml::from_str::<wcfg::Config>(&text) {
+            Ok(legacy) => {
+                tracing::debug!("config: legacy worker format detected");
+                let cfg_host = legacy.worker.host_id.clone();
+                (legacy, cfg_host)
+            }
+            Err(legacy_err) => {
+                anyhow::bail!(
+                    "config parse failed in both formats at {}:\n  \
+                     unified: {}\n  \
+                     legacy:  {}",
+                    path.display(),
+                    unified_err,
+                    legacy_err
+                );
+            }
+        },
+    };
 
-    let worker_cfg = build_worker_config(&cfg)?;
+    let host_id = args.id.or(host_id_from_cfg).unwrap_or_else(|| {
+        let host = hostname::get()
+            .ok()
+            .and_then(|s| s.into_string().ok())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!("{}-{}", host, std::process::id())
+    });
 
     tracing::info!(host_id = %host_id, "vamoose worker starting");
     migration_worker::orchestrator::run(worker_cfg, host_id).await

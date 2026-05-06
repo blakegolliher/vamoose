@@ -56,7 +56,10 @@ Optional env:
                        only if target/release is missing. The build/ symlink
                        on this host is stale and lacks export-parquet.
   MIG_WALKER_REWRITE   Path to mig-walker-rewrite (default: cargo run --release).
-  MIG_WORKER           Path to mig-worker binary (default: target/release/mig-worker).
+  VAMOOSE_BIN          Path to unified vamoose binary (default: target/release/vamoose).
+                       Invoked as 'vamoose worker --config <path>'. The worker
+                       subcommand auto-detects unified vs. legacy worker TOML
+                       formats; this harness emits the legacy format.
   AWS_S3_FLAGS         Extra args for aws s3 / aws s3api (e.g. --no-verify-ssl).
 
 Host requirements:
@@ -121,12 +124,17 @@ fi
 if ! command -v "${NFS_WALKER}" >/dev/null 2>&1 && [[ ! -x "${NFS_WALKER}" ]]; then
     fail "nfs-walker not found at ${NFS_WALKER}; set NFS_WALKER or build it."
 fi
-if ! "${NFS_WALKER}" export-parquet --help >/dev/null 2>&1; then
+# Use 'help <subcmd>' rather than '<subcmd> --help' because clap's
+# --help handler wins over unknown-subcommand errors when the
+# subcommand is actually parsed as the positional NFS_URL argument.
+# 'help export-parquet' returns non-zero on stale binaries that lack
+# the subcommand, which is what we actually want to detect.
+if ! "${NFS_WALKER}" help export-parquet >/dev/null 2>&1; then
     fail "${NFS_WALKER} does not support the export-parquet subcommand. \
 The build/ symlink in ~/projects/nfs-walker is stale; rebuild and use target/release/nfs-walker, \
 or point NFS_WALKER at a binary built from a recent walker checkout."
 fi
-MIG_WORKER="${MIG_WORKER:-${REPO_ROOT}/target/release/mig-worker}"
+VAMOOSE_BIN="${VAMOOSE_BIN:-${REPO_ROOT}/target/release/vamoose}"
 MIG_WALKER_REWRITE_BIN="${MIG_WALKER_REWRITE:-}"
 AWS_S3_FLAGS="${AWS_S3_FLAGS:-}"
 
@@ -168,8 +176,8 @@ cleanup() {
     set +e
     log "cleanup: ensuring A and B are not running"
     # Workers run as root under sudo, so signals must go via 'sudo -n kill'.
-    # Killing the mig-worker (the captured PID) causes its sudo parent to
-    # exit on its own; we don't track or kill the launcher PID separately.
+    # Killing the vamoose worker (the captured PID) causes its sudo parent
+    # to exit on its own; we don't track or kill the launcher PID separately.
     if [[ -s "${A_PID_FILE}" ]]; then
         local apid; apid="$(cat "${A_PID_FILE}")"
         # SIGCONT first in case we left it stopped.
@@ -185,14 +193,14 @@ cleanup() {
         sudo -n kill -KILL "${bpid}" 2>/dev/null || true
     fi
     # Reap direct children (the backgrounded launcher sudos from Phase 3).
-    # When mig-worker dies, its sudo monitor exits, then the launcher sudo
-    # exits — without `wait` they sit as zombies under this script until it
-    # itself exits, and any orphaned mig-worker reparented to init slips
-    # through. Belt-and-braces: also kill any mig-worker still parented to
-    # init that was launched from these configs, in case the sudo chain
-    # broke down.
+    # When the vamoose worker dies, its sudo monitor exits, then the launcher
+    # sudo exits — without `wait` they sit as zombies under this script until
+    # it itself exits, and any orphaned vamoose process reparented to init
+    # slips through. Belt-and-braces: also kill any vamoose worker still
+    # parented to init that was launched from these configs, in case the
+    # sudo chain broke down.
     wait 2>/dev/null || true
-    sudo -n pkill -KILL -P 1 -f "mig-worker --config ${RUN_DIR}/" 2>/dev/null || true
+    sudo -n pkill -KILL -P 1 -f "vamoose worker --config ${RUN_DIR}/" 2>/dev/null || true
     if [[ "${KEEP_ARTIFACTS}" -eq 0 && -n "${BUCKET_PREFIX:-}" ]]; then
         # Wipe everything we created in this bucket. Only known prefixes,
         # never the bucket itself.
@@ -218,21 +226,23 @@ if ! sudo -n true 2>/dev/null; then
     fail "sudo -n true failed; this harness requires passwordless sudo on this host"
 fi
 
-if [[ ! -x "${MIG_WORKER}" ]]; then
-    fail "mig-worker binary not found or not executable: ${MIG_WORKER}.
+if [[ ! -x "${VAMOOSE_BIN}" ]]; then
+    fail "vamoose binary not found or not executable: ${VAMOOSE_BIN}.
 Run: cargo build --release --workspace"
 fi
 
 # Stale-binary check (docs/CORRECTNESS_RULES.md "Verify binaries are fresh against current source").
-# If any source file under crates/migration-worker/src is newer than the
-# binary, refuse to start; the binary on disk may not include recent fixes.
-worker_mtime=$(stat -c %Y "${MIG_WORKER}")
+# If any source file under the worker stack (incl. the vamoose-cli
+# subcommand wrapper) is newer than the binary, refuse to start; the
+# binary on disk may not include recent fixes.
+worker_mtime=$(stat -c %Y "${VAMOOSE_BIN}")
 newest_src=$(find "${REPO_ROOT}/crates/migration-worker/src" \
                   "${REPO_ROOT}/crates/migration-mover/src" \
                   "${REPO_ROOT}/crates/migration-core/src" \
+                  "${REPO_ROOT}/crates/vamoose-cli/src" \
                   -type f -name '*.rs' -printf '%T@\n' | sort -n | tail -1 | cut -d. -f1)
 if [[ -n "${newest_src}" && "${newest_src}" -gt "${worker_mtime}" ]]; then
-    fail "mig-worker binary is older than crate sources. Rebuild:
+    fail "vamoose binary is older than crate sources. Rebuild:
   cargo build --release --workspace
   worker_mtime=${worker_mtime}, newest_src_mtime=${newest_src}"
 fi
@@ -542,25 +552,25 @@ WORKER_RUST_LOG="info,migration_worker=info,migration_mover=debug"
 
 # Launch under sudo -n: libnfs source-mount EACCES otherwise. SIGSTOP
 # can't be caught, so signaling the sudo parent does NOT stop the
-# mig-worker child — we have to capture mig-worker's PID and signal
-# that one directly. HOME is forwarded so root finds ~/.aws/credentials
-# at the operator's home, matching MANUAL_VERIFY.md.
+# vamoose child — we have to capture its PID and signal that one
+# directly. HOME is forwarded so root finds ~/.aws/credentials at the
+# operator's home, matching MANUAL_VERIFY.md.
 ( cd "${REPO_ROOT}" && \
   HOME="${HOME}" \
   RUST_LOG="${WORKER_RUST_LOG}" \
   AWS_PROFILE="${AWS_PROFILE}" \
-  exec setsid sudo -n -E "${MIG_WORKER}" --config "${A_TOML}" >"${A_OUT}" 2>"${A_ERR}" ) &
+  exec setsid sudo -n -E "${VAMOOSE_BIN}" worker --config "${A_TOML}" >"${A_OUT}" 2>"${A_ERR}" ) &
 A_LAUNCHER_PID=$!
-# sudo on this host uses a launcher → monitor → mig-worker chain, where
+# sudo on this host uses a launcher → monitor → vamoose chain, where
 # both launcher and monitor have comm=sudo. pgrep -P launcher_pid -x
-# mig-worker would match nothing (the only direct child has comm=sudo).
-# Instead: pgrep -x mig-worker for all candidates, then disambiguate A
+# vamoose would match nothing (the only direct child has comm=sudo).
+# Instead: pgrep -x vamoose for all candidates, then disambiguate A
 # vs B by matching the config-file basename in /proc/<pid>/cmdline.
 # Budget 50 × 0.2s = 10s for sudo PAM + AWS init + libnfs mount.
 A_PID=""
 for _ in $(seq 1 50); do
     sleep 0.2
-    for cand in $(pgrep -x mig-worker 2>/dev/null || true); do
+    for cand in $(pgrep -x vamoose 2>/dev/null || true); do
         if grep -qa -- "$(basename "${A_TOML}")" \
                "/proc/${cand}/cmdline" 2>/dev/null; then
             A_PID="${cand}"
@@ -627,13 +637,13 @@ log "launching worker B"
   HOME="${HOME}" \
   RUST_LOG="${WORKER_RUST_LOG}" \
   AWS_PROFILE="${AWS_PROFILE}" \
-  exec setsid sudo -n -E "${MIG_WORKER}" --config "${B_TOML}" >"${B_OUT}" 2>"${B_ERR}" ) &
+  exec setsid sudo -n -E "${VAMOOSE_BIN}" worker --config "${B_TOML}" >"${B_OUT}" 2>"${B_ERR}" ) &
 B_LAUNCHER_PID=$!
 # Same cmdline-disambiguation as A; see comment at A_LAUNCHER_PID.
 B_PID=""
 for _ in $(seq 1 50); do
     sleep 0.2
-    for cand in $(pgrep -x mig-worker 2>/dev/null || true); do
+    for cand in $(pgrep -x vamoose 2>/dev/null || true); do
         if grep -qa -- "$(basename "${B_TOML}")" \
                "/proc/${cand}/cmdline" 2>/dev/null; then
             B_PID="${cand}"
@@ -701,12 +711,12 @@ log "B completed shard"
 
 # Resume A. A's heartbeat will refresh with its old etag, get 412, fence,
 # and exit. Also SIGCONT the sudo launcher: sudo's monitor mirrors its
-# child's stopped state via job control, so when we SIGSTOP'd
-# mig-worker, sudo stopped too (state Ts in `ps`). Sending SIGCONT only
-# to mig-worker leaves sudo stopped, which means sudo never reaps its
-# child after _exit — the worker becomes a permanent zombie and
-# /proc/<pid> persists, fooling the harness's liveness check. CONTing
-# both is the correct fix.
+# child's stopped state via job control, so when we SIGSTOP'd the vamoose
+# worker, sudo stopped too (state Ts in `ps`). Sending SIGCONT only to
+# the worker leaves sudo stopped, which means sudo never reaps its child
+# after _exit — the worker becomes a permanent zombie and /proc/<pid>
+# persists, fooling the harness's liveness check. CONTing both is the
+# correct fix.
 log "SIGCONT A pid=${A_PID} launcher=${A_LAUNCHER_PID}"
 sudo -n kill -CONT "${A_LAUNCHER_PID}" "${A_PID}"
 
@@ -730,8 +740,8 @@ if [[ "${a_exited}" -ne 1 ]]; then
 fi
 
 # Capture A's exit code via the launcher (sudo). Bash's `wait` only
-# accepts direct children; A_PID is mig-worker (a grandchild). Sudo
-# exits with the wrapped process's status, so the launcher PID's
+# accepts direct children; A_PID is the vamoose worker (a grandchild).
+# Sudo exits with the wrapped process's status, so the launcher PID's
 # exit code is the worker's.
 wait "${A_LAUNCHER_PID}" 2>/dev/null && A_EXIT=0 || A_EXIT=$?
 log "A exit code: ${A_EXIT}"
