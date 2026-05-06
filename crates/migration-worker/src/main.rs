@@ -11,6 +11,7 @@ mod caps;
 mod config;
 mod fence;
 mod heartbeat;
+mod logging;
 mod orchestrator;
 mod shard_processor;
 mod throughput;
@@ -29,12 +30,22 @@ struct Cli {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
     let cfg = config::Config::load(&cli.config)?;
+    let s3 = migration_core::s3::S3Client::from_config(
+        &cfg.run.endpoint,
+        &cfg.run.region,
+        &cfg.run.bucket,
+        cfg.run.profile.as_deref(),
+        cfg.run.verify_tls,
+    )
+    .await?;
+    let _log_guard = logging::init(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        logging::LoggingConfig::default(),
+        s3,
+    )?;
     let host_id = cli
         .host_id
         .or_else(|| cfg.worker.host_id.clone().filter(|s| s != "auto"))
