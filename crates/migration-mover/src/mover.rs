@@ -40,6 +40,7 @@ use crate::libnfs::{ops, ContextPair, LibnfsContextPool, NfsContext};
 use crate::paths::{join_root, partial_path};
 use crate::strategy::{self, Strategy, StrategyContext};
 use crate::uring::{FixedBufferPool, UringConfig};
+use migration_core::fence::Fence;
 use migration_core::records::{DowngradeKind, FailurePhase, MigrationOptions, ServerSideCopy};
 use migration_core::shard::RowView;
 use std::sync::Arc;
@@ -124,9 +125,11 @@ impl MoverConfig {
 
 /// The mover. Holds long-lived resources: libnfs context pool, the
 /// host id and pid (used to construct `.partial` names), the buffer
-/// pool placeholder (M3.5 wires it in), the downgrade sink, and
-/// policy. Cloning is cheap (Arc inside) and required because
+/// pool placeholder (M3.5 wires it in), the downgrade sink, the
+/// fence (consulted immediately before each commit-point op per R8),
+/// and policy. Cloning is cheap (Arc inside) and required because
 /// concurrent shard dispatch hands a clone to each spawned task.
+/// The fence is Arc-backed; all clones share the same atomic flag.
 #[derive(Clone)]
 pub struct Mover {
     cfg: Arc<MoverConfig>,
@@ -134,6 +137,7 @@ pub struct Mover {
     host_id: Arc<str>,
     pid: u32,
     downgrades: DowngradeSink,
+    fence: Fence,
     _buffers: Arc<FixedBufferPool>,
 }
 
@@ -143,6 +147,7 @@ impl Mover {
         pool: Arc<dyn LibnfsContextPool>,
         host_id: impl Into<Arc<str>>,
         downgrades: DowngradeSink,
+        fence: Fence,
     ) -> Self {
         let buffers = FixedBufferPool::new(cfg.uring);
         Self {
@@ -151,6 +156,7 @@ impl Mover {
             host_id: host_id.into(),
             pid: std::process::id(),
             downgrades,
+            fence,
             _buffers: buffers,
         }
     }
@@ -331,6 +337,27 @@ impl Mover {
         )
     }
 
+    /// R8: consult the fence immediately before issuing a commit-point
+    /// op (`rename` / `link` / `symlink`). If the fence has tripped
+    /// since the shard processor's last between-row check, bail out
+    /// with `FailurePhase::Fenced` rather than commit. The shard
+    /// processor recognizes that phase and routes the row back to
+    /// claimable (via the shard's claim terminating) instead of
+    /// recording a per-file failure.
+    ///
+    /// Note: there is no fence check inside the per-byte READ→WRITE
+    /// loop. Once a row's commit op is in flight (mid-syscall) we
+    /// accept it — that's the residual at-least-once tolerance the
+    /// `.partial`-stamped + atomic-rename safety argument relies on
+    /// (see CLAIM_PROTOCOL.md "What's NOT enforced" / R8).
+    fn check_fence(&self) -> Result<(), MoveError> {
+        if self.fence.is_valid() {
+            Ok(())
+        } else {
+            Err(MoveError::new(FailurePhase::Fenced, "FENCE_TRIPPED"))
+        }
+    }
+
     /// **M4** — NFSv4.2 server-side COPY. Stubbed.
     fn do_server_side_copy(
         &self,
@@ -368,6 +395,11 @@ impl Mover {
         if let Err(e) = ops::mkdir_p_for_file(pair.dst(), &dst) {
             return Err(MoveError::new(FailurePhase::Symlink, e.error));
         }
+        // R8: symlink IS the commit point for symlink rows — there is
+        // no .partial + rename pattern (NFSv3 has no atomic
+        // symlink-replace primitive). Fence-check immediately before
+        // issuing it.
+        self.check_fence()?;
         ops::symlink(pair.dst(), &target, &dst)?;
 
         if self.cfg.policy.preserve_mode {
@@ -407,6 +439,10 @@ impl Mover {
         if let Err(e) = ops::mkdir_p_for_file(pair.dst(), &linkpath_abs) {
             return Err(MoveError::new(FailurePhase::Hardlink, e.error));
         }
+        // R8: link IS the commit point for hardlink rows — there is no
+        // .partial + rename pattern, the linkpath is the final dest.
+        // Fence-check immediately before issuing it.
+        self.check_fence()?;
         ops::link(pair.dst(), &target_abs, &linkpath_abs)?;
         Ok(())
     }
@@ -426,6 +462,8 @@ impl Mover {
         ops::close_fh(pair.dst(), fh, FailurePhase::Write)?;
 
         self.apply_attrs(pair.dst(), &dst_partial, row)?;
+        // R8: see do_libnfs_copy — fence check immediately before rename.
+        self.check_fence()?;
         tracing::debug!(
             dest = %String::from_utf8_lossy(&dst),
             host = %self.host_id,
@@ -484,6 +522,11 @@ impl Mover {
         }
 
         self.apply_attrs(pair.dst(), &dst_partial, row)?;
+        // R8: last-ditch fence check immediately before the commit-point
+        // rename. The shard processor only checks between rows; without
+        // this guard, every row already inside spawn_blocking at fence
+        // trip time still commits.
+        self.check_fence()?;
         tracing::debug!(
             dest = %String::from_utf8_lossy(&dst),
             host = %self.host_id,
@@ -819,5 +862,94 @@ mod tests {
             |_, _| panic!("on_short_eof must not fire for size 0"),
         );
         assert_eq!(result.unwrap(), 0);
+    }
+
+    // ---- R8 fence check ------------------------------------------
+    //
+    // Building a Mover requires a `LibnfsContextPool` to plug into the
+    // pre-commit acquire path. The fence check itself doesn't touch
+    // the pool — it just reads the atomic flag — so the tests below
+    // use a stub pool that never hands out a pair. The strategy
+    // bodies all funnel through `check_fence()` immediately before
+    // their commit-point op; confirming `check_fence()` honors the
+    // flag is sufficient to prove the fence guard fires for each
+    // strategy (verified by code inspection at the patch sites).
+
+    use crate::libnfs::{ContextPair, LibnfsContextPool};
+    use async_trait::async_trait;
+
+    struct StubPool;
+    #[async_trait]
+    impl LibnfsContextPool for StubPool {
+        async fn acquire(&self) -> anyhow::Result<ContextPair> {
+            // The fence-check tests construct the Mover but never
+            // actually call into a strategy body — driving libnfs from
+            // a unit test would require a real NFS context. We only
+            // need the Mover type to exist; acquire is never invoked.
+            anyhow::bail!("StubPool::acquire is not implemented for fence tests")
+        }
+    }
+
+    fn build_mover_with_fence(fence: Fence) -> Mover {
+        let cfg = MoverConfig {
+            source_url: "nfs://srcA/exp".to_string(),
+            dest_url: "nfs://srcB/exp".to_string(),
+            source_root: "/".to_string(),
+            dest_root: "/".to_string(),
+            same_server_v42: false,
+            policy: AttrPolicy {
+                preserve_mode: true,
+                preserve_owner: true,
+                preserve_times: true,
+                preserve_xattr: false,
+            },
+            server_side_copy: ServerSideCopy::Off,
+            server_side_copy_min_bytes: 0,
+            uring: UringConfig::default(),
+            inflight: InflightProfile::default(),
+            require_chown: false,
+            require_unchanged_size: false,
+        };
+        Mover::new(
+            cfg,
+            Arc::new(StubPool) as Arc<dyn LibnfsContextPool>,
+            "test-host",
+            crate::downgrade::DowngradeSink::new(),
+            fence,
+        )
+    }
+
+    #[test]
+    fn check_fence_passes_when_fence_valid() {
+        let fence = Fence::new();
+        let mover = build_mover_with_fence(fence);
+        assert!(mover.check_fence().is_ok());
+    }
+
+    #[test]
+    fn check_fence_returns_fenced_when_fence_tripped() {
+        let fence = Fence::new();
+        fence.trip("test trip");
+        let mover = build_mover_with_fence(fence);
+        let err = mover
+            .check_fence()
+            .expect_err("tripped fence must short-circuit commit");
+        assert_eq!(err.phase, FailurePhase::Fenced);
+        assert_eq!(err.error, "FENCE_TRIPPED");
+    }
+
+    #[test]
+    fn fence_clones_share_state_with_mover() {
+        // The Mover's fence is held by-value (Fence is Clone, Arc
+        // internally). Tripping the original handle after building
+        // the Mover must still cause check_fence() to return Fenced.
+        // This pins the "Arc-backed atomic flag" contract the mover
+        // relies on per docs/CLAIM_PROTOCOL.md "Self-fencing".
+        let fence = Fence::new();
+        let mover = build_mover_with_fence(fence.clone());
+        assert!(mover.check_fence().is_ok());
+        fence.trip("late trip after Mover constructed");
+        let err = mover.check_fence().expect_err("late trip must propagate");
+        assert_eq!(err.phase, FailurePhase::Fenced);
     }
 }

@@ -11,6 +11,9 @@ use anyhow::Context;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+// `aggr` is the published section header for future aggregator config;
+// no current cmd reads it. Keep the schema and silence dead_code.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub global: Global,
@@ -24,6 +27,8 @@ pub struct Config {
     pub aggr: Option<Aggr>,
     #[serde(default)]
     pub copy: Option<Copy>,
+    #[serde(default)]
+    pub logging: Option<Logging>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -31,6 +36,10 @@ pub struct Global {
     pub bucket: String,
 }
 
+// `access_key` / `secret_key` are the explicit-credential path the
+// doctor validates; current commands rely on `profile` + the default
+// SDK chain. Keep the fields published.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 pub struct S3 {
     pub endpoint: String,
@@ -105,6 +114,10 @@ fn default_bytes_budget() -> String {
     "8 GiB".to_string()
 }
 
+// `threads` is part of the walker section schema; the current walker
+// invocation runs the binary as-is and doesn't override it. Keep the
+// field for the documented config surface.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct Walker {
     #[serde(default = "default_walker_threads")]
@@ -119,6 +132,8 @@ fn default_walker_threads() -> usize {
     16
 }
 
+// Aggregator config; no command consumes it yet. Schema published.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct Aggr {
     #[serde(default = "default_aggr_refresh")]
@@ -162,6 +177,58 @@ fn default_true() -> bool {
 }
 fn default_ssc() -> Option<String> {
     Some("off".to_string())
+}
+
+/// Rotating worker logs. The active log file (`path`) is plain text so
+/// `tail -F` and `grep` work; rotated archives are gzipped. When
+/// `s3_upload` is true, archives are shipped to `[global].bucket` under
+/// `s3_prefix/{host_id}/{startup_ts}/...` and live on disk only until
+/// the upload succeeds or `max_archives` evicts them.
+#[derive(Deserialize, Debug, Clone)]
+pub struct Logging {
+    #[serde(default = "default_log_path")]
+    pub path: PathBuf,
+    /// Rotation threshold as a TOML size string ("50 MiB", "1 GiB", …).
+    #[serde(default = "default_log_max_bytes")]
+    pub max_bytes: String,
+    #[serde(default = "default_log_max_archives")]
+    pub max_archives: usize,
+    #[serde(default = "default_true")]
+    pub s3_upload: bool,
+    #[serde(default = "default_log_s3_prefix")]
+    pub s3_prefix: String,
+    /// Uploader scan interval (seconds).
+    #[serde(default = "default_log_poll_secs")]
+    pub poll_secs: u64,
+}
+
+impl Default for Logging {
+    fn default() -> Self {
+        Self {
+            path: default_log_path(),
+            max_bytes: default_log_max_bytes(),
+            max_archives: default_log_max_archives(),
+            s3_upload: true,
+            s3_prefix: default_log_s3_prefix(),
+            poll_secs: default_log_poll_secs(),
+        }
+    }
+}
+
+fn default_log_path() -> PathBuf {
+    PathBuf::from("./vamoose.log")
+}
+fn default_log_max_bytes() -> String {
+    "50 MiB".to_string()
+}
+fn default_log_max_archives() -> usize {
+    10
+}
+fn default_log_s3_prefix() -> String {
+    "logs".to_string()
+}
+fn default_log_poll_secs() -> u64 {
+    10
 }
 
 impl Config {

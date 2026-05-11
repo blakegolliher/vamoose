@@ -24,6 +24,7 @@
 
 pub mod claim;
 pub mod errors;
+pub mod fence;
 pub mod layout;
 pub mod overlap;
 pub mod records;
@@ -33,3 +34,4 @@ pub mod shard;
 pub mod time;
 
 pub use errors::{Error, Result};
+pub use fence::Fence;

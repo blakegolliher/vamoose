@@ -9,7 +9,6 @@ use clap::Parser;
 mod backpressure;
 mod caps;
 mod config;
-mod fence;
 mod heartbeat;
 mod orchestrator;
 mod shard_processor;

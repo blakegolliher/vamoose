@@ -50,6 +50,11 @@ pub struct WorkerCfg {
 fn default_heartbeat_sec() -> u64 { migration_core::time::DEFAULT_HEARTBEAT_SEC }
 fn default_lease_timeout_sec() -> u64 { migration_core::time::DEFAULT_LEASE_TIMEOUT_SEC }
 
+// `max_in_flight` is part of the published worker config schema
+// (DESIGN.md "Configuration") even though no Rust path reads it yet;
+// silence dead_code so removing the field doesn't become the path of
+// least resistance.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct ShardCfg {
     pub local_scratch: std::path::PathBuf,
@@ -58,6 +63,12 @@ pub struct ShardCfg {
 }
 fn one() -> u32 { 1 }
 
+// Most of MoverCfg's fields are M3.5+ stubs (`pipeline_depth`,
+// `io_uring_queue_depth`, `fixed_buffer_*`) or NFSv3-baseline holdouts
+// (`strategy_default`, `src_url`, `dst_url`); the orchestrator reads
+// the manifest's URLs instead. Keep the schema published — operators
+// have these in their TOMLs — and silence dead_code at the struct level.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct MoverCfg {
     #[serde(default = "default_strategy")]
@@ -130,6 +141,10 @@ fn default_false() -> bool { false }
 // BUGFIX_PLAN.md "Fix 4". The field stays for forward compatibility.
 fn default_ssc() -> String { "off".into() }
 
+// `failure_pct_window_sec` is the window for the future sliding
+// failure-rate gate (M3 evaluates per-shard, not over a window);
+// schema is published in examples/worker.toml. Silence dead_code.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct BackpressureCfg {
     #[serde(default = "default_failure_window")]

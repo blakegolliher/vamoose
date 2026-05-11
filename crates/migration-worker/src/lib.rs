@@ -6,7 +6,6 @@
 pub mod backpressure;
 pub mod caps;
 pub mod config;
-pub mod fence;
 pub mod heartbeat;
 pub mod orchestrator;
 pub mod shard_processor;

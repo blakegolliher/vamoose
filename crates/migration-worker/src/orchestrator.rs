@@ -23,7 +23,6 @@
 use crate::backpressure::Backpressure;
 use crate::caps;
 use crate::config::Config;
-use crate::fence::Fence;
 use crate::heartbeat::{HeartbeatTask, HeldClaim, ProgressState};
 use crate::shard_processor::{ProcessOutcome, ShardProcessor};
 use crate::throughput::ThroughputCounter;
@@ -31,6 +30,7 @@ use crate::throughput::ThroughputCounter;
 use migration_core::claim::{
     self, AcquireOutcome, ClaimStore, CompleteOutcome, ListEntry, ReclaimOutcome,
 };
+use migration_core::fence::Fence;
 use migration_core::layout;
 use migration_core::overlap;
 use migration_core::records::{
@@ -139,12 +139,12 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     };
     let downgrades = DowngradeSink::new();
     let failures = FailureSink::new();
-    let mover = Mover::new(mover_cfg, pool, host_id.clone(), downgrades.clone());
 
     // ---- 4. Shared progress + heartbeat ----------------------------
     let progress = Arc::new(RwLock::new(ProgressState::new()));
     let current = Arc::new(Mutex::new(None::<HeldClaim>));
     let fence = Fence::new();
+    let mover = Mover::new(mover_cfg, pool, host_id.clone(), downgrades.clone(), fence.clone());
     let throughput = ThroughputCounter::new();
     let inflight = InflightLimiter::new(&InflightProfile {
         small: cfg.batch.inflight_small,
@@ -159,6 +159,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         fence: fence.clone(),
         host_id: host_id.clone(),
         interval: Duration::from_secs(cfg.worker.heartbeat_sec),
+        lease_timeout: Duration::from_secs(cfg.worker.lease_timeout_sec),
         current: current.clone(),
         progress: progress.clone(),
         throughput: throughput.clone(),
@@ -298,6 +299,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
             p.shard_bytes_done = p.shard_bytes_done.saturating_add(outcome.bytes_moved);
             p.files_ok = p.files_ok.saturating_add(outcome.files_ok);
             p.files_failed = p.files_failed.saturating_add(outcome.files_failed);
+            p.files_fenced = p.files_fenced.saturating_add(outcome.files_fenced);
         }
 
         // Flush downgrade + failure JSONL produced this shard. PUTs
@@ -349,14 +351,26 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
             break;
         }
 
-        // Re-read the latest etag from the shared cell — heartbeat may
-        // have refreshed it during processing.
+        // R4 fix: snapshot the final etag/epoch AND clear the held-claim
+        // cell in a single lock-held block, BEFORE calling complete().
+        //
+        // complete() is two HTTP ops (DELETE If-Match + PUT If-None-Match).
+        // While those are in flight the claim object on S3 is transiently
+        // gone, then re-appears with a new etag. If `current` still held
+        // the old etag during that window, the heartbeat task's HEAD
+        // would see 404-then-new-etag, both of which trip
+        // `RefreshOutcome::Lost` and fence the worker — a spurious
+        // self-fence on a perfectly clean shard completion. Clearing
+        // `current` first means heartbeat sees `None`, skips HEAD, and
+        // just writes progress.
         let (final_etag, final_epoch) = {
-            let g = current.lock().await;
-            match g.as_ref() {
+            let mut g = current.lock().await;
+            let (e, ep) = match g.as_ref() {
                 Some(c) if c.shard == shard_filename => (c.etag.clone(), c.epoch),
                 _ => (etag.clone(), record.epoch),
-            }
+            };
+            *g = None;
+            (e, ep)
         };
 
         match claim::complete(&*s3, &shard_filename, &final_etag, &host_id, final_epoch).await {
@@ -376,12 +390,6 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
             Err(e) => {
                 tracing::warn!(error = ?e, shard = %shard_filename, "claim complete write failed");
             }
-        }
-
-        // Release the held claim so the heartbeat stops refreshing it.
-        {
-            let mut g = current.lock().await;
-            *g = None;
         }
     }
 

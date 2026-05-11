@@ -17,9 +17,9 @@
 //!
 //! See docs/work-items/CLAIM_PROTOCOL_V2_DELETE_THEN_CREATE.md §3.2.
 
-use crate::fence::Fence;
 use crate::throughput::ThroughputCounter;
 use migration_core::claim::{self, ClaimStore, RefreshOutcome};
+use migration_core::fence::Fence;
 use migration_core::layout;
 use migration_core::records::ProgressRecord;
 use migration_core::time::UtcTime;
@@ -32,6 +32,14 @@ pub struct HeartbeatTask {
     pub fence: Fence,
     pub host_id: String,
     pub interval: Duration,
+    /// Lease window. Used by two fence-trip guards in addition to the
+    /// HEAD-and-compare path:
+    ///   - R6 retry budget: if HEAD has been failing for at least one
+    ///     lease window's worth of consecutive ticks, trip preemptively
+    ///     rather than wait for an eventual etag-divergence detection.
+    ///   - R7 clock-jump: if wall-clock vs monotonic-clock drift exceeds
+    ///     `lease_timeout / 2`, our claimed_utc reasoning is unreliable.
+    pub lease_timeout: Duration,
     /// Updated by the worker as it claims/releases shards.
     pub current: Arc<Mutex<Option<HeldClaim>>>,
     /// Updated by the shard processor as batches complete; read-only
@@ -64,6 +72,8 @@ pub struct ProgressState {
     pub shard_bytes_done: u64,
     pub files_ok: u64,
     pub files_failed: u64,
+    /// R8 hits — rows whose commit was short-circuited by a fence trip.
+    pub files_fenced: u64,
     pub status: String,
 }
 
@@ -77,6 +87,7 @@ impl ProgressState {
             shard_bytes_done: 0,
             files_ok: 0,
             files_failed: 0,
+            files_fenced: 0,
             status: "starting".to_string(),
         }
     }
@@ -92,6 +103,22 @@ impl HeartbeatTask {
     pub async fn run(self) {
         let mut ticker = tokio::time::interval(self.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // R6 retry budget. After this many consecutive HEAD failures
+        // (while holding a claim), trip the fence — at that point a
+        // peer has almost certainly reclaimed and we just haven't
+        // been able to observe it, so writing more files is unsafe.
+        // Minimum 1 to keep behavior sane on absurd configs.
+        let retry_budget =
+            (self.lease_timeout.as_secs() / self.interval.as_secs().max(1)).max(1);
+        let mut consec_failures: u64 = 0;
+
+        // R7 clock-jump baseline. Wall-vs-monotonic divergence beyond
+        // lease/2 means our reasoning about claimed_utc-based lease
+        // expiry is unreliable; self-fence rather than trust it.
+        let start_mono = std::time::Instant::now();
+        let start_wall = chrono::Utc::now();
+        let max_drift_secs = (self.lease_timeout.as_secs() / 2).max(1) as i64;
 
         let cancel = self.fence.cancel_token();
         loop {
@@ -109,6 +136,24 @@ impl HeartbeatTask {
                 interval_ms = self.interval.as_millis() as u64,
                 "heartbeat: tick"
             );
+
+            // R7: check wall-vs-monotonic drift on every tick. Both
+            // clocks advance together in normal operation; if they
+            // diverge it's either a manual clock adjustment, a VM
+            // suspend that froze CLOCK_MONOTONIC, or an NTP step. Any
+            // of those invalidates our lease reasoning.
+            let mono_secs = start_mono.elapsed().as_secs() as i64;
+            let wall_secs = chrono::Utc::now()
+                .signed_duration_since(start_wall)
+                .num_seconds();
+            let drift_secs = (wall_secs - mono_secs).abs();
+            if drift_secs > max_drift_secs {
+                self.fence.trip(format!(
+                    "clock jump detected: wall-mono drift {drift_secs}s > lease/2 ({max_drift_secs}s); self-fencing"
+                ));
+                self.write_progress_bounded("fenced").await;
+                break;
+            }
 
             // Step 1: write progress unconditionally. This is the
             // per-host liveness signal aggregators + reclaimers observe;
@@ -138,6 +183,7 @@ impl HeartbeatTask {
             if let Some(held) = held {
                 match claim::refresh(&*self.store, &held.shard, &held.etag).await {
                     Ok(RefreshOutcome::StillHeld { etag }) => {
+                        consec_failures = 0;
                         if etag == held.etag {
                             tracing::info!(etag = %etag, "refresh: still held");
                         } else {
@@ -171,13 +217,36 @@ impl HeartbeatTask {
                         break;
                     }
                     Err(e) => {
-                        // Transient — log and continue. If the failure
-                        // persists past the lease window, a peer will
-                        // reclaim and the next tick's HEAD will see the
-                        // new etag.
-                        tracing::warn!(error = ?e, "heartbeat refresh failed (transient)");
+                        // R6 retry budget. A single transient failure is
+                        // fine — networks blip — but if HEAD has been
+                        // unable to confirm ownership for a full lease
+                        // window's worth of ticks, a peer has almost
+                        // certainly reclaimed without us seeing it. Trip
+                        // the fence here rather than wait for the
+                        // eventual etag-divergence detection, which may
+                        // never arrive if S3 stays unreachable for us.
+                        consec_failures += 1;
+                        tracing::warn!(
+                            error = ?e,
+                            consec_failures,
+                            retry_budget,
+                            "heartbeat refresh failed (transient)",
+                        );
+                        if consec_failures >= retry_budget {
+                            self.fence.trip(format!(
+                                "heartbeat HEAD failing for {consec_failures} consecutive ticks (>= lease window); self-fencing"
+                            ));
+                            self.write_progress_bounded("fenced").await;
+                            break;
+                        }
                     }
                 }
+            } else {
+                // No claim held — there is nothing to refresh, and a
+                // long idle period must not look like exhausted retry
+                // budget. Reset the counter so the next acquire starts
+                // with a full budget.
+                consec_failures = 0;
             }
         }
     }
@@ -219,6 +288,7 @@ impl HeartbeatTask {
             shard_bytes_done: snap.shard_bytes_done,
             files_ok: snap.files_ok,
             files_failed: snap.files_failed,
+            files_fenced: snap.files_fenced,
             throughput_mb_s_1m: throughput_mb_s,
             status: status.to_string(),
         };

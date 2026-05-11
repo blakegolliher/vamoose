@@ -38,9 +38,9 @@
 //!   singletons. **Never inside a copy.** Once a row enters the mover,
 //!   it runs to commit (rename) or per-file failure.
 
-use crate::fence::Fence;
 use crate::throughput::ThroughputCounter;
-use migration_core::records::DowngradeKind;
+use migration_core::fence::Fence;
+use migration_core::records::{DowngradeKind, FailurePhase};
 use migration_core::schema::FileTypeTag;
 use migration_core::shard::{RowView, ShardReader};
 use migration_mover::batch::{Batch, BatchBudget, InflightLimiter};
@@ -229,24 +229,53 @@ impl ShardProcessor {
     }
 
     fn record(&mut self, row: &RowView, mo: MoveOutcome, outcome: &mut ProcessOutcome) {
-        match mo.result {
-            Ok(()) => {
-                outcome.files_ok += 1;
-                outcome.bytes_moved = outcome.bytes_moved.saturating_add(mo.bytes_moved);
-                self.throughput.add(mo.bytes_moved);
-            }
-            Err(e) => {
-                outcome.files_failed += 1;
-                tracing::warn!(
-                    row_id = mo.row_id,
-                    strategy = ?mo.strategy,
-                    phase = ?e.phase,
-                    error = %e.error,
-                    "file failed",
-                );
-                self.failures
-                    .record(mo.row_id, &row.path, e.phase, e.error);
-            }
+        record_outcome(&row.path, mo, outcome, &self.failures, &self.throughput);
+    }
+}
+
+/// Classify a single mover outcome into one of three sinks: success
+/// counter, fenced counter, or the per-file failures sink. Factored
+/// out of `ShardProcessor::record` so the Fenced special-case can be
+/// unit-tested without standing up a Mover + libnfs pool.
+fn record_outcome(
+    row_path: &[u8],
+    mo: MoveOutcome,
+    outcome: &mut ProcessOutcome,
+    failures: &FailureSink,
+    throughput: &ThroughputCounter,
+) {
+    match mo.result {
+        Ok(()) => {
+            outcome.files_ok += 1;
+            outcome.bytes_moved = outcome.bytes_moved.saturating_add(mo.bytes_moved);
+            throughput.add(mo.bytes_moved);
+        }
+        // R8: a Fenced row is not a per-file failure. The mover saw
+        // the fence trip immediately before its commit-point op
+        // (rename / link / symlink) and bailed out without writing.
+        // The shard's claim will terminate; the next reclaimer
+        // copies this row. Recording it as a per-file failure would
+        // (a) trip M5 assertion E (failures sink must be empty), and
+        // (b) mislead operators into chasing a non-bug.
+        Err(e) if e.phase == FailurePhase::Fenced => {
+            outcome.files_fenced += 1;
+            tracing::warn!(
+                row_id = mo.row_id,
+                strategy = ?mo.strategy,
+                error = %e.error,
+                "row fenced before commit; will be picked up after reclaim",
+            );
+        }
+        Err(e) => {
+            outcome.files_failed += 1;
+            tracing::warn!(
+                row_id = mo.row_id,
+                strategy = ?mo.strategy,
+                phase = ?e.phase,
+                error = %e.error,
+                "file failed",
+            );
+            failures.record(mo.row_id, row_path, e.phase, e.error);
         }
     }
 }
@@ -256,6 +285,11 @@ pub struct ProcessOutcome {
     pub rows_total: u64,
     pub files_ok: u64,
     pub files_failed: u64,
+    /// R8: rows that bailed out at the mover's pre-commit fence check.
+    /// Not a failure (no failures-sink record, no operator alert) — the
+    /// row will be copied by whichever worker reclaims the shard next.
+    /// Surfaced for observability so a spike is visible.
+    pub files_fenced: u64,
     pub bytes_moved: u64,
     pub fenced: bool,
 }
@@ -420,5 +454,88 @@ mod tests {
         sort_deepest_first(&mut dirs);
         let paths: Vec<&[u8]> = dirs.iter().map(|r| r.path.as_slice()).collect();
         assert_eq!(paths, vec![&b"/a/x"[..], &b"/a/y"[..], &b"/a/z"[..]]);
+    }
+
+    // ---- R8: record_outcome Fenced special-case ------------------
+    //
+    // The classification rules are the load-bearing piece of R8 from
+    // the operator's POV. M5 assertion E ("failures/host-*.jsonl is
+    // empty or absent") becomes trivially false if a Fenced row is
+    // mis-routed into the failures sink, so these tests pin the
+    // routing for each of the three buckets.
+
+    use migration_mover::strategy::Strategy;
+    use migration_mover::MoveError;
+
+    fn fenced_err() -> MoveError {
+        MoveError::new(FailurePhase::Fenced, "FENCE_TRIPPED")
+    }
+
+    #[test]
+    fn record_outcome_routes_fenced_to_counter_not_sink() {
+        let sink = FailureSink::new();
+        let throughput = ThroughputCounter::new();
+        let mut outcome = ProcessOutcome::default();
+        let mo = MoveOutcome {
+            row_id: 42,
+            strategy: Strategy::LibnfsIoUring,
+            bytes_moved: 0,
+            result: Err(fenced_err()),
+        };
+
+        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput);
+
+        assert_eq!(outcome.files_fenced, 1, "Fenced must bump files_fenced");
+        assert_eq!(outcome.files_failed, 0, "Fenced must NOT bump files_failed");
+        assert_eq!(outcome.files_ok, 0);
+        assert_eq!(outcome.bytes_moved, 0);
+        assert!(
+            sink.is_empty(),
+            "Fenced must NOT land in the failures sink (M5 assertion E)",
+        );
+    }
+
+    #[test]
+    fn record_outcome_routes_non_fenced_err_to_failures_sink() {
+        // Sanity: pre-R8 routing for a genuine per-file failure must
+        // still record to the sink and bump files_failed.
+        let sink = FailureSink::new();
+        let throughput = ThroughputCounter::new();
+        let mut outcome = ProcessOutcome::default();
+        let mo = MoveOutcome {
+            row_id: 7,
+            strategy: Strategy::LibnfsIoUring,
+            bytes_moved: 0,
+            result: Err(MoveError::new(FailurePhase::Write, "ENOSPC")),
+        };
+
+        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput);
+
+        assert_eq!(outcome.files_failed, 1);
+        assert_eq!(outcome.files_fenced, 0);
+        assert_eq!(sink.len(), 1, "non-Fenced Err must land in failures sink");
+    }
+
+    #[test]
+    fn record_outcome_success_path_unchanged_by_r8() {
+        // Regression guard: the Ok branch must still bump files_ok
+        // and bytes_moved, untouched by the new Fenced arm.
+        let sink = FailureSink::new();
+        let throughput = ThroughputCounter::new();
+        let mut outcome = ProcessOutcome::default();
+        let mo = MoveOutcome {
+            row_id: 1,
+            strategy: Strategy::LibnfsIoUring,
+            bytes_moved: 4096,
+            result: Ok(()),
+        };
+
+        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput);
+
+        assert_eq!(outcome.files_ok, 1);
+        assert_eq!(outcome.files_failed, 0);
+        assert_eq!(outcome.files_fenced, 0);
+        assert_eq!(outcome.bytes_moved, 4096);
+        assert!(sink.is_empty());
     }
 }

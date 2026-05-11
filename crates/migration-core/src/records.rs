@@ -136,6 +136,12 @@ pub struct ProgressRecord {
     pub shard_bytes_done: u64,
     pub files_ok: u64,
     pub files_failed: u64,
+    /// Rows R8 caught at commit time — fence tripped between dispatch
+    /// and the row's rename/link/symlink op. NOT a failure: the next
+    /// reclaimer will copy the row. `#[serde(default)]` so older
+    /// progress objects from pre-R8 builds still parse.
+    #[serde(default)]
+    pub files_fenced: u64,
     pub throughput_mb_s_1m: f64,
     /// "active", "degraded", "draining", "exiting".
     pub status: String,
@@ -202,6 +208,15 @@ pub enum FailurePhase {
     Symlink,
     Hardlink,
     ServerSideCopy,
+    /// R8: the fence tripped between the shard processor's last
+    /// between-row check and the mover's commit-point op (rename / link
+    /// / symlink). The row was *not* committed and is *not* a per-file
+    /// failure — the shard goes back to claimable when our claim
+    /// terminates, and the next reclaimer will copy this row. The shard
+    /// processor recognizes this phase, skips the failures sink, and
+    /// emits a WARN with the row_id for operator visibility. See
+    /// `docs/CLAIM_PROTOCOL.md` "Race catalog" row R8.
+    Fenced,
 }
 
 // =============================================================================
@@ -263,4 +278,26 @@ pub enum DowngradeKind {
     /// for the time attributes.
     #[serde(rename = "SYMLINK_TIME_NFSV3")]
     SymlinkTimeNfsV3,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // R8: pin the wire form for FailurePhase::Fenced so a future
+    // rename_all change doesn't silently shift the on-disk JSON
+    // shape. The aggregator parses these strings; downgrade-records
+    // and failure-records share the same enum across the schema.
+    #[test]
+    fn failure_phase_fenced_serializes_to_snake_case() {
+        let json = serde_json::to_string(&FailurePhase::Fenced).unwrap();
+        assert_eq!(json, "\"fenced\"");
+    }
+
+    #[test]
+    fn failure_phase_fenced_roundtrips_through_json() {
+        let json = serde_json::to_string(&FailurePhase::Fenced).unwrap();
+        let decoded: FailurePhase = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, FailurePhase::Fenced);
+    }
 }

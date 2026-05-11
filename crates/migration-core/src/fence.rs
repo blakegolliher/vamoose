@@ -20,6 +20,15 @@
 //!     - Local clock jump > LEASE_TIMEOUT/2.
 //! - When `claim_valid()` returns false, the mover cancels in-flight
 //!   work, **does not RENAME**, and exits the shard.
+//!
+//! ## Why this lives in `migration-core`
+//!
+//! `Fence` is a primitive shared between the worker (`migration-worker`)
+//! — which trips it from the heartbeat task and consults it between
+//! rows — and the mover (`migration-mover`) — which consults it right
+//! before each commit-point op per R8 in `docs/CLAIM_PROTOCOL.md`.
+//! Putting it in `migration-core` avoids a `migration-mover ->
+//! migration-worker` dependency edge that would close a cycle.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -62,5 +71,11 @@ impl Fence {
 
     pub fn reason(&self) -> Option<String> {
         self.reason.lock().unwrap().clone()
+    }
+}
+
+impl Default for Fence {
+    fn default() -> Self {
+        Self::new()
     }
 }
