@@ -1,7 +1,15 @@
 # Multi-pass converging mover
 
-Status: not started. Blocked by
-`docs/work-items/LIBNFS_ASYNC_FORK.md` landing and verifying.
+Status: Phase 0 prerequisite (`docs/work-items/LIBNFS_ASYNC_FORK.md`)
+closed 2026-05-18 — `AsyncNfsContext` is shipped at
+`crates/migration-mover/src/libnfs/asyncio/`. Phase 1 (bucketed pool)
+ready to begin. The async-surface deltas from the closing note have
+been threaded into the `BUCKETS` table, the `pipelined_copy` sketch,
+and the cutover-pass language below; in summary: `nconnect>1` is
+rejected at mount, `libnfs_readahead` is gone, `fsync` is whole-file
+(per-range COMMIT deferred until cutover actually needs it — see
+`LIBNFS_ASYNC_FORK_AUDIT.md`), and FILE_SYNC stability is selected at
+open time via `Flags::wronly_sync()`, not per-write.
 
 ---
 
@@ -250,10 +258,14 @@ Do not duplicate this:
 
 Cutover pass = pass N (N ≥ 1) run with `--cutover`. Differences:
 
-- Writers use **FILE_SYNC** stability on every write (no UNSTABLE +
-  COMMIT batching). Throughput tanks; correctness wins. The
-  multi-pass model is the throughput optimization; cutover is the
-  paranoid pass.
+- Writers open destination files with **FILE_SYNC** stability via
+  `Flags::wronly_sync()` at `open` / `create` time (the linked
+  libnfs sets stability per-fh, not per-write — see
+  `LIBNFS_ASYNC_FORK_AUDIT.md`). Every `pwrite` against a cutover-
+  opened fh issues a stable write; no UNSTABLE + per-range COMMIT
+  batching. Throughput tanks; correctness wins. The multi-pass
+  model is the throughput optimization; cutover is the paranoid
+  pass.
 - After fleet completes but *before* the merge step, the pass
   driver runs **invariant: classifier must have produced zero DIRTY
   rows**. Writes are supposed to be stopped; any DIRTY is drift.
@@ -264,8 +276,10 @@ Cutover pass = pass N (N ≥ 1) run with `--cutover`. Differences:
   `file_hash` from the destination and compare to the manifest's
   `file_hash`. Mismatches fail the cutover. `--cutover-skip-verify`
   disables.
-- Writes still use the bucketed async pool — only the stability
-  flag changes per write.
+- Writes still use the bucketed async pool; only the per-file open
+  flag changes (cutover opens dest fhs with `Flags::wronly_sync()`,
+  bulk passes open without it). The bucket configs themselves are
+  identical between bulk and cutover.
 
 ### Resume on restart
 
@@ -297,47 +311,50 @@ pub struct BucketConfig {
     pub max_size: u64,        // inclusive
     pub rsize: u32,
     pub wsize: u32,
-    pub nconnect: u32,
     pub read_pipeline_depth: u32,
     pub write_pipeline_depth: u32,
-    pub libnfs_readahead: u32,
 }
 
 pub const BUCKETS: [BucketConfig; 3] = [
     BucketConfig {
         name: "large",     min_size: 1 << 30, max_size: u64::MAX,
-        rsize: 4 * MiB, wsize: 4 * MiB, nconnect: 2,
+        rsize: 4 * MiB, wsize: 4 * MiB,
         read_pipeline_depth: 32, write_pipeline_depth: 32,
-        libnfs_readahead: 128 * MiB,
     },
     BucketConfig {
         name: "medium",    min_size: 1 << 20, max_size: (1 << 30) - 1,
-        rsize: 2 * MiB, wsize: 2 * MiB, nconnect: 4,
+        rsize: 2 * MiB, wsize: 2 * MiB,
         read_pipeline_depth: 8,  write_pipeline_depth: 8,
-        libnfs_readahead: 16 * MiB,
     },
     BucketConfig {
         name: "small",     min_size: 0,       max_size: (1 << 20) - 1,
-        rsize: 128 * KiB, wsize: 128 * KiB, nconnect: 8,
+        rsize: 128 * KiB, wsize: 128 * KiB,
         read_pipeline_depth: 2,  write_pipeline_depth: 2,
-        libnfs_readahead: 1 * MiB,
     },
 ];
 ```
+
+Removed from this sketch vs the original external prompt: `nconnect`
+and `libnfs_readahead`. The linked libnfs (`/usr/local/lib/libnfs.so.16`)
+rejects `nconnect > 1` at mount and does not surface a readahead
+tunable on the async API — see `LIBNFS_ASYNC_FORK_AUDIT.md`. Every
+bucket therefore runs one TCP connection per context. If a future
+libnfs adds `nconnect` support, this field comes back; until then,
+parallelism per bucket is "one connection × per-file pipeline depth ×
+inflight-file count from `batch.rs::InflightLimiter`".
 
 Rationale (copy this comment block above `BUCKETS` in code):
 
 - **Large** (≥1 GiB): throughput-bound. Hide round-trip latency
   with a deep per-file pipeline (32 concurrent RPCs × 4 MiB =
-  128 MiB streaming window). Low connection count — depth per
-  connection matters more than connection count once the pipe is
-  fat.
+  128 MiB streaming window over the single TCP connection).
 - **Medium** (1 MiB – 1 GiB): balanced. 16 MiB window covers small
   files in one batch and pipelines well on larger ones.
 - **Small** (<1 MiB): latency-bound. Per-file pipeline depth of 2
   is defensive (256 KiB file = 2 RPCs total). Parallelism comes
   from many concurrent *files*, not pipelining within one file —
-  hence the higher connection count.
+  scale by raising the per-class `InflightLimiter` budget, not by
+  fanning out connections (libnfs gives us one per context).
 
 ### Implementation surface
 
@@ -368,8 +385,8 @@ concurrency budgets (small=256, medium=16, large=4 default). Those
 defaults stay; they govern *how many files* are in flight per
 size class. The per-file pipeline depth (32/8/2) is layered
 **inside** the per-file work. So at peak: large bucket runs
-(4 files × 32 in-flight RPCs) = 128 concurrent RPCs against 2
-connections.
+(4 files × 32 in-flight RPCs) = 128 concurrent RPCs over the
+large-bucket context's single TCP connection.
 
 The two layers stack cleanly: the existing `JoinSet` of size-class
 file fibers is unchanged; what changes is the body of each fiber
@@ -403,15 +420,22 @@ async fn pipelined_copy(
     let pre_attrs = src.fstat(src_fh).await?;
 
     let mut reader = ReadPipeline::new(src, src_fh, size, bucket.rsize, bucket.read_pipeline_depth);
-    let mut writer = WritePipeline::new(dst, dst_fh, bucket.write_pipeline_depth, Stability::Unstable);
+    let mut writer = WritePipeline::new(dst, dst_fh, bucket.write_pipeline_depth);
     let mut hasher = Xxh3Hasher::new();
+
+    // Note: stability (UNSTABLE vs FILE_SYNC) is selected at *open* time
+    // via `Flags::wronly_sync()` on the dst fh by the caller — the shipped
+    // libnfs surface does not take a per-pwrite stability flag. See
+    // LIBNFS_ASYNC_FORK.md closing note.
 
     while let Some(chunk) = reader.next_chunk().await? {
         hasher.update(&chunk);
         writer.submit(chunk).await?;        // backpressured by depth
     }
     writer.drain().await?;                  // wait for all writes acked
-    dst.commit(dst_fh, 0, size).await?;     // one COMMIT per file
+    dst.fsync(dst_fh).await?;               // whole-file NFS COMMIT (per-range
+                                            // COMMIT deferred — see
+                                            // LIBNFS_ASYNC_FORK_AUDIT.md)
 
     let file_hash = hasher.finalize();
 
@@ -433,9 +457,10 @@ fence.check_pre_rename()?;
 dst.rename(partial_path, final_path).await?;
 ```
 
-The rename **stays the commit point**. The COMMIT inside
-`pipelined_copy` durabilizes the bytes; the rename publishes them.
-The fence check between COMMIT and rename is the R8 invariant —
+The rename **stays the commit point**. The whole-file `fsync`
+inside `pipelined_copy` issues the NFS COMMIT that durabilizes the
+bytes; the rename publishes them. The fence check between
+`fsync().await?` and `rename().await` is the R8 invariant —
 unchanged from today's model in *placement* but more important in
 *timing* because the COMMIT can complete tens of milliseconds
 before the rename. See R-rule preservation below for the proof
@@ -612,23 +637,25 @@ window between fence check and rename issue is bounded by syscall
 overhead (microseconds).
 
 In the new async model, the rename happens after the COMMIT
-completes. The COMMIT can take milliseconds to tens of milliseconds.
-The fence check still happens **immediately before** the rename
-syscall is issued (i.e., between `commit().await?` and
-`rename().await`). The window between fence check and the rename
-RPC hitting the wire remains bounded by the time to send one RPC.
+completes. The COMMIT (issued via `AsyncNfsContext::fsync`, which
+is whole-file in the linked libnfs — see `LIBNFS_ASYNC_FORK_AUDIT.md`)
+can take milliseconds to tens of milliseconds. The fence check
+still happens **immediately before** the rename syscall is issued
+(i.e., between `fsync().await?` and `rename().await`). The window
+between fence check and the rename RPC hitting the wire remains
+bounded by the time to send one RPC.
 
 Proof obligation:
 
-- The fence check is placed exactly between `commit().await?` and
-  `rename(...).await`. Not before COMMIT — *after*. This is the
+- The fence check is placed exactly between `fsync().await?` and
+  `rename(...).await`. Not before fsync — *after*. This is the
   critical placement.
 - The M5 self-fence harness (`scripts/m5-self-fence-test.sh`,
   `docs/work-items/M5_SELF_FENCE.md`) is re-run against the new
   mover *unchanged*. If any assertion fails, R8 is violated and
   the work does not ship.
 - A new unit test in the mover crate stubs the fence, simulates
-  COMMIT returning ack, then trips the fence between COMMIT-ack
+  fsync returning ack, then trips the fence between fsync-ack
   and rename-issue, and asserts the rename is not issued.
 
 ### Source/dest overlap
@@ -726,9 +753,10 @@ Tuning flags (apply to fleet workers when present):
 ```
 --read-pipeline-depth-override <bucket>=<N>
 --write-pipeline-depth-override <bucket>=<N>
---reader-multiplier <N>        # multiplier on nconnect for per-bucket
-                               # reader worker count
---writer-multiplier <N>
+--reader-multiplier <N>        # multiplier on the bucket's
+                               # configured read_pipeline_depth for the
+                               # per-bucket reader worker count
+--writer-multiplier <N>        # likewise for write_pipeline_depth
 --channel-capacity <N>
 --legacy-single-context        # A/B benching gate; keeps existing sync pool
 ```
@@ -761,21 +789,39 @@ integration test pass).
 ### Phase 1 — Bucketed async pool
 
 - `bucketed_pool.rs`: `BucketedAsyncPool` + `BUCKETS` config.
+  `BucketConfig` carries only the fields the shipped FFI actually
+  honors: `rsize`, `wsize`, `read_pipeline_depth`,
+  `write_pipeline_depth` (plus `name` / `min_size` / `max_size` for
+  selection). No `nconnect`, no `libnfs_readahead`. The pool
+  constructor builds three `AsyncNfsContextPair`s (src+dst per
+  bucket) via `AsyncNfsContext::mount` with
+  `MountOpts { nconnect: 1, version: 3, rsize, wsize, .. }`.
 - Unit tests: bucket selection boundary cases at 1 MiB and 1 GiB
   exact and ±1 byte; size 0 boundary; `u64::MAX` boundary.
 - No mover integration yet — just the pool.
 - Verification: pool builds, mounts against real VAST, all three
   contexts come up with their tuned mount opts. Smoke against
-  small/medium/large files.
+  small/medium/large files. The async FFI smoke test gates from
+  `LIBNFS_ASYNC_FORK.md` Gate D are *not* re-run here — Phase 1 is
+  composition over an already-verified surface; we don't touch
+  `asyncio/` (see `CORRECTNESS_RULES.md` "Pre-merge runbook: async
+  libnfs FFI changes" — that gate fires only on changes inside
+  `asyncio/`).
 
 ### Phase 2 — Per-file async copy pipeline
 
 - `pipelined_copy.rs`: implements `pipelined_copy`. UNSTABLE writes
-  + per-file COMMIT. Inline xxh3_128. Pre/post stat brackets.
+  (dest fh opened *without* `Flags::wronly_sync()`) + one whole-
+  file `fsync` per file. Inline xxh3_128. Pre/post stat brackets.
+  Per-range COMMIT is **not** wired here — when the cutover pass
+  needs it, it lives behind a separate code path (see Phase 6 and
+  `LIBNFS_ASYNC_FORK_AUDIT.md` follow-up #2).
 - Integration in `mover.rs::do_libnfs_copy`: behind
   `--use-bucketed-pool` flag (default off), route to
   `pipelined_copy`. Sync path stays as fallback.
-- R8 fence check placement explicit in the new code path.
+- R8 fence check placement explicit in the new code path
+  (`fsync().await?` → `fence.check_pre_rename()?` →
+  `rename().await`).
 - Unit tests with mocked async context: pipeline depth saturation,
   drain semantics, torn-read pre/post mismatch flagged.
 - Integration test against real VAST: M2/M3 cookbook re-run with
@@ -933,7 +979,15 @@ integration test pass).
 
 ## Cross-references
 
-- `LIBNFS_ASYNC_FORK.md` — required prerequisite.
+- `LIBNFS_ASYNC_FORK.md` — required prerequisite, closed 2026-05-18.
+  Its closing note is the source of truth for the async-FFI shape;
+  the deltas (no `nconnect>1`, no readahead, `fsync` is whole-file,
+  FILE_SYNC stability is open-time) are already threaded into the
+  sections above.
+- `LIBNFS_ASYNC_FORK_AUDIT.md` — symbol-by-symbol audit. Item in the
+  "follow-up" section covers per-range NFS COMMIT support, which
+  this work item will revisit only if the cutover pass actually
+  needs it.
 - `CORRECTNESS_RULES.md` — every invariant that must continue to
   hold.
 - `M5_SELF_FENCE.md` — the verification harness that gates Phase 2.
