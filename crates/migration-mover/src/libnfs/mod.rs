@@ -40,6 +40,7 @@
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 
+pub mod asyncio;
 pub mod ops;
 pub mod pool;
 
@@ -123,11 +124,8 @@ extern "C" {
     pub fn nfs_mkdir2(nfs: *mut nfs_context, path: *const c_char, mode: c_int) -> c_int;
 
     // Links
-    pub fn nfs_link(
-        nfs: *mut nfs_context,
-        oldpath: *const c_char,
-        newpath: *const c_char,
-    ) -> c_int;
+    pub fn nfs_link(nfs: *mut nfs_context, oldpath: *const c_char, newpath: *const c_char)
+        -> c_int;
     pub fn nfs_symlink(
         nfs: *mut nfs_context,
         target: *const c_char,
@@ -142,12 +140,7 @@ extern "C" {
 
     // Attributes
     pub fn nfs_chmod(nfs: *mut nfs_context, path: *const c_char, mode: c_int) -> c_int;
-    pub fn nfs_chown(
-        nfs: *mut nfs_context,
-        path: *const c_char,
-        uid: c_int,
-        gid: c_int,
-    ) -> c_int;
+    pub fn nfs_chown(nfs: *mut nfs_context, path: *const c_char, uid: c_int, gid: c_int) -> c_int;
     /// `times` points to an array of two `struct timeval` —
     /// `[atime, mtime]`. Sub-second precision is microseconds; the
     /// nanosecond columns in the index are truncated and the precision
@@ -254,7 +247,10 @@ pub fn parse_nfs_url(url: &str) -> anyhow::Result<(String, String)> {
     if export == "/" || export.is_empty() {
         // libnfs accepts "/" for some servers but most VAST exports
         // look like "/exportname". Allow but warn.
-        tracing::warn!(url, "nfs URL export path is '/'; this may not be what you meant");
+        tracing::warn!(
+            url,
+            "nfs URL export path is '/'; this may not be what you meant"
+        );
     }
     Ok((server, export))
 }

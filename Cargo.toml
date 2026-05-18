@@ -42,7 +42,7 @@ arrow   = { version = "54", default-features = false, features = ["ipc"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "sync", "time", "io-util", "net"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Serde

@@ -444,6 +444,77 @@ All of the following must be true:
 
 ---
 
+## Closing note (2026-05-18, var204)
+
+Implementation landed. All eight "done" gates A–H satisfied. Specific
+results worth recording for the multi-pass mover work item:
+
+- **Symbol audit (Gate A):** `docs/work-items/LIBNFS_ASYNC_FORK_AUDIT.md`.
+  No C-side patches required (interpretation #1). Substitutes:
+  `nfs_fsync_async` for `nfs_commit_async`, `nfs_open2_async` for
+  `nfs_create_async`, `nfs_set_readmax`/`writemax` for
+  `nfs_set_rsize`/`wsize`. `nconnect>1` rejected at mount time
+  (linked libnfs v6 lacks support); `nfs_set_readahead` and
+  `nfs_utimensat_async` dropped from the surface.
+
+- **Patches (Gate B):** none in this work item. Pinned source tree
+  `~/projects/libnfs/` unchanged.
+
+- **Compile (Gate C):** clean — `cargo build -p migration-mover`
+  produces no warnings.
+
+- **Async FFI smoke (Gate D):** 5/5 pass against var204
+  (`async_pread_returns_actual_bytes`, `async_write_then_read_roundtrip`,
+  `async_stat_and_fstat_match`, `async_attribute_and_namespace_ops_round_trip`,
+  `async_symlink_readlink_roundtrip`).
+
+- **Service-task integration (Gate E):** 4/4 pass — 64-way concurrent
+  pread no cross-talk, drop-during-flight survives, `nconnect>1`
+  rejection, NFSv3-only gate.
+
+- **Perf smoke (Gate F):** at 1 ms service tick, var204, single
+  context, 32 concurrent 1 MiB reads:
+  - **ASYNC: 352.5 MB/s** (95 ms)
+  - **SYNC:  269.5 MB/s** (125 ms)
+  Async beats sync by ~30 % despite the service-task indirection;
+  the sync path is bottlenecked by spawn_blocking-pool serialization
+  against the single SimplePool pair. The ASYNC number is the floor
+  for what one context can do at this rsize; the multi-pass mover's
+  bucketed pool with three contexts should scale further. The
+  result also justified the **1 ms tick** decision: at 10 ms the
+  async path was 110 MB/s (≈ one tick of latency per response).
+
+- **Correctness invariants (Gate G):** `docs/CORRECTNESS_RULES.md`
+  updated with two new rules: "service task owns the context" and
+  "dropping a future does NOT cancel the RPC".
+
+- **Existing M2/M3/M5 (Gate H):** sync FFI smoke still passes
+  (`libnfs_ffi_smoke::nfs_pread_returns_actual_bytes`); 58/58 unit
+  tests pass; no changes to the sync surface so existing call sites
+  are unaffected.
+
+### Driver-design notes worth carrying forward
+
+- mio's epoll registration is edge-triggered. With libnfs's API,
+  callbacks fired inside `nfs_service` can enqueue more RPCs that
+  need the same direction we just got readiness for. Once
+  `clear_ready()` is called the fd does not transition again
+  (kernel buffer state didn't change) and we deadlock until the
+  next tick. Fix: the tick arm uses a non-blocking `libc::poll` to
+  read the *current* level state and pass those revents to
+  `nfs_service`. This is exactly what `libnfs-sync.c::wait_for_nfs_reply`
+  does (poll with `nfs_which_events`), just driven from a 1 ms
+  tokio interval instead of a blocking loop.
+- Inner drain loop after each AsyncFd wake: caps at 8 iterations,
+  breaks early when libnfs no longer wants the direction we have
+  readiness for OR when the queue is empty. Without this drain,
+  libnfs's "callback enqueues another RPC" pattern stalls until the
+  next tick.
+- Service-task `OwnedContext` is the only `Send` wrapper for the
+  raw `*mut nfs_context`. The context never escapes the task; the
+  pointer is recreated as `owned.0` inline at each FFI call site
+  so the future stays `Send` across awaits.
+
 ## Risks and known unknowns
 
 - **libnfs version skew.** The host has v4 and v5 side by side.

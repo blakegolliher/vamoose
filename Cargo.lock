@@ -2309,6 +2309,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "futures",
  "io-uring",
  "libc",
  "migration-core",

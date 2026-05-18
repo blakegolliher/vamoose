@@ -89,6 +89,27 @@ an explicit design change.
   source review proves nothing because the bug is below the source —
   the binary on disk is the diverged artifact.
 
+- **Async libnfs: one service task owns the context.** When using
+  `AsyncNfsContext` (`crates/migration-mover/src/libnfs/asyncio/`),
+  the service task is the only entity that may issue libnfs calls
+  against its context. libnfs contexts are not thread-safe; the
+  service task design relies on serialized issuance. Public API
+  methods always go through the request mpsc — never call any
+  libnfs `*_async` symbol directly from a caller task. Callbacks
+  fire on the service-task thread inside `nfs_service`; their only
+  legal work is `oneshot_tx.send(...)`. Any future change that wants
+  to chain libnfs calls from inside a callback must redesign the
+  service task.
+
+- **Async libnfs: dropping a future does NOT cancel the RPC.** libnfs
+  has no NFSv3 cancel surface. Dropping the returned future drops
+  the oneshot receiver; the RPC continues to completion and the
+  result is silently discarded. Callers that require cancellation
+  semantics (e.g. the multi-pass mover's cutover pass abandoning a
+  slow read) must layer a higher-level cancellation token themselves
+  and decide what to do with the in-flight bytes — they cannot rely
+  on Drop to make the RPC stop.
+
 ## Verification gates
 
 Manual verification against real hardware is a milestone gate. A
@@ -113,7 +134,7 @@ once the upper layer is in place.
   desired (e.g. invariant checks).
 
 - **Follow `nfs-walker`'s patterns where the problems overlap**
-  (work-stealing pool, RocksDB-style writer thread, libnfs FFI).
+  (work-stealing pool, sharded parquet writer threads, libnfs FFI).
 
 ## Authoritative source-of-truth files
 
