@@ -73,6 +73,7 @@ toml       = "0.8"
 hostname   = "0.4"
 getrandom  = "0.2"
 futures    = "0.3"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Concurrency primitives (same as nfs-walker)
 crossbeam-channel = "0.5"

@@ -25,6 +25,7 @@ pub mod error;
 pub mod failure;
 pub mod libnfs;
 pub mod paths;
+pub mod pipelined_copy;
 pub mod strategy;
 pub mod uring;
 
@@ -38,3 +39,4 @@ pub use failure::FailureSink;
 pub use libnfs::{ContextPair, LibnfsContextPool, MultiPool, NfsContext, SimplePool};
 pub use mover::{MoveOutcome, Mover, MoverConfig};
 pub use paths::join_root;
+pub use pipelined_copy::{pipelined_copy, FileCopyResult};
