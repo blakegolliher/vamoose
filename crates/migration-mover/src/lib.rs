@@ -23,6 +23,7 @@ pub mod bucketed_pool;
 pub mod downgrade;
 pub mod error;
 pub mod failure;
+pub mod file_mover;
 pub mod libnfs;
 pub mod paths;
 pub mod pipelined_copy;
@@ -36,6 +37,7 @@ pub use bucketed_pool::{
 pub use downgrade::DowngradeSink;
 pub use error::MoveError;
 pub use failure::FailureSink;
+pub use file_mover::{AsyncBucketedFileMover, FileMover};
 pub use libnfs::{ContextPair, LibnfsContextPool, MultiPool, NfsContext, SimplePool};
 pub use mover::{MoveOutcome, Mover, MoverConfig};
 pub use paths::join_root;

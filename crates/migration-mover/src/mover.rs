@@ -64,6 +64,7 @@ pub struct MoveOutcome {
     pub result: Result<(), MoveError>,
 }
 
+#[derive(Clone)]
 pub struct MoverConfig {
     pub source_url: String,
     pub dest_url: String,
@@ -222,10 +223,7 @@ impl Mover {
                     row_id,
                     strategy,
                     bytes_moved: 0,
-                    result: Err(MoveError::new(
-                        FailurePhase::Open,
-                        format!("pool: {e}"),
-                    )),
+                    result: Err(MoveError::new(FailurePhase::Open, format!("pool: {e}"))),
                 };
             }
         };
@@ -608,7 +606,7 @@ fn parent_dir(p: &[u8]) -> &[u8] {
 /// Free-function form of the per-file self-target check, factored out
 /// of `Mover` so it's unit-testable without spinning up a libnfs pool.
 /// See `Mover::check_self_target` for behavior; this is the body.
-fn check_self_target(
+pub(crate) fn check_self_target(
     source_url: &str,
     dest_url: &str,
     src: &[u8],
@@ -696,10 +694,7 @@ where
         }
         let mut written_in_chunk = 0;
         while written_in_chunk < n {
-            let w = write_at(
-                off + written_in_chunk as u64,
-                &buf[written_in_chunk..n],
-            )?;
+            let w = write_at(off + written_in_chunk as u64, &buf[written_in_chunk..n])?;
             if w == 0 {
                 return Err(MoveError::new(FailurePhase::Write, "EIO"));
             }
@@ -815,7 +810,10 @@ mod tests {
         let off = result.expect("short read is not an error in default mode");
         assert_eq!(off, 0, "off must equal bytes-actually-read");
         assert!(off < size, "off ({off}) must be < indexed size ({size})");
-        assert!(on_short_called, "on_short_eof must fire so caller can record EARLY_EOF");
+        assert!(
+            on_short_called,
+            "on_short_eof must fire so caller can record EARLY_EOF"
+        );
     }
 
     #[test]
@@ -830,9 +828,9 @@ mod tests {
             |_off, buf| {
                 reads += 1;
                 if reads == 1 {
-                    Ok(buf.len())  // first chunk: full read
+                    Ok(buf.len()) // first chunk: full read
                 } else {
-                    Ok(0)          // then EOF
+                    Ok(0) // then EOF
                 }
             },
             |_off, buf| {

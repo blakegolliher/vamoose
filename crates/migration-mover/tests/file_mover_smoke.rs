@@ -1,0 +1,251 @@
+//! End-to-end smoke for `AsyncBucketedFileMover` against real VAST.
+//!
+//! Constructs the full stack — sync `SimplePool`, `BucketedAsyncPool`,
+//! `Mover`, `AsyncBucketedFileMover` — and drives a single regular
+//! file through `FileMover::move_one`. Verifies the result.
+//!
+//! Builds on the env contract from `pipelined_copy_smoke.rs`. Add
+//! `VAMOOSE_TEST_NFS_WRITE_DIR` (must pre-exist under the write
+//! export).
+//!
+//! ```bash
+//! sudo -E target/debug/deps/file_mover_smoke-* --ignored --nocapture
+//! ```
+
+use std::env;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use migration_core::fence::Fence;
+use migration_core::records::{MigrationOptions, ServerSideCopy};
+use migration_core::schema::FileTypeTag;
+use migration_core::shard::RowView;
+use migration_mover::attrs::AttrPolicy;
+use migration_mover::batch::InflightProfile;
+use migration_mover::bucketed_pool::BucketedAsyncPool;
+use migration_mover::file_mover::AsyncBucketedFileMover;
+use migration_mover::libnfs::SimplePool;
+use migration_mover::uring::UringConfig;
+use migration_mover::{DowngradeSink, FileMover, Mover, MoverConfig};
+
+fn src_url() -> String {
+    env::var("VAMOOSE_TEST_NFS_URL").expect("VAMOOSE_TEST_NFS_URL not set")
+}
+
+fn dst_url() -> String {
+    env::var("VAMOOSE_TEST_NFS_WRITE_URL").expect("VAMOOSE_TEST_NFS_WRITE_URL not set")
+}
+
+fn src_path() -> Vec<u8> {
+    env::var("VAMOOSE_TEST_NFS_PATH")
+        .expect("VAMOOSE_TEST_NFS_PATH not set")
+        .into_bytes()
+}
+
+fn expected_size() -> u64 {
+    env::var("VAMOOSE_TEST_NFS_EXPECTED_SIZE")
+        .expect("VAMOOSE_TEST_NFS_EXPECTED_SIZE not set")
+        .parse()
+        .expect("VAMOOSE_TEST_NFS_EXPECTED_SIZE not numeric")
+}
+
+fn write_dir() -> String {
+    env::var("VAMOOSE_TEST_NFS_WRITE_DIR").expect("VAMOOSE_TEST_NFS_WRITE_DIR not set")
+}
+
+fn timestamp_suffix() -> String {
+    let n = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{n}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn async_bucketed_mover_copies_regular_file_end_to_end() {
+    let src_url_s = src_url();
+    let dst_url_s = dst_url();
+
+    // The path under the source export to copy.
+    let src_relative_inside_export = src_path();
+    let size = expected_size();
+    assert!(size > 0, "test file must be non-empty");
+
+    // Choose a destination path under VAMOOSE_TEST_NFS_WRITE_DIR.
+    // This becomes the row's relative-to-dst-root path. We'll set
+    // both source_root and dest_root to "" so join_root just returns
+    // the absolute paths we encode in row.path. But row.path is the
+    // *same* on both sides, so the source path under src_root and
+    // dest path under dest_root must match exactly.
+    //
+    // To make this work with a fixed row.path = "/foo/bar/large.bin",
+    // we set source_root="" and dest_root=write_dir so the source
+    // path is /foo/bar/large.bin (we'll temp-stage the source) and
+    // dest is write_dir/foo/bar/large.bin. That's clumsy. Simpler:
+    // set source_root and dest_root to "" and use the absolute path
+    // for the row, and append a per-run suffix to the dest by using
+    // a different layout for each side via a unique row.path that
+    // happens to resolve to both the existing src test file (via
+    // source_root prefix) AND a writable dst path (via dest_root
+    // prefix). Easiest: stage source_root = "/" then row.path is
+    // /src-test/m2-verify/large.bin which exists; dest_root =
+    // write_dir + "/file-mover-smoke-{ts}/" so the row's path falls
+    // under a per-run dir.
+    //
+    // We need source_root + row.path == /src-test/m2-verify/large.bin
+    //          dest_root  + row.path == {write_dir}/{suffix}/{rel}
+    //
+    // Set source_root = "" and dest_root = "" and put the *full*
+    // src absolute path in row.path. Then handle the dest separately:
+    // sad, doesn't fit join_root's API since src and dst share row.path.
+    //
+    // Simpler still: make the row path absolute on dest by setting
+    // source_root = "" and dest_root = write_dir/{suffix}, with the
+    // row.path = "/{basename}" e.g. "/large.bin". Source side: the
+    // test file's absolute path is /src-test/m2-verify/large.bin.
+    // join_root("", "/large.bin") → "/large.bin" which does NOT
+    // resolve to /src-test/m2-verify/large.bin.
+    //
+    // Cleanest: stage a fresh source file at write_dir to copy from.
+    // Both src and dst URLs are the same export (the write export),
+    // and we can write a fresh file under {write_dir}/in/, then
+    // mover copies it to {write_dir}/out/. Source and destination
+    // are the same export but different parent dirs, so the overlap
+    // guard doesn't trip.
+    //
+    // For this smoke we keep src_url and dst_url as the test
+    // configured (typically source-export and dest-export) and use
+    // separate root prefixes so the row's relative path maps to the
+    // actual test file on src and to a per-run path on dst.
+
+    let suffix = timestamp_suffix();
+    // Source path on src side: stage by treating the configured
+    // VAMOOSE_TEST_NFS_PATH as `{source_root}{row.path}`. We split
+    // off the last segment as row.path and use the leading portion
+    // as source_root. That way join_root reconstructs the actual
+    // file path on src.
+    let last_slash = src_relative_inside_export
+        .iter()
+        .rposition(|&b| b == b'/')
+        .expect("VAMOOSE_TEST_NFS_PATH must be absolute");
+    let source_root = String::from_utf8(src_relative_inside_export[..last_slash].to_vec())
+        .expect("source root utf8");
+    let basename = src_relative_inside_export[last_slash..].to_vec(); // starts with /
+
+    // Dest root: a fresh per-run directory under write_dir so the
+    // rename produces {write_dir}/file-mover-smoke-{suffix}/{basename}.
+    let dest_root = format!("{}/file-mover-smoke-{suffix}", write_dir());
+
+    let cfg = Arc::new(MoverConfig {
+        source_url: src_url_s.clone(),
+        dest_url: dst_url_s.clone(),
+        source_root: source_root.clone(),
+        dest_root: dest_root.clone(),
+        same_server_v42: false,
+        policy: AttrPolicy::from_options(&MigrationOptions::default()),
+        server_side_copy: ServerSideCopy::Off,
+        server_side_copy_min_bytes: 64 * 1024,
+        uring: UringConfig::default(),
+        inflight: InflightProfile::default(),
+        require_chown: false, // running as root in the test but be defensive
+        require_unchanged_size: false,
+    });
+
+    let downgrades = DowngradeSink::new();
+    let fence = Fence::new();
+
+    let sync_pool = SimplePool::build(&src_url_s, &dst_url_s).expect("SimplePool::build");
+    let sync_mover = Mover::new(
+        (*cfg).clone(),
+        sync_pool,
+        "test-host",
+        downgrades.clone(),
+        fence.clone(),
+    );
+
+    let async_pool = Arc::new(
+        BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+            .await
+            .expect("BucketedAsyncPool::new"),
+    );
+
+    let file_mover = AsyncBucketedFileMover::new(
+        async_pool,
+        sync_mover,
+        cfg.clone(),
+        fence.clone(),
+        "test-host",
+        downgrades.clone(),
+    );
+
+    // Build the row.
+    let row = RowView {
+        row_id: 1,
+        path: basename.clone(),
+        size,
+        mtime_sec: Some(1_700_000_000),
+        mtime_nsec: Some(0),
+        atime_sec: Some(1_700_000_000),
+        atime_nsec: Some(0),
+        mode: 0o644,
+        uid: Some(0),
+        gid: Some(0),
+        nlink: Some(1),
+        inode: None,
+        fsid: None,
+        xattr_blob: None,
+        symlink_target: None,
+        file_type: FileTypeTag::Regular,
+    };
+
+    let outcome = file_mover.move_one(&row).await;
+
+    assert!(
+        outcome.result.is_ok(),
+        "move_one failed: {:?}",
+        outcome.result
+    );
+    assert_eq!(
+        outcome.bytes_moved, size,
+        "bytes_moved {} != size {}",
+        outcome.bytes_moved, size
+    );
+
+    // Verify the file landed at the expected path on dst with the
+    // expected size. We reuse the bucketed pool's small bucket
+    // (any bucket's dst ctx sees the same namespace) for the stat.
+    let pool = BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+        .await
+        .expect("verify pool");
+    let dst_full = format!("{dest_root}{}", String::from_utf8_lossy(&basename));
+    let stat = pool
+        .pair_by_name("small")
+        .expect("small bucket")
+        .dst
+        .stat(dst_full.as_bytes())
+        .await
+        .expect("stat dst");
+    assert_eq!(stat.size, size, "dst stat size {} != {}", stat.size, size);
+    assert_eq!(
+        stat.mode & 0o777,
+        0o644,
+        "dst mode != 0o644 (got {:o})",
+        stat.mode & 0o777,
+    );
+    assert_eq!(
+        stat.mtime, 1_700_000_000,
+        "dst mtime != 1_700_000_000 (got {})",
+        stat.mtime
+    );
+
+    // Best-effort cleanup. Leaves the per-run dir; one path each so
+    // the export doesn't accumulate over many runs but the dirs
+    // hang around for postmortem if a test fails partway.
+    let _ = pool
+        .pair_by_name("small")
+        .expect("small bucket")
+        .dst
+        .unlink(dst_full.as_bytes())
+        .await;
+}
