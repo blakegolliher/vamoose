@@ -215,3 +215,55 @@ async fn rejects_non_v3() {
         "expected v4 rejection error; got: {msg}"
     );
 }
+
+/// Regression for the 2026-05-18 async-mount fd-swap bug:
+/// `nfs_mount_async` on NFSv3 walks portmap → mountd → portmap →
+/// nfsd, disconnecting and reconnecting at each step (each transition
+/// changes `rpc->fd`). The original `driver::run` captured the fd
+/// once and registered `AsyncFd` on it; after the first reconnect,
+/// the registration pointed at a closed fd that the kernel could
+/// recycle to a sibling libnfs context in the same process. When
+/// several mounts raced inside one process, libnfs got cross-wired
+/// events and the mount failed with `RPC_STATUS_CANCEL`
+/// ("Command was cancelled") or stalled out at the 60 s RPC
+/// timeout ("Command timed out").
+///
+/// This test asserts that several concurrent mounts in a single
+/// runtime all complete promptly. Failure mode if the fix regresses:
+/// hangs near the 60 s RPC timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn parallel_mounts_in_one_runtime_dont_collide() {
+    const N: usize = 4;
+    let url = env_url();
+
+    let started = std::time::Instant::now();
+    let mut handles = Vec::with_capacity(N);
+    for _ in 0..N {
+        let url = url.clone();
+        handles.push(tokio::spawn(async move {
+            AsyncNfsContext::mount(&url, MountOpts::default()).await
+        }));
+    }
+    let mut ctxs = Vec::with_capacity(N);
+    for h in handles {
+        let ctx = h
+            .await
+            .expect("join")
+            .expect("mount must complete (fd-swap regression?)");
+        ctxs.push(ctx);
+    }
+    let elapsed = started.elapsed();
+
+    // Mount against var204 is ~50 ms steady state. 10 s is generous
+    // headroom for cluster noise while still catching a regression
+    // that would otherwise hit the 60 s RPC timeout.
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "parallel mounts took {elapsed:?} — suggests fd-swap drift"
+    );
+
+    for ctx in ctxs {
+        ctx.shutdown().await.expect("shutdown");
+    }
+}

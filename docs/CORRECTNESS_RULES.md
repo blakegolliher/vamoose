@@ -152,9 +152,22 @@ sudo -E target/release/deps/libnfs_async_integration-*  --ignored --nocapture
 sudo -E target/release/deps/libnfs_async_perf_smoke-*   --ignored --nocapture
 ```
 
-Pass criteria: 5/5 smoke, 4/4 integration, async ≥ sync on perf. Any
-regression — including the perf binary dropping below the recorded
-baseline by more than ~10 % — is a blocker, not a soft signal.
+**Run the integration binary with the default `--test-threads`
+(parallel) — do not pass `--test-threads=1`.** Parallel execution
+spins up multiple `AsyncNfsContext::mount` calls in the same
+process, which is the only configuration that exercises the libnfs
+mount-time fd-swap path (NFSv3 `nfs_mount_async` walks
+portmap → mountd → portmap → nfsd, disconnecting and reconnecting
+at each step — each transition changes `rpc->fd`). The 2026-05-18
+post-mortem ("async libnfs mount regression" in
+`docs/work-items/LIBNFS_ASYNC_FORK.md`) lost ~half a day because
+the original gate run used `--test-threads=1` and the latent bug
+sat unobserved.
+
+Pass criteria: 5/5 smoke, 4/4 integration **at default
+parallelism**, async ≥ sync on perf. Any regression — including
+the perf binary dropping below the recorded baseline by more than
+~10 % — is a blocker, not a soft signal.
 
 ## Style conventions
 

@@ -586,3 +586,93 @@ results worth recording for the multi-pass mover work item:
   smoke test; extended by this work, not replaced.
 - `docs/work-items/MULTI_PASS_MOVER.md` — downstream work that
   consumes this surface.
+
+---
+
+## Closing note 2 (2026-05-18, var204) — async-mount fd-swap fix
+
+Picked up while starting Phase 2 of MULTI_PASS_MOVER. The Phase 2
+hand-off brief recorded an async-mount regression on var204 that
+blocked Task 1 (`pipelined_copy.rs`); two integration tests were
+failing — `concurrent_preads_no_crosstalk` with "Command was
+cancelled" and `dropping_futures_does_not_break_neighbors` with
+"Command timed out" at 60 s. The hand-off correctly noted that
+commit `34b8434` does not touch the mount path, so the bug had to
+be latent in `71ea279`.
+
+**Reproduction key.** The regression only fires under default
+`cargo test` parallelism. `--test-threads=1` masks it. The original
+gate run for `71ea279` (closing note above) used serial execution
+and so missed the bug. Specifically, the failure path needs at
+least two `AsyncNfsContext::mount` calls to race in the same
+process.
+
+**Root cause.** `nfs_mount_async` on NFSv3 is a multi-step RPC
+walk: portmap (port 111) → mountd → portmap → nfsd. Each step ends
+in `rpc_disconnect()` (`lib/nfs_v3.c:nfs3_mount_4_cb` and friends)
+followed by `rpc_connect_*_async()`. Every reconnect changes the
+socket fd in `rpc->fd`. The reference sync loop in
+`lib/libnfs-sync.c::wait_for_nfs_reply` refetches `nfs_get_fd` on
+every iteration to track this.
+
+The Rust driver did not. `driver::run` captured the fd once at
+startup (`AsyncFd::new(BorrowedSocket(fd))`) and used it forever.
+After the first mid-mount reconnect, AsyncFd was registered on a
+stale (closed) fd, and the tick branch's `libc::poll` also polled
+the dead fd. With a single context this just stalled the mount
+until the periodic `nfs_service(ctx, 0)` tick happened to let
+libnfs limp through its internal state machine. With two contexts
+racing, the kernel recycled the closed fd to a sibling context's
+new socket — so `libc::poll(stale_fd, …)` on context A returned
+context B's connect/recv events, libnfs-A then drove its state
+machine with bogus events, and the mount failed with
+`RPC_STATUS_CANCEL` ("Command was cancelled") or
+`RPC_STATUS_TIMEOUT` at the 60 s RPC timeout.
+
+**Fix.** `driver::run` now:
+
+- Reconciles its `AsyncFd<BorrowedSocket>` registration with the
+  live `nfs_get_fd(ctx)` at the top of every loop iteration —
+  drops and recreates on a swap, holds `None` during the transient
+  `fd == -1` window between disconnect and reconnect.
+- Drives `nfs_service` via a shared helper (`drain_nfs_service`)
+  that *always* derives revents from a non-blocking `libc::poll`
+  on the *current* libnfs fd, rather than trusting the mio
+  readiness mask (which describes the fd AsyncFd was watching at
+  the time the wakeup fired — possibly already stale by the time
+  our task gets scheduled). This is the same level-triggered
+  contract `lib/libnfs-sync.c` uses.
+- AsyncFd is now just a wakeup mechanism; the truth-source for
+  events is the per-iteration `libc::poll`.
+
+`crates/migration-mover/src/libnfs/asyncio/driver.rs` is the only
+file with logic changes. The public `AsyncNfsContext` surface is
+unchanged.
+
+**Pre-merge runbook tightening.** `docs/CORRECTNESS_RULES.md`
+"Pre-merge runbook: async libnfs FFI changes" now explicitly
+requires the integration binary to run at default `--test-threads`
+(parallel). Citing this incident: the runbook had been satisfied
+by the original `71ea279` pass run and re-satisfied by `34b8434`,
+yet neither caught the bug because both ran serially. The runbook
+text now spells out *why* parallel execution is load-bearing.
+
+**Verification (this session, var204).**
+
+- `libnfs_async_integration` at default parallelism, 5 reps:
+  5/5 passes per rep × 5 reps = 25/25. Wall time ≤ 0.22 s per rep.
+  Before the fix: 2/4 failed (the two tests that actually mount).
+- `libnfs_async_ffi_smoke` at default parallelism, 3 reps: 5/5 per
+  rep. Wall time ≤ 1.25 s per rep.
+- `libnfs_async_perf_smoke`, 3 serial reps: ASYNC 193 / 490 / 482
+  MB/s, SYNC 275 / 268 / 236 MB/s. Run 1 is a cold-cache outlier;
+  runs 2–3 are at or above the recorded `352 / 270` baseline.
+  Async beats sync on every run.
+- `cargo test --workspace --no-fail-fast`: all unit tests pass,
+  no regressions.
+
+**New regression test.**
+`libnfs_async_integration::parallel_mounts_in_one_runtime_dont_collide`
+mounts 4 contexts concurrently in a single multi-thread runtime
+and asserts all complete in under 10 s. Trips immediately (60 s
+hang) without the fix; passes in <0.2 s with it.

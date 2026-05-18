@@ -91,12 +91,57 @@ fn poll_to_interest(mask: c_int) -> Interest {
     }
 }
 
+/// Non-blocking level-triggered poll of the live libnfs fd. Mirrors
+/// what `lib/libnfs-sync.c::wait_for_nfs_reply` does on every loop
+/// iteration: refetch fd + which-events from the context, then ask
+/// the kernel for the *current* readiness mask. Returning the
+/// revents (or 0 if poll errored / not connected) is what
+/// `nfs_service` then consumes.
+fn poll_libnfs_revents(ctx_fd: RawFd, wants: c_int) -> c_int {
+    if ctx_fd < 0 {
+        return 0;
+    }
+    let mut pfd = libc::pollfd {
+        fd: ctx_fd,
+        events: wants as i16,
+        revents: 0,
+    };
+    let p = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if p > 0 {
+        pfd.revents as c_int
+    } else {
+        0
+    }
+}
+
 /// Service-task entry point used by `run_with_lazy_fd` once a real
 /// libnfs fd is in hand. Takes an `OwnedContext` (Send) so callers
 /// can spawn this on a multi-thread runtime.
+///
+/// ### fd-swap awareness
+///
+/// libnfs reuses the same `struct rpc_context` across multi-step
+/// operations that under the hood disconnect from one service and
+/// reconnect to another. The clearest case is `nfs_mount_async` on
+/// NFSv3, which walks portmap → mountd → portmap → nfsd, calling
+/// `rpc_disconnect` + `rpc_connect_*_async` at each step. Each
+/// reconnect changes `rpc->fd`. The reference sync loop in
+/// `lib/libnfs-sync.c::wait_for_nfs_reply` refetches `nfs_get_fd`
+/// on every iteration; if we don't, we end up registered on a
+/// stale (closed) socket fd that the kernel may have recycled to
+/// a sibling libnfs context in this process — `libc::poll` then
+/// surfaces the sibling's events to libnfs, which fails the mount
+/// with `RPC_STATUS_CANCEL` ("Command was cancelled") or stalls
+/// out at the 60 s timeout ("Command timed out"). Reproduces
+/// trivially when two `AsyncNfsContext::mount` calls race in a
+/// single process. We mirror the sync loop's contract: refetch fd
+/// every iteration, recreate the `AsyncFd` registration on
+/// transitions, and drive `nfs_service` with revents derived from
+/// a level-triggered `libc::poll` on the *current* fd (not the
+/// fd `AsyncFd` happens to be watching).
 async fn run(
     owned: OwnedContext,
-    fd: RawFd,
+    initial_fd: RawFd,
     mut rx: mpsc::Receiver<Request>,
 ) -> Result<(), NfsError> {
     // Pull the raw pointer fresh at each sync region rather than
@@ -104,19 +149,55 @@ async fn run(
     // and would poison this future's `Send`-ness across awaits.
     // Using `owned.0` inline restricts the !Send pointer to
     // synchronous sub-scopes that finish before the next `.await`.
-    let async_fd = AsyncFd::new(BorrowedSocket(fd))
-        .map_err(|e| NfsError::Init(format!("AsyncFd::new(libnfs fd={fd}): {e}")))?;
+    let mut current_fd: RawFd = initial_fd;
+    let mut async_fd: Option<AsyncFd<BorrowedSocket>> =
+        if current_fd >= 0 {
+            Some(AsyncFd::new(BorrowedSocket(current_fd)).map_err(|e| {
+                NfsError::Init(format!("AsyncFd::new(libnfs fd={current_fd}): {e}"))
+            })?)
+        } else {
+            None
+        };
 
     let mut tick = tokio::time::interval(SERVICE_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut shutting_down = false;
 
     loop {
+        // Reconcile our AsyncFd registration with the libnfs context's
+        // current fd. See the fd-swap awareness note on this fn.
+        let live_fd = unsafe { ffi::nfs_get_fd(owned.0) };
+        if live_fd != current_fd {
+            // Drop the stale registration first (BorrowedSocket does
+            // not close the underlying fd — only mio's epoll entry
+            // is removed).
+            async_fd = None;
+            current_fd = live_fd;
+            if current_fd >= 0 {
+                async_fd = Some(AsyncFd::new(BorrowedSocket(current_fd)).map_err(|e| {
+                    NfsError::Init(format!(
+                        "AsyncFd::new(libnfs fd={current_fd}) after swap: {e}"
+                    ))
+                })?);
+            }
+        }
+
         // Refresh which events libnfs currently wants. Calling this
         // every iteration is cheap and is the only correct way to
         // track POLLIN vs POLLOUT — the mask flips as the libnfs
         // send queue empties.
         let interest = poll_to_interest(unsafe { ffi::nfs_which_events(owned.0) });
+
+        // tokio::select! has no `if let` arm; wrap the ready future
+        // so the branch yields Pending forever when AsyncFd is None
+        // (transient fd == -1 window during a libnfs reconnect).
+        let ready_fut = async {
+            match async_fd.as_ref() {
+                Some(fd) => fd.ready(interest).await,
+                None => std::future::pending::<std::io::Result<_>>().await,
+            }
+        };
+        tokio::pin!(ready_fut);
 
         tokio::select! {
             // Bias the request branch so issuance doesn't starve
@@ -138,58 +219,23 @@ async fn run(
                 }
             }
 
-            // Socket is ready in the direction libnfs asked for.
-            ready = async_fd.ready(interest) => {
+            // Socket is ready (in some direction). We deliberately
+            // don't trust the readiness mask we got back from
+            // AsyncFd: the fd it watched may have been swapped out
+            // by libnfs by the time we get scheduled. The mio
+            // wakeup is just a signal that *something* happened;
+            // we re-derive the real revents from a non-blocking
+            // poll on the *current* libnfs fd below.
+            ready = &mut ready_fut => {
                 let mut guard = match ready {
                     Ok(g) => g,
                     Err(e) => {
                         return Err(NfsError::Init(format!("AsyncFd::ready: {e}")));
                     }
                 };
-                // mio uses edge-triggered epoll. Once we
-                // `clear_ready`, we won't be re-notified for the
-                // same direction until a *new* state transition. But
-                // libnfs callbacks fired from inside nfs_service can
-                // enqueue more RPCs that need the same direction
-                // (POLLOUT) we already have readiness for. If we
-                // return to await without sending them, the fd
-                // never transitions (kernel buffer state didn't
-                // change) and we deadlock until the 100ms tick.
-                //
-                // Drain pattern: call nfs_service with the events
-                // we have, then keep calling while libnfs still
-                // wants any direction we have readiness for. Bound
-                // the iteration count to prevent runaway spinning
-                // on a pathological wake; libnfs's per-wake fanout
-                // is typically 1–3 callbacks, so 8 is generous.
-                let revents: c_int = match (
-                    guard.ready().is_readable(),
-                    guard.ready().is_writable(),
-                ) {
-                    (true, true) => (libc::POLLIN | libc::POLLOUT) as c_int,
-                    (true, false) => libc::POLLIN as c_int,
-                    (false, true) => libc::POLLOUT as c_int,
-                    (false, false) => 0,
-                };
-                let mut rc = 0;
-                for _ in 0..8 {
-                    rc = unsafe { ffi::nfs_service(owned.0, revents) };
-                    if rc < 0 {
-                        break;
-                    }
-                    let wants = unsafe { ffi::nfs_which_events(owned.0) };
-                    let still_useful = (revents
-                        & wants
-                        & (libc::POLLIN | libc::POLLOUT) as c_int)
-                        != 0;
-                    let q = unsafe { ffi::nfs_queue_length(owned.0) };
-                    if !still_useful || q == 0 {
-                        break;
-                    }
-                }
                 guard.clear_ready();
+                let rc = drain_nfs_service(&owned)?;
                 if rc < 0 {
-                    tracing::error!(rc, "nfs_service returned error; tearing down");
                     return Err(NfsError::Protocol(format!("nfs_service rc={rc}")));
                 }
             }
@@ -205,17 +251,8 @@ async fn run(
             // — it always sees the current state. We mirror that
             // here with a non-blocking `libc::poll` on each tick.
             _ = tick.tick() => {
-                let wants = unsafe { ffi::nfs_which_events(owned.0) };
-                let mut pfd = libc::pollfd {
-                    fd,
-                    events: wants as i16,
-                    revents: 0,
-                };
-                let p = unsafe { libc::poll(&mut pfd, 1, 0) };
-                let revents = if p > 0 { pfd.revents as c_int } else { 0 };
-                let rc = unsafe { ffi::nfs_service(owned.0, revents) };
+                let rc = drain_nfs_service(&owned)?;
                 if rc < 0 {
-                    tracing::error!(rc, "nfs_service tick returned error; tearing down");
                     return Err(NfsError::Protocol(format!("nfs_service tick rc={rc}")));
                 }
             }
@@ -228,23 +265,23 @@ async fn run(
             if q <= 0 {
                 break;
             }
-            // One more service spin to let the queue clear.
+            // Short bounded wait for more wire activity, then tick
+            // anyway. Re-reconciling fd & registration happens at
+            // the top of the next loop iteration.
             let interest = poll_to_interest(unsafe { ffi::nfs_which_events(owned.0) });
-            match tokio::time::timeout(SERVICE_TICK, async_fd.ready(interest)).await {
+            let drain_fut = async {
+                match async_fd.as_ref() {
+                    Some(fd) => fd.ready(interest).await,
+                    None => std::future::pending::<std::io::Result<_>>().await,
+                }
+            };
+            match tokio::time::timeout(SERVICE_TICK, drain_fut).await {
                 Ok(Ok(mut guard)) => {
-                    let revents: c_int =
-                        match (guard.ready().is_readable(), guard.ready().is_writable()) {
-                            (true, true) => (libc::POLLIN | libc::POLLOUT) as c_int,
-                            (true, false) => libc::POLLIN as c_int,
-                            (false, true) => libc::POLLOUT as c_int,
-                            (false, false) => 0,
-                        };
-                    let _ = unsafe { ffi::nfs_service(owned.0, revents) };
                     guard.clear_ready();
+                    let _ = drain_nfs_service(&owned);
                 }
                 _ => {
-                    // Timed out or fd errored — tick anyway.
-                    let _ = unsafe { ffi::nfs_service(owned.0, 0) };
+                    let _ = drain_nfs_service(&owned);
                 }
             }
         }
@@ -252,6 +289,42 @@ async fn run(
 
     // owned drops here → nfs_destroy_context.
     Ok(())
+}
+
+/// Run `nfs_service` against the *live* fd, draining libnfs's queue
+/// if callbacks enqueue more work. Bound the spin to 8 iterations —
+/// libnfs's per-wake callback fanout is typically 1–3, so this is
+/// generous without risking a runaway loop on pathological input.
+///
+/// Each iteration refetches `nfs_get_fd` + `nfs_which_events` and
+/// computes revents via a non-blocking `libc::poll` on the current
+/// fd. This is the same pattern as `libnfs-sync.c` and is robust
+/// against libnfs swapping the fd out mid-operation (the mount
+/// dance does exactly this).
+fn drain_nfs_service(owned: &OwnedContext) -> Result<c_int, NfsError> {
+    let mut rc = 0;
+    for _ in 0..8 {
+        let cur_fd = unsafe { ffi::nfs_get_fd(owned.0) };
+        let wants = unsafe { ffi::nfs_which_events(owned.0) };
+        let revents = poll_libnfs_revents(cur_fd, wants);
+        rc = unsafe { ffi::nfs_service(owned.0, revents) };
+        if rc < 0 {
+            tracing::error!(rc, "nfs_service returned error; tearing down");
+            return Ok(rc);
+        }
+        let q = unsafe { ffi::nfs_queue_length(owned.0) };
+        // Stop spinning when libnfs no longer wants any direction
+        // the kernel is currently signalling readiness for, OR
+        // there's nothing left in the queue. Either way, the next
+        // wakeup (via AsyncFd or the periodic tick) will pick up
+        // any further work.
+        let new_wants = unsafe { ffi::nfs_which_events(owned.0) };
+        let still_useful = (revents & new_wants & (libc::POLLIN | libc::POLLOUT) as c_int) != 0;
+        if !still_useful || q == 0 {
+            break;
+        }
+    }
+    Ok(rc)
 }
 
 /// Production entry point. Receives a freshly-initialized context
