@@ -326,3 +326,108 @@ Per work-item doc, restated for clarity:
   semantics, FILE_SYNC-at-open).
 - This file is the Phase 2 design queue. Read §1–§4 first; decide §5
   and §6; then start implementation.
+
+---
+
+## Closing note (2026-05-18) — Tasks 0–3 landed; T4 handed back
+
+Tasks 0–3 from the Phase 2 hand-off brief
+(`MULTI_PASS_MOVER_PHASE2_HANDOFF.md`) shipped in four commits on
+`phase-1-bucketed-pool`:
+
+- `ada8b84` — **Task 0**: async libnfs mount fd-swap fix. Root cause
+  + verification + tightened pre-merge runbook live in
+  `docs/work-items/LIBNFS_ASYNC_FORK.md` "Closing note 2".
+- `dee7893` — **Task 1**: `pipelined_copy.rs`. Two-cursor short-read
+  read pipeline; bounded write pipeline; `pwrite_all` wrapper that
+  loops on libnfs's writemax cap (VAST var204 negotiates 1 MiB →
+  every chunk from the medium/large buckets short-writes without
+  this); inline `xxh3_128`; pre/post stat brackets; whole-file
+  fsync. Pre-rename fence check is the *caller's* job (T2).
+- `184dd1d` — **Task 2**: `FileMover` trait + `AsyncBucketedFileMover`
+  impl. R8 placement: `pipelined_copy().await? → close fhs →
+  apply_async_attrs → fence.check_pre_rename → rename`. Symlinks,
+  hardlinks, dirs, empty, skip all delegate to the wrapped sync
+  Mover per Phase 2 Decision #3.
+- `dacb2e6` — **Task 3**: `--use-bucketed-pool` CLI flag + worker
+  wiring. `ShardProcessor` now holds `Arc<dyn FileMover>`; the
+  orchestrator constructs either `Mover` or `AsyncBucketedFileMover`
+  at startup. Off by default during rollout.
+
+### Decisions baked in during implementation
+
+These either confirm or refine the hand-off's "Decisions baked in"
+section:
+
+- §5 Option B is what shipped: `pipelined_copy` stays concrete
+  against `AsyncNfsContext`, no `AsyncNfsOps` trait. Unit tests are
+  trivial (hash constant, error wrapping); real loop logic is
+  verified against var204 via env-gated smokes
+  (`pipelined_copy_smoke`, `file_mover_smoke`).
+- §6 Option **B** shipped (the hand-off's Decision #2, not the
+  NOTES's Option A recommendation): unified `FileMover` trait with
+  two impls, not duck-typed `Option<Arc<...>>`. Cleaner; worth the
+  small refactor to `Arc<dyn FileMover>` in `ShardProcessor`.
+- `MoverConfig` derived `Clone`. Necessary so the async wrapper can
+  share an `Arc<MoverConfig>` built from the same fields the sync
+  `Mover` was constructed with. All embedded subconfigs were
+  already `Copy`/`Clone`; only the four `String` fields needed
+  cloning.
+- libnfs `pwrite` short-write handling lives **inside**
+  `pipelined_copy::pwrite_all`, not at the `AsyncNfsContext` layer.
+  Touching `asyncio/` for Tasks 1–4 is forbidden (the hand-off's
+  constraint section). 2× memory per in-flight chunk in the fast
+  path; only the unwritten tail is rebuilt on short writes.
+
+### Verification gates (this session, var204)
+
+- **Task 0 gates** — see `LIBNFS_ASYNC_FORK.md` Closing note 2.
+  Async integration parallel 25/25 across 5 reps; FFI smoke 5/5
+  across 3 reps; perf smoke ASYNC 482–490 MB/s vs SYNC 236–275 MB/s
+  (runs 2–3; baseline was 352/270).
+- **`pipelined_copy_smoke`** — env-gated; byte-perfect 100 MiB
+  roundtrip through the medium bucket × 3 reps. Inline xxh3 hash
+  matches a fresh sync re-read of dst.
+- **`file_mover_smoke`** — env-gated; full end-to-end through
+  `AsyncBucketedFileMover::move_one` in ~550 ms. Dst `stat`
+  confirms size, mode `0o644`, and the applied mtime.
+- **Workspace** — `cargo test --workspace --no-fail-fast`: all
+  suites pass; 74/74 in migration-mover (+4 vs the pre-Phase-2
+  baseline: `pipelined_copy` × 3 + `file_mover::trait_is_dyn_safe`).
+- **`vamoose worker --help`** — `--use-bucketed-pool` flag visible
+  with help text.
+
+### What's left (T4 — operator-driven cookbook)
+
+The multi-shard M2/M3 cookbook re-run against var204 with
+`--use-bucketed-pool` is operator-scale work (build S3 manifest +
+parquet shards from the M2 test tree, upload, run, verify) and
+is handed back. The per-file end-to-end is already proven by
+`file_mover_smoke`; the orchestrator + shard-processor changes
+are mechanical (`Arc<dyn FileMover>` swap with no logic changes),
+covered by the existing workspace unit tests, and built clean.
+
+To drive the cookbook yourself:
+
+```bash
+# Build (or use Phase 1's existing build).
+cargo build -p migration-mover -p migration-worker -p vamoose-cli
+
+# Construct a fresh run pointing at /src-test/m2-verify on var204
+# (re-use scripts/m5-self-fence-test.sh's setup logic as a template
+# — scan, mig-walker-rewrite shim, upload index/<shard>, build
+# manifest.json, upload, prime shards/<shard>.claim Free).
+
+# Run with the async path.
+sudo HOME=/home/vastdata RUST_LOG=info,aws_smithy_runtime=warn \
+    target/debug/vamoose worker --use-bucketed-pool --config \
+    /path/to/worker.toml
+
+# Verify.
+scripts/manual-verify.sh /mnt/vamoose-source/src-test/m2-verify \
+    /mnt/vamoose-dest/<your-dst-root>/m2-verify
+```
+
+The M5 self-fence harness re-run (`scripts/m5-self-fence-test.sh`)
+is the R8 verification gate and is your job per the hand-off
+brief, not this session's.
