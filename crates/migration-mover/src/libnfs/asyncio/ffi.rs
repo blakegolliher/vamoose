@@ -8,8 +8,10 @@
 //!
 //! Parameter order is what causes silent data loss with libnfs (see
 //! `M2_NOTES.md` M2/M3 verification incidents). Do not "tidy up" any
-//! declaration here without re-running the audit + the FFI smoke test
-//! at `tests/libnfs_async_ffi_smoke.rs` against real hardware.
+//! declaration here without re-running the audit + the three async
+//! test binaries against real hardware per
+//! `docs/CORRECTNESS_RULES.md` "Pre-merge runbook: async libnfs FFI
+//! changes".
 
 #![allow(non_camel_case_types, dead_code)]
 

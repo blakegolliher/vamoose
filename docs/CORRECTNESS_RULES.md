@@ -121,6 +121,41 @@ Building a subsequent milestone on top of an unverified milestone
 compounds risk: bugs in the lower layer become harder to attribute
 once the upper layer is in place.
 
+### Pre-merge runbook: async libnfs FFI changes
+
+Any change that touches `crates/migration-mover/src/libnfs/asyncio/`
+— in particular `ffi.rs`, `callbacks.rs`, `driver.rs`, or the
+`AsyncNfsContext` public surface in `mod.rs` — must re-run all three
+async test binaries against var204 before merge. Like the sync FFI
+smoke gate (above), this exists because parameter-order or callback-
+shape mismatches against the linked `.so` produce silent data loss
+that no Rust-level test catches.
+
+The three binaries:
+
+1. `libnfs_async_ffi_smoke` — per-symbol round-trip (pread, write+read,
+   stat/fstat, attr+namespace ops, symlink/readlink).
+2. `libnfs_async_integration` — 64-way concurrent pread no-crosstalk,
+   drop-during-flight survives, `nconnect>1` rejection, NFSv3-only
+   gate.
+3. `libnfs_async_perf_smoke` — ASYNC vs SYNC throughput at single
+   context, 32 × 1 MiB reads. Async must meet or beat sync (see
+   `docs/work-items/LIBNFS_ASYNC_FORK.md` closing note for the
+   2026-05-18 baseline: 352 MB/s ASYNC vs 270 MB/s SYNC).
+
+Invocation (env vars per `reference_verification_env`):
+
+```
+cargo build -p migration-mover --tests --release
+sudo -E target/release/deps/libnfs_async_ffi_smoke-*    --ignored --nocapture
+sudo -E target/release/deps/libnfs_async_integration-*  --ignored --nocapture
+sudo -E target/release/deps/libnfs_async_perf_smoke-*   --ignored --nocapture
+```
+
+Pass criteria: 5/5 smoke, 4/4 integration, async ≥ sync on perf. Any
+regression — including the perf binary dropping below the recorded
+baseline by more than ~10 % — is a blocker, not a soft signal.
+
 ## Style conventions
 
 - **Errors: prefer matching on `Error` variants over string contents.**

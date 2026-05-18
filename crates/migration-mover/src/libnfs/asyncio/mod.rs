@@ -46,7 +46,7 @@ use crate::paths::cstr_from_bytes;
 use request::{RawFh, Request};
 use std::ffi::CString;
 use std::os::raw::c_int;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// Bound on the in-flight request channel between caller tasks and
@@ -149,6 +149,12 @@ pub struct AsyncNfsFh {
     /// Set to true once `close()` has accepted the handle, so Drop
     /// can warn loudly about leaks rather than silently leaking.
     consumed: bool,
+    /// Weak ref to the context that produced this fh. Drop uses it to
+    /// suppress the leak warning when the context is already gone —
+    /// `nfs_destroy_context` cleans up associated state, so the
+    /// "leak" doesn't survive context teardown and the warning would
+    /// just be noise.
+    ctx: Weak<Inner>,
 }
 
 // Safe to move across threads — the raw pointer is used only by the
@@ -157,10 +163,11 @@ unsafe impl Send for AsyncNfsFh {}
 unsafe impl Sync for AsyncNfsFh {}
 
 impl AsyncNfsFh {
-    fn new(raw: *mut nfsfh) -> Self {
+    fn new(raw: *mut nfsfh, ctx: Weak<Inner>) -> Self {
         Self {
             raw,
             consumed: false,
+            ctx,
         }
     }
     fn raw(&self) -> *mut nfsfh {
@@ -170,17 +177,22 @@ impl AsyncNfsFh {
 
 impl Drop for AsyncNfsFh {
     fn drop(&mut self) {
-        if !self.consumed && !self.raw.is_null() {
-            // The caller forgot to call `close()`. We can't issue an
-            // async RPC from Drop; surface a loud warning and accept
-            // the libnfs-side leak. This matches the contract for
-            // the sync `NfsFh` (close_quietly is the explicit form).
-            tracing::warn!(
-                fh = ?self.raw,
-                "AsyncNfsFh dropped without close(); libnfs handle leaked. \
-                 Call AsyncNfsContext::close(fh).await before drop."
-            );
+        if self.consumed || self.raw.is_null() {
+            return;
         }
+        if self.ctx.upgrade().is_none() {
+            // Context is already torn down; nfs_destroy_context has
+            // cleaned up any libnfs-side state for this fh.
+            return;
+        }
+        // Context is still alive, the caller forgot to call `close()`,
+        // and we can't issue an async RPC from Drop. Surface a warning
+        // and accept the libnfs-side leak.
+        tracing::warn!(
+            fh = ?self.raw,
+            "AsyncNfsFh dropped without close(); libnfs handle leaked. \
+             Call AsyncNfsContext::close(fh).await before drop."
+        );
     }
 }
 
@@ -364,7 +376,7 @@ impl AsyncNfsContext {
             .await
             .map_err(|_| NfsError::Closed)?;
         let raw = rx.await.map_err(|_| NfsError::Closed)??;
-        Ok(AsyncNfsFh::new(raw.0))
+        Ok(AsyncNfsFh::new(raw.0, Arc::downgrade(&self.inner)))
     }
 
     /// Open-or-create a file with explicit flags+mode. Used for the
@@ -388,7 +400,7 @@ impl AsyncNfsContext {
             .await
             .map_err(|_| NfsError::Closed)?;
         let raw = rx.await.map_err(|_| NfsError::Closed)??;
-        Ok(AsyncNfsFh::new(raw.0))
+        Ok(AsyncNfsFh::new(raw.0, Arc::downgrade(&self.inner)))
     }
 
     pub async fn close(&self, mut fh: AsyncNfsFh) -> Result<(), NfsError> {
@@ -439,19 +451,6 @@ impl AsyncNfsContext {
             .await
             .map_err(|_| NfsError::Closed)?;
         rx.await.map_err(|_| NfsError::Closed)?
-    }
-
-    /// Stable write convenience: alias for `pwrite`. Stability is
-    /// determined at open time in libnfs (see `pwrite` docs); this
-    /// method exists so callers that explicitly want "commit before
-    /// returning" semantics can spell it out at the call site.
-    pub async fn pwrite_stable(
-        &self,
-        fh: &AsyncNfsFh,
-        offset: u64,
-        buf: Vec<u8>,
-    ) -> Result<usize, NfsError> {
-        self.pwrite(fh, offset, buf).await
     }
 
     /// NFS COMMIT / fsync. Whole-file in this libnfs (no per-range

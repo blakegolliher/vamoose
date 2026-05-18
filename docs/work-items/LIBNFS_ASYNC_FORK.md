@@ -456,6 +456,11 @@ results worth recording for the multi-pass mover work item:
   `nfs_set_rsize`/`wsize`. `nconnect>1` rejected at mount time
   (linked libnfs v6 lacks support); `nfs_set_readahead` and
   `nfs_utimensat_async` dropped from the surface.
+  `ctx.pwrite_stable` (originally an alias for `pwrite`) removed
+  post-review: stability is set at open time via `Flags::wronly_sync()`,
+  so the alias was misleading. Callers that want FILE_SYNC writes
+  open with that flag; cutover-mode per-range COMMIT is the deferred
+  work in audit item #2.
 
 - **Patches (Gate B):** none in this work item. Pinned source tree
   `~/projects/libnfs/` unchanged.
