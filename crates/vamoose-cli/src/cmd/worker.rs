@@ -15,6 +15,12 @@ pub struct Args {
     /// Override worker host_id (default: `<hostname>-<pid>`).
     #[arg(long)]
     pub id: Option<String>,
+    /// Route regular-file copies through the bucketed async libnfs
+    /// pool (Phase 2 of the multi-pass mover). Off by default during
+    /// the rollout. Non-regular rows (symlinks / hardlinks / dirs /
+    /// empty / skip) still use the sync path either way.
+    #[arg(long)]
+    pub use_bucketed_pool: bool,
 }
 
 pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -28,7 +34,7 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
     // concurrency-bounding knobs ([shard].max_in_flight, [mover].
     // nfs_connections, [batch].inflight_*) that the unified Config
     // doesn't yet surface.
-    let (worker_cfg, host_id_from_cfg) = match toml::from_str::<Config>(&text) {
+    let (mut worker_cfg, host_id_from_cfg) = match toml::from_str::<Config>(&text) {
         Ok(unified) => {
             tracing::debug!("config: unified format detected");
             let cfg_host = unified.worker.as_ref().and_then(|w| w.host_id.clone());
@@ -52,6 +58,14 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
             }
         },
     };
+
+    // CLI override always wins over the config-file value (which
+    // defaults to false anyway). Passing the flag on a config that
+    // also sets `[mover].use_bucketed_pool = true` is redundant but
+    // not an error.
+    if args.use_bucketed_pool {
+        worker_cfg.mover.use_bucketed_pool = true;
+    }
 
     let host_id = args.id.or(host_id_from_cfg).unwrap_or_else(|| {
         let host = hostname::get()
@@ -104,6 +118,7 @@ fn build_worker_config(cfg: &Config) -> anyhow::Result<wcfg::Config> {
             io_uring_queue_depth: 256,
             fixed_buffer_count: 256,
             fixed_buffer_size: "1 MiB".to_string(),
+            use_bucketed_pool: false,
         },
         batch: wcfg::BatchCfg {
             bytes_budget: worker.bytes_budget.clone(),

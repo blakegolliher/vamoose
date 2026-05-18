@@ -44,9 +44,10 @@ use migration_core::records::{DowngradeKind, FailurePhase};
 use migration_core::schema::FileTypeTag;
 use migration_core::shard::{RowView, ShardReader};
 use migration_mover::batch::{Batch, BatchBudget, InflightLimiter};
-use migration_mover::{FailureSink, MoveOutcome, Mover};
+use migration_mover::{FailureSink, FileMover, MoveOutcome};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::task::JoinSet;
 
 /// Hardlink-map key. `None` for fsid means the source row didn't carry
@@ -55,7 +56,7 @@ use tokio::task::JoinSet;
 type HardlinkKey = (Option<u64>, u64);
 
 pub struct ShardProcessor {
-    pub mover: Mover,
+    pub mover: Arc<dyn FileMover>,
     pub fence: Fence,
     pub budget: BatchBudget,
     pub inflight: InflightLimiter,
@@ -76,7 +77,10 @@ impl ShardProcessor {
         self.fsid_fallback_warned = false;
 
         let mut current = Batch::default();
-        let mut outcome = ProcessOutcome { rows_total: total, ..Default::default() };
+        let mut outcome = ProcessOutcome {
+            rows_total: total,
+            ..Default::default()
+        };
 
         for row_result in reader.into_rows()? {
             if !self.fence.is_valid() {
@@ -141,14 +145,14 @@ impl ShardProcessor {
         let mut joins: JoinSet<Vec<(RowView, MoveOutcome)>> = JoinSet::new();
 
         for (_key, rows) in groups {
-            let mover = self.mover.clone();
+            let mover = Arc::clone(&self.mover);
             let inflight = self.inflight.clone();
             let fence = self.fence.clone();
             joins.spawn(async move { run_group(mover, inflight, fence, rows).await });
         }
 
         for row in singletons {
-            let mover = self.mover.clone();
+            let mover = Arc::clone(&self.mover);
             let inflight = self.inflight.clone();
             let fence = self.fence.clone();
             joins.spawn(async move {
@@ -307,7 +311,7 @@ impl ProcessOutcome {
 // =============================================================================
 
 async fn run_group(
-    mover: Mover,
+    mover: Arc<dyn FileMover>,
     inflight: InflightLimiter,
     fence: Fence,
     rows: Vec<RowView>,
@@ -434,11 +438,7 @@ mod tests {
 
     #[test]
     fn sort_deepest_first_orders_children_before_parents() {
-        let mut dirs = vec![
-            dir_row(b"/a"),
-            dir_row(b"/a/b/c"),
-            dir_row(b"/a/b"),
-        ];
+        let mut dirs = vec![dir_row(b"/a"), dir_row(b"/a/b/c"), dir_row(b"/a/b")];
         sort_deepest_first(&mut dirs);
         let paths: Vec<&[u8]> = dirs.iter().map(|r| r.path.as_slice()).collect();
         assert_eq!(paths, vec![&b"/a/b/c"[..], &b"/a/b"[..], &b"/a"[..]]);
@@ -446,11 +446,7 @@ mod tests {
 
     #[test]
     fn sort_deepest_first_is_stable_at_equal_depth() {
-        let mut dirs = vec![
-            dir_row(b"/a/x"),
-            dir_row(b"/a/y"),
-            dir_row(b"/a/z"),
-        ];
+        let mut dirs = vec![dir_row(b"/a/x"), dir_row(b"/a/y"), dir_row(b"/a/z")];
         sort_deepest_first(&mut dirs);
         let paths: Vec<&[u8]> = dirs.iter().map(|r| r.path.as_slice()).collect();
         assert_eq!(paths, vec![&b"/a/x"[..], &b"/a/y"[..], &b"/a/z"[..]]);

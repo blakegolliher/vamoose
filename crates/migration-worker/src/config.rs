@@ -35,7 +35,9 @@ pub struct RunCfg {
     #[serde(default = "default_verify_tls")]
     pub verify_tls: bool,
 }
-fn default_verify_tls() -> bool { true }
+fn default_verify_tls() -> bool {
+    true
+}
 
 #[derive(Debug, Deserialize)]
 pub struct WorkerCfg {
@@ -47,8 +49,12 @@ pub struct WorkerCfg {
     pub lease_timeout_sec: u64,
 }
 
-fn default_heartbeat_sec() -> u64 { migration_core::time::DEFAULT_HEARTBEAT_SEC }
-fn default_lease_timeout_sec() -> u64 { migration_core::time::DEFAULT_LEASE_TIMEOUT_SEC }
+fn default_heartbeat_sec() -> u64 {
+    migration_core::time::DEFAULT_HEARTBEAT_SEC
+}
+fn default_lease_timeout_sec() -> u64 {
+    migration_core::time::DEFAULT_LEASE_TIMEOUT_SEC
+}
 
 // `max_in_flight` is part of the published worker config schema
 // (DESIGN.md "Configuration") even though no Rust path reads it yet;
@@ -61,7 +67,9 @@ pub struct ShardCfg {
     #[serde(default = "one")]
     pub max_in_flight: u32,
 }
-fn one() -> u32 { 1 }
+fn one() -> u32 {
+    1
+}
 
 // Most of MoverCfg's fields are M3.5+ stubs (`pipeline_depth`,
 // `io_uring_queue_depth`, `fixed_buffer_*`) or NFSv3-baseline holdouts
@@ -85,13 +93,33 @@ pub struct MoverCfg {
     pub fixed_buffer_count: u32,
     #[serde(default = "default_fixed_buf_size")]
     pub fixed_buffer_size: String,
+    /// When true, route regular-file copies through the bucketed
+    /// async libnfs pool ([`AsyncBucketedFileMover`]) instead of the
+    /// sync `MultiPool`. Non-regular rows (symlinks / hardlinks /
+    /// dirs / empty / skip) still use the sync path. CLI override
+    /// via `vamoose worker run --use-bucketed-pool`. Off by default
+    /// during the Phase 2 rollout.
+    #[serde(default)]
+    pub use_bucketed_pool: bool,
 }
-fn default_strategy() -> String { "libnfs_io_uring".into() }
-fn default_nfs_connections() -> u32 { 16 }
-fn default_pipeline_depth() -> u32 { 8 }
-fn default_io_uring_qd() -> u32 { 256 }
-fn default_fixed_buf_count() -> u32 { 256 }
-fn default_fixed_buf_size() -> String { "1 MiB".into() }
+fn default_strategy() -> String {
+    "libnfs_io_uring".into()
+}
+fn default_nfs_connections() -> u32 {
+    16
+}
+fn default_pipeline_depth() -> u32 {
+    8
+}
+fn default_io_uring_qd() -> u32 {
+    256
+}
+fn default_fixed_buf_count() -> u32 {
+    256
+}
+fn default_fixed_buf_size() -> String {
+    "1 MiB".into()
+}
 
 #[derive(Debug, Deserialize)]
 pub struct BatchCfg {
@@ -109,37 +137,61 @@ pub struct BatchCfg {
     #[serde(default = "default_large_stripe_depth")]
     pub large_stripe_depth: usize,
 }
-fn default_files_budget() -> u64 { 100_000 }
-fn default_inflight_small() -> usize { 256 }
-fn default_inflight_medium() -> usize { 16 }
-fn default_inflight_large() -> usize { 4 }
-fn default_large_stripe_size() -> String { "4 MiB".into() }
-fn default_large_stripe_depth() -> usize { 32 }
+fn default_files_budget() -> u64 {
+    100_000
+}
+fn default_inflight_small() -> usize {
+    256
+}
+fn default_inflight_medium() -> usize {
+    16
+}
+fn default_inflight_large() -> usize {
+    4
+}
+fn default_large_stripe_size() -> String {
+    "4 MiB".into()
+}
+fn default_large_stripe_depth() -> usize {
+    32
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CopyCfg {
-    #[serde(default = "t")] pub preserve_owner: bool,
-    #[serde(default = "t")] pub preserve_mode: bool,
-    #[serde(default = "t")] pub preserve_times: bool,
-    #[serde(default = "t")] pub preserve_xattr: bool,
+    #[serde(default = "t")]
+    pub preserve_owner: bool,
+    #[serde(default = "t")]
+    pub preserve_mode: bool,
+    #[serde(default = "t")]
+    pub preserve_times: bool,
+    #[serde(default = "t")]
+    pub preserve_xattr: bool,
     #[serde(default = "default_ssc")]
     pub server_side_copy: String,
     /// True (default): refuse to start if `preserve_owner` is on but
     /// the worker doesn't hold `CAP_CHOWN`. False: downgrade — log a
     /// startup WARN and treat per-file `chown` EPERM as a non-fatal
     /// warning recorded to `failures/`.
-    #[serde(default = "t")] pub require_chown_capability: bool,
+    #[serde(default = "t")]
+    pub require_chown_capability: bool,
     /// True: verify bytes-written equals the row's `size` after each
     /// file copy and fail the row with `SIZE_CHANGED` on mismatch.
     /// Default false per SCHEMA_CONTRACT.md "Size semantics" — source
     /// truth wins.
-    #[serde(default = "default_false")] pub require_unchanged_size: bool,
+    #[serde(default = "default_false")]
+    pub require_unchanged_size: bool,
 }
-fn t() -> bool { true }
-fn default_false() -> bool { false }
+fn t() -> bool {
+    true
+}
+fn default_false() -> bool {
+    false
+}
 // NFSv3 baseline: server-side COPY is never selected. See
 // BUGFIX_PLAN.md "Fix 4". The field stays for forward compatibility.
-fn default_ssc() -> String { "off".into() }
+fn default_ssc() -> String {
+    "off".into()
+}
 
 // `failure_pct_window_sec` is the window for the future sliding
 // failure-rate gate (M3 evaluates per-shard, not over a window);
@@ -154,9 +206,15 @@ pub struct BackpressureCfg {
     #[serde(default = "default_throughput_floor")]
     pub throughput_floor_mb_s: u64,
 }
-fn default_failure_window() -> u64 { 60 }
-fn default_failure_threshold() -> f32 { 5.0 }
-fn default_throughput_floor() -> u64 { 100 }
+fn default_failure_window() -> u64 {
+    60
+}
+fn default_failure_threshold() -> f32 {
+    5.0
+}
+fn default_throughput_floor() -> u64 {
+    100
+}
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -216,12 +274,12 @@ mod tests {
         // Sanity: the checked-in example loads end-to-end. Catches
         // typos and out-of-sync defaults the per-section tests would
         // miss.
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/worker.toml");
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/worker.toml");
         let s = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let cfg: Config = toml::from_str(&s)
-            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let cfg: Config =
+            toml::from_str(&s).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
         // Just spot-check fields that come from the new [run] block.
         assert_eq!(cfg.run.bucket, "vamoose");
         assert_eq!(
@@ -245,10 +303,7 @@ mod tests {
         "#;
         let run: RunCfg = toml::from_str(toml_str).unwrap();
         assert_eq!(run.bucket, "vamoose");
-        assert_eq!(
-            run.endpoint,
-            "https://main.selab-var204.selab.vastdata.com",
-        );
+        assert_eq!(run.endpoint, "https://main.selab-var204.selab.vastdata.com",);
         assert_eq!(run.region, "us-east-1");
         assert_eq!(run.profile.as_deref(), Some("var204"));
         assert!(!run.verify_tls);

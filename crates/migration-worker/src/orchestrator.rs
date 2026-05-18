@@ -41,7 +41,8 @@ use migration_core::s3::S3Client;
 use migration_core::time::UtcTime;
 use migration_mover::batch::{BatchBudget, InflightLimiter, InflightProfile};
 use migration_mover::{
-    DowngradeSink, FailureSink, LibnfsContextPool, MultiPool, Mover, MoverConfig,
+    AsyncBucketedFileMover, BucketedAsyncPool, DowngradeSink, FailureSink, FileMover,
+    LibnfsContextPool, Mover, MoverConfig, MultiPool,
 };
 
 use std::collections::HashMap;
@@ -106,11 +107,8 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     // M3: pre-mount cfg.mover.nfs_connections context pairs so
     // concurrent shard dispatch has distinct contexts to draw from.
     let pool_size = cfg.mover.nfs_connections.max(1) as usize;
-    let pool: Arc<dyn LibnfsContextPool> = MultiPool::build(
-        &manifest.source.url,
-        &manifest.dest.url,
-        pool_size,
-    )?;
+    let pool: Arc<dyn LibnfsContextPool> =
+        MultiPool::build(&manifest.source.url, &manifest.dest.url, pool_size)?;
     tracing::info!(
         pool_size,
         src = %manifest.source.url,
@@ -144,7 +142,45 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     let progress = Arc::new(RwLock::new(ProgressState::new()));
     let current = Arc::new(Mutex::new(None::<HeldClaim>));
     let fence = Fence::new();
-    let mover = Mover::new(mover_cfg, pool, host_id.clone(), downgrades.clone(), fence.clone());
+
+    // Build the file mover behind the FileMover trait so we can swap
+    // between the sync path and the bucketed-async path at startup.
+    // The async path additionally mounts a BucketedAsyncPool (six
+    // contexts: src+dst × small/medium/large) and wraps a sync Mover
+    // for the non-regular-file fallback rows (symlinks / hardlinks /
+    // dirs / empty / skip) per Phase 2 Decision #3.
+    let mover: Arc<dyn FileMover> = if cfg.mover.use_bucketed_pool {
+        let async_pool =
+            Arc::new(BucketedAsyncPool::new(&manifest.source.url, &manifest.dest.url).await?);
+        tracing::info!(
+            src = %manifest.source.url,
+            dst = %manifest.dest.url,
+            "bucketed async libnfs pool mounted (6 contexts)",
+        );
+        let sync_mover = Mover::new(
+            mover_cfg.clone(),
+            pool,
+            host_id.clone(),
+            downgrades.clone(),
+            fence.clone(),
+        );
+        Arc::new(AsyncBucketedFileMover::new(
+            async_pool,
+            sync_mover,
+            Arc::new(mover_cfg),
+            fence.clone(),
+            host_id.clone(),
+            downgrades.clone(),
+        ))
+    } else {
+        Arc::new(Mover::new(
+            mover_cfg,
+            pool,
+            host_id.clone(),
+            downgrades.clone(),
+            fence.clone(),
+        ))
+    };
     let throughput = ThroughputCounter::new();
     let inflight = InflightLimiter::new(&InflightProfile {
         small: cfg.batch.inflight_small,
@@ -233,7 +269,11 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
                     }
                 }
             }
-            ClaimTarget::Stale { shard, stale_etag, prior_epoch } => {
+            ClaimTarget::Stale {
+                shard,
+                stale_etag,
+                prior_epoch,
+            } => {
                 let new_epoch = prior_epoch + 1;
                 match claim::reclaim(&*s3, &shard, &stale_etag, &host_id, new_epoch).await? {
                     ReclaimOutcome::Won { etag, record } => (etag, record),
@@ -269,7 +309,9 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
 
         // Download the parquet shard to scratch.
         let scratch = cfg.shard.local_scratch.join(&shard_filename);
-        let download_etag = s3.download_to(&layout::index_key(&shard_filename), &scratch).await?;
+        let download_etag = s3
+            .download_to(&layout::index_key(&shard_filename), &scratch)
+            .await?;
         verify_shard_etag(&manifest, &shard_filename, &download_etag)?;
 
         // Stamp the current shard onto both sinks so records carry
@@ -281,7 +323,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         // limiter/sinks/throughput so all shards report into one
         // throughput counter and one failure log per host.
         let mut processor = ShardProcessor {
-            mover: mover.clone(),
+            mover: Arc::clone(&mover),
             fence: fence.clone(),
             budget,
             inflight: inflight.clone(),
@@ -419,17 +461,12 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     // timeout; the runtime drop reaps the task on its own schedule.
     let mut hb_handle = hb_handle;
     eprintln!("[shutdown] awaiting hb_handle with 5s timeout");
-    if tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        &mut hb_handle,
-    )
-    .await
-    .is_err()
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut hb_handle)
+        .await
+        .is_err()
     {
         eprintln!("[shutdown] hb_handle timeout - aborting");
-        tracing::warn!(
-            "heartbeat task did not exit within 5s of shutdown; aborting it",
-        );
+        tracing::warn!("heartbeat task did not exit within 5s of shutdown; aborting it",);
         hb_handle.abort();
     }
     eprintln!("[shutdown] hb_handle done");
@@ -500,7 +537,11 @@ fn parse_ssc(s: &str) -> Option<ServerSideCopy> {
     }
 }
 
-fn verify_shard_etag(manifest: &Manifest, shard_filename: &str, actual_etag: &str) -> anyhow::Result<()> {
+fn verify_shard_etag(
+    manifest: &Manifest,
+    shard_filename: &str,
+    actual_etag: &str,
+) -> anyhow::Result<()> {
     let expected = manifest
         .shards
         .iter()
@@ -526,8 +567,14 @@ fn key_basename(k: &str) -> &str {
 
 #[derive(Debug)]
 enum ClaimTarget {
-    Free { shard: String },
-    Stale { shard: String, stale_etag: String, prior_epoch: u64 },
+    Free {
+        shard: String,
+    },
+    Stale {
+        shard: String,
+        stale_etag: String,
+        prior_epoch: u64,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -562,7 +609,9 @@ async fn scan_shards(
             None => {
                 all_terminal = false;
                 if next.is_none() {
-                    next = Some(ClaimTarget::Free { shard: shard_filename.clone() });
+                    next = Some(ClaimTarget::Free {
+                        shard: shard_filename.clone(),
+                    });
                     next_name = shard_filename;
                 }
             }
@@ -571,7 +620,9 @@ async fn scan_shards(
                 let Some((body, _)) = s3.get(&claim_key).await? else {
                     all_terminal = false;
                     if next.is_none() {
-                        next = Some(ClaimTarget::Free { shard: shard_filename.clone() });
+                        next = Some(ClaimTarget::Free {
+                            shard: shard_filename.clone(),
+                        });
                         next_name = shard_filename;
                     }
                     continue;
@@ -613,9 +664,15 @@ async fn scan_shards(
 async fn log_self_owned_claims(s3: &S3Client, host_id: &str) -> anyhow::Result<()> {
     let entries = s3.list(layout::SHARDS_PREFIX).await?;
     for e in entries {
-        let Some(shard) = layout::shard_from_claim_key(&e.key) else { continue };
-        let Some((body, _)) = s3.get(&e.key).await? else { continue };
-        let Ok(record) = serde_json::from_slice::<ClaimRecord>(&body) else { continue };
+        let Some(shard) = layout::shard_from_claim_key(&e.key) else {
+            continue;
+        };
+        let Some((body, _)) = s3.get(&e.key).await? else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<ClaimRecord>(&body) else {
+            continue;
+        };
         if record.host == host_id && matches!(record.state, ClaimState::Active) {
             tracing::warn!(
                 shard = %shard,
