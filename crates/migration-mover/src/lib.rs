@@ -19,6 +19,7 @@
 
 pub mod attrs;
 pub mod batch;
+pub mod bucketed_pool;
 pub mod downgrade;
 pub mod error;
 pub mod failure;
@@ -28,9 +29,12 @@ pub mod strategy;
 pub mod uring;
 
 mod mover;
+pub use bucketed_pool::{
+    bucket_for_size, AsyncNfsContextPair, BucketConfig, BucketedAsyncPool, BUCKETS,
+};
 pub use downgrade::DowngradeSink;
 pub use error::MoveError;
 pub use failure::FailureSink;
 pub use libnfs::{ContextPair, LibnfsContextPool, MultiPool, NfsContext, SimplePool};
-pub use mover::{Mover, MoverConfig, MoveOutcome};
+pub use mover::{MoveOutcome, Mover, MoverConfig};
 pub use paths::join_root;
