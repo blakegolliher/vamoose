@@ -13,8 +13,9 @@
 *.bak
 *.tmp
 
-# Run artifacts (M5 harness, scratch space, ad-hoc logs)
+# Run artifacts (M5 + T4 harnesses, scratch space, ad-hoc logs)
 /m5/run/
+/t4/run/
 /scratch/
 *.log
 

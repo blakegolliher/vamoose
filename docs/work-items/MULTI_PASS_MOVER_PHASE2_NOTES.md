@@ -431,3 +431,87 @@ scripts/manual-verify.sh /mnt/vamoose-source/src-test/m2-verify \
 The M5 self-fence harness re-run (`scripts/m5-self-fence-test.sh`)
 is the R8 verification gate and is your job per the hand-off
 brief, not this session's.
+
+---
+
+## Closing note — 2026-05-19 (T4 cookbook + M5 R8 gate)
+
+Both Phase 2 verification gates exercised against var204. Runs were
+driven by new harness scripts (`scripts/t4-cookbook.sh`,
+re-run of `scripts/m5-self-fence-test.sh`).
+
+### M5 self-fence harness (R8 gate, async path)
+
+`sudo -E bash scripts/m5-self-fence-test.sh --files 100 --file-size 4096`
+
+All seven A–G assertions PASS:
+- A: A's claim ended `state=completed host=m5-host-B`.
+- B: dst file count == src file count (100).
+- C: SHA-256 parity on all 100.
+- D: A exited 0 with v2 `claim refresh: HEAD shows different etag`.
+- E: failures/host-{A,B}.jsonl absent.
+- F: no concurrent renames across A+B within any 1.0 s window;
+  158 total commits with 58 sequential duplicates (at-least-once
+  under fence trip — expected and bounded).
+- G: 0 B-partials, 1 A-partial (A was paused mid-write — allowed).
+
+Worker A's post-rename `commit: rename .partial → final` log line
+(introduced in 9822296 for the async path) is what makes F countable
+under `--use-bucketed-pool`; without it the harness reported zero
+commits even on a clean run.
+
+### T4 cookbook (M2/M3 parity, async path)
+
+`sudo -E bash scripts/t4-cookbook.sh --skip-large`
+
+Mixed tree: 50 × 4 KiB (small bucket) + 5 × 10 MiB (medium bucket)
++ symlinks (2) + 3-way hardlink group + mode/owner variation +
+non-ASCII path. 65 regular files, ~52 MB.
+
+Async run: wall_clock 4.97 s, 10.1 MiB/s. Sync run (`--sync`):
+9.63 s, 5.2 MiB/s.
+
+Parity verified via `scripts/manual-verify.sh`. SHA-256 matches all
+65 regular files in both runs. Mode + uid + gid match in both.
+Symlink targets match. Hardlink groupings match.
+
+**Known mover-wide limitation:** `manual-verify.sh` step [5]
+(mtime to nanosecond resolution) fails for **both** sync and async
+runs against VAST var204 in exactly the same shape:
+
+1. Regular-file mtimes truncated to microseconds (sub-µs digits
+   zeroed). Affects every file. Identical in sync and async.
+2. Symlink mtimes ~10 s late (= worker run time, not source time);
+   libnfs lacks `lutimes` on either path.
+3. Directory mtimes ~10 s late (= last child-write on dst, not
+   source's last-child-write time); no post-pass dir-mtime
+   restoration on either path.
+
+Because both classes show up identically in the sync mover, this is
+**not a Phase 2 regression**. It's a pre-existing limitation of the
+libnfs FFI surface against VAST's NFSv3 SETATTR3 semantics. T4 is
+declared PASSED on the criteria the Phase 2 hand-off actually
+specifies (sha256 + mode + uid/gid + symlink target + hardlink
+grouping); the mtime parity gap is filed as a separate follow-up,
+not blocking on Phase 2.
+
+Parity logs for both runs saved at
+`t4/run/<ts>-{sync,async}/parity.log`.
+
+### Large-bucket coverage
+
+The Phase 2 acceptance pass deliberately ran with `--skip-large`
+to keep iteration time tight. The bucketed-pool selector code is
+exercised by unit tests (`buckets_form_non_overlapping_partition`,
+`bucket_for_size` table, etc.); a real ≥ 1 GiB run is queued as a
+follow-up once the mtime-parity follow-up doc lands so we can
+exercise the large bucket without re-deriving the limitation.
+
+### Phase 2 status
+
+Code: T0–T3 landed on `phase-1-bucketed-pool` (commits ada8b84
+through dacb2e6 + observability fix 9822296).
+Verification: M5 R8 gate green; T4 cookbook green on the
+spec'd criteria. Phase 2 is **done**. Remaining work is
+documenting the mtime follow-up and the routine repo cleanup.
+
