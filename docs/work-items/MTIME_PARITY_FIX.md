@@ -267,28 +267,49 @@ handles them correctly. Slice 3 was therefore re-scoped from a
 per-shard generic post-pass to a single end-of-run hook for the
 migration root only — the only un-rowed dir in the dest tree.
 
-### Verification status
+### Verification status — closed 2026-05-19
 
-Code committed but **hardware verification still pending** on
-var204. The user is expected to run:
+Both gates green on var204.
+
+**Async pre-merge runbook** (slice 2, `bf58ce1`). All 12 async FFI
+tests pass at default parallelism:
+
+- `libnfs_async_ffi_smoke`: 5/5 (including the new
+  `async_symlink_readlink_roundtrip` case exercising
+  `nfs_lutimes_async`).
+- `libnfs_async_integration`: 5/5.
+- `libnfs_async_perf_smoke`: 2/2 — 252.6 MB/s ASYNC vs
+  194.8 MB/s SYNC over a 32 MiB read at 1 MiB chunks, pipeline
+  depth 32. Ratio (~1.30×) matches the prior closing-note baseline
+  (352/270 ≈ 1.30×); absolute numbers were uniformly lower today
+  (lab load).
+
+Invocation gotcha worth recording: the
+`target/release/deps/<bin>-*` glob in
+`memory/reference_verification_env.md` no longer works once
+multiple build hashes accumulate under `deps/` — sudo+glob expands
+to two binaries, the second gets read as a filter pattern, zero
+tests run. Use the cargo form instead:
 
 ```bash
-cargo build --release -p vamoose-cli
-TS=$(date -u +%Y%m%dT%H%M%SZ)
-export VAMOOSE_SRC_ROOT=/mtime/${TS}
-export VAMOOSE_DST_ROOT=/mtime-dst/${TS}
-sudo -E bash scripts/t4-cookbook.sh --sync --skip-large
-
-TS=$(date -u +%Y%m%dT%H%M%SZ)
-export VAMOOSE_SRC_ROOT=/mtime/${TS}
-export VAMOOSE_DST_ROOT=/mtime-dst/${TS}
-sudo -E bash scripts/t4-cookbook.sh --skip-large
+sudo -E HOME=/home/vastdata PATH="$PATH" \
+    cargo test -p migration-mover --release \
+    --test libnfs_async_ffi_smoke -- --ignored --nocapture
 ```
 
-Both runs must report `parity: PASS` with empty parity.log. Async
-pre-merge runbook (`docs/CORRECTNESS_RULES.md` "Pre-merge runbook:
-async libnfs FFI changes") applies before merging slice 2 — the
-three async test binaries must pass at default parallelism on
-var204.
+**T4 cookbook A/B parity** (slices 1+3+4 end-to-end). Both runs
+green:
 
-A/B bytes/sec to be filled in here after the verification run.
+| Mover | Files | Bytes | Wall clock | Throughput | Parity |
+| --- | --- | --- | --- | --- | --- |
+| sync (`--sync`)               | 65 | 52,658,200 | 3.61 s | 13.9 MiB/s | PASS, empty parity.log |
+| async (`--use-bucketed-pool`) | 65 | 52,658,200 | 1.26 s | **39.9 MiB/s** | PASS, empty parity.log |
+
+Run dirs:
+- `t4/run/20260519T062214Z-sync/`
+- `t4/run/20260519T062259Z-async/`
+
+The mtime gap is closed. `memory/project_mtime_parity_gap.md` is
+removed alongside this verification commit. The work item itself
+is retained for the design history but can be archived next time
+someone trims `docs/work-items/`.
