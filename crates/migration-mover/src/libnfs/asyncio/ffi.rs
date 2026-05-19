@@ -169,6 +169,17 @@ extern "C" {
         cb: nfs_cb,
         private_data: *mut c_void,
     ) -> c_int;
+    /// Symlink-aware utimes_async — sets times on the link itself, not
+    /// the target. Same µs-precision timeval layout as the non-`l`
+    /// form. libnfs has no ns-precision variant (see
+    /// `docs/work-items/MTIME_PARITY_FIX.md`).
+    pub fn nfs_lutimes_async(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        times: *mut libc::timeval,
+        cb: nfs_cb,
+        private_data: *mut c_void,
+    ) -> c_int;
     pub fn nfs_symlink_async(
         nfs: *mut nfs_context,
         target: *const c_char,

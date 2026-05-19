@@ -515,17 +515,26 @@ impl AsyncNfsContext {
         mtime_nsec: i32,
     ) -> Result<(), NfsError> {
         let path = path_to_cstring(path)?;
-        let times = [
-            libc::timeval {
-                tv_sec: atime_sec as libc::time_t,
-                tv_usec: (atime_nsec / 1_000) as libc::suseconds_t,
-            },
-            libc::timeval {
-                tv_sec: mtime_sec as libc::time_t,
-                tv_usec: (mtime_nsec / 1_000) as libc::suseconds_t,
-            },
-        ];
+        let times = build_timeval_pair(atime_sec, atime_nsec, mtime_sec, mtime_nsec);
         self.send_unit(|tx| Request::Utimes { path, times, tx })
+            .await
+    }
+
+    /// Symlink-aware `utimes` — sets atime + mtime on the link itself
+    /// rather than its target. µs-precision (libnfs has no
+    /// ns-precision variant, see
+    /// `docs/work-items/MTIME_PARITY_FIX.md`).
+    pub async fn lutimes(
+        &self,
+        path: &[u8],
+        atime_sec: i64,
+        atime_nsec: i32,
+        mtime_sec: i64,
+        mtime_nsec: i32,
+    ) -> Result<(), NfsError> {
+        let path = path_to_cstring(path)?;
+        let times = build_timeval_pair(atime_sec, atime_nsec, mtime_sec, mtime_nsec);
+        self.send_unit(|tx| Request::Lutimes { path, times, tx })
             .await
     }
 
@@ -607,6 +616,24 @@ impl AsyncNfsContext {
             .map_err(|_| NfsError::Closed)?;
         rx.await.map_err(|_| NfsError::Closed)
     }
+}
+
+fn build_timeval_pair(
+    atime_sec: i64,
+    atime_nsec: i32,
+    mtime_sec: i64,
+    mtime_nsec: i32,
+) -> [libc::timeval; 2] {
+    [
+        libc::timeval {
+            tv_sec: atime_sec as libc::time_t,
+            tv_usec: (atime_nsec / 1_000) as libc::suseconds_t,
+        },
+        libc::timeval {
+            tv_sec: mtime_sec as libc::time_t,
+            tv_usec: (mtime_nsec / 1_000) as libc::suseconds_t,
+        },
+    ]
 }
 
 fn path_to_cstring(path: &[u8]) -> Result<CString, NfsError> {

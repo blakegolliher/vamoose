@@ -502,6 +502,24 @@ fn issue(ctx: *mut nfs_context, req: Request) {
             handle_issue_failure_unit(ctx, rc, pd);
             let _ = (path, times);
         }
+        Request::Lutimes {
+            path,
+            mut times,
+            tx,
+        } => {
+            let pd = Box::into_raw(Box::new(PendingUnit { tx }));
+            let rc = unsafe {
+                ffi::nfs_lutimes_async(
+                    ctx,
+                    path.as_ptr(),
+                    times.as_mut_ptr(),
+                    unit_cb,
+                    pd as *mut _,
+                )
+            };
+            handle_issue_failure_unit(ctx, rc, pd);
+            let _ = (path, times);
+        }
         Request::Chmod { path, mode, tx } => {
             let pd = Box::into_raw(Box::new(PendingUnit { tx }));
             let rc =

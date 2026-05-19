@@ -109,6 +109,12 @@ pub(crate) enum Request {
         times: [libc::timeval; 2],
         tx: oneshot::Sender<NfsResult<()>>,
     },
+    /// Symlink-aware utimes — acts on the link itself, not the target.
+    Lutimes {
+        path: CString,
+        times: [libc::timeval; 2],
+        tx: oneshot::Sender<NfsResult<()>>,
+    },
     Chmod {
         path: CString,
         mode: c_int,

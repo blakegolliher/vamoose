@@ -222,7 +222,8 @@ async fn async_attribute_and_namespace_ops_round_trip() {
 }
 
 /// Symlink + readlink round-trip — catches missing or reordered
-/// arg pair on `nfs_symlink_async`.
+/// arg pair on `nfs_symlink_async`. Also exercises `lutimes_async`
+/// (mtime-on-link-itself) — see MTIME_PARITY_FIX.md slice 2.
 #[tokio::test]
 #[ignore]
 async fn async_symlink_readlink_roundtrip() {
@@ -237,6 +238,13 @@ async fn async_symlink_readlink_roundtrip() {
         .expect("symlink");
     let got = ctx.readlink(link_path.as_bytes()).await.expect("readlink");
     assert_eq!(got.as_slice(), target_str.as_bytes());
+
+    // lutimes on the symlink itself — must not error and must not
+    // follow the link to a (likely non-existent) target.
+    ctx.lutimes(link_path.as_bytes(), 1_700_000_000, 0, 1_700_000_000, 0)
+        .await
+        .expect("lutimes on symlink");
+
     ctx.unlink(link_path.as_bytes()).await.expect("unlink");
     ctx.shutdown().await.expect("shutdown");
 }
