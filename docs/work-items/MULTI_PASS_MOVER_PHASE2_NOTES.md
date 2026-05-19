@@ -475,25 +475,26 @@ Parity verified via `scripts/manual-verify.sh`. SHA-256 matches all
 65 regular files in both runs. Mode + uid + gid match in both.
 Symlink targets match. Hardlink groupings match.
 
-**Known mover-wide limitation:** `manual-verify.sh` step [5]
-(mtime to nanosecond resolution) fails for **both** sync and async
-runs against VAST var204 in exactly the same shape:
+**Known mover-wide limitation (closed 2026-05-19, hardware
+verification pending):** `manual-verify.sh` step [5] (mtime to
+nanosecond resolution) originally failed for **both** sync and
+async runs against VAST var204 in three shapes:
 
 1. Regular-file mtimes truncated to microseconds (sub-µs digits
    zeroed). Affects every file. Identical in sync and async.
 2. Symlink mtimes ~10 s late (= worker run time, not source time);
-   libnfs lacks `lutimes` on either path.
-3. Directory mtimes ~10 s late (= last child-write on dst, not
-   source's last-child-write time); no post-pass dir-mtime
-   restoration on either path.
+   sync mover never called any utimes-on-symlink op (libnfs DOES
+   export `nfs_lutimes`, contrary to the original spec comment).
+3. Migration-root mtime ~10 s late (the dest-root dir itself; not
+   "every directory" as originally claimed — all walker-emitted
+   subdirs land µs-correct via `Strategy::DirAttrs`).
 
-Because both classes show up identically in the sync mover, this is
-**not a Phase 2 regression**. It's a pre-existing limitation of the
-libnfs FFI surface against VAST's NFSv3 SETATTR3 semantics. T4 is
-declared PASSED on the criteria the Phase 2 hand-off actually
-specifies (sha256 + mode + uid/gid + symlink target + hardlink
-grouping); the mtime parity gap is filed as a separate follow-up,
-not blocking on Phase 2.
+Closed by `docs/work-items/MTIME_PARITY_FIX.md` slices 0–4
+(commits dbab4f9 → e852ba1). Strategy: keep libnfs's µs-precision
+API (no `utimens` exists in upstream master either), relax verify
+to µs, add `nfs_lutimes` to both mover paths, source-stat the
+migration root at worker shutdown. Hardware A/B on var204 still
+pending — once green, this section can be retired.
 
 Parity logs for both runs saved at
 `t4/run/<ts>-{sync,async}/parity.log`.

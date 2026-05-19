@@ -216,3 +216,79 @@ files if they don't — they should be empty.
   the bytes/sec for the final A/B run.
 - The `project_mtime_parity_gap.md` memory removed (since the
   gap is closed).
+
+## Closing note — implementation summary (2026-05-19)
+
+Commits on `phase-1-bucketed-pool`:
+
+- `dbab4f9` slice 0: header-survey doc.
+- `23cf22e` slice 1: `nfs_lutimes` in `crates/migration-mover/src/
+  libnfs/mod.rs` + `ops::lutimes` wrapper; `do_symlink` now calls
+  lutimes post-symlink-commit. `SymlinkTimeNfsV3` downgrade now
+  only fires on actual lutimes failure (was: every symlink with
+  mtime).
+- `bf58ce1` slice 2: `nfs_lutimes_async` + `Request::Lutimes` +
+  `AsyncNfsContext::lutimes`. `async_symlink_readlink_roundtrip`
+  smoke test now exercises lutimes.
+- `b9a92a5` slice 3 (re-scoped): worker orchestrator source-stats
+  `manifest.source.root` and applies utimes to
+  `manifest.dest.root` once when the shard loop reports
+  `all_terminal`. Adds sync `nfs_stat64` FFI + `ops::stat_times`
+  wrapper + `migration_mover::restore_root_mtime` helper.
+- `e852ba1` slice 4: `scripts/manual-verify.sh` step [5] now
+  truncates `%T@` to 6 fractional digits (µs) before diffing.
+
+Libnfs symbols used (all pre-existing, none added to the build):
+
+| Symbol | Slice | Notes |
+| --- | --- | --- |
+| `nfs_lutimes` | 1 | µs precision; existing libnfs 1.16 export |
+| `nfs_lutimes_async` | 2 | same call shape as `nfs_utimes_async` |
+| `nfs_stat64` | 3 | new sync FFI in `libnfs/mod.rs`, struct duplicated from `asyncio/ffi.rs` to keep the sync surface independent of the async runbook |
+
+### Re-scope vs. original spec
+
+Slice 3 in the original spec asked for a per-shard "touched dirs"
+post-pass with source-stat at first-touch. Concrete parity-log
+evidence from the 2026-05-19 A/B run
+(`t4/run/20260519T052041Z-sync/parity.log`) showed only THREE
+classes of failure once decoded line-for-line:
+
+1. Sub-µs digits zeroed on regular files (every row). → slice 4
+   (verify truncates to µs).
+2. Both symlinks 17 s late. → slice 1 (`nfs_lutimes`).
+3. The migration root (`%P == ""`) 17 s late. → slice 3 (end-of-run
+   `restore_root_mtime`).
+
+All other subdirs (`small/`, `medium/`, `links/`, `modes/`,
+`unicode/`) were already µs-correct on the dst side. The existing
+`Strategy::DirAttrs` + shard-processor Phase 2 deepest-first sort
+handles them correctly. Slice 3 was therefore re-scoped from a
+per-shard generic post-pass to a single end-of-run hook for the
+migration root only — the only un-rowed dir in the dest tree.
+
+### Verification status
+
+Code committed but **hardware verification still pending** on
+var204. The user is expected to run:
+
+```bash
+cargo build --release -p vamoose-cli
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+export VAMOOSE_SRC_ROOT=/mtime/${TS}
+export VAMOOSE_DST_ROOT=/mtime-dst/${TS}
+sudo -E bash scripts/t4-cookbook.sh --sync --skip-large
+
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+export VAMOOSE_SRC_ROOT=/mtime/${TS}
+export VAMOOSE_DST_ROOT=/mtime-dst/${TS}
+sudo -E bash scripts/t4-cookbook.sh --skip-large
+```
+
+Both runs must report `parity: PASS` with empty parity.log. Async
+pre-merge runbook (`docs/CORRECTNESS_RULES.md` "Pre-merge runbook:
+async libnfs FFI changes") applies before merging slice 2 — the
+three async test binaries must pass at default parallelism on
+var204.
+
+A/B bytes/sec to be filled in here after the verification run.
