@@ -408,14 +408,42 @@ impl Mover {
             }
         }
 
-        // NFSv3 has no lutimes-equivalent. nfs_utimes follows symlinks
-        // and would clobber the target's mtime, so we don't call it
-        // here at all — but if the source row had a real mtime we
-        // owe the operator a downgrade record so the gap is visible
-        // (`docs/CORRECTNESS_RULES.md` "NFSv3 is the protocol baseline" + post-M2 fix 5).
-        if self.cfg.policy.preserve_times && row.mtime_sec.is_some() {
-            self.downgrades
-                .record(row.row_id, &row.path, DowngradeKind::SymlinkTimeNfsV3);
+        // Symlink mtime — best-effort post-commit. libnfs 1.16 does
+        // export `nfs_lutimes` (µs precision, the symlink-itself
+        // counterpart to `nfs_utimes`). If the row has no mtime,
+        // record `NullMtime` consistent with the regular-file path.
+        // If `lutimes` itself errors, log + downgrade rather than fail
+        // the row — the symlink is already committed.
+        if self.cfg.policy.preserve_times {
+            match (row.mtime_sec, row.mtime_nsec) {
+                (Some(mt_s), mt_n_opt) => {
+                    let mt_n = mt_n_opt.unwrap_or(0);
+                    let (at_s, at_n) = match (row.atime_sec, row.atime_nsec) {
+                        (Some(a_s), a_n_opt) => (a_s, a_n_opt.unwrap_or(0)),
+                        _ => {
+                            self.downgrades
+                                .record(row.row_id, &row.path, DowngradeKind::NullAtime);
+                            (mt_s, mt_n)
+                        }
+                    };
+                    if let Err(e) = ops::lutimes(pair.dst(), &dst, at_s, at_n, mt_s, mt_n) {
+                        tracing::warn!(
+                            row_id = row.row_id,
+                            error = %e.error,
+                            "lutimes on symlink failed; recording SymlinkTimeNfsV3 downgrade",
+                        );
+                        self.downgrades.record(
+                            row.row_id,
+                            &row.path,
+                            DowngradeKind::SymlinkTimeNfsV3,
+                        );
+                    }
+                }
+                (None, _) => {
+                    self.downgrades
+                        .record(row.row_id, &row.path, DowngradeKind::NullMtime);
+                }
+            }
         }
 
         Ok(())

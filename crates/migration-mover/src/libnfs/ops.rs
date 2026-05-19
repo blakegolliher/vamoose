@@ -172,7 +172,41 @@ pub fn utimes(
     mtime_nsec: i32,
 ) -> Result<(), MoveError> {
     let c = cstr_from_bytes(path)?;
-    let mut times: [libc::timeval; 2] = [
+    let mut times = build_timeval_pair(atime_sec, atime_nsec, mtime_sec, mtime_nsec);
+    let rc = unsafe { super::nfs_utimes(ctx.raw(), c.as_ptr(), times.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(err_from_rc(ctx, rc, FailurePhase::Setattr));
+    }
+    Ok(())
+}
+
+/// Symlink-aware `utimes`. Sets atime + mtime on the symlink itself,
+/// not its target. Same µs-precision ceiling as [`utimes`]; libnfs
+/// has no `lutimens` variant (see `MTIME_PARITY_FIX.md`).
+pub fn lutimes(
+    ctx: &mut NfsContext,
+    path: &[u8],
+    atime_sec: i64,
+    atime_nsec: i32,
+    mtime_sec: i64,
+    mtime_nsec: i32,
+) -> Result<(), MoveError> {
+    let c = cstr_from_bytes(path)?;
+    let mut times = build_timeval_pair(atime_sec, atime_nsec, mtime_sec, mtime_nsec);
+    let rc = unsafe { super::nfs_lutimes(ctx.raw(), c.as_ptr(), times.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(err_from_rc(ctx, rc, FailurePhase::Setattr));
+    }
+    Ok(())
+}
+
+fn build_timeval_pair(
+    atime_sec: i64,
+    atime_nsec: i32,
+    mtime_sec: i64,
+    mtime_nsec: i32,
+) -> [libc::timeval; 2] {
+    [
         libc::timeval {
             tv_sec: atime_sec as libc::time_t,
             tv_usec: (atime_nsec / 1_000) as libc::suseconds_t,
@@ -181,12 +215,7 @@ pub fn utimes(
             tv_sec: mtime_sec as libc::time_t,
             tv_usec: (mtime_nsec / 1_000) as libc::suseconds_t,
         },
-    ];
-    let rc = unsafe { super::nfs_utimes(ctx.raw(), c.as_ptr(), times.as_mut_ptr()) };
-    if rc < 0 {
-        return Err(err_from_rc(ctx, rc, FailurePhase::Setattr));
-    }
-    Ok(())
+    ]
 }
 
 pub fn rename(ctx: &mut NfsContext, old: &[u8], new: &[u8]) -> Result<(), MoveError> {
@@ -346,6 +375,7 @@ mod tests {
             ("chmod", FailurePhase::Setattr),
             ("chown", FailurePhase::Setattr),
             ("utimes", FailurePhase::Setattr),
+            ("lutimes", FailurePhase::Setattr),
             ("rename", FailurePhase::Rename),
             ("link", FailurePhase::Hardlink),
             ("symlink", FailurePhase::Symlink),

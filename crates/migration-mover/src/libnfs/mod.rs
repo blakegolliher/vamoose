@@ -150,6 +150,16 @@ extern "C" {
         path: *const c_char,
         times: *mut libc::timeval,
     ) -> c_int;
+    /// Symlink-aware utimes — sets atime + mtime on the link itself
+    /// rather than its target. Same `[atime, mtime]` timeval layout as
+    /// `nfs_utimes`; same µs-precision ceiling. libnfs 1.16 has no
+    /// ns-precision (`lutimens`) variant — neither this build nor
+    /// upstream master, see `docs/work-items/MTIME_PARITY_FIX.md`.
+    pub fn nfs_lutimes(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        times: *mut libc::timeval,
+    ) -> c_int;
 }
 
 /// Last error string from a context, as a borrowed `&str`.
