@@ -56,19 +56,27 @@ Required env (same as m5-self-fence-test.sh):
   VAMOOSE_DST_ROOT     Path under the dest export root. Must differ from SRC.
 
 Optional env:
-  NFS_WALKER           Path to nfs-walker (export-parquet-capable).
+  NFS_WALKER           Path to nfs-walker (post-RocksDB-removal walker
+                       with single-step direct parquet output).
   VAMOOSE_BIN          Path to unified vamoose binary.
   MIG_WALKER_REWRITE   Path to mig-walker-rewrite (default: cargo run).
   AWS_S3_FLAGS         Extra args for aws s3 / aws s3api.
 
 Host requirements:
-  - Passwordless sudo, same as the SIGSTOP harness.
+  - Run as root (libnfs UID 0 requirement; same as the SIGSTOP harness).
+  - Passwordless sudo for the in-script 'sudo -n' signal-delivery path.
   - sudo -n iptables -L OUTPUT must work. The partition window installs
     and removes an OUTPUT REJECT rule on TCP port 443 to the resolved
     VAST endpoint IP. The harness fails fast in Phase 0 if it can't.
   - During the partition window the entire host loses S3 connectivity
     to that endpoint (the iptables match is per-destination, not
     per-process). Don't run on a host doing other VAST work.
+
+Invocation:
+  sudo -E bash $0 [options]
+
+  HOME and PATH are auto-recovered from \$SUDO_USER so AWS credentials
+  and pipx-installed 'aws' stay discoverable.
 
 This harness is a COMPANION to m5-self-fence-test.sh. It does NOT
 replace it — the SIGSTOP test exercises clean-recovery from a paused
@@ -88,6 +96,38 @@ while [[ $# -gt 0 ]]; do
         *)                        echo "unknown arg: $1" >&2; usage; exit 2;;
     esac
 done
+
+# -----------------------------------------------------------------------------
+# Bootstrap — tolerate sudo's HOME/PATH stripping.
+#
+# libnfs requires UID 0, but sudo's defaults clobber HOME (→ /root) and PATH
+# (→ secure_path) even with -E, which breaks AWS credential lookup and tool
+# discovery respectively. Rebuild both from $SUDO_USER so a bare
+# `sudo -E bash <script>` just works.
+# -----------------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    echo "FAIL: this harness must run as root (libnfs needs UID 0)." >&2
+    echo "Re-run with: sudo -E bash $0 $*" >&2
+    exit 2
+fi
+
+if [[ -n "${SUDO_USER:-}" ]]; then
+    invoker_home="$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)"
+    if [[ -n "${invoker_home}" && -d "${invoker_home}" ]]; then
+        if [[ "${HOME}" != "${invoker_home}" ]]; then
+            export HOME="${invoker_home}"
+        fi
+        if ! command -v aws >/dev/null 2>&1 && [[ -x "${invoker_home}/.local/bin/aws" ]]; then
+            export PATH="${invoker_home}/.local/bin:${PATH}"
+        fi
+    fi
+fi
+
+if ! command -v aws >/dev/null 2>&1; then
+    echo "FAIL: aws CLI not found on PATH (PATH=${PATH})." >&2
+    echo "Install it under root's PATH or expose it via SUDO_USER's ~/.local/bin." >&2
+    exit 2
+fi
 
 : "${AWS_PROFILE:?AWS_PROFILE is required}"
 : "${VAMOOSE_BUCKET:?VAMOOSE_BUCKET is required}"
@@ -233,8 +273,11 @@ fi
 if ! command -v "${NFS_WALKER}" >/dev/null 2>&1 && [[ ! -x "${NFS_WALKER}" ]]; then
     fail "nfs-walker not found at ${NFS_WALKER}"
 fi
-if ! "${NFS_WALKER}" help export-parquet >/dev/null 2>&1; then
-    fail "${NFS_WALKER} does not support the export-parquet subcommand"
+# Reject pre-RocksDB-removal walkers: those still ship export-parquet
+# and expect a two-step rocks → parquet workflow that this harness no
+# longer drives.
+if "${NFS_WALKER}" help export-parquet >/dev/null 2>&1; then
+    fail "${NFS_WALKER} still ships the export-parquet subcommand; rebuild from a current nfs-walker checkout (single-step parquet output required)"
 fi
 
 if ! aws_s3 ls "s3://${VAMOOSE_BUCKET}/" >/dev/null 2>&1; then
@@ -306,35 +349,32 @@ if [[ "${ACTUAL_FILES}" -ne "${FILES}" ]]; then
 fi
 log "source tree built: ${ACTUAL_FILES} files at ${SRC_TREE_HOST}"
 
-SCAN_ROCKS="${RUN_DIR}/scan.rocks"
 LEGACY_PARQUET_DIR="${RUN_DIR}/legacy.parquet"
 CANON_OUT="${RUN_DIR}/canonical"
 WALKER_LOG="${RUN_DIR}/walker.log"
 : > "${WALKER_LOG}"
 
-log "scan: ${NFS_WALKER} ${VAMOOSE_SRC_NFS_URL}${VAMOOSE_SRC_ROOT} → ${SCAN_ROCKS}"
+# Single-step direct parquet output. --writer-shards=1 pins the test to
+# a single part-rNN-SSSSS.parquet so the downstream single-shard
+# invariant holds without extra plumbing; --no-log suppresses the
+# walker's sidecar progress logfile.
+log "scan: ${NFS_WALKER} ${VAMOOSE_SRC_NFS_URL}${VAMOOSE_SRC_ROOT} → ${LEGACY_PARQUET_DIR}"
 {
     echo "===== scan ====="
     if ! sudo "${NFS_WALKER}" "${VAMOOSE_SRC_NFS_URL}${VAMOOSE_SRC_ROOT}" \
-            -o "${SCAN_ROCKS}" -w 16 -v 2>&1; then
+            -o "${LEGACY_PARQUET_DIR}" \
+            -w 16 -v \
+            --writer-shards 1 \
+            --no-log 2>&1; then
         echo "===== scan failed ====="
         cat "${WALKER_LOG}" >&2 || true
         fail "nfs-walker scan failed; see ${WALKER_LOG}"
     fi
 } >> "${WALKER_LOG}" 2>&1
 
-log "export-parquet: ${SCAN_ROCKS} → ${LEGACY_PARQUET_DIR}/"
-{
-    echo "===== export-parquet ====="
-    if ! "${NFS_WALKER}" export-parquet \
-            --parallelism 1 \
-            "${SCAN_ROCKS}" "${LEGACY_PARQUET_DIR}" 2>&1; then
-        echo "===== export-parquet failed ====="
-        cat "${WALKER_LOG}" >&2 || true
-        fail "nfs-walker export-parquet failed; see ${WALKER_LOG}"
-    fi
-} >> "${WALKER_LOG}" 2>&1
-
+# Walker writes scans/<scan_id>/part-rNN-SSSSS.parquet + metadata.json
+# under the output dir. The recursive globstar glob locates the part
+# file; the shim's .parquet extension filter skips metadata.json.
 shopt -s globstar nullglob
 legacy_files=( "${LEGACY_PARQUET_DIR}"/**/*.parquet )
 shopt -u globstar nullglob
@@ -502,7 +542,7 @@ HEARTBEAT_SEC=1
 LEASE_TIMEOUT_SEC=10
 # Partition window: long enough for R6 retry budget to exhaust
 # (ceil(lease/heartbeat) = 10 ticks) plus 30s buffer for A to exit.
-PARTITION_WINDOW=$((LEASE_TIMEOUT_SEC + 30))
+PARTITION_WINDOW=$((LEASE_TIMEOUT_SEC + 60))
 
 # -----------------------------------------------------------------------------
 # Phase 3 — orchestrate (partition variant)
@@ -525,7 +565,7 @@ read_claim() {
   HOME="${HOME}" \
   RUST_LOG="${WORKER_RUST_LOG}" \
   AWS_PROFILE="${AWS_PROFILE}" \
-  exec setsid sudo -n -E "${VAMOOSE_BIN}" worker --config "${A_TOML}" >"${A_OUT}" 2>"${A_ERR}" ) &
+  exec setsid sudo -n -E "${VAMOOSE_BIN}" worker --config "${A_TOML}" --use-bucketed-pool >"${A_OUT}" 2>"${A_ERR}" ) &
 A_LAUNCHER_PID=$!
 A_PID=""
 for _ in $(seq 1 50); do
@@ -638,7 +678,7 @@ log "launching worker B"
   HOME="${HOME}" \
   RUST_LOG="${WORKER_RUST_LOG}" \
   AWS_PROFILE="${AWS_PROFILE}" \
-  exec setsid sudo -n -E "${VAMOOSE_BIN}" worker --config "${B_TOML}" >"${B_OUT}" 2>"${B_ERR}" ) &
+  exec setsid sudo -n -E "${VAMOOSE_BIN}" worker --config "${B_TOML}" --use-bucketed-pool >"${B_OUT}" 2>"${B_ERR}" ) &
 B_LAUNCHER_PID=$!
 B_PID=""
 for _ in $(seq 1 50); do

@@ -56,20 +56,22 @@ pub fn build(row: &RowView, policy: AttrPolicy) -> AttrSet {
         mode: policy.preserve_mode.then_some(row.mode),
         uid: policy.preserve_owner.then(|| row.uid).flatten(),
         gid: policy.preserve_owner.then(|| row.gid).flatten(),
-        mtime: policy.preserve_times.then(|| {
-            match (row.mtime_sec, row.mtime_nsec) {
+        mtime: policy
+            .preserve_times
+            .then(|| match (row.mtime_sec, row.mtime_nsec) {
                 (Some(s), Some(ns)) => Some((s, ns)),
                 (Some(s), None) => Some((s, 0)),
                 _ => None,
-            }
-        }).flatten(),
-        atime: policy.preserve_times.then(|| {
-            match (row.atime_sec, row.atime_nsec) {
+            })
+            .flatten(),
+        atime: policy
+            .preserve_times
+            .then(|| match (row.atime_sec, row.atime_nsec) {
                 (Some(s), Some(ns)) => Some((s, ns)),
                 (Some(s), None) => Some((s, 0)),
                 _ => None,
-            }
-        }).flatten(),
+            })
+            .flatten(),
         xattrs: if policy.preserve_xattr {
             parse_xattr_blob(row.xattr_blob.as_deref())
         } else {

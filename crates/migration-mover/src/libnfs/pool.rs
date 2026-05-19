@@ -43,8 +43,14 @@ impl ContextPair {
     /// each hold an independent `&mut NfsContext` without a second
     /// borrow of the whole pair. Both contexts must be present.
     pub fn split(&mut self) -> (&mut NfsContext, &mut NfsContext) {
-        let s = self.src.as_mut().expect("ContextPair::split src after drop");
-        let d = self.dst.as_mut().expect("ContextPair::split dst after drop");
+        let s = self
+            .src
+            .as_mut()
+            .expect("ContextPair::split src after drop");
+        let d = self
+            .dst
+            .as_mut()
+            .expect("ContextPair::split dst after drop");
         (s, d)
     }
 }
@@ -109,11 +115,7 @@ impl MultiPool {
     /// Mount `n` (src, dst) pairs against the same URLs and return the
     /// pool. Mount failures during seeding return early — already-mounted
     /// pairs drop cleanly via `NfsContext::Drop`.
-    pub fn build(
-        src_url: &str,
-        dst_url: &str,
-        n: usize,
-    ) -> anyhow::Result<Arc<Self>> {
+    pub fn build(src_url: &str, dst_url: &str, n: usize) -> anyhow::Result<Arc<Self>> {
         Ok(Arc::new(Self::build_inner(src_url, dst_url, n)?))
     }
 

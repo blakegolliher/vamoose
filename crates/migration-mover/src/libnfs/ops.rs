@@ -14,7 +14,7 @@
 //!
 //! All paths are `&[u8]` because POSIX paths are byte sequences.
 
-use super::{NfsContext, errno_name, last_error, nfsfh};
+use super::{errno_name, last_error, nfs_stat_64, nfsfh, NfsContext};
 use crate::error::MoveError;
 use crate::paths::cstr_from_bytes;
 use migration_core::records::FailurePhase;
@@ -78,11 +78,7 @@ pub fn open_read(ctx: &mut NfsContext, path: &[u8]) -> Result<NfsFh, MoveError> 
 /// Create a new file for writing. `mode` is the initial mode; the
 /// final mode is set by [`chmod`] at end-of-file. M2 callers create
 /// with `0o600` so the in-flight `.partial` is not world-readable.
-pub fn create_write(
-    ctx: &mut NfsContext,
-    path: &[u8],
-    mode: u32,
-) -> Result<NfsFh, MoveError> {
+pub fn create_write(ctx: &mut NfsContext, path: &[u8], mode: u32) -> Result<NfsFh, MoveError> {
     let c = cstr_from_bytes(path)?;
     let mut fh: *mut nfsfh = std::ptr::null_mut();
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
@@ -156,12 +152,7 @@ pub fn chmod(ctx: &mut NfsContext, path: &[u8], mode: u32) -> Result<(), MoveErr
     Ok(())
 }
 
-pub fn chown(
-    ctx: &mut NfsContext,
-    path: &[u8],
-    uid: u32,
-    gid: u32,
-) -> Result<(), MoveError> {
+pub fn chown(ctx: &mut NfsContext, path: &[u8], uid: u32, gid: u32) -> Result<(), MoveError> {
     let c = cstr_from_bytes(path)?;
     let rc = unsafe { super::nfs_chown(ctx.raw(), c.as_ptr(), uid as c_int, gid as c_int) };
     if rc < 0 {
@@ -181,7 +172,41 @@ pub fn utimes(
     mtime_nsec: i32,
 ) -> Result<(), MoveError> {
     let c = cstr_from_bytes(path)?;
-    let mut times: [libc::timeval; 2] = [
+    let mut times = build_timeval_pair(atime_sec, atime_nsec, mtime_sec, mtime_nsec);
+    let rc = unsafe { super::nfs_utimes(ctx.raw(), c.as_ptr(), times.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(err_from_rc(ctx, rc, FailurePhase::Setattr));
+    }
+    Ok(())
+}
+
+/// Symlink-aware `utimes`. Sets atime + mtime on the symlink itself,
+/// not its target. Same µs-precision ceiling as [`utimes`]; libnfs
+/// has no `lutimens` variant (see `MTIME_PARITY_FIX.md`).
+pub fn lutimes(
+    ctx: &mut NfsContext,
+    path: &[u8],
+    atime_sec: i64,
+    atime_nsec: i32,
+    mtime_sec: i64,
+    mtime_nsec: i32,
+) -> Result<(), MoveError> {
+    let c = cstr_from_bytes(path)?;
+    let mut times = build_timeval_pair(atime_sec, atime_nsec, mtime_sec, mtime_nsec);
+    let rc = unsafe { super::nfs_lutimes(ctx.raw(), c.as_ptr(), times.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(err_from_rc(ctx, rc, FailurePhase::Setattr));
+    }
+    Ok(())
+}
+
+fn build_timeval_pair(
+    atime_sec: i64,
+    atime_nsec: i32,
+    mtime_sec: i64,
+    mtime_nsec: i32,
+) -> [libc::timeval; 2] {
+    [
         libc::timeval {
             tv_sec: atime_sec as libc::time_t,
             tv_usec: (atime_nsec / 1_000) as libc::suseconds_t,
@@ -190,12 +215,26 @@ pub fn utimes(
             tv_sec: mtime_sec as libc::time_t,
             tv_usec: (mtime_nsec / 1_000) as libc::suseconds_t,
         },
-    ];
-    let rc = unsafe { super::nfs_utimes(ctx.raw(), c.as_ptr(), times.as_mut_ptr()) };
+    ]
+}
+
+/// Stat a path (follows symlinks). Returns the (atime_sec, atime_nsec,
+/// mtime_sec, mtime_nsec) tuple — that's the only subset
+/// `restore_root_mtime` needs. If a more general consumer arrives,
+/// promote this to return the full `nfs_stat_64`.
+pub fn stat_times(ctx: &mut NfsContext, path: &[u8]) -> Result<(i64, i32, i64, i32), MoveError> {
+    let c = cstr_from_bytes(path)?;
+    let mut st: nfs_stat_64 = nfs_stat_64::default();
+    let rc = unsafe { super::nfs_stat64(ctx.raw(), c.as_ptr(), &mut st as *mut _) };
     if rc < 0 {
         return Err(err_from_rc(ctx, rc, FailurePhase::Setattr));
     }
-    Ok(())
+    Ok((
+        st.nfs_atime as i64,
+        st.nfs_atime_nsec as i32,
+        st.nfs_mtime as i64,
+        st.nfs_mtime_nsec as i32,
+    ))
 }
 
 pub fn rename(ctx: &mut NfsContext, old: &[u8], new: &[u8]) -> Result<(), MoveError> {
@@ -280,9 +319,9 @@ pub fn mkdir(ctx: &mut NfsContext, path: &[u8], mode: u32) -> Result<(), MoveErr
 /// yet without requiring a pre-pass.
 pub fn mkdir_p_for_file(ctx: &mut NfsContext, file_path: &[u8]) -> Result<(), MoveError> {
     let last_slash = match file_path.iter().rposition(|&b| b == b'/') {
-        Some(0) => return Ok(()),       // file is at root; root always exists
+        Some(0) => return Ok(()), // file is at root; root always exists
         Some(i) => i,
-        None => return Ok(()),          // no parent component
+        None => return Ok(()), // no parent component
     };
     let parent = &file_path[..last_slash];
     if parent.is_empty() {
@@ -355,6 +394,7 @@ mod tests {
             ("chmod", FailurePhase::Setattr),
             ("chown", FailurePhase::Setattr),
             ("utimes", FailurePhase::Setattr),
+            ("lutimes", FailurePhase::Setattr),
             ("rename", FailurePhase::Rename),
             ("link", FailurePhase::Hardlink),
             ("symlink", FailurePhase::Symlink),

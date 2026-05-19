@@ -64,6 +64,7 @@ pub struct MoveOutcome {
     pub result: Result<(), MoveError>,
 }
 
+#[derive(Clone)]
 pub struct MoverConfig {
     pub source_url: String,
     pub dest_url: String,
@@ -222,10 +223,7 @@ impl Mover {
                     row_id,
                     strategy,
                     bytes_moved: 0,
-                    result: Err(MoveError::new(
-                        FailurePhase::Open,
-                        format!("pool: {e}"),
-                    )),
+                    result: Err(MoveError::new(FailurePhase::Open, format!("pool: {e}"))),
                 };
             }
         };
@@ -410,14 +408,42 @@ impl Mover {
             }
         }
 
-        // NFSv3 has no lutimes-equivalent. nfs_utimes follows symlinks
-        // and would clobber the target's mtime, so we don't call it
-        // here at all — but if the source row had a real mtime we
-        // owe the operator a downgrade record so the gap is visible
-        // (`docs/CORRECTNESS_RULES.md` "NFSv3 is the protocol baseline" + post-M2 fix 5).
-        if self.cfg.policy.preserve_times && row.mtime_sec.is_some() {
-            self.downgrades
-                .record(row.row_id, &row.path, DowngradeKind::SymlinkTimeNfsV3);
+        // Symlink mtime — best-effort post-commit. libnfs 1.16 does
+        // export `nfs_lutimes` (µs precision, the symlink-itself
+        // counterpart to `nfs_utimes`). If the row has no mtime,
+        // record `NullMtime` consistent with the regular-file path.
+        // If `lutimes` itself errors, log + downgrade rather than fail
+        // the row — the symlink is already committed.
+        if self.cfg.policy.preserve_times {
+            match (row.mtime_sec, row.mtime_nsec) {
+                (Some(mt_s), mt_n_opt) => {
+                    let mt_n = mt_n_opt.unwrap_or(0);
+                    let (at_s, at_n) = match (row.atime_sec, row.atime_nsec) {
+                        (Some(a_s), a_n_opt) => (a_s, a_n_opt.unwrap_or(0)),
+                        _ => {
+                            self.downgrades
+                                .record(row.row_id, &row.path, DowngradeKind::NullAtime);
+                            (mt_s, mt_n)
+                        }
+                    };
+                    if let Err(e) = ops::lutimes(pair.dst(), &dst, at_s, at_n, mt_s, mt_n) {
+                        tracing::warn!(
+                            row_id = row.row_id,
+                            error = %e.error,
+                            "lutimes on symlink failed; recording SymlinkTimeNfsV3 downgrade",
+                        );
+                        self.downgrades.record(
+                            row.row_id,
+                            &row.path,
+                            DowngradeKind::SymlinkTimeNfsV3,
+                        );
+                    }
+                }
+                (None, _) => {
+                    self.downgrades
+                        .record(row.row_id, &row.path, DowngradeKind::NullMtime);
+                }
+            }
         }
 
         Ok(())
@@ -608,7 +634,7 @@ fn parent_dir(p: &[u8]) -> &[u8] {
 /// Free-function form of the per-file self-target check, factored out
 /// of `Mover` so it's unit-testable without spinning up a libnfs pool.
 /// See `Mover::check_self_target` for behavior; this is the body.
-fn check_self_target(
+pub(crate) fn check_self_target(
     source_url: &str,
     dest_url: &str,
     src: &[u8],
@@ -696,10 +722,7 @@ where
         }
         let mut written_in_chunk = 0;
         while written_in_chunk < n {
-            let w = write_at(
-                off + written_in_chunk as u64,
-                &buf[written_in_chunk..n],
-            )?;
+            let w = write_at(off + written_in_chunk as u64, &buf[written_in_chunk..n])?;
             if w == 0 {
                 return Err(MoveError::new(FailurePhase::Write, "EIO"));
             }
@@ -815,7 +838,10 @@ mod tests {
         let off = result.expect("short read is not an error in default mode");
         assert_eq!(off, 0, "off must equal bytes-actually-read");
         assert!(off < size, "off ({off}) must be < indexed size ({size})");
-        assert!(on_short_called, "on_short_eof must fire so caller can record EARLY_EOF");
+        assert!(
+            on_short_called,
+            "on_short_eof must fire so caller can record EARLY_EOF"
+        );
     }
 
     #[test]
@@ -830,9 +856,9 @@ mod tests {
             |_off, buf| {
                 reads += 1;
                 if reads == 1 {
-                    Ok(buf.len())  // first chunk: full read
+                    Ok(buf.len()) // first chunk: full read
                 } else {
-                    Ok(0)          // then EOF
+                    Ok(0) // then EOF
                 }
             },
             |_off, buf| {

@@ -111,7 +111,10 @@ mod tests {
 
         let body = sink.drain_jsonl();
         assert_eq!(sink.len(), 0, "drain empties the buffer");
-        let lines: Vec<_> = body.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+        let lines: Vec<_> = body
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
         assert_eq!(lines.len(), 2);
 
         let r0: DowngradeRecord = serde_json::from_slice(lines[0]).unwrap();
@@ -158,7 +161,10 @@ mod tests {
 
         let body = sink.drain_jsonl();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("\"EARLY_EOF\""), "expected EARLY_EOF tag, got body: {s}");
+        assert!(
+            s.contains("\"EARLY_EOF\""),
+            "expected EARLY_EOF tag, got body: {s}"
+        );
 
         let line = body.split(|&b| b == b'\n').next().unwrap();
         let r: DowngradeRecord = serde_json::from_slice(line).unwrap();

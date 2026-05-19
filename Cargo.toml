@@ -42,7 +42,7 @@ arrow   = { version = "54", default-features = false, features = ["ipc"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "sync", "time", "io-util", "net"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Serde
@@ -73,6 +73,7 @@ toml       = "0.8"
 hostname   = "0.4"
 getrandom  = "0.2"
 futures    = "0.3"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Concurrency primitives (same as nfs-walker)
 crossbeam-channel = "0.5"

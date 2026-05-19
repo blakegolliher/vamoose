@@ -2,6 +2,9 @@
 //! `mig-walker-rewrite` library to convert legacy walker parquet
 //! into the canonical schema. For now invoke that crate's binary
 //! directly.
+//!
+//! The shim accepts either the walker output root (auto-descends
+//! into `scans/<scan_id>/`) or a specific scan subdirectory.
 
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
@@ -22,6 +25,9 @@ pub struct Args {
 pub async fn run(_args: Args, _config_path: Option<PathBuf>) -> anyhow::Result<()> {
     anyhow::bail!(
         "`vamoose rewrite` is not yet implemented. \
-         Invoke `cargo run --release -p mig-walker-rewrite -- ...` directly for now."
+         Invoke `cargo run --release -p mig-walker-rewrite -- \
+         --input <walker-out> --output <canonical-out> --source-root <path>` \
+         directly for now. The shim auto-descends into \
+         `scans/<scan_id>/` when given a walker output root."
     );
 }

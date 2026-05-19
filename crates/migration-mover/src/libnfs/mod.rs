@@ -40,6 +40,7 @@
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 
+pub mod asyncio;
 pub mod ops;
 pub mod pool;
 
@@ -57,6 +58,33 @@ pub struct nfs_context {
 #[repr(C)]
 pub struct nfsfh {
     _private: [u8; 0],
+}
+
+/// libnfs's stat shape. Layout matches `struct nfs_stat_64` in
+/// `/usr/local/include/nfsc/libnfs.h`. Duplicated here (deliberately,
+/// not re-exported from `asyncio/ffi.rs`) so the sync surface can
+/// stand alone — `asyncio/` is gated by the async pre-merge runbook
+/// and we don't want sync edits to drag it in.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct nfs_stat_64 {
+    pub nfs_dev: u64,
+    pub nfs_ino: u64,
+    pub nfs_mode: u64,
+    pub nfs_nlink: u64,
+    pub nfs_uid: u64,
+    pub nfs_gid: u64,
+    pub nfs_rdev: u64,
+    pub nfs_size: u64,
+    pub nfs_blksize: u64,
+    pub nfs_blocks: u64,
+    pub nfs_atime: u64,
+    pub nfs_mtime: u64,
+    pub nfs_ctime: u64,
+    pub nfs_atime_nsec: u64,
+    pub nfs_mtime_nsec: u64,
+    pub nfs_ctime_nsec: u64,
+    pub nfs_used: u64,
 }
 
 // =============================================================================
@@ -123,11 +151,8 @@ extern "C" {
     pub fn nfs_mkdir2(nfs: *mut nfs_context, path: *const c_char, mode: c_int) -> c_int;
 
     // Links
-    pub fn nfs_link(
-        nfs: *mut nfs_context,
-        oldpath: *const c_char,
-        newpath: *const c_char,
-    ) -> c_int;
+    pub fn nfs_link(nfs: *mut nfs_context, oldpath: *const c_char, newpath: *const c_char)
+        -> c_int;
     pub fn nfs_symlink(
         nfs: *mut nfs_context,
         target: *const c_char,
@@ -142,12 +167,7 @@ extern "C" {
 
     // Attributes
     pub fn nfs_chmod(nfs: *mut nfs_context, path: *const c_char, mode: c_int) -> c_int;
-    pub fn nfs_chown(
-        nfs: *mut nfs_context,
-        path: *const c_char,
-        uid: c_int,
-        gid: c_int,
-    ) -> c_int;
+    pub fn nfs_chown(nfs: *mut nfs_context, path: *const c_char, uid: c_int, gid: c_int) -> c_int;
     /// `times` points to an array of two `struct timeval` —
     /// `[atime, mtime]`. Sub-second precision is microseconds; the
     /// nanosecond columns in the index are truncated and the precision
@@ -157,6 +177,21 @@ extern "C" {
         path: *const c_char,
         times: *mut libc::timeval,
     ) -> c_int;
+    /// Symlink-aware utimes — sets atime + mtime on the link itself
+    /// rather than its target. Same `[atime, mtime]` timeval layout as
+    /// `nfs_utimes`; same µs-precision ceiling. libnfs 1.16 has no
+    /// ns-precision (`lutimens`) variant — neither this build nor
+    /// upstream master, see `docs/work-items/MTIME_PARITY_FIX.md`.
+    pub fn nfs_lutimes(
+        nfs: *mut nfs_context,
+        path: *const c_char,
+        times: *mut libc::timeval,
+    ) -> c_int;
+    /// Sync stat — fills in `nfs_stat_64` for `path`. Currently used
+    /// by the end-of-run root-dir mtime restore (see
+    /// `Mover::restore_root_mtime` / orchestrator slice 3) which
+    /// source-stats the migration root once at shutdown.
+    pub fn nfs_stat64(nfs: *mut nfs_context, path: *const c_char, st: *mut nfs_stat_64) -> c_int;
 }
 
 /// Last error string from a context, as a borrowed `&str`.
@@ -254,7 +289,10 @@ pub fn parse_nfs_url(url: &str) -> anyhow::Result<(String, String)> {
     if export == "/" || export.is_empty() {
         // libnfs accepts "/" for some servers but most VAST exports
         // look like "/exportname". Allow but warn.
-        tracing::warn!(url, "nfs URL export path is '/'; this may not be what you meant");
+        tracing::warn!(
+            url,
+            "nfs URL export path is '/'; this may not be what you meant"
+        );
     }
     Ok((server, export))
 }

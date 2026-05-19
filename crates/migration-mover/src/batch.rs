@@ -25,7 +25,10 @@ pub struct BatchBudget {
 
 impl Default for BatchBudget {
     fn default() -> Self {
-        Self { bytes: 8 * 1024 * 1024 * 1024, files: 100_000 }
+        Self {
+            bytes: 8 * 1024 * 1024 * 1024,
+            files: 100_000,
+        }
     }
 }
 
@@ -43,8 +46,7 @@ impl Batch {
         if self.rows.is_empty() {
             return false; // never refuse the first row in an empty batch
         }
-        self.rows.len() as u64 >= budget.files
-            || self.bytes.saturating_add(row.size) > budget.bytes
+        self.rows.len() as u64 >= budget.files || self.bytes.saturating_add(row.size) > budget.bytes
     }
 
     pub fn push(&mut self, row: RowView) {
@@ -65,9 +67,9 @@ impl Batch {
 /// "Byte-budgeted micro-batches".
 #[derive(Debug, Clone, Copy)]
 pub struct InflightProfile {
-    pub small: usize,      // files < 1 MiB
-    pub medium: usize,     // 1 MiB – 1 GiB
-    pub large: usize,      // > 1 GiB
+    pub small: usize,  // files < 1 MiB
+    pub medium: usize, // 1 MiB – 1 GiB
+    pub large: usize,  // > 1 GiB
     pub large_stripe_size: u64,
     pub large_stripe_depth: usize,
 }

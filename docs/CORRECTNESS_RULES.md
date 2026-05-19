@@ -89,6 +89,27 @@ an explicit design change.
   source review proves nothing because the bug is below the source —
   the binary on disk is the diverged artifact.
 
+- **Async libnfs: one service task owns the context.** When using
+  `AsyncNfsContext` (`crates/migration-mover/src/libnfs/asyncio/`),
+  the service task is the only entity that may issue libnfs calls
+  against its context. libnfs contexts are not thread-safe; the
+  service task design relies on serialized issuance. Public API
+  methods always go through the request mpsc — never call any
+  libnfs `*_async` symbol directly from a caller task. Callbacks
+  fire on the service-task thread inside `nfs_service`; their only
+  legal work is `oneshot_tx.send(...)`. Any future change that wants
+  to chain libnfs calls from inside a callback must redesign the
+  service task.
+
+- **Async libnfs: dropping a future does NOT cancel the RPC.** libnfs
+  has no NFSv3 cancel surface. Dropping the returned future drops
+  the oneshot receiver; the RPC continues to completion and the
+  result is silently discarded. Callers that require cancellation
+  semantics (e.g. the multi-pass mover's cutover pass abandoning a
+  slow read) must layer a higher-level cancellation token themselves
+  and decide what to do with the in-flight bytes — they cannot rely
+  on Drop to make the RPC stop.
+
 ## Verification gates
 
 Manual verification against real hardware is a milestone gate. A
@@ -99,6 +120,54 @@ been explicitly waived for that milestone.
 Building a subsequent milestone on top of an unverified milestone
 compounds risk: bugs in the lower layer become harder to attribute
 once the upper layer is in place.
+
+### Pre-merge runbook: async libnfs FFI changes
+
+Any change that touches `crates/migration-mover/src/libnfs/asyncio/`
+— in particular `ffi.rs`, `callbacks.rs`, `driver.rs`, or the
+`AsyncNfsContext` public surface in `mod.rs` — must re-run all three
+async test binaries against var204 before merge. Like the sync FFI
+smoke gate (above), this exists because parameter-order or callback-
+shape mismatches against the linked `.so` produce silent data loss
+that no Rust-level test catches.
+
+The three binaries:
+
+1. `libnfs_async_ffi_smoke` — per-symbol round-trip (pread, write+read,
+   stat/fstat, attr+namespace ops, symlink/readlink).
+2. `libnfs_async_integration` — 64-way concurrent pread no-crosstalk,
+   drop-during-flight survives, `nconnect>1` rejection, NFSv3-only
+   gate.
+3. `libnfs_async_perf_smoke` — ASYNC vs SYNC throughput at single
+   context, 32 × 1 MiB reads. Async must meet or beat sync (see
+   `docs/work-items/LIBNFS_ASYNC_FORK.md` closing note for the
+   2026-05-18 baseline: 352 MB/s ASYNC vs 270 MB/s SYNC).
+
+Invocation (env vars per `reference_verification_env`):
+
+```
+cargo build -p migration-mover --tests --release
+sudo -E target/release/deps/libnfs_async_ffi_smoke-*    --ignored --nocapture
+sudo -E target/release/deps/libnfs_async_integration-*  --ignored --nocapture
+sudo -E target/release/deps/libnfs_async_perf_smoke-*   --ignored --nocapture
+```
+
+**Run the integration binary with the default `--test-threads`
+(parallel) — do not pass `--test-threads=1`.** Parallel execution
+spins up multiple `AsyncNfsContext::mount` calls in the same
+process, which is the only configuration that exercises the libnfs
+mount-time fd-swap path (NFSv3 `nfs_mount_async` walks
+portmap → mountd → portmap → nfsd, disconnecting and reconnecting
+at each step — each transition changes `rpc->fd`). The 2026-05-18
+post-mortem ("async libnfs mount regression" in
+`docs/work-items/LIBNFS_ASYNC_FORK.md`) lost ~half a day because
+the original gate run used `--test-threads=1` and the latent bug
+sat unobserved.
+
+Pass criteria: 5/5 smoke, 4/4 integration **at default
+parallelism**, async ≥ sync on perf. Any regression — including
+the perf binary dropping below the recorded baseline by more than
+~10 % — is a blocker, not a soft signal.
 
 ## Style conventions
 
@@ -113,7 +182,7 @@ once the upper layer is in place.
   desired (e.g. invariant checks).
 
 - **Follow `nfs-walker`'s patterns where the problems overlap**
-  (work-stealing pool, RocksDB-style writer thread, libnfs FFI).
+  (work-stealing pool, sharded parquet writer threads, libnfs FFI).
 
 ## Authoritative source-of-truth files
 

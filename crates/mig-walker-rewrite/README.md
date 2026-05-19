@@ -12,11 +12,22 @@ natively. Do not build long-lived workflows on top of it.
 ## Usage
 
 ```text
+# Walker output root (auto-descends into scans/<scan_id>/):
+mig-walker-rewrite \
+    --input  /path/to/walker-output/ \
+    --output /path/to/canonical-shards/ \
+    --source-root /bgolliher/vamoose-source
+
+# Or point directly at the scan subdirectory:
 mig-walker-rewrite \
     --input  /path/to/walker-output/scans/<scan_id>/ \
     --output /path/to/canonical-shards/ \
     --source-root /bgolliher/vamoose-source
 ```
+
+`--input` accepts either form. If an output root contains more than
+one `scans/<scan_id>/` subdirectory, the shim refuses to guess and
+requires `--input` pointed at a specific scan.
 
 `--source-root` is the export root that the walker scanned. Walker
 emits absolute paths (e.g. `/bgolliher/vamoose-source/m2-verify/file.bin`);

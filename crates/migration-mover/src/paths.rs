@@ -139,10 +139,7 @@ mod tests {
 
     #[test]
     fn rejects_trailing_slash() {
-        assert_eq!(
-            partial_path(b"/foo/", "h", 1).unwrap_err().error,
-            "EISDIR",
-        );
+        assert_eq!(partial_path(b"/foo/", "h", 1).unwrap_err().error, "EISDIR",);
     }
 
     #[test]
@@ -180,10 +177,7 @@ mod tests {
 
     #[test]
     fn cstr_from_bytes_rejects_nul() {
-        assert_eq!(
-            cstr_from_bytes(b"/foo\0bar").unwrap_err().error,
-            "EINVAL",
-        );
+        assert_eq!(cstr_from_bytes(b"/foo\0bar").unwrap_err().error, "EINVAL",);
     }
 
     // -------------------------------------------------------------

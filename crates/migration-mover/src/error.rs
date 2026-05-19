@@ -21,6 +21,9 @@ pub struct MoveError {
 
 impl MoveError {
     pub fn new(phase: FailurePhase, error: impl Into<String>) -> Self {
-        Self { phase, error: error.into() }
+        Self {
+            phase,
+            error: error.into(),
+        }
     }
 }

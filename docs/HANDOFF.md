@@ -37,13 +37,17 @@ Recent commits:
 Branch: `master`. Tests: 100 passing, 1 ignored (the FFI smoke).
 
 Outside git (session state, parent dir):
-- `~/projects/vamoose/m2.rocks` — RocksDB walker output (sudo-owned)
-- `~/projects/vamoose/m2.parquet` — walker parquet (legacy schema)
+- `~/projects/vamoose/m2.parquet` — walker parquet output
+  (`scans/<scan_id>/part-*.parquet`; legacy-schema, pre-canonical)
 - `~/projects/vamoose/m2.canonical` — shim output (canonical schema)
 - `~/projects/vamoose/migration.tar.gz` — pre-git snapshot
 - `~/projects/vamoose/worker.toml` — **DANGEROUS:** still has
   self-overlap dest URL from a previous session; do not use as-is.
   Use `examples/worker.toml` from inside the repo instead.
+
+(Historical: an `m2.rocks` directory used to live here from the
+RocksDB-walker era. Walker is parquet-only now; if you still see one
+of those, it's a stale artifact and can be removed.)
 
 ---
 

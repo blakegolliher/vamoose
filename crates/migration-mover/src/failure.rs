@@ -38,13 +38,7 @@ impl FailureSink {
         }
     }
 
-    pub fn record(
-        &self,
-        row_id: u64,
-        path: &[u8],
-        phase: FailurePhase,
-        error: impl Into<String>,
-    ) {
+    pub fn record(&self, row_id: u64, path: &[u8], phase: FailurePhase, error: impl Into<String>) {
         let mut g = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -104,7 +98,10 @@ mod tests {
 
         let body = sink.drain_jsonl();
         assert_eq!(sink.len(), 0);
-        let lines: Vec<_> = body.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+        let lines: Vec<_> = body
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
         assert_eq!(lines.len(), 2);
 
         let r0: FailureRecord = serde_json::from_slice(lines[0]).unwrap();
