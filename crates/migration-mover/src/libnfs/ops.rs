@@ -14,7 +14,7 @@
 //!
 //! All paths are `&[u8]` because POSIX paths are byte sequences.
 
-use super::{NfsContext, errno_name, last_error, nfsfh};
+use super::{errno_name, last_error, nfsfh, NfsContext};
 use crate::error::MoveError;
 use crate::paths::cstr_from_bytes;
 use migration_core::records::FailurePhase;
@@ -78,11 +78,7 @@ pub fn open_read(ctx: &mut NfsContext, path: &[u8]) -> Result<NfsFh, MoveError> 
 /// Create a new file for writing. `mode` is the initial mode; the
 /// final mode is set by [`chmod`] at end-of-file. M2 callers create
 /// with `0o600` so the in-flight `.partial` is not world-readable.
-pub fn create_write(
-    ctx: &mut NfsContext,
-    path: &[u8],
-    mode: u32,
-) -> Result<NfsFh, MoveError> {
+pub fn create_write(ctx: &mut NfsContext, path: &[u8], mode: u32) -> Result<NfsFh, MoveError> {
     let c = cstr_from_bytes(path)?;
     let mut fh: *mut nfsfh = std::ptr::null_mut();
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
@@ -156,12 +152,7 @@ pub fn chmod(ctx: &mut NfsContext, path: &[u8], mode: u32) -> Result<(), MoveErr
     Ok(())
 }
 
-pub fn chown(
-    ctx: &mut NfsContext,
-    path: &[u8],
-    uid: u32,
-    gid: u32,
-) -> Result<(), MoveError> {
+pub fn chown(ctx: &mut NfsContext, path: &[u8], uid: u32, gid: u32) -> Result<(), MoveError> {
     let c = cstr_from_bytes(path)?;
     let rc = unsafe { super::nfs_chown(ctx.raw(), c.as_ptr(), uid as c_int, gid as c_int) };
     if rc < 0 {
@@ -280,9 +271,9 @@ pub fn mkdir(ctx: &mut NfsContext, path: &[u8], mode: u32) -> Result<(), MoveErr
 /// yet without requiring a pre-pass.
 pub fn mkdir_p_for_file(ctx: &mut NfsContext, file_path: &[u8]) -> Result<(), MoveError> {
     let last_slash = match file_path.iter().rposition(|&b| b == b'/') {
-        Some(0) => return Ok(()),       // file is at root; root always exists
+        Some(0) => return Ok(()), // file is at root; root always exists
         Some(i) => i,
-        None => return Ok(()),          // no parent component
+        None => return Ok(()), // no parent component
     };
     let parent = &file_path[..last_slash];
     if parent.is_empty() {

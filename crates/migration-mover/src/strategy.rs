@@ -151,13 +151,19 @@ mod tests {
     #[test]
     fn symlinks_pick_symlink() {
         let r = row(0, FileTypeTag::Symlink);
-        assert_eq!(pick(&r, &ctx(ServerSideCopy::Off, false)), Strategy::Symlink);
+        assert_eq!(
+            pick(&r, &ctx(ServerSideCopy::Off, false)),
+            Strategy::Symlink
+        );
     }
 
     #[test]
     fn dirs_pick_dir_attrs() {
         let r = row(0, FileTypeTag::Dir);
-        assert_eq!(pick(&r, &ctx(ServerSideCopy::Off, false)), Strategy::DirAttrs);
+        assert_eq!(
+            pick(&r, &ctx(ServerSideCopy::Off, false)),
+            Strategy::DirAttrs
+        );
     }
 
     #[test]
