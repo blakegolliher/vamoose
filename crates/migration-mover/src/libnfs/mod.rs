@@ -60,6 +60,33 @@ pub struct nfsfh {
     _private: [u8; 0],
 }
 
+/// libnfs's stat shape. Layout matches `struct nfs_stat_64` in
+/// `/usr/local/include/nfsc/libnfs.h`. Duplicated here (deliberately,
+/// not re-exported from `asyncio/ffi.rs`) so the sync surface can
+/// stand alone — `asyncio/` is gated by the async pre-merge runbook
+/// and we don't want sync edits to drag it in.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct nfs_stat_64 {
+    pub nfs_dev: u64,
+    pub nfs_ino: u64,
+    pub nfs_mode: u64,
+    pub nfs_nlink: u64,
+    pub nfs_uid: u64,
+    pub nfs_gid: u64,
+    pub nfs_rdev: u64,
+    pub nfs_size: u64,
+    pub nfs_blksize: u64,
+    pub nfs_blocks: u64,
+    pub nfs_atime: u64,
+    pub nfs_mtime: u64,
+    pub nfs_ctime: u64,
+    pub nfs_atime_nsec: u64,
+    pub nfs_mtime_nsec: u64,
+    pub nfs_ctime_nsec: u64,
+    pub nfs_used: u64,
+}
+
 // =============================================================================
 // Bindings the mover needs.
 // =============================================================================
@@ -160,6 +187,11 @@ extern "C" {
         path: *const c_char,
         times: *mut libc::timeval,
     ) -> c_int;
+    /// Sync stat — fills in `nfs_stat_64` for `path`. Currently used
+    /// by the end-of-run root-dir mtime restore (see
+    /// `Mover::restore_root_mtime` / orchestrator slice 3) which
+    /// source-stats the migration root once at shutdown.
+    pub fn nfs_stat64(nfs: *mut nfs_context, path: *const c_char, st: *mut nfs_stat_64) -> c_int;
 }
 
 /// Last error string from a context, as a borrowed `&str`.

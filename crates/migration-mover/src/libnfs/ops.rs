@@ -14,7 +14,7 @@
 //!
 //! All paths are `&[u8]` because POSIX paths are byte sequences.
 
-use super::{errno_name, last_error, nfsfh, NfsContext};
+use super::{errno_name, last_error, nfs_stat_64, nfsfh, NfsContext};
 use crate::error::MoveError;
 use crate::paths::cstr_from_bytes;
 use migration_core::records::FailurePhase;
@@ -216,6 +216,25 @@ fn build_timeval_pair(
             tv_usec: (mtime_nsec / 1_000) as libc::suseconds_t,
         },
     ]
+}
+
+/// Stat a path (follows symlinks). Returns the (atime_sec, atime_nsec,
+/// mtime_sec, mtime_nsec) tuple — that's the only subset
+/// `restore_root_mtime` needs. If a more general consumer arrives,
+/// promote this to return the full `nfs_stat_64`.
+pub fn stat_times(ctx: &mut NfsContext, path: &[u8]) -> Result<(i64, i32, i64, i32), MoveError> {
+    let c = cstr_from_bytes(path)?;
+    let mut st: nfs_stat_64 = nfs_stat_64::default();
+    let rc = unsafe { super::nfs_stat64(ctx.raw(), c.as_ptr(), &mut st as *mut _) };
+    if rc < 0 {
+        return Err(err_from_rc(ctx, rc, FailurePhase::Setattr));
+    }
+    Ok((
+        st.nfs_atime as i64,
+        st.nfs_atime_nsec as i32,
+        st.nfs_mtime as i64,
+        st.nfs_mtime_nsec as i32,
+    ))
 }
 
 pub fn rename(ctx: &mut NfsContext, old: &[u8], new: &[u8]) -> Result<(), MoveError> {

@@ -109,6 +109,9 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     let pool_size = cfg.mover.nfs_connections.max(1) as usize;
     let pool: Arc<dyn LibnfsContextPool> =
         MultiPool::build(&manifest.source.url, &manifest.dest.url, pool_size)?;
+    // Keep a clone for the end-of-run root-mtime restore (slice 3 of
+    // MTIME_PARITY_FIX). `pool` itself is moved into Mover::new below.
+    let pool_for_root_mtime = Arc::clone(&pool);
     tracing::info!(
         pool_size,
         src = %manifest.source.url,
@@ -245,6 +248,36 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         let scan = scan_shards(&s3, &manifest, lease).await?;
         if scan.all_terminal {
             tracing::info!("all shards terminal; worker exiting");
+            // Slice 3 of MTIME_PARITY_FIX: walker doesn't emit a row
+            // for the migration root, so the per-shard DirAttrs path
+            // never touches `dest.root` — yet every file commit inside
+            // it bumps its mtime. Source-stat the root once at
+            // shutdown and apply the captured (atime, mtime) to the
+            // dest. Idempotent across workers because the value comes
+            // from source. Failures are warnings, not fatal — the
+            // bytes are already durable.
+            let src_root_bytes = manifest.source.root.as_bytes().to_vec();
+            let dst_root_bytes = manifest.dest.root.as_bytes().to_vec();
+            if let Err(e) = migration_mover::restore_root_mtime(
+                Arc::clone(&pool_for_root_mtime),
+                &src_root_bytes,
+                &dst_root_bytes,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = ?e,
+                    src_root = %manifest.source.root,
+                    dst_root = %manifest.dest.root,
+                    "end-of-run root-dir mtime restore failed (non-fatal)",
+                );
+            } else {
+                tracing::info!(
+                    src_root = %manifest.source.root,
+                    dst_root = %manifest.dest.root,
+                    "end-of-run root-dir mtime restored",
+                );
+            }
             break;
         }
         let Some(target) = scan.next_target else {

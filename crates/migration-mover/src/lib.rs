@@ -27,6 +27,7 @@ pub mod file_mover;
 pub mod libnfs;
 pub mod paths;
 pub mod pipelined_copy;
+pub mod root_mtime;
 pub mod strategy;
 pub mod uring;
 
@@ -42,3 +43,4 @@ pub use libnfs::{ContextPair, LibnfsContextPool, MultiPool, NfsContext, SimplePo
 pub use mover::{MoveOutcome, Mover, MoverConfig};
 pub use paths::join_root;
 pub use pipelined_copy::{pipelined_copy, FileCopyResult};
+pub use root_mtime::restore_root_mtime;
