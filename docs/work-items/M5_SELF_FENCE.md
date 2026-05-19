@@ -212,12 +212,13 @@ Required environment:
   (b) read back the dest tree for SHA-256 verification. The worker
   itself uses libnfs on `*_NFS_URL`; the kernel mounts exist only
   for the harness's own driving and reading.
-- `NFS_WALKER` — path to a walker binary that supports the
-  `export-parquet` subcommand. Default detection prefers
+- `NFS_WALKER` — path to a post-RocksDB-removal walker binary
+  (single-step direct parquet output: `nfs-walker <url> -o <out>.parquet`).
+  Default detection prefers
   `~/projects/nfs-walker/target/release/nfs-walker`; the older
   `~/projects/nfs-walker/build/nfs-walker` symlink is stale and
-  lacks `export-parquet`, so the harness only falls back to it if
-  `target/release` is missing entirely.
+  ships the obsolete `export-parquet` subcommand, so the harness only
+  falls back to it if `target/release` is missing entirely.
 
 ## Layout
 

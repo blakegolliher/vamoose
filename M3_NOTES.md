@@ -2,6 +2,15 @@
 
 What M3 actually delivered, what it intentionally deferred, and why.
 
+> Historical note (post-2026-05-15): the nfs-walker has since been
+> rewritten to drop RocksDB and SQLite entirely; the only output
+> backend is sharded Parquet written direct. References below to a
+> walker RocksDB intermediate or to `nfs-walker convert` describe the
+> data flow as it existed during M3 sign-off and are preserved for
+> historical accuracy. The "Stale binary caveat" sub-section is
+> obsolete: walker's parquet writer is now the canonical path, not
+> an experimental [[bin]] orphan.
+
 ## What M3 ships
 
 - **Multi-context libnfs pool** (`MultiPool`). Pre-mounts

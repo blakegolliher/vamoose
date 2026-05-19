@@ -46,13 +46,12 @@ correctness:
 ## High-level architecture
 
 ```
-   ┌───────────────────┐
-   │  nfs-walker scan  │   (pre-existing, libnfs-based)
-   │   → RocksDB       │
-   │   → Parquet shards│
-   └─────────┬─────────┘
-             │  upload (one-shot, immutable)
-             ▼
+   ┌─────────────────────────────────┐
+   │  nfs-walker scan                │   (pre-existing, libnfs-based)
+   │   → sharded Parquet, direct     │   scans/<scan_id>/part-rNN-SSSSS.parquet
+   └─────────────┬───────────────────┘
+                 │  upload (one-shot, immutable)
+                 ▼
    ┌──────────────────────────────────────────────┐
    │  VAST S3 bucket: migration-run-<id>/         │
    │  ├── manifest.json                           │
@@ -95,8 +94,10 @@ correctness:
 
 ### 1. Index (input, immutable)
 
-Pre-built by `nfs-walker` (existing, libnfs-based) → RocksDB → Parquet.
-Sharded into ~hundreds of parquet files, ~GB each, ~5–6 B rows total.
+Pre-built by `nfs-walker` (existing, libnfs-based), writing sharded
+Parquet directly. Output layout is
+`scans/<scan_id>/part-rNN-SSSSS.parquet` + a `metadata.json`. Sharded
+into ~hundreds of parquet files, ~GB each, ~5–6 B rows total.
 
 **Required schema** (columns the mover relies on):
 
