@@ -33,7 +33,11 @@ use std::sync::Arc;
     about = "Translate nfs-walker parquet shards to the canonical migration schema."
 )]
 struct Cli {
-    /// Directory containing walker parquet shards.
+    /// Walker parquet location. Accepts either:
+    ///   - the walker output root (contains `scans/<scan_id>/`), or
+    ///   - a `scans/<scan_id>/` directory containing part files directly.
+    /// Pre-RocksDB-removal walker layouts (flat directory of part files)
+    /// are also accepted for backwards compat.
     #[arg(short = 'i', long)]
     input: PathBuf,
 
@@ -67,8 +71,16 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let mut inputs: Vec<PathBuf> = std::fs::read_dir(&args.input)
-        .with_context(|| format!("reading input dir {}", args.input.display()))?
+    let scan_dir = resolve_scan_dir(&args.input)?;
+    if scan_dir != args.input {
+        tracing::info!(
+            input = %args.input.display(),
+            scan_dir = %scan_dir.display(),
+            "resolved walker scan directory under scans/<scan_id>/",
+        );
+    }
+    let mut inputs: Vec<PathBuf> = std::fs::read_dir(&scan_dir)
+        .with_context(|| format!("reading scan dir {}", scan_dir.display()))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("parquet"))
@@ -76,7 +88,7 @@ fn main() -> Result<()> {
     inputs.sort();
 
     if inputs.is_empty() {
-        bail!("no parquet files found in {}", args.input.display());
+        bail!("no parquet files found in {}", scan_dir.display());
     }
 
     std::fs::create_dir_all(&args.output)
@@ -107,6 +119,66 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Walker layout discovery
+// =============================================================================
+
+/// Resolve `--input` to the directory that actually contains the part
+/// files. The post-RocksDB-removal walker writes
+/// `<output>/scans/<scan_id>/part-rNN-SSSSS.parquet`, so callers can
+/// pass either the output root or the scan directory itself. Older
+/// flat layouts (part files directly under the input directory) are
+/// also accepted unchanged.
+fn resolve_scan_dir(input: &Path) -> Result<PathBuf> {
+    if !input.is_dir() {
+        bail!("input is not a directory: {}", input.display());
+    }
+    // If the input already contains part files, use it as-is.
+    if dir_has_parquet(input)? {
+        return Ok(input.to_path_buf());
+    }
+    // Walker output root: contains a `scans/` subdir with one or more
+    // scan_id directories under it.
+    let scans_root = input.join("scans");
+    if scans_root.is_dir() {
+        let scan_dirs: Vec<PathBuf> = std::fs::read_dir(&scans_root)
+            .with_context(|| format!("reading {}", scans_root.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        match scan_dirs.len() {
+            0 => bail!(
+                "walker output at {} has scans/ but no scan_id subdirs",
+                input.display(),
+            ),
+            1 => return Ok(scan_dirs.into_iter().next().unwrap()),
+            n => bail!(
+                "walker output at {} has {n} scan_id subdirs under scans/; \
+                 pass --input pointed at the specific scan directory instead",
+                input.display(),
+            ),
+        }
+    }
+    bail!(
+        "no parquet files found at {} and no scans/<scan_id>/ subdir present",
+        input.display(),
+    )
+}
+
+fn dir_has_parquet(dir: &Path) -> Result<bool> {
+    for e in std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .flatten()
+    {
+        let p = e.path();
+        if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("parquet") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // =============================================================================
@@ -648,6 +720,68 @@ mod tests {
             strip_source_root(b"/src-test/foo", sr).unwrap(),
             b"/foo".to_vec(),
         );
+    }
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn resolve_scan_dir_accepts_flat_layout() {
+        // Pre-RocksDB-removal walker layout: part files sit directly under input.
+        let work = tempdir("flat");
+        touch(&work.join("part-r00-00000.parquet"));
+        let resolved = resolve_scan_dir(&work).expect("flat layout");
+        assert_eq!(resolved, work);
+    }
+
+    #[test]
+    fn resolve_scan_dir_descends_into_scans_scan_id() {
+        // Post-RocksDB-removal walker writes scans/<scan_id>/part-*.parquet.
+        let work = tempdir("nested");
+        let scan_id = "11111111-2222-3333-4444-555555555555";
+        let scan_dir = work.join("scans").join(scan_id);
+        touch(&scan_dir.join("part-r00-00000.parquet"));
+        std::fs::write(scan_dir.join("metadata.json"), b"{}").unwrap();
+        let resolved = resolve_scan_dir(&work).expect("nested layout");
+        assert_eq!(resolved, scan_dir);
+    }
+
+    #[test]
+    fn resolve_scan_dir_accepts_scan_dir_directly() {
+        // Passing the inner `scans/<scan_id>/` directly should also work,
+        // because it satisfies the dir-has-parquet short-circuit.
+        let work = tempdir("inner");
+        let scan_id = "deadbeef-dead-beef-dead-beefdeadbeef";
+        let scan_dir = work.join("scans").join(scan_id);
+        touch(&scan_dir.join("part-r00-00000.parquet"));
+        let resolved = resolve_scan_dir(&scan_dir).expect("scan_dir directly");
+        assert_eq!(resolved, scan_dir);
+    }
+
+    #[test]
+    fn resolve_scan_dir_rejects_multiple_scans() {
+        // Pointing at an output root that accumulated multiple scan_ids
+        // is ambiguous — the harness must point at the specific one.
+        let work = tempdir("multi");
+        for scan_id in ["aaaa-1", "bbbb-2"] {
+            let scan_dir = work.join("scans").join(scan_id);
+            touch(&scan_dir.join("part-r00-00000.parquet"));
+        }
+        let err = resolve_scan_dir(&work).expect_err("multi-scan must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("2 scan_id subdirs"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_scan_dir_rejects_empty_input() {
+        let work = tempdir("empty");
+        let err = resolve_scan_dir(&work).expect_err("empty must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no parquet files found"), "{msg}");
     }
 
     #[test]
