@@ -49,12 +49,13 @@ Required env:
                        the dest writes.
 
 Optional env:
-  NFS_WALKER           Path to nfs-walker binary. MUST support the
-                       export-parquet subcommand. Default detection
-                       prefers \$HOME/projects/nfs-walker/target/release/nfs-walker
+  NFS_WALKER           Path to nfs-walker binary. MUST support direct
+                       parquet output (post-RocksDB-removal walker;
+                       \`nfs-walker <url> -o <out>.parquet\`). Default
+                       detection prefers
+                       \$HOME/projects/nfs-walker/target/release/nfs-walker
                        and falls back to \$HOME/projects/nfs-walker/build/nfs-walker
-                       only if target/release is missing. The build/ symlink
-                       on this host is stale and lacks export-parquet.
+                       only if target/release is missing.
   MIG_WALKER_REWRITE   Path to mig-walker-rewrite (default: cargo run --release).
   VAMOOSE_BIN          Path to unified vamoose binary (default: target/release/vamoose).
                        Invoked as 'vamoose worker --config <path>'. The worker
@@ -63,10 +64,18 @@ Optional env:
   AWS_S3_FLAGS         Extra args for aws s3 / aws s3api (e.g. --no-verify-ssl).
 
 Host requirements:
-  Passwordless sudo. The harness runs the worker via 'sudo -n' because
-  libnfs mounts of the source export return EACCES under unprivileged
-  users (matches the M2/M3 MANUAL_VERIFY.md flow). The harness fails
-  fast in Phase 0 if 'sudo -n true' is not allowed.
+  Run as root. libnfs mounts of the source export return EACCES under
+  unprivileged users (matches the M2/M3 MANUAL_VERIFY.md flow). The
+  harness also requires passwordless sudo for the in-script 'sudo -n'
+  signal-delivery path; it fails fast in Phase 0 if that isn't usable.
+
+Invocation:
+  sudo -E bash $0 [options]
+
+  The script auto-recovers HOME and PATH from \$SUDO_USER so AWS
+  credentials at ~/.aws/credentials and pipx-installed 'aws' on
+  ~/.local/bin remain discoverable. No need to thread HOME=\$HOME
+  PATH=\$PATH manually.
 EOF
 }
 
@@ -80,6 +89,38 @@ while [[ $# -gt 0 ]]; do
         *)                  echo "unknown arg: $1" >&2; usage; exit 2;;
     esac
 done
+
+# -----------------------------------------------------------------------------
+# Bootstrap — tolerate sudo's HOME/PATH stripping.
+#
+# libnfs requires UID 0, but sudo's defaults clobber HOME (→ /root) and PATH
+# (→ secure_path) even with -E, which breaks AWS credential lookup and tool
+# discovery respectively. Rebuild both from $SUDO_USER so a bare
+# `sudo -E bash <script>` just works.
+# -----------------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    echo "FAIL: this harness must run as root (libnfs needs UID 0)." >&2
+    echo "Re-run with: sudo -E bash $0 $*" >&2
+    exit 2
+fi
+
+if [[ -n "${SUDO_USER:-}" ]]; then
+    invoker_home="$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)"
+    if [[ -n "${invoker_home}" && -d "${invoker_home}" ]]; then
+        if [[ "${HOME}" != "${invoker_home}" ]]; then
+            export HOME="${invoker_home}"
+        fi
+        if ! command -v aws >/dev/null 2>&1 && [[ -x "${invoker_home}/.local/bin/aws" ]]; then
+            export PATH="${invoker_home}/.local/bin:${PATH}"
+        fi
+    fi
+fi
+
+if ! command -v aws >/dev/null 2>&1; then
+    echo "FAIL: aws CLI not found on PATH (PATH=${PATH})." >&2
+    echo "Install it under root's PATH or expose it via SUDO_USER's ~/.local/bin." >&2
+    exit 2
+fi
 
 : "${AWS_PROFILE:?AWS_PROFILE is required}"
 : "${VAMOOSE_BUCKET:?VAMOOSE_BUCKET is required}"
@@ -108,10 +149,9 @@ ASSERT_LOG="${RUN_DIR}/assertions.log"
 A_HOST="m5-host-A"
 B_HOST="m5-host-B"
 
-# Walker default detection. The fresh walker with the export-parquet
-# subcommand is at target/release/. The build/ symlink on this host
-# is stale (April 26) and lacks export-parquet — only fall back to it
-# if target/release is missing entirely.
+# Walker default detection. We require the post-RocksDB-removal walker
+# (single-step direct parquet output). target/release is preferred; the
+# build/ symlink is only used if target/release is missing.
 if [[ -z "${NFS_WALKER:-}" ]]; then
     if [[ -x "${HOME}/projects/nfs-walker/target/release/nfs-walker" ]]; then
         NFS_WALKER="${HOME}/projects/nfs-walker/target/release/nfs-walker"
@@ -124,15 +164,14 @@ fi
 if ! command -v "${NFS_WALKER}" >/dev/null 2>&1 && [[ ! -x "${NFS_WALKER}" ]]; then
     fail "nfs-walker not found at ${NFS_WALKER}; set NFS_WALKER or build it."
 fi
-# Use 'help <subcmd>' rather than '<subcmd> --help' because clap's
-# --help handler wins over unknown-subcommand errors when the
-# subcommand is actually parsed as the positional NFS_URL argument.
-# 'help export-parquet' returns non-zero on stale binaries that lack
-# the subcommand, which is what we actually want to detect.
-if ! "${NFS_WALKER}" help export-parquet >/dev/null 2>&1; then
-    fail "${NFS_WALKER} does not support the export-parquet subcommand. \
-The build/ symlink in ~/projects/nfs-walker is stale; rebuild and use target/release/nfs-walker, \
-or point NFS_WALKER at a binary built from a recent walker checkout."
+# Stale-walker check: the post-removal walker rejects `help export-parquet`
+# because that subcommand no longer exists. Conversely, presence of any
+# `export-parquet`/`stats --live`/etc. hint in --help means a pre-removal
+# binary that still wants a two-step rocks workflow. Reject either way.
+if "${NFS_WALKER}" help export-parquet >/dev/null 2>&1; then
+    fail "${NFS_WALKER} still ships the export-parquet subcommand; this harness now \
+requires the post-RocksDB-removal walker (nfs-walker <url> -o <out>.parquet). \
+Rebuild from a current nfs-walker checkout."
 fi
 VAMOOSE_BIN="${VAMOOSE_BIN:-${REPO_ROOT}/target/release/vamoose}"
 MIG_WALKER_REWRITE_BIN="${MIG_WALKER_REWRITE:-}"
@@ -321,58 +360,50 @@ if [[ "${ACTUAL_FILES}" -ne "${FILES}" ]]; then
 fi
 log "source tree built: ${ACTUAL_FILES} files at ${SRC_TREE_HOST}"
 
-# Walker scan → export-parquet → mig-walker-rewrite → canonical single
-# shard. Walker is two-step: scan writes RocksDB, export-parquet
-# converts the rocks dir into a directory of parquet files (split at
-# --file-size-mb, default 256 MB; for our 4 MiB test exactly one file
-# results).
-SCAN_ROCKS="${RUN_DIR}/scan.rocks"
+# Walker scan → mig-walker-rewrite → canonical single shard.
+# Walker is single-step: writes sharded parquet under
+# <output>/scans/<scan_id>/part-rNN-SSSSS.parquet + metadata.json. At
+# 1000 × 4 KiB our test tree fits well under the part-file rotation
+# threshold (--parquet-file-size-mb, default 512), so the default
+# 32-shard layout produces a small handful of part files; we still
+# require exactly one .parquet on disk to keep the M5 "single-shard
+# manifest" invariant, so the harness pins --writer-shards=1.
 LEGACY_PARQUET_DIR="${RUN_DIR}/legacy.parquet"
 CANON_OUT="${RUN_DIR}/canonical"
 WALKER_LOG="${RUN_DIR}/walker.log"
 : > "${WALKER_LOG}"
-# LEGACY_PARQUET_DIR and CANON_OUT must NOT exist yet — exporters /
-# shim refuse to clobber non-empty dirs.
+# LEGACY_PARQUET_DIR and CANON_OUT must NOT exist yet — walker / shim
+# refuse to clobber non-empty dirs.
 
-# Step 1: scan source NFS into RocksDB.
-# sudo because m2.rocks under ~/projects/vamoose is root-owned per the
-# established M2/M3 cookbook; the new scan dir inherits the same shape.
-log "scan: ${NFS_WALKER} ${VAMOOSE_SRC_NFS_URL}${VAMOOSE_SRC_ROOT} → ${SCAN_ROCKS}"
+# sudo because the source export is mounted with squash semantics and
+# libnfs reads under the unprivileged user return EACCES (matches the
+# M2/M3 cookbook). --no-log keeps the run dir free of the sidecar
+# progress logfile; --writer-shards=1 enforces single-shard
+# output so the downstream manifest invariant holds without extra
+# plumbing.
+log "scan: ${NFS_WALKER} ${VAMOOSE_SRC_NFS_URL}${VAMOOSE_SRC_ROOT} → ${LEGACY_PARQUET_DIR}"
 {
     echo "===== scan ====="
     if ! sudo "${NFS_WALKER}" "${VAMOOSE_SRC_NFS_URL}${VAMOOSE_SRC_ROOT}" \
-            -o "${SCAN_ROCKS}" -w 16 -v 2>&1; then
+            -o "${LEGACY_PARQUET_DIR}" \
+            -w 16 -v \
+            --writer-shards 1 \
+            --no-log 2>&1; then
         echo "===== scan failed ====="
         cat "${WALKER_LOG}" >&2 || true
         fail "nfs-walker scan failed; see ${WALKER_LOG}"
     fi
 } >> "${WALKER_LOG}" 2>&1
 
-# Step 2: export RocksDB to legacy parquet directory. Walker's CLI:
-#   nfs-walker export-parquet [OPTIONS] <INPUT> <OUTPUT_DIR>
-# At 1000 × 4 KiB the 256 MB default split keeps it to one file.
-# --parallelism 1 is the documented default; passing it explicitly
-# avoids the file-descriptor bump warning.
-log "export-parquet: ${SCAN_ROCKS} → ${LEGACY_PARQUET_DIR}/"
-{
-    echo "===== export-parquet ====="
-    if ! "${NFS_WALKER}" export-parquet \
-            --parallelism 1 \
-            "${SCAN_ROCKS}" "${LEGACY_PARQUET_DIR}" 2>&1; then
-        echo "===== export-parquet failed ====="
-        cat "${WALKER_LOG}" >&2 || true
-        fail "nfs-walker export-parquet failed; see ${WALKER_LOG}"
-    fi
-} >> "${WALKER_LOG}" 2>&1
-
-# export-parquet emits a directory; require exactly one .parquet file
-# in it so the downstream "single-shard manifest" invariant is met
-# without further plumbing.
+# Walker writes scans/<scan_id>/part-rNN-SSSSS.parquet under the output
+# dir. With --writer-shards=1 and the test-size tree that's
+# exactly one part-r00-00000.parquet (plus metadata.json, which the shim
+# ignores by extension filter).
 shopt -s globstar nullglob
 legacy_files=( "${LEGACY_PARQUET_DIR}"/**/*.parquet )
 shopt -u globstar nullglob
 if [[ "${#legacy_files[@]}" -ne 1 ]]; then
-    fail "M5 requires single-shard manifest; export-parquet produced ${#legacy_files[@]} files in ${LEGACY_PARQUET_DIR} (expected 1). Reduce --files or raise walker --file-size-mb."
+    fail "M5 requires single-shard manifest; walker produced ${#legacy_files[@]} files in ${LEGACY_PARQUET_DIR} (expected 1). Pin --writer-shards=1 (already set) and reduce --files if the part-file rotation threshold is being hit."
 fi
 WALK_PARQUET_DIR="$(dirname "${legacy_files[0]}")"
 log "walker parquet at ${WALK_PARQUET_DIR} (1 file)"
@@ -559,7 +590,7 @@ WORKER_RUST_LOG="info,migration_worker=info,migration_mover=debug"
   HOME="${HOME}" \
   RUST_LOG="${WORKER_RUST_LOG}" \
   AWS_PROFILE="${AWS_PROFILE}" \
-  exec setsid sudo -n -E "${VAMOOSE_BIN}" worker --config "${A_TOML}" >"${A_OUT}" 2>"${A_ERR}" ) &
+  exec setsid sudo -n -E "${VAMOOSE_BIN}" worker --config "${A_TOML}" --use-bucketed-pool >"${A_OUT}" 2>"${A_ERR}" ) &
 A_LAUNCHER_PID=$!
 # sudo on this host uses a launcher → monitor → vamoose chain, where
 # both launcher and monitor have comm=sudo. pgrep -P launcher_pid -x
@@ -641,7 +672,7 @@ log "launching worker B"
   HOME="${HOME}" \
   RUST_LOG="${WORKER_RUST_LOG}" \
   AWS_PROFILE="${AWS_PROFILE}" \
-  exec setsid sudo -n -E "${VAMOOSE_BIN}" worker --config "${B_TOML}" >"${B_OUT}" 2>"${B_ERR}" ) &
+  exec setsid sudo -n -E "${VAMOOSE_BIN}" worker --config "${B_TOML}" --use-bucketed-pool >"${B_OUT}" 2>"${B_ERR}" ) &
 B_LAUNCHER_PID=$!
 # Same cmdline-disambiguation as A; see comment at A_LAUNCHER_PID.
 B_PID=""
