@@ -203,6 +203,19 @@ impl AsyncBucketedFileMover {
             )
         })?;
 
+        // Post-commit observability. Outside the R8 critical section —
+        // the rename has already published the file. Matches the sync
+        // mover's `commit: rename` line so M5/M5-partition harnesses
+        // (which poll worker stdout for that string) work unchanged
+        // against the bucketed-async path.
+        tracing::debug!(
+            dest = %String::from_utf8_lossy(&dst),
+            host = %self.host_id,
+            pid = self.pid,
+            row_id = row.row_id,
+            "commit: rename .partial → final",
+        );
+
         Ok(copy.bytes_copied)
     }
 
