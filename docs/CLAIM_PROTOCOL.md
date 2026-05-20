@@ -105,6 +105,26 @@ Terminal-state writes use delete-then-create rather than overwrite so
 they share the same S3 semantics as reclaim, which simplifies
 reasoning. The completed claim has a stable etag forever after.
 
+### `fail(shard, held_etag, host, epoch)`
+
+Identical S3 shape to `complete`, but writes `state=Failed`. Called
+from the orchestrator when `processor.process()` returns an error
+that would re-occur for any worker reclaiming the shard — corrupt
+parquet, malformed row schema, anything shard-fatal as opposed to
+worker-fatal. Distinct from `complete` so scanners can tell
+"finished cleanly" from "couldn't be processed."
+
+```
+DELETE If-Match: held_etag      →  Deleted | EtagMismatch | NotFound
+PUT If-None-Match: *            →  Failed { etag } | Lost (412)
+```
+
+Without `fail`, an unrecoverable shard would loop forever through
+the fleet: worker A bails on corrupt parquet → lease expires →
+worker B reclaims → also bails → repeat. `Failed` is terminal for
+the scanner, so the loop terminates and an operator can see the
+record and intervene.
+
 ---
 
 ## State machine

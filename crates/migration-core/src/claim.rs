@@ -50,7 +50,10 @@ pub enum AcquireOutcome {
     Acquired { etag: String, record: ClaimRecord },
     /// Another worker holds the claim. The reader can inspect
     /// `existing` to decide whether to wait or attempt a stale-reclaim.
-    Contended { existing_etag: String, existing: ClaimRecord },
+    Contended {
+        existing_etag: String,
+        existing: ClaimRecord,
+    },
 }
 
 /// Outcome of a heartbeat refresh (HEAD-and-compare in v2).
@@ -87,6 +90,23 @@ pub enum CompleteOutcome {
     /// in either case another worker took over. The fence should
     /// already be tripping via the heartbeat detection path; complete
     /// returns `Lost` so the caller can drop the held claim cleanly.
+    Lost,
+}
+
+/// Outcome of a `fail` attempt. Mirrors `CompleteOutcome` — used to
+/// mark a shard's claim as terminal-`Failed` when the shard cannot
+/// be processed at all (e.g. corrupt parquet that won't decode).
+/// Another worker reclaiming the shard would just re-encounter the
+/// same error, so we want scanners to skip it and an operator to
+/// intervene.
+#[derive(Debug)]
+pub enum FailOutcome {
+    /// Failed record written; the shard is now in terminal state.
+    Failed { etag: String },
+    /// Either the DELETE didn't see our etag, or the PUT collided —
+    /// another worker took over before we could mark Failed. Caller
+    /// drops the held claim cleanly; the new owner will discover the
+    /// same shard-fatal error and (eventually) mark it Failed itself.
     Lost,
 }
 
@@ -179,14 +199,16 @@ pub async fn try_acquire(
         Ok(etag) => Ok(AcquireOutcome::Acquired { etag, record }),
         Err(Error::PreconditionFailed) => {
             // Read the contended claim so the caller can decide.
-            let (existing_body, existing_etag) = store
-                .get(&key)
-                .await?
-                .ok_or_else(|| Error::Other(anyhow::anyhow!(
+            let (existing_body, existing_etag) = store.get(&key).await?.ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
                     "412 on PUT but GET returned None for {key}"
-                )))?;
+                ))
+            })?;
             let existing: ClaimRecord = serde_json::from_slice(&existing_body)?;
-            Ok(AcquireOutcome::Contended { existing_etag, existing })
+            Ok(AcquireOutcome::Contended {
+                existing_etag,
+                existing,
+            })
         }
         Err(e) => Err(e),
     }
@@ -207,9 +229,9 @@ pub async fn refresh(
 ) -> Result<RefreshOutcome> {
     let key = crate::layout::claim_key(shard_filename);
     match store.head_object(&key).await? {
-        Some((etag, _body)) if etag == held_etag => {
-            Ok(RefreshOutcome::StillHeld { etag: held_etag.to_string() })
-        }
+        Some((etag, _body)) if etag == held_etag => Ok(RefreshOutcome::StillHeld {
+            etag: held_etag.to_string(),
+        }),
         _ => Ok(RefreshOutcome::Lost),
     }
 }
@@ -293,6 +315,49 @@ pub async fn complete(
     match store.put_if_absent(&key, body).await {
         Ok(etag) => Ok(CompleteOutcome::Completed { etag }),
         Err(Error::PreconditionFailed) => Ok(CompleteOutcome::Lost),
+        Err(e) => Err(e),
+    }
+}
+
+/// Mark a shard `Failed` via delete-then-create.
+///
+/// Identical shape to `complete` but writes `ClaimState::Failed`.
+/// Called by the orchestrator when a shard is shard-fatal — i.e.
+/// the error would re-occur for any worker that reclaimed and
+/// retried (corrupt parquet, malformed row schema). Marking
+/// `Failed` keeps scanners from picking the shard up again; the
+/// operator needs to intervene.
+///
+/// Distinct from `complete` so the on-disk state distinguishes
+/// "this shard finished cleanly" from "this shard couldn't be
+/// processed." Both are terminal for the scanner.
+pub async fn fail(
+    store: &dyn ClaimStore,
+    shard_filename: &str,
+    held_etag: &str,
+    host: &str,
+    epoch: u64,
+) -> Result<FailOutcome> {
+    let key = crate::layout::claim_key(shard_filename);
+
+    match store.delete_if_match(&key, held_etag).await? {
+        DeleteOutcome::Deleted => {}
+        DeleteOutcome::EtagMismatch | DeleteOutcome::NotFound => {
+            return Ok(FailOutcome::Lost);
+        }
+    }
+
+    let record = ClaimRecord {
+        host: host.to_string(),
+        claimed_utc: UtcTime::now(),
+        epoch,
+        state: ClaimState::Failed,
+    };
+    let body = serde_json::to_vec(&record)?;
+
+    match store.put_if_absent(&key, body).await {
+        Ok(etag) => Ok(FailOutcome::Failed { etag }),
+        Err(Error::PreconditionFailed) => Ok(FailOutcome::Lost),
         Err(e) => Err(e),
     }
 }
@@ -418,8 +483,10 @@ mod tests {
         let r_b = try_acquire(&s, SHARD, "host-B").await.unwrap();
 
         match (r_a, r_b) {
-            (AcquireOutcome::Acquired { record: ra, .. },
-             AcquireOutcome::Contended { existing, .. }) => {
+            (
+                AcquireOutcome::Acquired { record: ra, .. },
+                AcquireOutcome::Contended { existing, .. },
+            ) => {
                 assert_eq!(ra.host, "host-A");
                 assert_eq!(existing.host, "host-A");
             }
@@ -448,7 +515,10 @@ mod tests {
         // claimed_utc field.
         let now = chrono::Utc::now();
         let age = now.signed_duration_since(r.claimed_utc.0).num_seconds();
-        assert!(age < 60, "fresh claim should be within typical lease window (age={age}s)");
+        assert!(
+            age < 60,
+            "fresh claim should be within typical lease window (age={age}s)"
+        );
     }
 
     /// Scenario 3: owner stalled, reclaimer wins via delete-then-create;
@@ -459,7 +529,9 @@ mod tests {
         let s = FakeStore::new();
         let AcquireOutcome::Acquired { etag: a_etag, .. } =
             try_acquire(&s, SHARD, "host-A").await.unwrap()
-        else { panic!("acquire should succeed") };
+        else {
+            panic!("acquire should succeed")
+        };
 
         // host-B HEADs to observe the current claim (records its etag).
         let key = layout::claim_key(SHARD);
@@ -468,7 +540,9 @@ mod tests {
 
         // host-B reclaims with the observed etag — wins the delete race
         // (A hasn't moved) and the create race (no concurrent reclaimer).
-        let won = reclaim(&s, SHARD, &observed_etag, "host-B", 2).await.unwrap();
+        let won = reclaim(&s, SHARD, &observed_etag, "host-B", 2)
+            .await
+            .unwrap();
         let new_etag = match won {
             ReclaimOutcome::Won { etag, record } => {
                 assert_eq!(record.host, "host-B");
@@ -513,11 +587,15 @@ mod tests {
         let (observed_etag, _) = s.head_object(&key).await.unwrap().expect("present");
 
         // host-B reclaims first (full sequence: DELETE then PUT).
-        let r_b = reclaim(&s, SHARD, &observed_etag, "host-B", 2).await.unwrap();
+        let r_b = reclaim(&s, SHARD, &observed_etag, "host-B", 2)
+            .await
+            .unwrap();
         // host-C tries to reclaim against the same observed etag from
         // BEFORE host-B's reclaim. host-C's DELETE will see a different
         // etag (host-B's new one) → EtagMismatch → LostRace.
-        let r_c = reclaim(&s, SHARD, &observed_etag, "host-C", 3).await.unwrap();
+        let r_c = reclaim(&s, SHARD, &observed_etag, "host-C", 3)
+            .await
+            .unwrap();
 
         match (r_b, r_c) {
             (ReclaimOutcome::Won { record, .. }, ReclaimOutcome::LostRace) => {
@@ -537,13 +615,18 @@ mod tests {
         // deleting the object directly and then having two reclaimers
         // both attempt PUT-If-None-Match.
         let (b_etag, _) = s.head_object(&key).await.unwrap().expect("present");
-        assert_eq!(s.delete_if_match(&key, &b_etag).await.unwrap(), DeleteOutcome::Deleted);
+        assert_eq!(
+            s.delete_if_match(&key, &b_etag).await.unwrap(),
+            DeleteOutcome::Deleted
+        );
         // Now key is absent. host-D's reclaim with a fabricated etag
         // hits NotFound at DELETE step → LostRace; this matches §3.3
         // "DELETE NotFound → LostRace; restart from HEAD".
         let r_d = reclaim(&s, SHARD, "etag-stale", "host-D", 4).await.unwrap();
-        assert!(matches!(r_d, ReclaimOutcome::LostRace),
-                "DELETE on absent key → NotFound → LostRace");
+        assert!(
+            matches!(r_d, ReclaimOutcome::LostRace),
+            "DELETE on absent key → NotFound → LostRace"
+        );
         // host-E does the right thing: HEAD returns absent, so it goes
         // through `try_acquire` instead, which uses PUT If-None-Match.
         match try_acquire(&s, SHARD, "host-E").await.unwrap() {
@@ -562,9 +645,10 @@ mod tests {
     #[tokio::test]
     async fn refresh_still_held_with_correct_etag() {
         let s = FakeStore::new();
-        let AcquireOutcome::Acquired { etag, .. } =
-            try_acquire(&s, SHARD, "host-A").await.unwrap()
-        else { panic!() };
+        let AcquireOutcome::Acquired { etag, .. } = try_acquire(&s, SHARD, "host-A").await.unwrap()
+        else {
+            panic!()
+        };
 
         match refresh(&s, SHARD, &etag).await.unwrap() {
             RefreshOutcome::StillHeld { etag: returned } => assert_eq!(returned, etag),
@@ -584,12 +668,15 @@ mod tests {
     #[tokio::test]
     async fn complete_writes_completed_state() {
         let s = FakeStore::new();
-        let AcquireOutcome::Acquired { etag, .. } =
-            try_acquire(&s, SHARD, "host-A").await.unwrap()
-        else { panic!() };
+        let AcquireOutcome::Acquired { etag, .. } = try_acquire(&s, SHARD, "host-A").await.unwrap()
+        else {
+            panic!()
+        };
 
         match complete(&s, SHARD, &etag, "host-A", 5).await.unwrap() {
-            CompleteOutcome::Completed { etag: completed_etag } => {
+            CompleteOutcome::Completed {
+                etag: completed_etag,
+            } => {
                 assert!(!completed_etag.is_empty());
                 assert_ne!(completed_etag, etag, "complete mints a new etag");
             }
@@ -610,7 +697,9 @@ mod tests {
         let s = FakeStore::new();
         let AcquireOutcome::Acquired { etag: a_etag, .. } =
             try_acquire(&s, SHARD, "host-A").await.unwrap()
-        else { panic!() };
+        else {
+            panic!()
+        };
 
         // host-B reclaims while A was working.
         let _ = reclaim(&s, SHARD, &a_etag, "host-B", 2).await.unwrap();
@@ -623,26 +712,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_writes_failed_state() {
+        let s = FakeStore::new();
+        let AcquireOutcome::Acquired { etag, .. } = try_acquire(&s, SHARD, "host-A").await.unwrap()
+        else {
+            panic!()
+        };
+
+        match fail(&s, SHARD, &etag, "host-A", 3).await.unwrap() {
+            FailOutcome::Failed { etag: failed_etag } => {
+                assert!(!failed_etag.is_empty());
+                assert_ne!(failed_etag, etag, "fail mints a new etag");
+            }
+            FailOutcome::Lost => panic!("expected Failed"),
+        }
+
+        // The terminal-state record is what HEAD returns now.
+        let key = layout::claim_key(SHARD);
+        let (_, body) = s.head_object(&key).await.unwrap().expect("present");
+        let r: ClaimRecord = serde_json::from_slice(&body).unwrap();
+        assert_eq!(r.state, ClaimState::Failed);
+        assert_eq!(r.epoch, 3);
+        assert_eq!(r.host, "host-A");
+    }
+
+    #[tokio::test]
+    async fn fail_lost_when_someone_reclaimed() {
+        let s = FakeStore::new();
+        let AcquireOutcome::Acquired { etag: a_etag, .. } =
+            try_acquire(&s, SHARD, "host-A").await.unwrap()
+        else {
+            panic!()
+        };
+
+        // host-B reclaims while A was working.
+        let _ = reclaim(&s, SHARD, &a_etag, "host-B", 2).await.unwrap();
+
+        // host-A's fail() must observe Lost rather than overwriting.
+        match fail(&s, SHARD, &a_etag, "host-A", 7).await.unwrap() {
+            FailOutcome::Lost => {}
+            other => panic!("expected Lost, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_state_is_terminal_for_scan() {
+        // Regression guard: a Failed claim must HEAD back as Failed —
+        // scan_shards keys off ClaimState to skip terminal shards.
+        // If `fail` ever drifted to writing Active or Completed,
+        // scanners would treat the shard as live or done; either is
+        // wrong.
+        let s = FakeStore::new();
+        let AcquireOutcome::Acquired { etag, .. } = try_acquire(&s, SHARD, "host-A").await.unwrap()
+        else {
+            panic!()
+        };
+        let _ = fail(&s, SHARD, &etag, "host-A", 1).await.unwrap();
+
+        let key = layout::claim_key(SHARD);
+        let (_, body) = s.head_object(&key).await.unwrap().expect("present");
+        let r: ClaimRecord = serde_json::from_slice(&body).unwrap();
+        assert_eq!(r.state, ClaimState::Failed);
+        assert_ne!(r.state, ClaimState::Active);
+        assert_ne!(r.state, ClaimState::Completed);
+    }
+
+    #[tokio::test]
     async fn delete_if_match_outcomes() {
         let s = FakeStore::new();
         let key = layout::claim_key(SHARD);
 
         // NotFound on absent.
-        assert_eq!(s.delete_if_match(&key, "any").await.unwrap(),
-                   DeleteOutcome::NotFound);
+        assert_eq!(
+            s.delete_if_match(&key, "any").await.unwrap(),
+            DeleteOutcome::NotFound
+        );
 
         let _ = try_acquire(&s, SHARD, "host-A").await.unwrap();
         let (current_etag, _) = s.head_object(&key).await.unwrap().expect("present");
 
         // EtagMismatch when wrong etag.
-        assert_eq!(s.delete_if_match(&key, "wrong-etag").await.unwrap(),
-                   DeleteOutcome::EtagMismatch);
+        assert_eq!(
+            s.delete_if_match(&key, "wrong-etag").await.unwrap(),
+            DeleteOutcome::EtagMismatch
+        );
         // Object still present after a mismatched delete.
         assert!(s.head_object(&key).await.unwrap().is_some());
 
         // Deleted when correct.
-        assert_eq!(s.delete_if_match(&key, &current_etag).await.unwrap(),
-                   DeleteOutcome::Deleted);
+        assert_eq!(
+            s.delete_if_match(&key, &current_etag).await.unwrap(),
+            DeleteOutcome::Deleted
+        );
         assert!(s.head_object(&key).await.unwrap().is_none());
     }
 }
