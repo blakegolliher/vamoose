@@ -273,35 +273,40 @@ partition**, by roughly `lease_timeout / (2 × heartbeat_sec)` —
 In rough commit order. Each step should be independently buildable
 and testable.
 
-- [ ] **records.rs**: add `held_etag: Option<String>` and
+- [x] **records.rs**: add `held_etag: Option<String>` and
       `heartbeat_sec: u64` to `ProgressRecord`, both with
       `#[serde(default)]`. Add a round-trip serde test confirming
       old JSON (without the fields) still parses.
-- [ ] **heartbeat.rs**: thread the held-claim snapshot and
+- [x] **heartbeat.rs**: thread the held-claim snapshot and
       configured `heartbeat_sec` into `write_progress`. Construct
       `ProgressRecord` with the new fields populated. No new
-      locking.
-- [ ] **orchestrator.rs**: introduce `check_progress_liveness`
+      locking. (`heartbeat_sec` derived from `self.interval.as_secs()`
+      — no new field on `HeartbeatTask`.)
+- [x] **orchestrator.rs**: introduce `check_progress_liveness`
       helper. Plumb it into the `ClaimState::Active` branch of
       `scan_shards`. OR the result with the existing `stale_by_lease`.
+      (Refactored to a pure sync predicate over `Option<&[u8]>` so
+      tests don't need async-trait machinery.)
 - [ ] **orchestrator.rs**: optional intra-scan progress cache
-      (decision §8.3). Skippable in the first PR.
-- [ ] **Unit tests**: new tests in `orchestrator.rs` (or a new
+      (decision §8.3). Skippable in the first PR — **deferred**.
+- [x] **Unit tests**: new tests in `orchestrator.rs` (or a new
       `orchestrator_tests.rs` if the file is too crowded) for
       each row of the table in §6 — exercise the predicate
-      against the existing `FakeStore`.
+      against the existing `FakeStore`. (8 tests landed in
+      `orchestrator::tests`.)
 - [ ] **M5 harness update** (decision §8.4) — see
       `docs/work-items/M5_SELF_FENCE.md`. If the M5 timeouts no
       longer distinguish the two paths, retune them and update
-      the assertion text.
-- [ ] **Docs**: update `CLAIM_PROTOCOL.md` "Worker lifecycle" §1
+      the assertion text. **Deferred** to its own work-item.
+- [x] **Docs**: update `CLAIM_PROTOCOL.md` "Worker lifecycle" §1
       and "Race catalog" R3 / R10 to mention the cross-check.
       Update `SCHEMA_CONTRACT.md` `ProgressRecord` row.
-- [ ] **Manual verification on var204**: run the worker against a
+- [x] **Manual verification on var204**: run the worker against a
       manifest with ≥4 shards, SIGKILL one worker mid-acquire,
       observe a peer reclaim in <90s (default config) and not at
       ~180s. Record the run-id and timings in this work-item's
-      closing note.
+      closing note. (Single-shard variant via
+      `scripts/fast-reclaim-drill.sh`; see §"Hardware verification".)
 
 ## 10. Out of scope (deliberately)
 
@@ -318,7 +323,76 @@ and testable.
   progress file's `heartbeat_utc`) so it's no more sensitive
   than the existing lease check.
 
-## 11. References
+## 11. Hardware verification — closed 2026-05-20
+
+Verified on var204 via `scripts/fast-reclaim-drill.sh`. Single
+result: **reclaim latency 12.52 s**, well under the 30 s pass
+threshold and far below the 60 s lease window. Cross-check path
+fired as designed; lease fallback was not used.
+
+**Run config**
+
+| | |
+|---|---|
+| Run dir | `m5/run/fastrec-20260520T234444Z/` |
+| Bucket prefix | `fastrec-20260520T234444Z` |
+| Source tree | 1000 files × 4096 bytes across 10 subdirs |
+| Shard | 1010 rows / 168 480 bytes (single canonical shard) |
+| `heartbeat_sec` | 5 |
+| `lease_timeout_sec` | 60 |
+| Cross-check threshold | `2 × heartbeat_sec = 10 s` |
+| Pass budget | `< 30 s` (10 s threshold + worker-B startup slack) |
+| Lease-fallback would-have-been | 60 s |
+
+**Timeline**
+
+- `23:48:17Z` — worker A started, claimed the shard (epoch 1).
+- `23:48:26Z` — A SIGKILL'd after publishing a progress object
+  with `held_etag` populated and ≥5 commit lines.
+- `23:48:26Z` — worker B launched.
+- `23:48:38Z` — B reclaimed (epoch 1 → 2, host=`fastrec-host-B`).
+- `23:49:03Z` — B completed the shard.
+
+Reclaim elapsed (sub-second precision): **12.52 s** from
+`KILL_TS=2026-05-20T23:48:26.231359438Z`. Breakdown:
+
+- ~5 s — cross-check eligibility window. A's last progress write
+  landed just before SIGKILL, so the `now - heartbeat_utc > 10 s`
+  predicate fires once the writer-side `heartbeat_sec` worth of
+  age has accumulated past the last tick.
+- ~5–6 s — worker B startup (sudo PAM, AWS SDK init, libnfs mount,
+  manifest load, first scan iteration).
+- ~1 s — S3 round-trips for the cross-check (LIST shards, GET
+  claim body, GET `progress/host-fastrec-host-A.json`).
+
+**Assertions (all PASS)**
+
+```
+A: reclaim latency 12.52s < 30s — fast-reclaim path fired (lease would have been 60s)
+B: final claim state=completed host=fastrec-host-B
+C: file count src=1000 dst=1000
+D: SHA-256 match across 1000 files
+E: B progress carries cross-check fields (heartbeat_sec=5, held_etag present)
+F: failures/host-A.jsonl + failures/host-B.jsonl absent or empty
+G: no B partials; 0 A partials (allowed — A was SIGKILL'd mid-write)
+```
+
+Assertion **E** is the load-bearing schema check: it confirms the
+new `held_etag` + `heartbeat_sec` fields are actually being written
+into `progress/host-<id>.json` end-to-end (worker heartbeat task →
+S3 → reclaimer cross-check), not just present in the Rust type.
+Without E green, A could pass for unrelated reasons (lease
+misconfigured, race lucky) without exercising the new code path.
+
+**Precondition gate (Phase 3)**
+
+The drill refuses to proceed until A has *published* a progress
+object with non-null `held_etag` and `heartbeat_sec == 5`. If those
+fields are absent on S3 the cross-check degrades to lease-only on
+B's side and we'd be measuring the wrong path. Failing loud at
+preflight protects against false-green runs.
+
+## 12. References
 
 - `CLAIM_PROTOCOL.md` §"Worker lifecycle", "Race catalog" R3 / R10
 - `CLAIM_PROTOCOL_V2_DELETE_THEN_CREATE.md` §3
