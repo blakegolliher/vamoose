@@ -40,6 +40,61 @@ use crate::errors::{Error, Result};
 use crate::records::{ClaimRecord, ClaimState};
 use crate::time::UtcTime;
 use async_trait::async_trait;
+use std::time::Duration;
+
+/// Maximum attempts for the terminal-state PUT inside `complete` /
+/// `fail`. Only counts transient errors — `PreconditionFailed` is a
+/// real Lost signal and is never retried.
+///
+/// The reclaim path is intentionally NOT retried: a transient
+/// failure there is safe to surface as `Err` (caller exits the loop;
+/// peer eventually picks up the still-stale claim). Terminal-state
+/// writes are different — the DELETE already succeeded, so the
+/// claim object is transiently absent on S3; without the retry, the
+/// next worker re-acquires the shard and silently redoes work.
+const TERMINAL_PUT_ATTEMPTS: u32 = 3;
+const TERMINAL_PUT_BACKOFF_BASE_MS: u64 = 1000;
+
+/// PUT-If-None-Match with exponential backoff on transient errors.
+/// Used by the new-state half of `complete` and `fail` after their
+/// DELETE has already succeeded — at that point the claim object is
+/// absent on S3, and a transient PUT failure that we surface as
+/// `Err` means the next worker re-acquires the shard and redoes the
+/// shard's work. Retrying for a few seconds is cheaper than that.
+///
+/// `Error::PreconditionFailed` is returned immediately without
+/// retry: it means a fresh `try_acquire` won the absent-window
+/// race, which is a genuine `Lost` for our caller. Retrying that
+/// would just race the new owner.
+async fn put_if_absent_with_retry(
+    store: &dyn ClaimStore,
+    key: &str,
+    body: Vec<u8>,
+    attempts: u32,
+) -> Result<String> {
+    debug_assert!(attempts >= 1, "attempts must be >= 1");
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match store.put_if_absent(key, body.clone()).await {
+            Ok(etag) => return Ok(etag),
+            Err(Error::PreconditionFailed) => return Err(Error::PreconditionFailed),
+            Err(e) if attempt >= attempts => return Err(e),
+            Err(e) => {
+                let delay_ms = TERMINAL_PUT_BACKOFF_BASE_MS << (attempt - 1);
+                tracing::warn!(
+                    key = %key,
+                    attempt,
+                    of = attempts,
+                    delay_ms,
+                    error = ?e,
+                    "terminal-state PUT failed transiently; retrying after backoff",
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+}
 
 /// Outcome of a claim acquisition attempt.
 #[derive(Debug)]
@@ -312,7 +367,7 @@ pub async fn complete(
     };
     let body = serde_json::to_vec(&record)?;
 
-    match store.put_if_absent(&key, body).await {
+    match put_if_absent_with_retry(store, &key, body, TERMINAL_PUT_ATTEMPTS).await {
         Ok(etag) => Ok(CompleteOutcome::Completed { etag }),
         Err(Error::PreconditionFailed) => Ok(CompleteOutcome::Lost),
         Err(e) => Err(e),
@@ -355,7 +410,7 @@ pub async fn fail(
     };
     let body = serde_json::to_vec(&record)?;
 
-    match store.put_if_absent(&key, body).await {
+    match put_if_absent_with_retry(store, &key, body, TERMINAL_PUT_ATTEMPTS).await {
         Ok(etag) => Ok(FailOutcome::Failed { etag }),
         Err(Error::PreconditionFailed) => Ok(FailOutcome::Lost),
         Err(e) => Err(e),
@@ -375,6 +430,20 @@ mod tests {
     pub struct FakeStore {
         inner: Mutex<HashMap<String, (Vec<u8>, String)>>,
         etag_counter: Mutex<u64>,
+        /// Test rig for the terminal-state retry path. When non-zero,
+        /// the next N `put_if_absent` calls return the configured
+        /// error WITHOUT mutating state; the counter decrements on
+        /// each failed attempt and the (N+1)-th call falls through
+        /// to the normal logic. `put_failure_kind` selects between
+        /// transient (retryable) and PreconditionFailed (not).
+        put_failures_remaining: Mutex<u32>,
+        put_failure_kind: Mutex<RiggedFailureKind>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum RiggedFailureKind {
+        Transient,
+        PreconditionFailed,
     }
 
     impl FakeStore {
@@ -382,6 +451,8 @@ mod tests {
             Self {
                 inner: Mutex::new(HashMap::new()),
                 etag_counter: Mutex::new(0),
+                put_failures_remaining: Mutex::new(0),
+                put_failure_kind: Mutex::new(RiggedFailureKind::Transient),
             }
         }
         fn next_etag(&self) -> String {
@@ -389,11 +460,38 @@ mod tests {
             *c += 1;
             format!("etag-{}", *c)
         }
+
+        /// Configure the next `n` `put_if_absent` calls to return
+        /// the given failure mode without mutating state. Used by
+        /// terminal-state retry tests.
+        fn rig_next_puts_to_fail(&self, n: u32, kind: RiggedFailureKind) {
+            *self.put_failures_remaining.lock().unwrap() = n;
+            *self.put_failure_kind.lock().unwrap() = kind;
+        }
+
+        /// How many rigged failures remain to consume.
+        fn rigged_remaining(&self) -> u32 {
+            *self.put_failures_remaining.lock().unwrap()
+        }
     }
 
     #[async_trait]
     impl ClaimStore for FakeStore {
         async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<String> {
+            // Consume a rigged failure if one was configured.
+            {
+                let mut rem = self.put_failures_remaining.lock().unwrap();
+                if *rem > 0 {
+                    *rem -= 1;
+                    let kind = *self.put_failure_kind.lock().unwrap();
+                    return Err(match kind {
+                        RiggedFailureKind::Transient => {
+                            Error::Other(anyhow::anyhow!("rigged transient PUT failure"))
+                        }
+                        RiggedFailureKind::PreconditionFailed => Error::PreconditionFailed,
+                    });
+                }
+            }
             let mut g = self.inner.lock().unwrap();
             if g.contains_key(key) {
                 return Err(Error::PreconditionFailed);
@@ -775,6 +873,119 @@ mod tests {
         assert_eq!(r.state, ClaimState::Failed);
         assert_ne!(r.state, ClaimState::Active);
         assert_ne!(r.state, ClaimState::Completed);
+    }
+
+    // -------------------------------------------------------------------------
+    // Terminal-state PUT retry (B1).
+    //
+    // The retry path lives inside `complete` and `fail`. It must:
+    //  - Retry on transient errors (anything that isn't PreconditionFailed).
+    //  - Return Lost immediately on PreconditionFailed without retrying —
+    //    that's a real "fresh try_acquire won the absent window" signal,
+    //    not a transient error.
+    //  - Surface the last transient error if all attempts exhaust.
+    // -------------------------------------------------------------------------
+
+    /// Override the constant so tests don't actually sleep multiple
+    /// seconds per attempt. We can't shadow `TERMINAL_PUT_BACKOFF_BASE_MS`
+    /// at call time, but tokio's mock-time pause/advance suffices.
+    use tokio::time::advance;
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_retries_on_transient_then_succeeds() {
+        // Two transient PUT failures, then success. With
+        // TERMINAL_PUT_ATTEMPTS=3 we have one attempt to spare.
+        // `start_paused = true` makes tokio auto-advance through
+        // `tokio::time::sleep` calls when nothing else is pending,
+        // so the test doesn't actually wait the backoff durations.
+        let s = FakeStore::new();
+        let AcquireOutcome::Acquired { etag, .. } = try_acquire(&s, SHARD, "host-A").await.unwrap()
+        else {
+            panic!()
+        };
+        s.rig_next_puts_to_fail(2, RiggedFailureKind::Transient);
+
+        let outcome = complete(&s, SHARD, &etag, "host-A", 5).await.unwrap();
+        match outcome {
+            CompleteOutcome::Completed { etag: e } => assert!(!e.is_empty()),
+            CompleteOutcome::Lost => panic!("expected Completed after retry"),
+        }
+        assert_eq!(
+            s.rigged_remaining(),
+            0,
+            "all rigged failures should have been consumed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_does_not_retry_on_precondition_failed() {
+        let s = FakeStore::new();
+        let AcquireOutcome::Acquired { etag, .. } = try_acquire(&s, SHARD, "host-A").await.unwrap()
+        else {
+            panic!()
+        };
+        // Rig 3 PreconditionFailed responses. The retry helper must
+        // return on the FIRST one without consuming the others.
+        s.rig_next_puts_to_fail(3, RiggedFailureKind::PreconditionFailed);
+
+        let outcome = complete(&s, SHARD, &etag, "host-A", 5).await.unwrap();
+        match outcome {
+            CompleteOutcome::Lost => {}
+            other => panic!("expected Lost on PreconditionFailed, got {other:?}"),
+        }
+        assert_eq!(
+            s.rigged_remaining(),
+            2,
+            "PreconditionFailed must NOT trigger retry; should have consumed exactly 1 of 3 rigged failures",
+        );
+        // Advance mock time to confirm no extra sleeps were scheduled.
+        advance(Duration::from_secs(60)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_returns_last_error_after_exhausting_attempts() {
+        let s = FakeStore::new();
+        let AcquireOutcome::Acquired { etag, .. } = try_acquire(&s, SHARD, "host-A").await.unwrap()
+        else {
+            panic!()
+        };
+        // Rig MORE failures than TERMINAL_PUT_ATTEMPTS — every attempt
+        // hits a transient and the helper finally surfaces the error.
+        s.rig_next_puts_to_fail(TERMINAL_PUT_ATTEMPTS + 5, RiggedFailureKind::Transient);
+
+        let err = complete(&s, SHARD, &etag, "host-A", 5).await.unwrap_err();
+        match err {
+            Error::Other(_) => {} // simulated transient
+            other => panic!("expected Error::Other (transient), got {other:?}"),
+        }
+        // Exactly TERMINAL_PUT_ATTEMPTS rigged failures should have
+        // been consumed; the remaining (5) are still queued.
+        assert_eq!(s.rigged_remaining(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fail_uses_same_retry_path() {
+        // Sanity: fail() goes through put_if_absent_with_retry just
+        // like complete(). One transient failure → second attempt
+        // succeeds → Failed state landed.
+        let s = FakeStore::new();
+        let AcquireOutcome::Acquired { etag, .. } = try_acquire(&s, SHARD, "host-A").await.unwrap()
+        else {
+            panic!()
+        };
+        s.rig_next_puts_to_fail(1, RiggedFailureKind::Transient);
+
+        let outcome = fail(&s, SHARD, &etag, "host-A", 2).await.unwrap();
+        match outcome {
+            FailOutcome::Failed { .. } => {}
+            FailOutcome::Lost => panic!("expected Failed after retry"),
+        }
+        assert_eq!(s.rigged_remaining(), 0);
+
+        let key = layout::claim_key(SHARD);
+        let (_, body) = s.head_object(&key).await.unwrap().expect("present");
+        let r: ClaimRecord = serde_json::from_slice(&body).unwrap();
+        assert_eq!(r.state, ClaimState::Failed);
     }
 
     #[tokio::test]

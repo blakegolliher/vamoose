@@ -125,6 +125,23 @@ worker B reclaims → also bails → repeat. `Failed` is terminal for
 the scanner, so the loop terminates and an operator can see the
 record and intervene.
 
+#### Terminal-state PUT retry
+
+Both `complete` and `fail` retry the new-state `PUT If-None-Match: *`
+up to **3 attempts with 1s / 2s / 4s exponential backoff** on
+transient errors (anything that isn't `PreconditionFailed`).
+Reclaim's PUT is **not** retried — a transient there is safe to
+surface (peer eventually picks up the still-stale claim), but a
+transient terminal PUT after a successful DELETE leaves the claim
+absent on S3, and the next worker would re-acquire and silently
+redo the shard. The retry costs at most ~7s in the rare exhaustion
+case and pays for itself the first time a 503/429 lands on the
+final PUT of a real shard.
+
+`PreconditionFailed` is returned immediately without retry — it
+means a fresh `try_acquire` won the absent-window race, which is a
+genuine `Lost`, not a transient.
+
 ---
 
 ## State machine
@@ -339,6 +356,37 @@ aws s3 cp s3://$BUCKET/progress/host-$HOST.json - | jq .
 ```
 
 ---
+
+## Bucket prerequisites
+
+**Bucket versioning must be OFF.** The v2 protocol depends on
+`DELETE If-Match` actually removing the claim object. Under bucket
+versioning the DELETE creates a delete marker instead; subsequent
+`PUT If-None-Match: *` calls can race the marker and produce
+surprising 412s on what should be a free claim.
+
+The orchestrator probes `GetBucketVersioning` at startup and:
+
+- exits with a clear error if the bucket reports `Enabled` or
+  `Suspended` (suspended is unsafe too — pre-existing delete
+  markers and non-current versions still persist);
+- emits a `WARN` and continues if the probe itself errors (e.g.
+  the IAM permission is restricted); the operator is responsible
+  for confirming the bucket state in that case.
+
+If you're migrating onto a bucket that *was* versioned, disable
+versioning and clear any non-current versions / delete markers
+under the `shards/` prefix before starting workers.
+
+## LostRace / Contended backoff
+
+When multiple workers race for the same Free or Stale shard, all
+losers see `Contended` (try_acquire) or `LostRace` (reclaim) on
+the same tick. The orchestrator sleeps `heartbeat_sec / 4 + jitter`
+(uniform in `[0, heartbeat_sec / 4)`) before its next scan,
+spreading the inevitable LIST+GET retry storm across roughly half a
+heartbeat. Without the backoff, M-1 of M workers all re-issue
+`scan_shards` immediately, amplifying S3 ops linearly in M.
 
 ## Operational tuning
 
