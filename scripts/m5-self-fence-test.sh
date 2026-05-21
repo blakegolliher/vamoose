@@ -662,7 +662,9 @@ if [[ -n "${claim_body}" ]]; then
     A_EPOCH_AT_STOP=$(echo "${claim_body}" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("epoch",0))' 2>/dev/null || echo 0)
 fi
 
-STOP_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+STOP_TS=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
+# Sub-second epoch for the reclaim-latency assertion (H).
+STOP_TS_NS=$(date +%s.%N)
 log "SIGSTOP A pid=${A_PID} at rows_done=${A_ROWS_AT_STOP} epoch_pre=${A_EPOCH_AT_STOP} ts=${STOP_TS}"
 sudo -n kill -STOP "${A_PID}"
 
@@ -696,8 +698,16 @@ echo "${B_PID}" > "${B_PID_FILE}"
 log "worker B started, pid=${B_PID} (launcher=${B_LAUNCHER_PID})"
 
 # Wait for B to reclaim. Budget: 2 × lease_timeout_sec.
+#
+# Poll tightly (0.5s) so the captured reclaim timestamp is accurate
+# enough for assertion H. With the progress-cross-check landed
+# (PROGRESS_LIVENESS_CROSS_CHECK.md) the typical reclaim time at
+# heartbeat=1/lease=10 is ~2s, not the full lease — assertion H
+# pins this and would fail loud if we ever regressed back to the
+# lease-only path.
 deadline=$(( $(date +%s) + 2 * LEASE_TIMEOUT_SEC ))
 reclaimed=0
+RECLAIM_TS_NS=""
 while [[ $(date +%s) -lt ${deadline} ]]; do
     if ! proc_alive "${B_PID}"; then
         fail "worker B exited before reclaim; see ${B_ERR}"
@@ -708,15 +718,19 @@ while [[ $(date +%s) -lt ${deadline} ]]; do
         cepoch=$(echo "${body}" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("epoch",0))' 2>/dev/null || echo 0)
         if [[ "${chost}" == "${B_HOST}" && "${cepoch}" -gt "${A_EPOCH_AT_STOP}" ]]; then
             reclaimed=1
+            RECLAIM_TS_NS=$(date +%s.%N)
             log "B reclaimed: epoch ${A_EPOCH_AT_STOP} → ${cepoch}"
             break
         fi
     fi
-    sleep 2
+    sleep 0.5
 done
 if [[ "${reclaimed}" -ne 1 ]]; then
     fail "B did not reclaim within 2 × lease_timeout_sec (${LEASE_TIMEOUT_SEC}s × 2)"
 fi
+RECLAIM_ELAPSED=$(awk -v s="${STOP_TS_NS}" -v r="${RECLAIM_TS_NS}" \
+    'BEGIN{printf "%.2f", r - s}')
+log "reclaim latency: ${RECLAIM_ELAPSED}s (lease=${LEASE_TIMEOUT_SEC}s, threshold for cross-check assertion: lease/2)"
 
 # Wait for B to complete the shard. Budget: 4 × lease_timeout_sec.
 deadline=$(( $(date +%s) + 4 * LEASE_TIMEOUT_SEC ))
@@ -975,6 +989,26 @@ elif [[ "${b_clobber}" -eq 1 ]]; then
 else
     a_count=$(grep -cE "\.${A_HOST}\.${A_PID_VAL}\.partial$" "${ALL_PARTIALS}" || true)
     assert_pass "G: no B partials; ${a_count:-0} A partials (allowed — A was paused mid-write)"
+fi
+
+# H. Reclaim took < lease_timeout / 2 — proves the cross-check
+# (progress-file liveness) path fired, not the lease-fallback path.
+#
+# At M5's config (heartbeat=1, lease=10) the cross-check is
+# eligible at 2 × heartbeat = 2s, while lease wouldn't fire until
+# 10s. The half-lease threshold (5s) gives 2.5x headroom over the
+# expected ~2s reclaim, absorbing B's startup + scan iteration
+# without false-failing on slow clusters. A latency at or above
+# lease_timeout_sec / 2 means the cross-check probe didn't see the
+# progress object as stale and we waited the full lease — which
+# would be a regression of the PROGRESS_LIVENESS_CROSS_CHECK work
+# and warrants investigation.
+H_THRESHOLD_S=$(awk -v l="${LEASE_TIMEOUT_SEC}" 'BEGIN{printf "%.2f", l / 2}')
+if awk -v e="${RECLAIM_ELAPSED}" -v t="${H_THRESHOLD_S}" \
+       'BEGIN{exit (e < t) ? 0 : 1}'; then
+    assert_pass "H: reclaim latency ${RECLAIM_ELAPSED}s < ${H_THRESHOLD_S}s (lease/2) — cross-check path fired (lease would have been ${LEASE_TIMEOUT_SEC}s)"
+else
+    assert_fail "H: reclaim latency ${RECLAIM_ELAPSED}s ≥ ${H_THRESHOLD_S}s (lease/2) — cross-check did NOT fire; reclaim took the slow lease-fallback path. Verify the held_etag + heartbeat_sec fields are present on the progress object and that scan_shards is consulting them."
 fi
 
 if [[ "${FAILED}" -ne 0 ]]; then
