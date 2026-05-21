@@ -62,6 +62,40 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     .await?;
     let s3 = Arc::new(s3);
 
+    // Bucket-versioning guard. The v2 claim protocol depends on
+    // `DELETE If-Match` actually removing the object — under bucket
+    // versioning a DELETE creates a delete marker instead, and the
+    // following `PUT If-None-Match: *` can race the marker into
+    // surprising 412s. Refuse to start on Enabled / Suspended;
+    // warn-only on probe failure (operator may have restricted the
+    // GetBucketVersioning IAM action — that's a separate decision).
+    match s3.get_bucket_versioning().await {
+        Ok(migration_core::s3::BucketVersioning::NotEnabled) => {
+            tracing::info!(
+                bucket = %s3.bucket(),
+                "bucket versioning is off (required for v2 claim protocol)",
+            );
+        }
+        Ok(state) => {
+            anyhow::bail!(
+                "bucket {} has versioning state {:?}; the v2 claim protocol \
+                 requires versioning OFF. Disable versioning on the bucket \
+                 (and clear any existing non-current versions / delete markers) \
+                 before running. See docs/CLAIM_PROTOCOL.md.",
+                s3.bucket(),
+                state,
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                bucket = %s3.bucket(),
+                error = ?e,
+                "could not verify bucket versioning state — proceeding; \
+                 operator must confirm versioning is OFF (see docs/CLAIM_PROTOCOL.md)",
+            );
+        }
+    }
+
     let manifest = load_manifest(&s3).await?;
     if manifest.format_version != RUN_FORMAT_VERSION {
         anyhow::bail!(
@@ -294,9 +328,16 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
                 match claim::try_acquire(&*s3, &shard, &host_id).await? {
                     AcquireOutcome::Acquired { etag, record } => (etag, record),
                     AcquireOutcome::Contended { existing, .. } => {
+                        // Thundering-herd dampener: when many workers race
+                        // the same Free/Stale shard, all losers hit this
+                        // path simultaneously, and a bare `continue` would
+                        // immediately re-issue scan_shards (LIST + per-Active
+                        // GETs). Backoff with jitter spreads them out so the
+                        // S3 LIST/GET storm doesn't pile up.
+                        backoff_after_lost_race(cfg.worker.heartbeat_sec).await;
                         tracing::debug!(
                             existing_host = %existing.host,
-                            "shard contended; trying another",
+                            "shard contended; backing off before next scan",
                         );
                         continue;
                     }
@@ -311,9 +352,10 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
                 match claim::reclaim(&*s3, &shard, &stale_etag, &host_id, new_epoch).await? {
                     ReclaimOutcome::Won { etag, record } => (etag, record),
                     ReclaimOutcome::LostRace => {
+                        backoff_after_lost_race(cfg.worker.heartbeat_sec).await;
                         tracing::debug!(
                             shard = %shard,
-                            "reclaim lost race; trying another",
+                            "reclaim lost race; backing off before next scan",
                         );
                         continue;
                     }
@@ -917,6 +959,30 @@ fn parse_batch_budget(cfg: &Config) -> Option<BatchBudget> {
         bytes,
         files: cfg.batch.files_budget,
     })
+}
+
+/// Sleep `heartbeat_sec / 4 + jitter` before the next scan iteration
+/// after a `Contended` or `LostRace`. The jitter is uniform in
+/// `[0, base)` so the total backoff is in `[base, 2 × base)` —
+/// enough spread to break a thundering herd of M workers all
+/// racing the same Free/Stale shard.
+///
+/// Uses `getrandom` (already a worker dep). On the practically-
+/// impossible case that `getrandom` fails we fall back to a
+/// pid-derived jitter so the worker still makes progress; safety
+/// of the backoff doesn't depend on cryptographic randomness, just
+/// on workers landing at different wall-clock instants.
+async fn backoff_after_lost_race(heartbeat_sec: u64) {
+    let base_ms = (heartbeat_sec * 1000) / 4;
+    let base_ms = base_ms.max(100); // floor for absurd configs
+    let mut buf = [0u8; 8];
+    let jitter_ms = if getrandom::getrandom(&mut buf).is_ok() {
+        u64::from_le_bytes(buf) % base_ms
+    } else {
+        (std::process::id() as u64) % base_ms
+    };
+    let total_ms = base_ms + jitter_ms;
+    tokio::time::sleep(Duration::from_millis(total_ms)).await;
 }
 
 // Touch the imported types so cargo doesn't warn about unused names

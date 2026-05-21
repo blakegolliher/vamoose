@@ -24,8 +24,8 @@ use crate::errors::{Error, Result};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
-use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::Client;
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone)]
@@ -36,7 +36,10 @@ pub struct S3Client {
 
 impl S3Client {
     pub fn new(inner: Client, bucket: impl Into<String>) -> Self {
-        Self { inner, bucket: bucket.into() }
+        Self {
+            inner,
+            bucket: bucket.into(),
+        }
     }
 
     pub fn bucket(&self) -> &str {
@@ -88,8 +91,7 @@ impl S3Client {
 
         let aws_cfg = loader.load().await;
 
-        let mut s3_cfg = aws_sdk_s3::config::Builder::from(&aws_cfg)
-            .force_path_style(true);
+        let mut s3_cfg = aws_sdk_s3::config::Builder::from(&aws_cfg).force_path_style(true);
 
         if !verify_tls {
             tracing::warn!(
@@ -192,9 +194,11 @@ impl ClaimStore for S3Client {
             Ok(resp) => {
                 let etag = resp
                     .e_tag()
-                    .ok_or_else(|| Error::Other(anyhow::anyhow!(
-                        "head_object: GET returned no etag for {key}"
-                    )))?
+                    .ok_or_else(|| {
+                        Error::Other(anyhow::anyhow!(
+                            "head_object: GET returned no etag for {key}"
+                        ))
+                    })?
                     .trim_matches('"')
                     .to_string();
                 let body = resp
@@ -207,9 +211,7 @@ impl ClaimStore for S3Client {
                 Ok(Some((etag, body)))
             }
             Err(SdkError::ServiceError(svc)) if svc.err().is_no_such_key() => Ok(None),
-            Err(e) => Err(Error::Other(anyhow::anyhow!(
-                "S3 head_object {key}: {e}"
-            ))),
+            Err(e) => Err(Error::Other(anyhow::anyhow!("S3 head_object {key}: {e}"))),
         }
     }
 
@@ -331,7 +333,49 @@ fn map_put_err(err: SdkError<aws_sdk_s3::operation::put_object::PutObjectError>)
 // Convenience helpers for non-claim objects
 // =============================================================================
 
+/// Bucket versioning status, normalized for the v2 claim protocol's
+/// expectations. Versioning **must be off** on a vamoose bucket: the
+/// claim protocol depends on `DELETE If-Match` actually removing the
+/// object, not creating a delete marker that future `PUT If-None-Match`
+/// calls then race against. We accept only `NotEnabled`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BucketVersioning {
+    /// Versioning has never been enabled on the bucket. Safe for v2.
+    NotEnabled,
+    /// Versioning is currently enabled. Unsafe — every DELETE leaves a
+    /// delete marker; `PUT If-None-Match: *` may see the marker as
+    /// "object exists" and 412 on what should be a free claim.
+    Enabled,
+    /// Versioning was enabled at some point and has been suspended.
+    /// Still unsafe — prior delete markers and non-current versions
+    /// can persist and produce the same race symptoms as `Enabled`.
+    Suspended,
+    /// Any value the SDK doesn't recognize, surfaced rather than
+    /// silently treated as `NotEnabled`. Treat as unsafe.
+    Unknown(String),
+}
+
 impl S3Client {
+    /// Return the bucket's versioning state. Used as a startup guard
+    /// by the worker: a vamoose bucket must have versioning off.
+    /// See `BucketVersioning` for why.
+    pub async fn get_bucket_versioning(&self) -> Result<BucketVersioning> {
+        use aws_sdk_s3::types::BucketVersioningStatus;
+        let out = self
+            .inner
+            .get_bucket_versioning()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("get_bucket_versioning: {e:?}")))?;
+        Ok(match out.status() {
+            None => BucketVersioning::NotEnabled,
+            Some(BucketVersioningStatus::Enabled) => BucketVersioning::Enabled,
+            Some(BucketVersioningStatus::Suspended) => BucketVersioning::Suspended,
+            Some(other) => BucketVersioning::Unknown(other.as_str().to_string()),
+        })
+    }
+
     /// Upload an object unconditionally. Used for progress, batches,
     /// failures — anything that isn't a claim.
     pub async fn put(&self, key: &str, body: Vec<u8>) -> Result<String> {
