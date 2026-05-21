@@ -392,6 +392,32 @@ fields are absent on S3 the cross-check degrades to lease-only on
 B's side and we'd be measuring the wrong path. Failing loud at
 preflight protects against false-green runs.
 
+**M5 self-fence regression — also green**
+
+Re-ran `scripts/m5-self-fence-test.sh` against var204 unchanged
+(`heartbeat_sec=1`, `lease_timeout_sec=10`). Run dir
+`m5/run/20260520T235829Z/`. All 7 M5 assertions PASS. The
+observable shift from the pre-cross-check baseline:
+
+- **Reclaim latency 5 s** (SIGSTOP at 23:59:08Z → B reclaim at
+  23:59:13Z). Previously this took ~10 s — the full lease. The
+  cross-check fires at `2 × heartbeat_sec = 2 s`; +3 s of B
+  startup + first scan = 5 s. Two paths cleanly distinguished.
+- M5 assertion F: 1047 total commits, **47 sequential duplicates**
+  accepted, **0 concurrent renames within 1.0 s**. That's the R3
+  at-least-once dupe pattern intact: A wrote 15 rows pre-SIGSTOP,
+  B reclaimed and re-ran the full shard, A resumed → fenced →
+  no further commits. Safety argument unchanged by the cross-check
+  landing.
+- M5 assertion D: A self-fenced cleanly with reason
+  `"claim refresh: HEAD shows different etag"` (the v2 fence
+  text). R4 + cross-check interaction is clean — heartbeat task
+  sees the new etag on its first post-SIGCONT HEAD, no spurious
+  fences, no shutdown hang.
+
+Net: existing self-fence path preserved end-to-end, no regression,
+recovery is now ~50 % faster at the M5 ratio.
+
 ## 12. References
 
 - `CLAIM_PROTOCOL.md` §"Worker lifecycle", "Race catalog" R3 / R10
