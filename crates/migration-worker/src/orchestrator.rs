@@ -28,14 +28,14 @@ use crate::shard_processor::{ProcessOutcome, ShardProcessor};
 use crate::throughput::ThroughputCounter;
 
 use migration_core::claim::{
-    self, AcquireOutcome, ClaimStore, CompleteOutcome, ListEntry, ReclaimOutcome,
+    self, AcquireOutcome, ClaimStore, CompleteOutcome, FailOutcome, ListEntry, ReclaimOutcome,
 };
 use migration_core::fence::Fence;
 use migration_core::layout;
 use migration_core::overlap;
 use migration_core::records::{
-    ClaimRecord, ClaimState, Manifest, MigrationOptions, ServerSideCopy, ShardEntry,
-    RUN_FORMAT_VERSION,
+    ClaimRecord, ClaimState, Manifest, MigrationOptions, ProgressRecord, ServerSideCopy,
+    ShardEntry, RUN_FORMAT_VERSION,
 };
 use migration_core::s3::S3Client;
 use migration_core::time::UtcTime;
@@ -364,7 +364,71 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
             throughput: throughput.clone(),
             fsid_fallback_warned: false,
         };
-        let outcome = processor.process(&scratch).await?;
+        let outcome = match processor.process(&scratch).await {
+            Ok(o) => o,
+            Err(e) => {
+                // Shard-fatal: the parquet won't decode, or a row
+                // schema is malformed. A peer reclaiming after lease
+                // expiry would just hit the same error → infinite
+                // fleet-wide reclaim loop. Mark the claim `Failed`
+                // (terminal, scanners skip it) and continue to the
+                // next shard. Operator inspects the error log + the
+                // Failed claim record and re-uploads / re-indexes.
+                tracing::error!(
+                    error = ?e,
+                    shard = %shard_filename,
+                    "shard-fatal error; marking claim Failed and moving on",
+                );
+                // Best-effort scratch cleanup before we give up on
+                // this shard.
+                if let Err(rm) = tokio::fs::remove_file(&scratch).await {
+                    tracing::warn!(
+                        error = ?rm,
+                        scratch = %scratch.display(),
+                        "scratch cleanup failed (post-shard-fatal)",
+                    );
+                }
+                // Same R4 reasoning as the complete() path: clear the
+                // held-claim cell BEFORE calling fail() so the
+                // heartbeat doesn't fence us on the transient absent
+                // window between DELETE and PUT.
+                let (fail_etag, fail_epoch) = {
+                    let mut g = current.lock().await;
+                    let (e, ep) = match g.as_ref() {
+                        Some(c) if c.shard == shard_filename => (c.etag.clone(), c.epoch),
+                        _ => (etag.clone(), record.epoch),
+                    };
+                    *g = None;
+                    (e, ep)
+                };
+                match claim::fail(&*s3, &shard_filename, &fail_etag, &host_id, fail_epoch).await {
+                    Ok(FailOutcome::Failed { .. }) => {
+                        tracing::warn!(
+                            shard = %shard_filename,
+                            "claim marked Failed (terminal); requires operator follow-up",
+                        );
+                    }
+                    Ok(FailOutcome::Lost) => {
+                        // Another worker took over while we were
+                        // processing — they'll hit the same error and
+                        // mark Failed themselves. Drop the claim
+                        // cleanly here.
+                        tracing::warn!(
+                            shard = %shard_filename,
+                            "claim lost while marking Failed; new owner will retry-then-fail",
+                        );
+                    }
+                    Err(write_err) => {
+                        tracing::warn!(
+                            error = ?write_err,
+                            shard = %shard_filename,
+                            "claim Failed write errored; shard will remain Active until lease expiry",
+                        );
+                    }
+                }
+                continue;
+            }
+        };
 
         // Push final per-shard counters into the shared progress.
         {
@@ -661,7 +725,18 @@ async fn scan_shards(
                     continue;
                 };
                 let Ok(record) = serde_json::from_slice::<ClaimRecord>(&body) else {
-                    tracing::warn!(claim = %claim_key, "unparseable claim record; treating as terminal-failed");
+                    // Unparseable body: log-and-skip would let the worker
+                    // declare `all_terminal=true` and exit prematurely with
+                    // an unprocessed shard sitting on S3. Force the worker
+                    // to keep running so an operator notices the ERROR
+                    // line and can intervene (delete the corrupt claim
+                    // object → next scan sees the shard as Free).
+                    tracing::error!(
+                        claim = %claim_key,
+                        "unparseable claim record; operator intervention required \
+                         (worker will not exit while this persists)",
+                    );
+                    all_terminal = false;
                     continue;
                 };
                 match record.state {
@@ -669,8 +744,40 @@ async fn scan_shards(
                     ClaimState::Active => {
                         all_terminal = false;
                         let age = now.signed_duration_since(record.claimed_utc.0);
-                        let stale = age.to_std().map(|d| d > lease).unwrap_or(false);
-                        if stale && next.is_none() {
+                        let stale_by_lease = age.to_std().map(|d| d > lease).unwrap_or(false);
+                        // Cross-check the per-host progress file. Lets
+                        // a peer reclaim within ~2× the owner's
+                        // heartbeat_sec when the owner has stopped
+                        // heartbeating, instead of waiting the full
+                        // lease window. See
+                        // docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md.
+                        // Only fetch when we'd act on the result —
+                        // saves a GET per Active claim when we
+                        // already have a `next` target or the lease
+                        // path already fired.
+                        let stale_by_progress = if next.is_none() && !stale_by_lease {
+                            match s3.get(&layout::progress_key(&record.host)).await {
+                                Ok(Some((body, _))) => {
+                                    check_progress_liveness(Some(&body), &e.etag, now)
+                                }
+                                Ok(None) => check_progress_liveness(None, &e.etag, now),
+                                Err(err) => {
+                                    // Fail-safe: defer to lease on
+                                    // any S3 hiccup. The outer LIST
+                                    // already succeeded, so this is
+                                    // a per-object glitch.
+                                    tracing::warn!(
+                                        error = ?err,
+                                        host = %record.host,
+                                        "progress GET failed; deferring to lease check",
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        if (stale_by_lease || stale_by_progress) && next.is_none() {
                             next = Some(ClaimTarget::Stale {
                                 shard: shard_filename.clone(),
                                 stale_etag: e.etag.clone(),
@@ -689,6 +796,60 @@ async fn scan_shards(
         all_terminal,
         last_target_filename: next_name,
     })
+}
+
+/// Peer-side liveness cross-check for an `Active` claim.
+///
+/// Returns `true` iff the per-host progress file confirms the owning
+/// worker has stopped heartbeating against this specific claim — i.e.
+/// the shard is fast-reclaim-eligible without waiting for the lease
+/// window. The caller ORs this with `stale_by_lease`, so a `false`
+/// here just means "defer to the lease check".
+///
+/// Pure & synchronous — the caller fetches the progress body and
+/// passes it in. The S3 GET error path is its responsibility (the
+/// reference implementation in `scan_shards` swallows GET errors and
+/// defers to lease, which is the conservative choice).
+///
+/// Edges, per `PROGRESS_LIVENESS_CROSS_CHECK.md` §6:
+///
+/// | Progress file state                       | Returns |
+/// |-------------------------------------------|---------|
+/// | Absent (`body=None`)                      | `true`  (owner never started or crashed pre-tick) |
+/// | Parse failure                             | `false` (don't act on garbage; defer to lease) |
+/// | `heartbeat_sec == 0` (pre-cross-check)    | `false` (no calibrated freshness window) |
+/// | `held_etag` is `None`                     | `true`  (writer announced "not holding this") |
+/// | `held_etag` differs from current claim    | `true`  (claim has been replaced; old progress is stale → same-host_id restart safety) |
+/// | etag matches; heartbeat age ≤ 2 × hb_sec  | `false` (alive) |
+/// | etag matches; heartbeat age > 2 × hb_sec  | `true`  (dead) |
+fn check_progress_liveness(
+    progress_body: Option<&[u8]>,
+    claim_etag: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(body) = progress_body else {
+        // No progress object at all — owner never started, or it
+        // crashed before its first tick landed. Eligible.
+        return true;
+    };
+    let Ok(p) = serde_json::from_slice::<ProgressRecord>(body) else {
+        // Garbage body — defer to lease.
+        return false;
+    };
+    if p.heartbeat_sec == 0 {
+        // Pre-cross-check progress object: no calibrated threshold.
+        return false;
+    }
+    match p.held_etag.as_deref() {
+        Some(e) if e == claim_etag => {}
+        // None or mismatched etag — the progress object isn't bound
+        // to this claim's ownership window (worker self-fenced or
+        // same-host_id restart minted a new claim). Eligible.
+        _ => return true,
+    }
+    let age = now.signed_duration_since(p.heartbeat_utc.0);
+    let threshold_secs = (p.heartbeat_sec.saturating_mul(2)) as i64;
+    age.num_seconds() > threshold_secs
 }
 
 /// Log (don't resume) any claims still owned by this host_id. The
@@ -762,3 +923,157 @@ fn parse_batch_budget(cfg: &Config) -> Option<BatchBudget> {
 // when the code paths above evolve.
 #[allow(dead_code)]
 fn _types_anchor(_o: ProcessOutcome, _u: UtcTime, _s: ShardEntry) {}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for `check_progress_liveness` — one per row of
+    //! `docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md` §6's safety
+    //! table. The predicate is pure & sync, so each test constructs a
+    //! `ProgressRecord`, serializes it to JSON, and asserts the
+    //! returned boolean.
+    use super::check_progress_liveness;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use migration_core::records::ProgressRecord;
+    use migration_core::time::UtcTime;
+
+    const CLAIM_ETAG: &str = "etag-claim-abc";
+    const HB_SEC: u64 = 30;
+
+    fn record_at(heartbeat: chrono::DateTime<Utc>, held_etag: Option<&str>) -> ProgressRecord {
+        ProgressRecord {
+            host: "host-A".into(),
+            started_utc: UtcTime::now(),
+            heartbeat_utc: UtcTime(heartbeat),
+            current_shard: Some("part-0001.parquet".into()),
+            shard_rows_total: 0,
+            shard_rows_done: 0,
+            shard_bytes_done: 0,
+            files_ok: 0,
+            files_failed: 0,
+            files_fenced: 0,
+            throughput_mb_s_1m: 0.0,
+            status: "active".into(),
+            held_etag: held_etag.map(str::to_string),
+            heartbeat_sec: HB_SEC,
+        }
+    }
+
+    fn body_of(r: &ProgressRecord) -> Vec<u8> {
+        serde_json::to_vec(r).unwrap()
+    }
+
+    /// Absent progress object → eligible. Owner crashed before its
+    /// first tick landed, or never started; peer reclaims fast.
+    #[test]
+    fn absent_body_is_eligible() {
+        assert!(check_progress_liveness(None, CLAIM_ETAG, Utc::now()));
+    }
+
+    /// Parse failure → conservative; defer to lease.
+    #[test]
+    fn unparseable_body_defers_to_lease() {
+        let garbage = b"not-json-at-all";
+        assert!(!check_progress_liveness(
+            Some(garbage),
+            CLAIM_ETAG,
+            Utc::now()
+        ));
+    }
+
+    /// Old-schema progress (no cross-check fields → heartbeat_sec=0
+    /// via serde default) → no calibrated threshold; defer to lease.
+    #[test]
+    fn old_schema_progress_defers_to_lease() {
+        // Hand-build a pre-cross-check progress body (no held_etag /
+        // heartbeat_sec fields present). With recent heartbeat_utc to
+        // rule out the freshness path firing.
+        let json = format!(
+            r#"{{
+              "host": "host-A",
+              "started_utc": "2025-01-01T00:00:00Z",
+              "heartbeat_utc": "{}",
+              "current_shard": null,
+              "shard_rows_total": 0,
+              "shard_rows_done": 0,
+              "shard_bytes_done": 0,
+              "files_ok": 0,
+              "files_failed": 0,
+              "throughput_mb_s_1m": 0.0,
+              "status": "active"
+            }}"#,
+            Utc::now().to_rfc3339(),
+        );
+        assert!(!check_progress_liveness(
+            Some(json.as_bytes()),
+            CLAIM_ETAG,
+            Utc::now()
+        ));
+    }
+
+    /// `held_etag = None` means the writer announced "I am not
+    /// holding any claim right now" (worker self-fenced, exiting, or
+    /// between shards) → peer is eligible to reclaim.
+    #[test]
+    fn held_etag_none_is_eligible() {
+        let r = record_at(Utc::now(), None);
+        assert!(check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            Utc::now()
+        ));
+    }
+
+    /// Same-host_id restart: the live claim has a new etag, but the
+    /// pre-restart progress object still carries the old one. The
+    /// mismatch makes the shard fast-reclaim-eligible — and the
+    /// post-restart progress write will carry the new etag, so the
+    /// new ownership window won't ever match the dead claim.
+    #[test]
+    fn held_etag_mismatch_is_eligible() {
+        let r = record_at(Utc::now(), Some("etag-old-from-prior-acquire"));
+        assert!(check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            Utc::now()
+        ));
+    }
+
+    /// Owner alive, etag matches, heartbeat is fresh (< 2× hb_sec).
+    /// Not stale — defer to lease.
+    #[test]
+    fn fresh_heartbeat_with_matching_etag_is_alive() {
+        let now = Utc::now();
+        let r = record_at(now - ChronoDuration::seconds(5), Some(CLAIM_ETAG));
+        assert!(!check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            now
+        ));
+    }
+
+    /// Owner stopped heartbeating: etag matches, but heartbeat_utc is
+    /// older than 2 × heartbeat_sec. Eligible for fast reclaim.
+    #[test]
+    fn stale_heartbeat_with_matching_etag_is_eligible() {
+        let now = Utc::now();
+        let age = ChronoDuration::seconds((HB_SEC * 2 + 1) as i64);
+        let r = record_at(now - age, Some(CLAIM_ETAG));
+        assert!(check_progress_liveness(Some(&body_of(&r)), CLAIM_ETAG, now));
+    }
+
+    /// Boundary case: heartbeat age exactly equal to the threshold is
+    /// NOT stale (the predicate uses strict `>`). Documents the
+    /// inclusive/exclusive semantics so a future refactor doesn't
+    /// silently flip it.
+    #[test]
+    fn heartbeat_at_threshold_is_alive() {
+        let now = Utc::now();
+        let age = ChronoDuration::seconds((HB_SEC * 2) as i64);
+        let r = record_at(now - age, Some(CLAIM_ETAG));
+        assert!(!check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            now
+        ));
+    }
+}

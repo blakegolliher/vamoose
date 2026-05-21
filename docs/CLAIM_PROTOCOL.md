@@ -105,6 +105,26 @@ Terminal-state writes use delete-then-create rather than overwrite so
 they share the same S3 semantics as reclaim, which simplifies
 reasoning. The completed claim has a stable etag forever after.
 
+### `fail(shard, held_etag, host, epoch)`
+
+Identical S3 shape to `complete`, but writes `state=Failed`. Called
+from the orchestrator when `processor.process()` returns an error
+that would re-occur for any worker reclaiming the shard — corrupt
+parquet, malformed row schema, anything shard-fatal as opposed to
+worker-fatal. Distinct from `complete` so scanners can tell
+"finished cleanly" from "couldn't be processed."
+
+```
+DELETE If-Match: held_etag      →  Deleted | EtagMismatch | NotFound
+PUT If-None-Match: *            →  Failed { etag } | Lost (412)
+```
+
+Without `fail`, an unrecoverable shard would loop forever through
+the fleet: worker A bails on corrupt parquet → lease expires →
+worker B reclaims → also bails → repeat. `Failed` is terminal for
+the scanner, so the loop terminates and an operator can see the
+record and intervene.
+
 ---
 
 ## State machine
@@ -142,7 +162,15 @@ discovers a terminal claim in `scan_shards` skips the shard.
 The orchestrator loop in `migration-worker/src/orchestrator.rs`:
 
 1. **Scan**: list `shards/`, classify each as `Free` / `Stale(etag)` /
-   `Active(live)` / `Terminal`.
+   `Active(live)` / `Terminal`. An `Active` claim is considered
+   `Stale` when *either* `now - claimed_utc > lease_timeout`
+   (the lease path) *or* the owner's `progress/host-<id>.json` is
+   absent, has a mismatched `held_etag`, or has `heartbeat_utc`
+   older than `2 × heartbeat_sec` (the progress-cross-check path —
+   see `docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md`). The
+   cross-check shortens typical recovery from `lease_timeout` to
+   `2 × heartbeat_sec` without changing the v2 protocol's
+   correctness story; both signals are OR'd and either can fire.
 2. **Acquire**: `try_acquire` on a Free shard, or `reclaim` on a Stale
    shard. On `Contended`/`LostRace`, pick another.
 3. **Set held-claim cell**: `*current = Some(HeldClaim{shard, etag, epoch})`.
@@ -194,8 +222,12 @@ content / atomic rename argument (see below).
   point; the protocol never asks the workers to compare clocks against
   each other or vote.
 - **Bounded recovery from worker death.** Within
-  `lease_timeout + heartbeat_sec` of the last live heartbeat, the
-  claim is reclaimable.
+  `min(2 × heartbeat_sec, lease_timeout) + heartbeat_sec` of the
+  last live progress write, the claim is reclaimable. The first
+  term is the progress-cross-check window (per
+  `PROGRESS_LIVENESS_CROSS_CHECK.md`); the lease term remains as
+  the fallback for any reclaimer whose progress fetch fails or
+  whose schema cannot read the cross-check fields.
 - **Terminal-state immutability.** Completed/Failed claims cannot be
   silently overwritten by a new owner.
 
@@ -253,14 +285,14 @@ revision fixed.
 |---|---|---|---|
 | R1 | Two workers race for the same Free shard via `try_acquire` | S3 picks one via `If-None-Match: *`; loser sees `Contended`, re-scans | Common at multi-worker startup; transparent |
 | R2 | Two workers race to `reclaim` the same Stale claim | One DELETE succeeds, others see EtagMismatch/NotFound and report `LostRace` | Once per worker-death event |
-| R3 | **Fence-window dupes.** Owner is partitioned; peer reclaims; owner keeps committing renames until its next HEAD sees the new etag (bounded by `heartbeat_sec`) | At-least-once row commits, all bit-identical, atomic | Per partition / GC pause / lease overrun event |
+| R3 | **Fence-window dupes.** Owner is partitioned; peer reclaims; owner keeps committing renames until either (a) its next HEAD sees the new etag, (b) R6 retry-budget exhausts. Since the progress-cross-check landed, peer reclaims at `2 × heartbeat_sec` (faster), but owner's R6 trip is still gated on `lease_timeout` — so the dupe window under sustained partition can widen to ~`lease_timeout - 2 × heartbeat_sec` of overlapping writes. | At-least-once row commits, all bit-identical, atomic. Wider window = more duplicate work, no corruption. M5 assertion F (1.0s concurrent-rename bound) still holds. | Per partition / GC pause / lease overrun event |
 | R4 | ~~Spurious fence after clean `complete()`~~ — **fixed** | Held-claim cell is now cleared *before* `complete()`; heartbeat skips HEAD during complete's window | Fixed |
 | R5 | Reclaim PUT race: fresh `try_acquire` lands between reclaimer's DELETE and PUT | Reclaimer sees `LostRace`; the fresh acquirer owns | Sub-ms window; effectively zero |
 | R6 | ~~Persistent transient HEAD failure never trips fence~~ — **fixed** | Heartbeat now counts consecutive failures; trips after a full lease window's worth (`ceil(lease_timeout / heartbeat_sec)` ticks) | Fixed |
 | R7 | ~~Local clock jump not detected~~ — **fixed** | Wall-vs-monotonic drift is compared each tick; fence trips on `> lease_timeout / 2` | Fixed |
 | R8 | Mover commits one more rename per row that was already inside `spawn_blocking` at fence-trip time | Bounded by per-file copy time; safe due to bit-identical content | One-per-row at fence-trip; **not fixed**, deferred |
 | R9 | Manifest swapped under us (operator fat-fingers re-upload) | `verify_shard_etag` catches this at download; otherwise undetected | Operator fault |
-| R10 | Shard processor's runtime stalls past `lease_timeout` | Heartbeat ticks queue up; on resume, peer has reclaimed → next HEAD → fence | Requires multi-minute runtime stall |
+| R10 | Shard processor's runtime stalls past `2 × heartbeat_sec` (was `lease_timeout` pre-cross-check) | Owner's heartbeat task can't publish progress while the runtime is stalled; peer's next scan sees `heartbeat_utc` stale and fast-reclaims. On resume, owner's next HEAD sees the new etag → fence. Recovery is `O(heartbeat_sec)` rather than `O(lease_timeout)`. | Triggered by any runtime stall longer than `2 × heartbeat_sec` (used to require multi-minute stalls; now ~tens of seconds at defaults) |
 
 ---
 

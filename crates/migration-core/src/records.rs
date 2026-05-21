@@ -145,6 +145,24 @@ pub struct ProgressRecord {
     pub throughput_mb_s_1m: f64,
     /// "active", "degraded", "draining", "exiting".
     pub status: String,
+    /// Etag of the claim object this worker currently holds, if any.
+    /// `None` means the worker is between shards (idle/scanning) or
+    /// has self-fenced. `Some(etag)` is the proof-of-ownership that
+    /// peers cross-check against the claim body's etag for the
+    /// progress-file liveness fast-reclaim path. See
+    /// `docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md`.
+    /// `#[serde(default)]` so pre-cross-check progress objects parse
+    /// as `None`, which the reclaimer treats as "not held → eligible".
+    #[serde(default)]
+    pub held_etag: Option<String>,
+    /// Heartbeat interval (seconds) the writing worker is configured
+    /// with. Peers compute a freshness threshold of `2 ×
+    /// heartbeat_sec` from this value so the cross-check is
+    /// calibrated against the *writer*, not assumed from the reader's
+    /// config. `0` (the default for pre-cross-check progress
+    /// objects) means "missing → defer to lease".
+    #[serde(default)]
+    pub heartbeat_sec: u64,
 }
 
 // =============================================================================
@@ -299,5 +317,54 @@ mod tests {
         let json = serde_json::to_string(&FailurePhase::Fenced).unwrap();
         let decoded: FailurePhase = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, FailurePhase::Fenced);
+    }
+
+    // Pre-cross-check progress objects (written by workers before
+    // held_etag/heartbeat_sec were added) must still parse. Both
+    // new fields are `#[serde(default)]`; absence means `None` and
+    // `0`, which the reclaimer's predicate degrades safely on.
+    #[test]
+    fn progress_record_parses_old_schema_without_cross_check_fields() {
+        let json = r#"{
+            "host": "host-A",
+            "started_utc": "2025-01-01T00:00:00Z",
+            "heartbeat_utc": "2025-01-01T00:00:30Z",
+            "current_shard": null,
+            "shard_rows_total": 0,
+            "shard_rows_done": 0,
+            "shard_bytes_done": 0,
+            "files_ok": 0,
+            "files_failed": 0,
+            "throughput_mb_s_1m": 0.0,
+            "status": "active"
+        }"#;
+        let p: ProgressRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(p.host, "host-A");
+        assert_eq!(p.held_etag, None);
+        assert_eq!(p.heartbeat_sec, 0);
+    }
+
+    #[test]
+    fn progress_record_roundtrips_with_cross_check_fields() {
+        let p = ProgressRecord {
+            host: "host-B".into(),
+            started_utc: UtcTime::now(),
+            heartbeat_utc: UtcTime::now(),
+            current_shard: Some("part-0001.parquet".into()),
+            shard_rows_total: 100,
+            shard_rows_done: 50,
+            shard_bytes_done: 1024,
+            files_ok: 50,
+            files_failed: 0,
+            files_fenced: 0,
+            throughput_mb_s_1m: 12.5,
+            status: "active".into(),
+            held_etag: Some("etag-abc".into()),
+            heartbeat_sec: 30,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let decoded: ProgressRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.held_etag.as_deref(), Some("etag-abc"));
+        assert_eq!(decoded.heartbeat_sec, 30);
     }
 }

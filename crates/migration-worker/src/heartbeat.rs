@@ -109,8 +109,7 @@ impl HeartbeatTask {
         // peer has almost certainly reclaimed and we just haven't
         // been able to observe it, so writing more files is unsafe.
         // Minimum 1 to keep behavior sane on absurd configs.
-        let retry_budget =
-            (self.lease_timeout.as_secs() / self.interval.as_secs().max(1)).max(1);
+        let retry_budget = (self.lease_timeout.as_secs() / self.interval.as_secs().max(1)).max(1);
         let mut consec_failures: u64 = 0;
 
         // R7 clock-jump baseline. Wall-vs-monotonic divergence beyond
@@ -127,7 +126,7 @@ impl HeartbeatTask {
                 _ = cancel.cancelled() => {
                     // Fence tripped — write a final progress record so
                     // the aggregator sees a clean exit, then break.
-                    self.write_progress_bounded("exiting").await;
+                    self.write_progress_bounded("exiting", None).await;
                     break;
                 }
             }
@@ -151,19 +150,16 @@ impl HeartbeatTask {
                 self.fence.trip(format!(
                     "clock jump detected: wall-mono drift {drift_secs}s > lease/2 ({max_drift_secs}s); self-fencing"
                 ));
-                self.write_progress_bounded("fenced").await;
+                self.write_progress_bounded("fenced", None).await;
                 break;
             }
 
-            // Step 1: write progress unconditionally. This is the
-            // per-host liveness signal aggregators + reclaimers observe;
-            // it must land before any HEAD round-trip can stall the loop.
-            if let Err(e) = self.write_progress("active").await {
-                tracing::warn!(error = ?e, "progress write failed (transient)");
-            }
-
-            // Step 2: snapshot what we currently hold — the worker may
-            // have changed it underneath us.
+            // Step 1: snapshot what we currently hold. We do this
+            // BEFORE writing progress so the progress object can
+            // carry our owning etag for the peer-side liveness
+            // cross-check. A reclaimer reads `held_etag` from the
+            // progress file and compares it against the live claim
+            // etag to decide whether to fast-reclaim.
             let held = {
                 let g = self.current.lock().await;
                 g.clone()
@@ -175,6 +171,13 @@ impl HeartbeatTask {
                 epoch = ?held.as_ref().map(|h| h.epoch),
                 "heartbeat: held-state snapshot"
             );
+
+            // Step 2: write progress unconditionally. This is the
+            // per-host liveness signal aggregators + reclaimers observe;
+            // it must land before any HEAD round-trip can stall the loop.
+            if let Err(e) = self.write_progress("active", held.as_ref()).await {
+                tracing::warn!(error = ?e, "progress write failed (transient)");
+            }
 
             // Step 3: HEAD-and-compare to detect ownership loss. The
             // v2 refresh does not write — epoch is not bumped here; it
@@ -213,7 +216,7 @@ impl HeartbeatTask {
                             "claim refresh: HEAD shows different etag, claim was reclaimed (shard {})",
                             held.shard
                         ));
-                        self.write_progress_bounded("fenced").await;
+                        self.write_progress_bounded("fenced", None).await;
                         break;
                     }
                     Err(e) => {
@@ -236,7 +239,7 @@ impl HeartbeatTask {
                             self.fence.trip(format!(
                                 "heartbeat HEAD failing for {consec_failures} consecutive ticks (>= lease window); self-fencing"
                             ));
-                            self.write_progress_bounded("fenced").await;
+                            self.write_progress_bounded("fenced", None).await;
                             break;
                         }
                     }
@@ -257,11 +260,12 @@ impl HeartbeatTask {
     /// AWS SDK connection-pool entry after a long SIGSTOP/SIGCONT
     /// cycle can hang the heartbeat task here, which in turn hangs
     /// the orchestrator's hb_handle.await.
-    async fn write_progress_bounded(&self, status: &str) {
+    async fn write_progress_bounded(&self, status: &str, held: Option<&HeldClaim>) {
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            self.write_progress(status),
-        ).await;
+            self.write_progress(status, held),
+        )
+        .await;
         match r {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(
@@ -275,7 +279,11 @@ impl HeartbeatTask {
         }
     }
 
-    async fn write_progress(&self, status: &str) -> migration_core::Result<()> {
+    async fn write_progress(
+        &self,
+        status: &str,
+        held: Option<&HeldClaim>,
+    ) -> migration_core::Result<()> {
         let throughput_mb_s = self.throughput.sample_mb_s(self.throughput_window_secs);
         let snap = self.progress.read().await.clone();
         let record = ProgressRecord {
@@ -291,6 +299,12 @@ impl HeartbeatTask {
             files_fenced: snap.files_fenced,
             throughput_mb_s_1m: throughput_mb_s,
             status: status.to_string(),
+            // Cross-check fields (PROGRESS_LIVENESS_CROSS_CHECK.md):
+            // peers compare `held_etag` to the live claim etag and
+            // use `heartbeat_sec` to set the freshness threshold
+            // (2× the writer's configured interval).
+            held_etag: held.map(|h| h.etag.clone()),
+            heartbeat_sec: self.interval.as_secs(),
         };
         let body = serde_json::to_vec(&record)?;
         let key = layout::progress_key(&self.host_id);
