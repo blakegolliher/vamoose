@@ -240,10 +240,22 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     };
     let hb_handle = tokio::spawn(async move { hb.run().await });
 
-    // ---- 5. Reconcile self-owned claims ----------------------------
-    if let Err(e) = log_self_owned_claims(&s3, &host_id).await {
-        tracing::warn!(error = ?e, "self-claim reconcile scan failed (continuing)");
-    }
+    // ---- 5. Reclaim self-owned claims from a previous run ----------
+    // On a fast worker restart (host_id reuse), any claims we held
+    // are still Active on S3 with our host_id and the previous
+    // run's etag. Reclaiming them ourselves is race-free (we're
+    // the same host_id) and skips the wait for the cross-check
+    // staleness window or the lease.
+    let self_reclaim_queue: std::collections::VecDeque<(String, String, u64)> =
+        reclaim_self_owned_claims(&*s3, &host_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = ?e, "self-claim reclaim scan failed (continuing)");
+                Vec::new()
+            })
+            .into_iter()
+            .collect();
+    let mut self_reclaim_queue = self_reclaim_queue;
 
     // ---- 6. Main shard loop ----------------------------------------
     let lease = Duration::from_secs(cfg.worker.lease_timeout_sec);
@@ -252,6 +264,8 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         cfg.backpressure.failure_pct_threshold,
         cfg.backpressure.throughput_floor_mb_s,
     );
+    // Cross-pass claim-body cache. See `ClaimBodyCache` doc.
+    let mut claim_body_cache: ClaimBodyCache = HashMap::new();
 
     loop {
         if !fence.is_valid() {
@@ -279,7 +293,30 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
             continue;
         }
 
-        let scan = scan_shards(&s3, &manifest, lease).await?;
+        // Self-restart queue drains first — these are shards we
+        // reclaimed at startup from a previous run. They're already
+        // Active under our (new) etag; skip scan_shards for them
+        // and go straight to processing.
+        let from_self_reclaim = self_reclaim_queue.pop_front();
+        let scan_or_self: ScanResult = if let Some((shard, etag, epoch)) = from_self_reclaim {
+            tracing::info!(
+                shard = %shard,
+                epoch,
+                "processing self-reclaimed orphan from previous run",
+            );
+            ScanResult {
+                next_target: Some(ClaimTarget::AlreadyReclaimed {
+                    shard: shard.clone(),
+                    etag,
+                    epoch,
+                }),
+                all_terminal: false,
+                last_target_filename: shard,
+            }
+        } else {
+            scan_shards(&*s3, &manifest, lease, &mut claim_body_cache).await?
+        };
+        let scan = scan_or_self;
         if scan.all_terminal {
             tracing::info!("all shards terminal; worker exiting");
             // Slice 3 of MTIME_PARITY_FIX: walker doesn't emit a row
@@ -360,6 +397,31 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
                         continue;
                     }
                 }
+            }
+            ClaimTarget::AlreadyReclaimed { shard, etag, epoch } => {
+                // Synthesize a stand-in record for the downstream
+                // code that expects `(etag, ClaimRecord)`. The
+                // authoritative on-disk record was written by
+                // `claim::reclaim` inside `reclaim_self_owned_claims`
+                // with its own `claimed_utc`. This local record is
+                // consumed only by `current_shard_filename` (which
+                // ignores it; reads only the fallback shard name)
+                // and the HeldClaim cell's `epoch` field below.
+                // `claimed_utc` from this struct is NEVER used —
+                // the on-disk value is what lease/cross-check
+                // arithmetic reads.
+                tracing::debug!(
+                    %shard,
+                    epoch,
+                    "claiming self-reclaimed orphan (skipping acquire/reclaim)",
+                );
+                let record = ClaimRecord {
+                    host: host_id.clone(),
+                    claimed_utc: UtcTime::now(),
+                    epoch,
+                    state: ClaimState::Active,
+                };
+                (etag, record)
             }
         };
 
@@ -714,6 +776,15 @@ enum ClaimTarget {
         stale_etag: String,
         prior_epoch: u64,
     },
+    /// Reclaimed at startup from a previous run with the same host_id
+    /// (self-restart shortcut). The shard is already ours; the
+    /// orchestrator skips try_acquire/reclaim and goes straight to
+    /// processing. See `reclaim_self_owned_claims`.
+    AlreadyReclaimed {
+        shard: String,
+        etag: String,
+        epoch: u64,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -725,13 +796,51 @@ struct ScanResult {
     last_target_filename: String,
 }
 
+/// Cross-pass claim-body cache. Keyed by claim key (e.g.
+/// `shards/part-0042.parquet.claim`); value is `(LIST etag,
+/// parsed body)`. A scan only re-GETs a claim object when the LIST
+/// response carries a new etag for it (which can only happen when
+/// another worker has reclaimed / completed / failed it). In steady
+/// state — all claims still owned and unchanged — this drops
+/// per-Active-claim GETs to zero; scan cost becomes pure LIST plus
+/// progress GETs (which the intra-pass cache also dedupes).
+pub(crate) type ClaimBodyCache = HashMap<String, (String, ClaimRecord)>;
+
+/// Intra-pass progress cache. Built fresh inside each scan pass.
+/// Lets M Active claims owned by N hosts cost N progress GETs
+/// instead of M.
+#[derive(Debug, Clone)]
+enum ProgressFetch {
+    /// `progress/host-<id>.json` was present and we have its body.
+    Hit(Vec<u8>),
+    /// 404 — the owner never wrote progress (or it was deleted).
+    /// `check_progress_liveness` treats this as eligible-for-reclaim.
+    Miss,
+    /// S3 erroring out on us. Defer to the lease path; don't
+    /// fast-reclaim on the basis of a failed read.
+    Error,
+}
+
 async fn scan_shards(
-    s3: &S3Client,
+    store: &dyn ClaimStore,
     manifest: &Manifest,
     lease: Duration,
+    claim_body_cache: &mut ClaimBodyCache,
 ) -> anyhow::Result<ScanResult> {
-    let entries = s3.list(layout::SHARDS_PREFIX).await?;
+    let entries = store.list(layout::SHARDS_PREFIX).await?;
     let by_key: HashMap<String, &ListEntry> = entries.iter().map(|e| (e.key.clone(), e)).collect();
+
+    // GC: drop cache entries for keys no longer present in LIST.
+    // Without this, completed shards' bodies would linger
+    // forever in the cache. The worker is long-lived; the manifest
+    // shard set is bounded, but operator re-runs could rename
+    // shards, and we don't want stale bodies surviving across
+    // those.
+    claim_body_cache.retain(|k, _| by_key.contains_key(k));
+
+    // Intra-pass progress cache. Built fresh each scan because
+    // heartbeat_utc must be re-read every iteration to be useful.
+    let mut progress_cache: HashMap<String, ProgressFetch> = HashMap::new();
 
     let now = chrono::Utc::now();
     let mut all_terminal = true;
@@ -755,31 +864,46 @@ async fn scan_shards(
                 }
             }
             Some(e) => {
-                // Need to peek at the body to read state.
-                let Some((body, _)) = s3.get(&claim_key).await? else {
-                    all_terminal = false;
-                    if next.is_none() {
-                        next = Some(ClaimTarget::Free {
-                            shard: shard_filename.clone(),
-                        });
-                        next_name = shard_filename;
+                // Cache lookup: skip the GET when LIST etag matches
+                // what we already have parsed.
+                let record = match claim_body_cache.get(&claim_key) {
+                    Some((cached_etag, cached_record)) if cached_etag == &e.etag => {
+                        cached_record.clone()
                     }
-                    continue;
-                };
-                let Ok(record) = serde_json::from_slice::<ClaimRecord>(&body) else {
-                    // Unparseable body: log-and-skip would let the worker
-                    // declare `all_terminal=true` and exit prematurely with
-                    // an unprocessed shard sitting on S3. Force the worker
-                    // to keep running so an operator notices the ERROR
-                    // line and can intervene (delete the corrupt claim
-                    // object → next scan sees the shard as Free).
-                    tracing::error!(
-                        claim = %claim_key,
-                        "unparseable claim record; operator intervention required \
-                         (worker will not exit while this persists)",
-                    );
-                    all_terminal = false;
-                    continue;
+                    _ => {
+                        let Some((body, _)) = store.get(&claim_key).await? else {
+                            all_terminal = false;
+                            if next.is_none() {
+                                next = Some(ClaimTarget::Free {
+                                    shard: shard_filename.clone(),
+                                });
+                                next_name = shard_filename;
+                            }
+                            claim_body_cache.remove(&claim_key);
+                            continue;
+                        };
+                        let Ok(record) = serde_json::from_slice::<ClaimRecord>(&body) else {
+                            // Unparseable body: log-and-skip would let
+                            // the worker declare `all_terminal=true` and
+                            // exit prematurely with an unprocessed
+                            // shard sitting on S3. Force the worker to
+                            // keep running so an operator notices the
+                            // ERROR line and can intervene (delete the
+                            // corrupt claim object → next scan sees the
+                            // shard as Free).
+                            tracing::error!(
+                                claim = %claim_key,
+                                "unparseable claim record; operator intervention required \
+                                 (worker will not exit while this persists)",
+                            );
+                            all_terminal = false;
+                            claim_body_cache.remove(&claim_key);
+                            continue;
+                        };
+                        claim_body_cache
+                            .insert(claim_key.clone(), (e.etag.clone(), record.clone()));
+                        record
+                    }
                 };
                 match record.state {
                     ClaimState::Completed | ClaimState::Failed => { /* terminal */ }
@@ -793,28 +917,40 @@ async fn scan_shards(
                         // heartbeating, instead of waiting the full
                         // lease window. See
                         // docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md.
-                        // Only fetch when we'd act on the result —
-                        // saves a GET per Active claim when we
-                        // already have a `next` target or the lease
-                        // path already fired.
+                        //
+                        // Only fetch when we'd act on the result — and
+                        // dedupe by host within a single pass so M
+                        // active shards owned by N hosts cost at most
+                        // N progress GETs.
                         let stale_by_progress = if next.is_none() && !stale_by_lease {
-                            match s3.get(&layout::progress_key(&record.host)).await {
-                                Ok(Some((body, _))) => {
+                            let fetch = match progress_cache.get(&record.host).cloned() {
+                                Some(cached) => cached,
+                                None => {
+                                    let fetched = match store
+                                        .get(&layout::progress_key(&record.host))
+                                        .await
+                                    {
+                                        Ok(Some((body, _))) => ProgressFetch::Hit(body),
+                                        Ok(None) => ProgressFetch::Miss,
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                error = ?err,
+                                                host = %record.host,
+                                                "progress GET failed; deferring to lease check",
+                                            );
+                                            ProgressFetch::Error
+                                        }
+                                    };
+                                    progress_cache.insert(record.host.clone(), fetched.clone());
+                                    fetched
+                                }
+                            };
+                            match fetch {
+                                ProgressFetch::Hit(body) => {
                                     check_progress_liveness(Some(&body), &e.etag, now)
                                 }
-                                Ok(None) => check_progress_liveness(None, &e.etag, now),
-                                Err(err) => {
-                                    // Fail-safe: defer to lease on
-                                    // any S3 hiccup. The outer LIST
-                                    // already succeeded, so this is
-                                    // a per-object glitch.
-                                    tracing::warn!(
-                                        error = ?err,
-                                        host = %record.host,
-                                        "progress GET failed; deferring to lease check",
-                                    );
-                                    false
-                                }
+                                ProgressFetch::Miss => check_progress_liveness(None, &e.etag, now),
+                                ProgressFetch::Error => false,
                             }
                         } else {
                             false
@@ -894,30 +1030,64 @@ fn check_progress_liveness(
     age.num_seconds() > threshold_secs
 }
 
-/// Log (don't resume) any claims still owned by this host_id. The
-/// design intentionally leaves resume-after-restart for a future
-/// milestone; M1 just surfaces the situation so an operator notices.
-async fn log_self_owned_claims(s3: &S3Client, host_id: &str) -> anyhow::Result<()> {
-    let entries = s3.list(layout::SHARDS_PREFIX).await?;
+/// Reclaim any Active claims still tagged with our `host_id` from a
+/// previous run. Returns `(shard_filename, new_etag, new_epoch)` for
+/// each successfully reclaimed orphan, in LIST order. The orchestrator
+/// queues these and processes them before falling through to
+/// `scan_shards`.
+///
+/// Race-free because the host_id is unique to us — no other worker can
+/// observe an `Active` claim with our host_id and assume the original
+/// us is still alive. (If another operator misconfigures two workers
+/// with the same host_id, the loser of any race here gets `LostRace`
+/// and the orphan is just skipped — same outcome as the cross-check
+/// path would produce.)
+async fn reclaim_self_owned_claims(
+    store: &dyn ClaimStore,
+    host_id: &str,
+) -> anyhow::Result<Vec<(String, String, u64)>> {
+    let entries = store.list(layout::SHARDS_PREFIX).await?;
+    let mut reclaimed = Vec::new();
     for e in entries {
         let Some(shard) = layout::shard_from_claim_key(&e.key) else {
             continue;
         };
-        let Some((body, _)) = s3.get(&e.key).await? else {
+        let Some((body, _)) = store.get(&e.key).await? else {
             continue;
         };
         let Ok(record) = serde_json::from_slice::<ClaimRecord>(&body) else {
             continue;
         };
-        if record.host == host_id && matches!(record.state, ClaimState::Active) {
-            tracing::warn!(
-                shard = %shard,
-                epoch = record.epoch,
-                "found self-owned active claim from previous run; not resumed in M1",
-            );
+        if record.host != host_id || !matches!(record.state, ClaimState::Active) {
+            continue;
+        }
+        let new_epoch = record.epoch + 1;
+        match claim::reclaim(store, &shard, &e.etag, host_id, new_epoch).await {
+            Ok(ReclaimOutcome::Won { etag: new_etag, .. }) => {
+                tracing::info!(
+                    shard = %shard,
+                    prior_epoch = record.epoch,
+                    new_epoch,
+                    "self-restart: reclaimed orphan from previous run",
+                );
+                reclaimed.push((shard.to_string(), new_etag, new_epoch));
+            }
+            Ok(ReclaimOutcome::LostRace) => {
+                tracing::warn!(
+                    shard = %shard,
+                    "self-restart reclaim LostRace; another worker took the orphan first",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    shard = %shard,
+                    "self-restart reclaim errored; orphan will be picked up via cross-check on a later iteration",
+                );
+            }
         }
     }
-    Ok(())
+    Ok(reclaimed)
 }
 
 // `record.host` already carries our identity; this helper exists so
