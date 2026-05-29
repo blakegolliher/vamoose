@@ -406,6 +406,40 @@ impl CoordRuntime {
         Ok(command_id)
     }
 
+    /// Update a worker's heartbeat-only fields (counters,
+    /// transient state, queue depth, inflight ops) without writing
+    /// an event. Heartbeats are intentionally absent from the event
+    /// log per the build prompt — they drive state derivation but
+    /// would flood SSE consumers if streamed.
+    ///
+    /// Returns `true` if the worker existed and was updated,
+    /// `false` if it was unknown (caller responds with 404).
+    pub async fn record_heartbeat(
+        &self,
+        worker_id: crate::schema::WorkerId,
+        counters: crate::schema::WorkerCounters,
+        state: crate::schema::WorkerState,
+        inflight_ops: u32,
+        queue_depth: u32,
+    ) -> Result<bool> {
+        let now = self.clock.now();
+        let mut guard = self.inner.lock().await;
+        if guard.lease_lost {
+            return Err(Error::LeaseLost);
+        }
+        match guard.state.workers.get_mut(&worker_id) {
+            Some(w) => {
+                w.counters = counters;
+                w.state = state;
+                w.inflight_ops = inflight_ops;
+                w.queue_depth = queue_depth;
+                w.last_heartbeat = now;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Subscribe to live events. Returns a `broadcast::Receiver`;
     /// the SSE handler typically wraps it in a stream and emits
     /// each envelope as a wire frame.

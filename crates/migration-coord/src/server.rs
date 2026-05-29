@@ -35,6 +35,7 @@
 pub mod command;
 pub mod read;
 pub mod stream;
+pub mod worker;
 
 use crate::runtime::CoordRuntime;
 use axum::response::{IntoResponse, Response};
@@ -74,6 +75,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/jobs/{id}/cancel", post(command::cancel))
         .route("/jobs/{id}/drain", post(command::drain))
         .route("/jobs/{id}/retry-failed", post(command::retry_failed))
+        .route("/workers/register", post(worker::register))
+        .route("/workers/{id}/heartbeat", post(worker::heartbeat))
+        .route("/workers/{id}/events", post(worker::events_batch))
+        .route("/workers/{id}/fence", post(worker::fence))
         .route("/events", get(read::list_all_events))
         .with_state(state)
 }
