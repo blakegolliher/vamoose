@@ -42,7 +42,7 @@ pub struct ListJobsParams {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ListJobsResponse {
     pub jobs: Vec<Job>,
     pub next_cursor: Option<String>,
@@ -92,7 +92,7 @@ pub async fn get_job(
 // GET /jobs/{id}/workers
 // =============================================================================
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ListWorkersResponse {
     pub workers: Vec<Worker>,
 }
@@ -115,7 +115,7 @@ pub async fn list_workers(
 // GET /jobs/{id}/errors
 // =============================================================================
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ListErrorsResponse {
     pub buckets: Vec<ErrorBucket>,
 }
@@ -146,7 +146,7 @@ pub struct ListEventsParams {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ListEventsResponse {
     pub events: Vec<EventEnvelope>,
     /// Seq of the last event returned (or the original `since` if
@@ -217,9 +217,9 @@ pub async fn list_all_events(
 // GET /healthz
 // =============================================================================
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthzResponse {
-    pub status: &'static str,
+    pub status: String,
     pub last_seq: u64,
     pub subscriber_count: usize,
     pub lease_lost: bool,
@@ -237,7 +237,7 @@ pub async fn healthz(State(state): State<AppState>) -> (StatusCode, Json<Healthz
     (
         status,
         Json(HealthzResponse {
-            status: body_status,
+            status: body_status.to_string(),
             last_seq,
             subscriber_count,
             lease_lost,

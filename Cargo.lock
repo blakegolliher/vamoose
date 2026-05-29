@@ -2499,6 +2499,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "migration-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum-server",
+ "bytes",
+ "chrono",
+ "crossterm",
+ "futures",
+ "http 1.4.0",
+ "migration-coord",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "migration-worker"
 version = "0.1.0"
 dependencies = [

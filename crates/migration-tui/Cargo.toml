@@ -1,0 +1,44 @@
+[package]
+name        = "migration-tui"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "Operator TUI for vamoose coord (live REST + SSE dashboard)"
+
+[lib]
+name = "migration_tui"
+path = "src/lib.rs"
+
+[dependencies]
+# Schema types + Snapshot reducer (shared with the coord). The TUI
+# does NOT depend on the coord's HTTP server side beyond the wire
+# types — cargo only compiles what's referenced.
+migration-coord = { workspace = true }
+
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+chrono      = { workspace = true }
+futures     = { workspace = true }
+async-stream = { workspace = true }
+
+# HTTP client + SSE byte-stream over reqwest.
+reqwest = { workspace = true }
+bytes   = { workspace = true }
+
+# Rendering layer — wired in step 4b, declared here so the workspace
+# resolves them in one shot.
+ratatui   = { workspace = true }
+crossterm = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tokio-util = { workspace = true }
+
+# Bring up an in-process coord for the integration test.
+axum-server = { workspace = true }
+http        = { workspace = true }
