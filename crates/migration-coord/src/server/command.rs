@@ -26,9 +26,10 @@
 //! requests landed under un-authenticated mode (a dev-mode
 //! disclaimer the operator can grep for).
 
+use super::auth::AdminLabel;
 use super::{ApiError, AppState};
 use crate::schema::{AuditResult, EventKind, JobId};
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +45,6 @@ pub struct ReasonBody {
     #[serde(default)]
     pub reason: Option<String>,
 }
-
-const ANONYMOUS_LABEL: &str = "anonymous";
 
 async fn require_job(state: &AppState, id: &JobId) -> Result<(), ApiError> {
     if state.runtime.job_view(id).await.is_none() {
@@ -63,6 +62,7 @@ fn parse_id(raw: String) -> Result<JobId, ApiError> {
 
 async fn record_and_ingest(
     state: &AppState,
+    label: &AdminLabel,
     action: &str,
     job_id: &JobId,
     reason: String,
@@ -72,13 +72,7 @@ async fn record_and_ingest(
     let args = serde_json::json!({ "reason": reason });
     let command_id = state
         .runtime
-        .record_audit(
-            ANONYMOUS_LABEL,
-            action,
-            &target,
-            args,
-            AuditResult::Accepted,
-        )
+        .record_audit(label.as_str(), action, &target, args, AuditResult::Accepted)
         .await
         .map_err(ApiError::storage)?;
     state
@@ -100,6 +94,7 @@ fn reason_or_default(body: Option<ReasonBody>, fallback: &str) -> String {
 
 pub async fn pause(
     State(state): State<AppState>,
+    Extension(label): Extension<AdminLabel>,
     Path(id): Path<String>,
     body: Option<Json<ReasonBody>>,
 ) -> Result<Json<CommandAccepted>, ApiError> {
@@ -110,7 +105,7 @@ pub async fn pause(
         job_id: id.clone(),
         reason: reason.clone(),
     };
-    let accepted = record_and_ingest(&state, "pause", &id, reason, kind).await?;
+    let accepted = record_and_ingest(&state, &label, "pause", &id, reason, kind).await?;
     Ok(Json(accepted))
 }
 
@@ -120,6 +115,7 @@ pub async fn pause(
 
 pub async fn resume(
     State(state): State<AppState>,
+    Extension(label): Extension<AdminLabel>,
     Path(id): Path<String>,
     body: Option<Json<ReasonBody>>,
 ) -> Result<Json<CommandAccepted>, ApiError> {
@@ -130,7 +126,7 @@ pub async fn resume(
         job_id: id.clone(),
         reason: reason.clone(),
     };
-    let accepted = record_and_ingest(&state, "resume", &id, reason, kind).await?;
+    let accepted = record_and_ingest(&state, &label, "resume", &id, reason, kind).await?;
     Ok(Json(accepted))
 }
 
@@ -140,6 +136,7 @@ pub async fn resume(
 
 pub async fn cancel(
     State(state): State<AppState>,
+    Extension(label): Extension<AdminLabel>,
     Path(id): Path<String>,
     body: Option<Json<ReasonBody>>,
 ) -> Result<Json<CommandAccepted>, ApiError> {
@@ -150,7 +147,7 @@ pub async fn cancel(
         job_id: id.clone(),
         reason: reason.clone(),
     };
-    let accepted = record_and_ingest(&state, "cancel", &id, reason, kind).await?;
+    let accepted = record_and_ingest(&state, &label, "cancel", &id, reason, kind).await?;
     Ok(Json(accepted))
 }
 
@@ -166,6 +163,7 @@ pub async fn cancel(
 
 pub async fn drain(
     State(state): State<AppState>,
+    Extension(label): Extension<AdminLabel>,
     Path(id): Path<String>,
     _body: Option<Json<ReasonBody>>,
 ) -> Result<Json<CommandAccepted>, ApiError> {
@@ -176,7 +174,7 @@ pub async fn drain(
         job_id: id.clone(),
         reason: reason.clone(),
     };
-    let accepted = record_and_ingest(&state, "drain", &id, reason, kind).await?;
+    let accepted = record_and_ingest(&state, &label, "drain", &id, reason, kind).await?;
     Ok(Json(accepted))
 }
 
@@ -186,6 +184,7 @@ pub async fn drain(
 
 pub async fn retry_failed(
     State(state): State<AppState>,
+    Extension(label): Extension<AdminLabel>,
     Path(id): Path<String>,
     _body: Option<Json<ReasonBody>>,
 ) -> Result<Json<CommandAccepted>, ApiError> {
@@ -198,7 +197,7 @@ pub async fn retry_failed(
     let command_id = state
         .runtime
         .record_audit(
-            ANONYMOUS_LABEL,
+            label.as_str(),
             "retry-failed",
             &target,
             serde_json::json!({}),

@@ -32,6 +32,7 @@
 //! holds the skeleton + documentation so the crate keeps compiling
 //! as each piece arrives.
 
+pub mod auth;
 pub mod command;
 pub mod read;
 pub mod stream;
@@ -40,31 +41,53 @@ pub mod worker;
 use crate::runtime::CoordRuntime;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{middleware, Json, Router};
 use http::StatusCode;
 use serde::Serialize;
+use std::sync::Arc;
 
 /// Application state shared across every handler. Cheap to clone
 /// — the runtime itself is `Arc`-backed.
 #[derive(Clone)]
 pub struct AppState {
     pub runtime: CoordRuntime,
+    pub auth: Arc<auth::AuthConfig>,
 }
 
 impl AppState {
+    /// Convenience constructor for tests and dev mode — no
+    /// admin tokens, no cluster secret, every request passes
+    /// through with the `dev-mode` audit label.
     pub fn new(runtime: CoordRuntime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            auth: Arc::new(auth::AuthConfig::default()),
+        }
+    }
+
+    pub fn with_auth(runtime: CoordRuntime, auth: auth::AuthConfig) -> Self {
+        Self {
+            runtime,
+            auth: Arc::new(auth),
+        }
     }
 }
 
-/// Build the read-only axum router. Phase 2.6 (commands), 2.7
-/// (worker endpoints), and 2.8 (auth) will wrap this. The stream
-/// route is mounted here so SSE is reachable from Phase 2.5 onward;
-/// the actual axum SSE adapter ships with the integration tests in
-/// Phase 2.11.
+/// Build the full axum router. Three route groups:
+///
+/// - **Public** — only `/healthz`. Reachable without credentials so
+///   liveness probes don't need to know the admin token.
+/// - **Admin** — read and command endpoints. Behind
+///   [`auth::require_admin`].
+/// - **Worker** — `/workers/*`. Behind
+///   [`auth::require_cluster_secret`].
+///
+/// In dev mode ([`auth::AuthConfig::is_dev_mode`]) both middleware
+/// layers pass every request through and stamp the
+/// [`auth::AdminLabel`] with `"dev-mode"` so the audit log records
+/// the unauthenticated origin.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(read::healthz))
+    let admin = Router::new()
         .route("/jobs", get(read::list_jobs))
         .route("/jobs/{id}", get(read::get_job))
         .route("/jobs/{id}/workers", get(read::list_workers))
@@ -75,11 +98,26 @@ pub fn build_router(state: AppState) -> Router {
         .route("/jobs/{id}/cancel", post(command::cancel))
         .route("/jobs/{id}/drain", post(command::drain))
         .route("/jobs/{id}/retry-failed", post(command::retry_failed))
+        .route("/events", get(read::list_all_events))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_admin,
+        ));
+
+    let workers = Router::new()
         .route("/workers/register", post(worker::register))
         .route("/workers/{id}/heartbeat", post(worker::heartbeat))
         .route("/workers/{id}/events", post(worker::events_batch))
         .route("/workers/{id}/fence", post(worker::fence))
-        .route("/events", get(read::list_all_events))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_cluster_secret,
+        ));
+
+    Router::new()
+        .route("/healthz", get(read::healthz))
+        .merge(admin)
+        .merge(workers)
         .with_state(state)
 }
 
