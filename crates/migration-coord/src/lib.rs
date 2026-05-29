@@ -43,5 +43,6 @@ pub mod server;
 pub mod snapshot;
 pub mod state;
 pub mod store;
+pub mod ticks;
 
 pub use errors::{Error, Result};
