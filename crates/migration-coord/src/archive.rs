@@ -40,7 +40,7 @@
 //! operator garbage-collects (out of scope for v1).
 
 use crate::errors::Result;
-use crate::layout::{job_events_prefix, ARCHIVE_PREFIX, EVENTS_PREFIX};
+use crate::layout::{job_events_prefix, ARCHIVE_PREFIX};
 use crate::schema::JobId;
 use crate::store::CoordStore;
 

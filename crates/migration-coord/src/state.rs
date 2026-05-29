@@ -39,7 +39,9 @@
 //! grow more nuanced derived state from them; that's intentionally
 //! deferred.
 
-use crate::errors::{Error, Result};
+#[cfg(any(test, feature = "test-helpers"))]
+use crate::errors::Error;
+use crate::errors::Result;
 use crate::events::{list_chunks, read_chunk};
 use crate::layout::EVENTS_PREFIX;
 use crate::schema::{
