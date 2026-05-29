@@ -21,4 +21,6 @@
 //! [`state::AppState`] directly for tests.
 
 pub mod client;
+pub mod format;
+pub mod render;
 pub mod state;
