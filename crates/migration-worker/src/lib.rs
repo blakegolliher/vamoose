@@ -7,6 +7,7 @@ pub mod backpressure;
 pub mod caps;
 pub mod config;
 pub mod coord_client;
+pub mod coord_driver;
 pub mod heartbeat;
 pub mod orchestrator;
 pub mod run_control;

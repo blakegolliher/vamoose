@@ -23,7 +23,9 @@
 use crate::backpressure::Backpressure;
 use crate::caps;
 use crate::config::Config;
+use crate::coord_driver::{self, CoordDriverHandle, DriverInputs};
 use crate::heartbeat::{HeartbeatTask, HeldClaim, ProgressState};
+use crate::run_control::RunControlReader;
 use crate::shard_processor::{ProcessOutcome, ShardProcessor};
 use crate::throughput::ThroughputCounter;
 
@@ -49,8 +51,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
+    // Worker-process start time. Captured before any awaits so the
+    // value reflects the actual process boot, not the first config
+    // I/O — coord-side register dedup pairs this with (host, pid)
+    // to identify the worker instance across restarts.
+    let process_start = chrono::Utc::now();
+    let pid = std::process::id();
+
     // ---- 1. S3 client + manifest -----------------------------------
     let s3 = S3Client::from_config(
         &cfg.run.endpoint,
@@ -240,6 +250,51 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     };
     let hb_handle = tokio::spawn(async move { hb.run().await });
 
+    // ---- 4b. Coord wiring (Phase 3, optional) ----------------------
+    // When [coord] is configured, spawn a background driver that
+    // registers + heartbeats over HTTP. The driver writes the coord-
+    // supplied control mode into a `RunControl`; the claim loop
+    // below reads it to honor operator-issued pause/cancel commands
+    // without touching the claim-protocol primitives.
+    //
+    // When [coord] is absent, the worker runs in legacy S3-only
+    // mode — `run_control_reader` stays None and the claim loop is
+    // bit-for-bit unchanged.
+    let coord_cancel = CancellationToken::new();
+    let coord_handle: Option<CoordDriverHandle> = match cfg.coord.as_ref() {
+        Some(c) => {
+            let driver_inputs = DriverInputs {
+                progress: progress.clone(),
+                throughput: throughput.clone(),
+                fence: fence.clone(),
+            };
+            match coord_driver::spawn(
+                c,
+                host_id.clone(),
+                pid,
+                process_start,
+                env!("CARGO_PKG_VERSION").to_string(),
+                driver_inputs,
+                coord_cancel.clone(),
+            ) {
+                Ok(h) => {
+                    tracing::info!(coord_url = %c.url, job_id = %c.job_id,
+                        "coord driver spawned");
+                    Some(h)
+                }
+                Err(e) => {
+                    // Fast-fail at startup on config bugs (bad URL,
+                    // missing secret env). The worker should not
+                    // keep running half-configured.
+                    anyhow::bail!("coord driver spawn failed: {e}");
+                }
+            }
+        }
+        None => None,
+    };
+    let mut run_control_reader: Option<RunControlReader> =
+        coord_handle.as_ref().map(|h| h.run_control.subscribe());
+
     // ---- 5. Reclaim self-owned claims from a previous run ----------
     // On a fast worker restart (host_id reuse), any claims we held
     // are still Active on S3 with our host_id and the previous
@@ -271,6 +326,35 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         if !fence.is_valid() {
             tracing::warn!(reason = ?fence.reason(), "worker fenced; exiting main loop");
             break;
+        }
+
+        // Coord-driven run control. Honored AFTER the fence check
+        // so safety invariants always win — a tripped fence exits
+        // immediately regardless of operator pause/cancel intent.
+        //
+        // Drain / Cancel break the loop with no new claim — there's
+        // nothing in flight here at the top of the loop, so the
+        // exit path is identical to a clean "all shards terminal"
+        // finish below. The R-rules are unaffected: no claim is
+        // touched, no batch is interrupted mid-commit.
+        //
+        // Pause blocks the loop on a `watch::Receiver::changed()` —
+        // O(1) wake on resume, no busy poll. After wake, `continue`
+        // restarts the loop from the top so the fence check and the
+        // run-control check both re-evaluate (fence may have tripped
+        // during the wait; the new mode may be Cancel).
+        if let Some(rc) = run_control_reader.as_mut() {
+            if rc.is_terminating() {
+                tracing::info!(mode = ?rc.mode(),
+                    "coord requested termination; exiting main loop");
+                break;
+            }
+            if rc.is_paused() {
+                tracing::info!("coord requested pause; waiting for resume");
+                let after = rc.wait_while_paused().await;
+                tracing::info!(?after, "coord pause released");
+                continue;
+            }
         }
 
         // Backpressure gate per DESIGN.md "Backpressure": if the last
@@ -645,6 +729,21 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         p.status = "exiting".into();
     }
     eprintln!("[shutdown] released progress write lock");
+    // Cancel the coord driver so it stops heartbeating and the
+    // task joins. Bounded await — if the HTTP layer is wedged the
+    // worker should still get to clean exit; the driver leaks at
+    // process termination, which is benign (no shared resources).
+    if let Some(handle) = coord_handle {
+        coord_cancel.cancel();
+        eprintln!("[shutdown] awaiting coord_driver with 5s timeout");
+        match tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await {
+            Ok(Ok(Ok(()))) => tracing::info!("coord_driver: clean exit"),
+            Ok(Ok(Err(e))) => tracing::warn!(error = %e, "coord_driver returned error"),
+            Ok(Err(e)) => tracing::warn!(join_error = %e, "coord_driver join failed"),
+            Err(_) => tracing::warn!("coord_driver did not exit within 5s; dropping handle"),
+        }
+        eprintln!("[shutdown] coord_driver done");
+    }
     // Drop the held claim so the heartbeat stops refreshing.
     {
         eprintln!("[shutdown] acquiring current lock");
