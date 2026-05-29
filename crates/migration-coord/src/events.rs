@@ -216,6 +216,36 @@ pub async fn list_chunks(store: &dyn CoordStore, route_prefix: &str) -> Result<V
     Ok(entries.into_iter().map(|e| e.key).collect())
 }
 
+/// Read every envelope across **every** route under `events/`
+/// with `seq > since`, sorted ascending by seq. Used by the SSE
+/// resume path: when a client connects with `Last-Event-ID = N`,
+/// the handler emits these in order before switching to the live
+/// broadcast.
+///
+/// Memory: O(events-since-checkpoint). The SSE catch-up window is
+/// expected to be small (a reconnect after a brief blip); a client
+/// that lags by hours past the snapshot cadence gets a synthetic
+/// `Resync` from the live side instead and re-fetches `/jobs`.
+pub async fn read_all_events_since(
+    store: &dyn CoordStore,
+    since: u64,
+) -> Result<Vec<EventEnvelope>> {
+    let entries = store.list(crate::layout::EVENTS_PREFIX).await?;
+    let mut envelopes = Vec::new();
+    for entry in entries {
+        if !entry.key.ends_with(crate::layout::EVENT_CHUNK_EXT) {
+            continue;
+        }
+        for env in read_chunk(store, &entry.key).await? {
+            if env.seq > since {
+                envelopes.push(env);
+            }
+        }
+    }
+    envelopes.sort_by_key(|e| e.seq);
+    Ok(envelopes)
+}
+
 /// Read every envelope from a chunk file. Caller is responsible for
 /// merging across chunks in seq order.
 pub async fn read_chunk(store: &dyn CoordStore, key: &str) -> Result<Vec<EventEnvelope>> {

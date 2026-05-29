@@ -32,4 +32,4 @@
 //! holds the skeleton + documentation so the crate keeps compiling
 //! as each piece arrives.
 
-// Stub: implementation lands in subsequent Phase 2 commits.
+pub mod stream;

@@ -108,6 +108,9 @@ io-uring = "0.6"
 # trait async fns over dyn
 async-trait = "0.1"
 
+# Imperative async stream construction (SSE handler)
+async-stream = "0.3"
+
 [profile.release]
 lto = true
 codegen-units = 1
