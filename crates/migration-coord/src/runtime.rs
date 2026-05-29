@@ -135,6 +135,16 @@ struct RuntimeInner {
     lease_lost: bool,
 }
 
+/// One page of the jobs view, returned from
+/// [`CoordRuntime::jobs_view`]. `next_cursor` is the `JobId` of the
+/// first job that would have been in the *next* page, or `None` if
+/// the current page contained the last job.
+#[derive(Debug, Clone)]
+pub struct JobsPage {
+    pub jobs: Vec<crate::schema::Job>,
+    pub next_cursor: Option<crate::schema::JobId>,
+}
+
 /// The runtime handle. Clones share the same inner state via `Arc`.
 ///
 /// Construct via [`CoordRuntime::start`]. Drop the handle to release
@@ -263,6 +273,84 @@ impl CoordRuntime {
     /// Highest seq ingested so far. `0` on a fresh bucket.
     pub async fn last_seq(&self) -> u64 {
         self.inner.lock().await.next_seq.saturating_sub(1)
+    }
+
+    /// Clone a single job's view. Returns `None` if the job has
+    /// not been created yet.
+    pub async fn job_view(&self, id: &crate::schema::JobId) -> Option<crate::schema::Job> {
+        self.inner.lock().await.state.jobs.get(id).cloned()
+    }
+
+    /// Page of jobs sorted lexically by [`crate::schema::JobId`].
+    /// `cursor` is the JobId of the last entry the client saw
+    /// (excluded from the next page). `limit` caps the page size.
+    pub async fn jobs_view(&self, cursor: Option<&crate::schema::JobId>, limit: usize) -> JobsPage {
+        let guard = self.inner.lock().await;
+        // Walk the BTreeMap from the cursor (excluded) forward.
+        let iter: Box<dyn Iterator<Item = (&crate::schema::JobId, &crate::schema::Job)>> =
+            match cursor {
+                Some(c) => Box::new(guard.state.jobs.range((
+                    std::ops::Bound::Excluded(c.clone()),
+                    std::ops::Bound::Unbounded,
+                ))),
+                None => Box::new(guard.state.jobs.iter()),
+            };
+
+        let mut jobs = Vec::with_capacity(limit);
+        let mut has_more = false;
+        for (_id, job) in iter {
+            if jobs.len() == limit {
+                has_more = true;
+                break;
+            }
+            jobs.push(job.clone());
+        }
+        // Cursor is the LAST RETURNED job's id — the next request
+        // passes it as `cursor=` and gets everything strictly after.
+        // If there isn't a next page, no cursor.
+        let next_cursor = if has_more {
+            jobs.last().map(|j| j.id.clone())
+        } else {
+            None
+        };
+        JobsPage { jobs, next_cursor }
+    }
+
+    /// All workers assigned to a job, in the order they joined.
+    /// Returns `None` if the job has not been created yet.
+    pub async fn workers_view_for_job(
+        &self,
+        id: &crate::schema::JobId,
+    ) -> Option<Vec<crate::schema::Worker>> {
+        let guard = self.inner.lock().await;
+        guard.state.jobs.get(id).map(|job| {
+            job.assigned_workers
+                .iter()
+                .filter_map(|wid| guard.state.workers.get(wid).cloned())
+                .collect()
+        })
+    }
+
+    /// Error buckets for a job. Returns `Some(vec![])` for a job
+    /// with no errors yet, `None` for an unknown job.
+    pub async fn errors_view_for_job(
+        &self,
+        id: &crate::schema::JobId,
+    ) -> Option<Vec<crate::schema::ErrorBucket>> {
+        let guard = self.inner.lock().await;
+        // A job that exists but has no errors yet returns an empty
+        // vec; a job that does not exist returns None.
+        if !guard.state.jobs.contains_key(id) {
+            return None;
+        }
+        Some(
+            guard
+                .state
+                .error_buckets
+                .get(id)
+                .cloned()
+                .unwrap_or_default(),
+        )
     }
 
     /// Subscribe to live events. Returns a `broadcast::Receiver`;
@@ -395,10 +483,10 @@ async fn acquire_with_backoff(
 }
 
 // =============================================================================
-// Test helpers
+// Test clock — always available so integration tests in tests/ can
+// use it without depending on the test-helpers feature.
 // =============================================================================
 
-#[cfg(any(test, feature = "test-helpers"))]
 pub mod test_clock {
     use super::*;
     use std::sync::Mutex;

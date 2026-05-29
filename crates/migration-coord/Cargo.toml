@@ -44,3 +44,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # VAST integration tests (gated by env vars; #[ignore]'d by default).
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
+
+# In-process router tests via tower::ServiceExt::oneshot
+http-body-util = "0.1"
