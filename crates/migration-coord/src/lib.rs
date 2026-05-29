@@ -38,6 +38,7 @@ pub mod layout;
 pub mod lease;
 pub mod schema;
 pub mod snapshot;
+pub mod state;
 pub mod store;
 
 pub use errors::{Error, Result};
