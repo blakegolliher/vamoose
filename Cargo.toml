@@ -5,6 +5,7 @@ members = [
     "crates/migration-mover",
     "crates/migration-worker",
     "crates/migration-aggr",
+    "crates/migration-coord",
     "crates/mig-walker-rewrite",
     "crates/vamoose-cli",
 ]
@@ -23,6 +24,7 @@ readme = "README.md"
 # Internal
 migration-core  = { path = "crates/migration-core" }
 migration-mover = { path = "crates/migration-mover" }
+migration-coord = { path = "crates/migration-coord" }
 
 # AWS / S3
 aws-sdk-s3   = "1"
