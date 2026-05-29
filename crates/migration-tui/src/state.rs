@@ -77,6 +77,93 @@ pub struct UiState {
     /// navigation; `Filter` captures typed characters into the
     /// filter buffer.
     pub input_mode: InputMode,
+    /// Top-level view. Defaults to `List`; the operator presses
+    /// Enter on a job row to switch to `Detail`. The render layer
+    /// dispatches on this; the event loop reads it to decide which
+    /// keybindings are active.
+    pub view: View,
+}
+
+/// Top-level view dispatcher. Phase 4 had only the jobs list;
+/// Phase 5 adds a per-job detail view with five tabs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum View {
+    List,
+    Detail {
+        /// Job currently being inspected. The render layer fetches
+        /// the [`Job`] from the snapshot on every draw, so the
+        /// detail view tracks live changes automatically.
+        job_id: JobId,
+        /// Which tab is currently active. `Tab` cycle methods are
+        /// hooked to Tab / Shift-Tab in the event loop.
+        tab: Tab,
+    },
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self::List
+    }
+}
+
+/// Five-tab dispatcher for the per-job detail view.
+///
+/// Order is the on-screen order in the tab bar; `cycle_next` /
+/// `cycle_prev` walk this sequence with wrap-around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Overview,
+    Workers,
+    Errors,
+    Plan,
+    Verify,
+}
+
+impl Tab {
+    pub fn all() -> [Tab; 5] {
+        [
+            Tab::Overview,
+            Tab::Workers,
+            Tab::Errors,
+            Tab::Plan,
+            Tab::Verify,
+        ]
+    }
+
+    /// Short label rendered in the tab bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Overview => "Overview",
+            Tab::Workers => "Workers",
+            Tab::Errors => "Errors",
+            Tab::Plan => "Plan",
+            Tab::Verify => "Verify",
+        }
+    }
+
+    /// Cycle to the next tab (wraps from Verify back to Overview).
+    /// Hooked to the Tab key.
+    pub fn cycle_next(self) -> Self {
+        match self {
+            Tab::Overview => Tab::Workers,
+            Tab::Workers => Tab::Errors,
+            Tab::Errors => Tab::Plan,
+            Tab::Plan => Tab::Verify,
+            Tab::Verify => Tab::Overview,
+        }
+    }
+
+    /// Cycle to the previous tab (wraps from Overview back to
+    /// Verify). Hooked to Shift-Tab / BackTab.
+    pub fn cycle_prev(self) -> Self {
+        match self {
+            Tab::Overview => Tab::Verify,
+            Tab::Workers => Tab::Overview,
+            Tab::Errors => Tab::Workers,
+            Tab::Plan => Tab::Errors,
+            Tab::Verify => Tab::Plan,
+        }
+    }
 }
 
 /// Modal dispatcher for keypresses. Normal = jobs-list navigation;
@@ -694,5 +781,76 @@ mod tests {
     fn default_input_mode_is_normal() {
         let ui = UiState::default();
         assert!(matches!(ui.input_mode, InputMode::Normal));
+    }
+
+    // ----- View / Tab (Phase 5a) -----
+
+    #[test]
+    fn default_view_is_list() {
+        let ui = UiState::default();
+        assert!(matches!(ui.view, View::List));
+    }
+
+    #[test]
+    fn tab_cycle_next_walks_all_five_then_wraps() {
+        let order = [
+            Tab::Overview,
+            Tab::Workers,
+            Tab::Errors,
+            Tab::Plan,
+            Tab::Verify,
+        ];
+        let mut cur = order[0];
+        for next in order.iter().skip(1) {
+            cur = cur.cycle_next();
+            assert_eq!(cur, *next);
+        }
+        cur = cur.cycle_next();
+        assert_eq!(cur, Tab::Overview, "Verify must wrap to Overview");
+    }
+
+    #[test]
+    fn tab_cycle_prev_walks_all_five_in_reverse_and_wraps() {
+        let mut cur = Tab::Overview;
+        let reverse = [
+            Tab::Verify,
+            Tab::Plan,
+            Tab::Errors,
+            Tab::Workers,
+            Tab::Overview,
+        ];
+        for expected in reverse {
+            cur = cur.cycle_prev();
+            assert_eq!(cur, expected);
+        }
+    }
+
+    #[test]
+    fn tab_labels_are_distinct_and_human_readable() {
+        let labels: Vec<&'static str> = Tab::all().iter().map(|t| t.label()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 5, "labels must be unique");
+        for l in labels {
+            assert!(!l.is_empty());
+            // Tab bar real estate is tight — keep labels ≤ 10 chars.
+            assert!(l.len() <= 10, "label too long: {l:?}");
+        }
+    }
+
+    #[test]
+    fn tab_all_returns_canonical_order() {
+        let all = Tab::all();
+        assert_eq!(
+            all,
+            [
+                Tab::Overview,
+                Tab::Workers,
+                Tab::Errors,
+                Tab::Plan,
+                Tab::Verify,
+            ]
+        );
     }
 }

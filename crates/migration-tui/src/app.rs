@@ -16,7 +16,7 @@
 
 use crate::client::{Client, ClientError, SseFrame};
 use crate::render;
-use crate::state::{AppState, InputMode};
+use crate::state::{AppState, InputMode, Tab, View};
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use migration_coord::schema::JobId;
@@ -128,7 +128,17 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> AppAction {
     }
 }
 
+/// Normal-mode dispatcher: routes by [`View`]. `Filter` mode is
+/// List-view-only (entered via `/` from List Normal), so it does
+/// not appear here.
 fn handle_key_normal(state: &mut AppState, key: KeyEvent) -> AppAction {
+    match &state.ui.view {
+        View::List => handle_key_list_normal(state, key),
+        View::Detail { .. } => handle_key_detail(state, key),
+    }
+}
+
+fn handle_key_list_normal(state: &mut AppState, key: KeyEvent) -> AppAction {
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => AppAction::Quit,
         KeyCode::Up => {
@@ -151,6 +161,18 @@ fn handle_key_normal(state: &mut AppState, key: KeyEvent) -> AppAction {
             }
             AppAction::Continue
         }
+        KeyCode::Enter => {
+            // Open the detail view for the selected job. No-op when
+            // nothing is selected (would be misleading to flip to a
+            // detail view with no job to inspect).
+            if let Some(id) = state.ui.selected_job.clone() {
+                state.ui.view = View::Detail {
+                    job_id: id,
+                    tab: Tab::Overview,
+                };
+            }
+            AppAction::Continue
+        }
         KeyCode::Char('/') => {
             // Enter filter-input mode. Capture the current filter as
             // `prior` so Esc reverts cleanly.
@@ -163,6 +185,42 @@ fn handle_key_normal(state: &mut AppState, key: KeyEvent) -> AppAction {
         }
         KeyCode::Char('s') => {
             state.ui.sort = state.ui.sort.cycle();
+            AppAction::Continue
+        }
+        _ => AppAction::Continue,
+    }
+}
+
+/// Detail-view dispatcher. Operator keys:
+/// - `Esc` / `Backspace` → back to the jobs list. Convention: Esc
+///   in TUI nav means "back", so it does NOT quit from Detail.
+/// - `q` / `Q` → still quits the app from any view.
+/// - `Tab` → next tab (wraps). `BackTab` / Shift-Tab → previous tab.
+/// - everything else: no-op for now. Per-tab keybindings land in
+///   the step that fleshes out each tab body.
+fn handle_key_detail(state: &mut AppState, key: KeyEvent) -> AppAction {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => AppAction::Quit,
+        KeyCode::Esc | KeyCode::Backspace => {
+            state.ui.view = View::List;
+            AppAction::Continue
+        }
+        KeyCode::Tab => {
+            if let View::Detail { job_id, tab } = state.ui.view.clone() {
+                state.ui.view = View::Detail {
+                    job_id,
+                    tab: tab.cycle_next(),
+                };
+            }
+            AppAction::Continue
+        }
+        KeyCode::BackTab => {
+            if let View::Detail { job_id, tab } = state.ui.view.clone() {
+                state.ui.view = View::Detail {
+                    job_id,
+                    tab: tab.cycle_prev(),
+                };
+            }
             AppAction::Continue
         }
         _ => AppAction::Continue,
@@ -836,5 +894,127 @@ mod tests {
         // selected_job must have moved off charlie onto the now-
         // visible bravo.
         assert_eq!(s.ui.selected_job, Some(jid("bravo")));
+    }
+
+    // ----- Detail view navigation (Phase 5a) -----
+
+    fn assert_list(s: &AppState) {
+        assert!(matches!(s.ui.view, View::List), "expected View::List");
+    }
+
+    fn assert_detail(s: &AppState, want_job: &str, want_tab: Tab) {
+        match &s.ui.view {
+            View::Detail { job_id, tab } => {
+                assert_eq!(job_id.as_str(), want_job);
+                assert_eq!(*tab, want_tab);
+            }
+            View::List => panic!("expected View::Detail, got List"),
+        }
+    }
+
+    fn seed_two_jobs() -> AppState {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+        s.apply_envelope(&job_created(2, "bravo"));
+        s
+    }
+
+    #[test]
+    fn enter_on_selected_job_opens_detail_with_overview_tab() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("bravo"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        assert_detail(&s, "bravo", Tab::Overview);
+    }
+
+    #[test]
+    fn enter_with_no_selection_does_not_open_detail() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = None;
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        assert_list(&s);
+    }
+
+    #[test]
+    fn esc_in_detail_returns_to_list_not_quit() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("alpha"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        assert_detail(&s, "alpha", Tab::Overview);
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Esc)), at(0));
+        assert_eq!(action, AppAction::Continue, "Esc in Detail must NOT quit");
+        assert_list(&s);
+    }
+
+    #[test]
+    fn backspace_in_detail_also_returns_to_list() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("alpha"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Backspace)), at(0));
+        assert_list(&s);
+    }
+
+    #[test]
+    fn q_in_detail_still_quits() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("alpha"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Char('q'))), at(0));
+        assert_eq!(action, AppAction::Quit);
+    }
+
+    #[test]
+    fn tab_key_cycles_tabs_forward_and_wraps() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("alpha"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        // Overview → Workers → Errors → Plan → Verify → Overview
+        let order = [
+            Tab::Workers,
+            Tab::Errors,
+            Tab::Plan,
+            Tab::Verify,
+            Tab::Overview,
+        ];
+        for expected in order {
+            handle_input(&mut s, Input::Key(key(KeyCode::Tab)), at(0));
+            assert_detail(&s, "alpha", expected);
+        }
+    }
+
+    #[test]
+    fn backtab_key_cycles_tabs_backward_and_wraps() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("alpha"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        // Overview ← Verify ← Plan ← Errors ← Workers ← Overview
+        let order = [
+            Tab::Verify,
+            Tab::Plan,
+            Tab::Errors,
+            Tab::Workers,
+            Tab::Overview,
+        ];
+        for expected in order {
+            handle_input(&mut s, Input::Key(key(KeyCode::BackTab)), at(0));
+            assert_detail(&s, "alpha", expected);
+        }
+    }
+
+    #[test]
+    fn list_view_keys_inert_after_entering_detail() {
+        // / and s do navigation in List, but in Detail they're
+        // operator typos — must NOT open filter mode or cycle sort.
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("alpha"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        let prior_sort = s.ui.sort;
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('/'))), at(0));
+        // input_mode must stay Normal — filter mode is List-only.
+        assert!(matches!(s.ui.input_mode, InputMode::Normal));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('s'))), at(0));
+        // sort criterion unchanged.
+        assert_eq!(s.ui.sort, prior_sort);
     }
 }

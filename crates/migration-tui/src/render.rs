@@ -22,13 +22,13 @@
 //! ```
 
 use crate::format::{format_bytes, format_count, format_elapsed, format_pct};
-use crate::state::{AppState, ConnectionStatus, JobSort, UiState};
+use crate::state::{AppState, ConnectionStatus, JobSort, Tab, UiState, View};
 use chrono::{DateTime, Utc};
-use migration_coord::schema::{Job, Phase};
+use migration_coord::schema::{Job, JobId, Phase};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Tabs};
 use ratatui::Frame;
 
 // =============================================================================
@@ -37,7 +37,18 @@ use ratatui::Frame;
 
 /// Render the full TUI into `frame` using `state` and the current
 /// wall-clock `now` (passed in so tests are deterministic).
+///
+/// Dispatches by [`View`]: List view is the Phase 4 jobs list;
+/// Detail view (Phase 5) opens after the operator presses Enter on
+/// a job row.
 pub fn render(frame: &mut Frame, state: &AppState, now: DateTime<Utc>) {
+    match &state.ui.view {
+        View::List => render_list(frame, state, now),
+        View::Detail { job_id, tab } => render_detail(frame, state, now, job_id, *tab),
+    }
+}
+
+fn render_list(frame: &mut Frame, state: &AppState, now: DateTime<Utc>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -50,6 +61,29 @@ pub fn render(frame: &mut Frame, state: &AppState, now: DateTime<Utc>) {
     render_top_banner(frame, chunks[0], state, now);
     render_jobs_table(frame, chunks[1], state, now);
     render_bottom_hints(frame, chunks[2], state, now);
+}
+
+fn render_detail(
+    frame: &mut Frame,
+    state: &AppState,
+    now: DateTime<Utc>,
+    job_id: &JobId,
+    tab: Tab,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // top banner (shared with List)
+            Constraint::Length(1), // tab bar
+            Constraint::Min(0),    // tab body
+            Constraint::Length(1), // bottom hints (mode-aware)
+        ])
+        .split(frame.area());
+
+    render_top_banner(frame, chunks[0], state, now);
+    render_tab_bar(frame, chunks[1], tab);
+    render_tab_body(frame, chunks[2], state, job_id, tab, now);
+    render_bottom_hints(frame, chunks[3], state, now);
 }
 
 // =============================================================================
@@ -293,11 +327,14 @@ fn header_style() -> Style {
 // =============================================================================
 
 fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: DateTime<Utc>) {
-    // Context-aware hints: filter mode swaps to "Enter apply / Esc
-    // cancel / Backspace delete" since the normal-mode bindings
-    // would mislead the operator (q would append, not quit).
-    let hints: Vec<Span<'static>> = match &state.ui.input_mode {
-        crate::state::InputMode::Filter { .. } => vec![
+    // Three-way switch: Filter mode wins (the only mode that takes
+    // typed characters as literal input). Otherwise dispatch by view
+    // — List shows the navigation bindings; Detail shows "back +
+    // tab + quit". The shape is the same Vec<Span> so the renderer
+    // doesn't care which arm produced it.
+    use crate::state::InputMode;
+    let hints: Vec<Span<'static>> = match (&state.ui.input_mode, &state.ui.view) {
+        (InputMode::Filter { .. }, _) => vec![
             key_hint("Enter", "apply"),
             Span::raw("  "),
             key_hint("Esc", "cancel"),
@@ -309,7 +346,7 @@ fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: Da
                 Style::default().fg(Color::DarkGray),
             ),
         ],
-        crate::state::InputMode::Normal => vec![
+        (InputMode::Normal, View::List) => vec![
             key_hint("q", "quit"),
             Span::raw("  "),
             key_hint("/", "filter"),
@@ -320,9 +357,213 @@ fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: Da
             Span::raw("  "),
             key_hint("Enter", "details"),
         ],
+        (InputMode::Normal, View::Detail { .. }) => vec![
+            key_hint("Esc", "back"),
+            Span::raw("  "),
+            key_hint("Tab", "next"),
+            Span::raw("  "),
+            key_hint("Shift-Tab", "prev"),
+            Span::raw("  "),
+            key_hint("q", "quit"),
+        ],
     };
     let para = Paragraph::new(Line::from(hints));
     frame.render_widget(para, area);
+}
+
+// =============================================================================
+// Detail view: tab bar + per-tab bodies
+// =============================================================================
+
+fn render_tab_bar(frame: &mut Frame, area: Rect, current: Tab) {
+    let titles: Vec<Line<'static>> = Tab::all()
+        .into_iter()
+        .map(|t| Line::from(Span::raw(t.label())))
+        .collect();
+    let selected = Tab::all()
+        .into_iter()
+        .position(|t| t == current)
+        .unwrap_or(0);
+    let tabs = Tabs::new(titles)
+        .select(selected)
+        .divider("│")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+    frame.render_widget(tabs, area);
+}
+
+fn render_tab_body(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    job_id: &JobId,
+    tab: Tab,
+    now: DateTime<Utc>,
+) {
+    let job = match state.job(job_id) {
+        Some(j) => j,
+        None => {
+            // Defensive: the operator might have entered Detail
+            // just as the job was archived. Show a single line so
+            // they know to press Esc.
+            let text = Text::from(vec![
+                Line::from(Span::styled(
+                    format!("Job '{}' not found.", job_id.as_str()),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::raw(""),
+                Line::from(Span::raw("Press Esc to return to the jobs list.")),
+            ]);
+            frame.render_widget(Paragraph::new(text), area);
+            return;
+        }
+    };
+    match tab {
+        Tab::Overview => render_overview_tab(frame, area, state, job, now),
+        Tab::Workers => render_placeholder_tab(frame, area, "Workers", "step 5b"),
+        Tab::Errors => render_placeholder_tab(frame, area, "Errors", "step 5c"),
+        Tab::Plan => render_placeholder_tab(frame, area, "Plan", "step 5d"),
+        Tab::Verify => render_placeholder_tab(frame, area, "Verify", "step 5d"),
+    }
+}
+
+fn render_overview_tab(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    job: &Job,
+    now: DateTime<Utc>,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // ---- Identity --------------------------------------------------
+    lines.push(section_header("Identity"));
+    lines.push(kv_line("ID", job.id.as_str().to_string()));
+    lines.push(kv_line("Name", job.name.clone()));
+    lines.push(kv_line(
+        "Owner",
+        if job.owner.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            job.owner.clone()
+        },
+    ));
+    lines.push(kv_line("Created", format_elapsed(job.created_at, now)));
+    lines.push(Line::raw(""));
+
+    // ---- Source / Dest --------------------------------------------
+    lines.push(section_header("Source / Dest"));
+    lines.push(kv_line("Source", job.source.clone()));
+    lines.push(kv_line("Dest", job.dest.clone()));
+    lines.push(Line::raw(""));
+
+    // ---- Status ---------------------------------------------------
+    lines.push(section_header("Status"));
+    lines.push(Line::from(vec![kv_key("Phase"), phase_span(job.phase)]));
+    lines.push(kv_line("Files", files_summary(job)));
+    lines.push(kv_line("Bytes", bytes_summary(job)));
+    lines.push(kv_line("Errors", format!("{}", job.progress.errors_total)));
+
+    // ---- Throughput (1s / 1m / 5m) --------------------------------
+    let bps1 = state.job_bytes_per_sec(&job.id, 1, now).unwrap_or(0.0);
+    let bps60 = state.job_bytes_per_sec(&job.id, 60, now).unwrap_or(0.0);
+    let bps300 = state.job_bytes_per_sec(&job.id, 300, now).unwrap_or(0.0);
+    lines.push(kv_line(
+        "Throughput",
+        format!(
+            "1s {}/s   1m {}/s   5m {}/s",
+            format_bytes(bps1 as u64),
+            format_bytes(bps60 as u64),
+            format_bytes(bps300 as u64),
+        ),
+    ));
+    lines.push(Line::raw(""));
+
+    // ---- Workers + Errors counts (full breakdowns in their tabs) ----
+    lines.push(section_header("Activity"));
+    lines.push(kv_line(
+        "Workers",
+        format!("{} assigned (see Workers tab)", job.assigned_workers.len()),
+    ));
+    let err_buckets = state.errors_for_job(&job.id);
+    lines.push(kv_line(
+        "Error classes",
+        format!("{} (see Errors tab)", err_buckets.len()),
+    ));
+
+    let para = Paragraph::new(Text::from(lines));
+    frame.render_widget(para, area);
+}
+
+fn render_placeholder_tab(frame: &mut Frame, area: Rect, name: &str, milestone: &str) {
+    let lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            format!("{name} tab"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            format!("Coming in P5 {milestone}."),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+// ----- small helpers for the Overview layout -----
+
+fn section_header(label: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        label.to_string(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn kv_key(label: &str) -> Span<'static> {
+    // 13-char column for the key so values align across lines.
+    Span::styled(
+        format!("  {label:<11}"),
+        Style::default().fg(Color::DarkGray),
+    )
+}
+
+fn kv_line(label: &str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![kv_key(label), Span::raw(value.into())])
+}
+
+fn files_summary(job: &Job) -> String {
+    let done = format_count(job.progress.files_done);
+    if job.progress.files_total > 0 {
+        format!(
+            "{} / {}  ({})",
+            done,
+            format_count(job.progress.files_total),
+            format_pct(job.progress.files_done, job.progress.files_total).trim(),
+        )
+    } else {
+        format!("{done} (total unknown)")
+    }
+}
+
+fn bytes_summary(job: &Job) -> String {
+    let done = format_bytes(job.progress.bytes_done);
+    if job.progress.bytes_total > 0 {
+        format!(
+            "{} / {}  ({})",
+            done,
+            format_bytes(job.progress.bytes_total),
+            format_pct(job.progress.bytes_done, job.progress.bytes_total).trim(),
+        )
+    } else {
+        format!("{done} (total unknown)")
+    }
 }
 
 fn key_hint(key: &str, label: &str) -> Span<'static> {
@@ -782,5 +1023,100 @@ mod tests {
         assert!(last.contains("Esc cancel"));
         // Normal-mode hints should NOT be present.
         assert!(!last.contains("q quit"));
+    }
+
+    // ----- Detail view rendering (Phase 5a) -----
+
+    fn enter_detail(s: &mut AppState, job: &str, tab: Tab) {
+        s.ui.view = crate::state::View::Detail {
+            job_id: jid(job),
+            tab,
+        };
+    }
+
+    #[test]
+    fn detail_view_renders_tab_bar_with_all_five_tabs() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        enter_detail(&mut s, "alpha", Tab::Overview);
+        let buf = render_to_buffer(&s, at(100), 100, 16);
+        let text = buffer_text(&buf);
+        for label in ["Overview", "Workers", "Errors", "Plan", "Verify"] {
+            assert!(text.contains(label), "missing tab '{label}' in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn detail_overview_tab_shows_job_identity_and_status() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        enter_detail(&mut s, "alpha", Tab::Overview);
+        let buf = render_to_buffer(&s, at(100), 100, 24);
+        let text = buffer_text(&buf);
+        // Section headers and key fields are present.
+        assert!(text.contains("Identity"), "missing 'Identity' section");
+        assert!(text.contains("Source / Dest"), "missing 'Source / Dest'");
+        assert!(text.contains("Status"), "missing 'Status'");
+        assert!(text.contains("Throughput"), "missing 'Throughput'");
+        // Job id + name from the fixture must surface.
+        assert!(text.contains("alpha"));
+        assert!(text.contains("alpha-mig"));
+        assert!(text.contains("nfs://src"));
+        assert!(text.contains("nfs://dst"));
+    }
+
+    #[test]
+    fn detail_bottom_hints_swap_to_back_tab_quit() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        enter_detail(&mut s, "alpha", Tab::Overview);
+        let buf = render_to_buffer(&s, at(0), 100, 16);
+        let last = buffer_row(&buf, buf.area.height - 1);
+        assert!(last.contains("Esc back"), "got: >>>{last}<<<");
+        assert!(last.contains("Tab next"));
+        assert!(last.contains("Shift-Tab prev"));
+        assert!(last.contains("q quit"));
+        // List-mode bindings must NOT be present in Detail hints.
+        assert!(!last.contains("/ filter"));
+        assert!(!last.contains("s sort"));
+    }
+
+    #[test]
+    fn detail_unknown_job_shows_not_found_message() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        // Detail view points at a job that doesn't exist in the
+        // snapshot (was archived between Enter and render).
+        enter_detail(&mut s, "ghost", Tab::Overview);
+        let buf = render_to_buffer(&s, at(0), 80, 16);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("not found"),
+            "expected error line in:\n{text}"
+        );
+        assert!(text.contains("Press Esc"));
+    }
+
+    #[test]
+    fn detail_placeholder_tabs_render_without_panicking() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        for tab in [Tab::Workers, Tab::Errors, Tab::Plan, Tab::Verify] {
+            enter_detail(&mut s, "alpha", tab);
+            let buf = render_to_buffer(&s, at(0), 100, 16);
+            let text = buffer_text(&buf);
+            // The placeholder body labels the tab and notes the
+            // milestone — both should appear.
+            assert!(
+                text.contains(tab.label()),
+                "tab body missing label for {:?}: \n{text}",
+                tab
+            );
+            assert!(text.contains("Coming in P5"));
+        }
     }
 }
