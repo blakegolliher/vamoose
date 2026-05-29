@@ -16,10 +16,11 @@
 
 use crate::client::{Client, ClientError, SseFrame};
 use crate::render;
-use crate::state::{AppState, InputMode, Tab, View};
+use crate::state::{AppState, InputMode, Modal, Tab, View};
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use migration_coord::schema::JobId;
+use migration_coord::schema::WorkerId;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -191,14 +192,91 @@ fn handle_key_list_normal(state: &mut AppState, key: KeyEvent) -> AppAction {
     }
 }
 
-/// Detail-view dispatcher. Operator keys:
-/// - `Esc` / `Backspace` → back to the jobs list. Convention: Esc
-///   in TUI nav means "back", so it does NOT quit from Detail.
-/// - `q` / `Q` → still quits the app from any view.
-/// - `Tab` → next tab (wraps). `BackTab` / Shift-Tab → previous tab.
-/// - everything else: no-op for now. Per-tab keybindings land in
-///   the step that fleshes out each tab body.
+/// Detail-view dispatcher with two interposed layers:
+///
+/// 1. Modal takes priority. When a modal is open the Workers-tab
+///    selection / sort bindings would mislead the operator (Up/Down
+///    looks like it should scroll the modal, not move the table
+///    cursor underneath), so the modal intercepts input first —
+///    only Esc/Backspace close it and `q` still quits.
+///
+/// 2. Workers tab gets its own sub-dispatcher (Up/Down/Home/End for
+///    row selection, `s` cycles `worker_sort`, Enter opens the
+///    modal). Falls through to the base Detail dispatcher for
+///    keys the Workers tab doesn't claim (Esc/Tab/etc).
+///
+/// 3. Base Detail handler — Esc/Backspace returns to List, Tab
+///    cycles tab forward (wraps), BackTab cycles back, q quits.
 fn handle_key_detail(state: &mut AppState, key: KeyEvent) -> AppAction {
+    if state.ui.modal.is_some() {
+        return handle_key_modal(state, key);
+    }
+    if let View::Detail {
+        tab: Tab::Workers, ..
+    } = state.ui.view
+    {
+        return handle_key_workers_tab(state, key);
+    }
+    handle_key_detail_base(state, key)
+}
+
+fn handle_key_modal(state: &mut AppState, key: KeyEvent) -> AppAction {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') => AppAction::Quit,
+        KeyCode::Esc | KeyCode::Backspace => {
+            state.ui.modal = None;
+            AppAction::Continue
+        }
+        _ => AppAction::Continue,
+    }
+}
+
+fn handle_key_workers_tab(state: &mut AppState, key: KeyEvent) -> AppAction {
+    match key.code {
+        KeyCode::Up => {
+            move_worker_selection(state, -1);
+            AppAction::Continue
+        }
+        KeyCode::Down => {
+            move_worker_selection(state, 1);
+            AppAction::Continue
+        }
+        KeyCode::Home => {
+            let ids = visible_worker_ids(state);
+            state.ui.selected_worker = ids.into_iter().next();
+            AppAction::Continue
+        }
+        KeyCode::End => {
+            let ids = visible_worker_ids(state);
+            state.ui.selected_worker = ids.into_iter().last();
+            AppAction::Continue
+        }
+        KeyCode::Char('s') => {
+            state.ui.worker_sort = state.ui.worker_sort.cycle();
+            AppAction::Continue
+        }
+        KeyCode::Enter => {
+            // Drill-down on the selected worker. Auto-select the
+            // first visible if the operator hasn't moved the
+            // cursor yet — Enter on a tab with workers should
+            // always do something.
+            let target = state
+                .ui
+                .selected_worker
+                .or_else(|| visible_worker_ids(state).into_iter().next());
+            if let Some(wid) = target {
+                state.ui.modal = Some(Modal::WorkerDetail { worker_id: wid });
+                state.ui.selected_worker = Some(wid);
+            }
+            AppAction::Continue
+        }
+        // Anything else flows through to Esc/Backspace/Tab/BackTab/q
+        // in the base Detail handler.
+        _ => handle_key_detail_base(state, key),
+    }
+}
+
+fn handle_key_detail_base(state: &mut AppState, key: KeyEvent) -> AppAction {
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') => AppAction::Quit,
         KeyCode::Esc | KeyCode::Backspace => {
@@ -225,6 +303,42 @@ fn handle_key_detail(state: &mut AppState, key: KeyEvent) -> AppAction {
         }
         _ => AppAction::Continue,
     }
+}
+
+fn visible_worker_ids(state: &AppState) -> Vec<WorkerId> {
+    let job_id = match &state.ui.view {
+        View::Detail { job_id, .. } => job_id.clone(),
+        _ => return Vec::new(),
+    };
+    render::visible_workers(state, &job_id)
+        .iter()
+        .map(|w| w.id)
+        .collect()
+}
+
+fn move_worker_selection(state: &mut AppState, delta: isize) {
+    let ids = visible_worker_ids(state);
+    if ids.is_empty() {
+        state.ui.selected_worker = None;
+        return;
+    }
+    let len = ids.len() as isize;
+    let current = state
+        .ui
+        .selected_worker
+        .as_ref()
+        .and_then(|id| ids.iter().position(|i| i == id));
+    let next = match current {
+        Some(i) => ((i as isize + delta).rem_euclid(len)) as usize,
+        None => {
+            if delta >= 0 {
+                0
+            } else {
+                (len - 1) as usize
+            }
+        }
+    };
+    state.ui.selected_worker = Some(ids[next]);
 }
 
 fn handle_key_filter(state: &mut AppState, key: KeyEvent) -> AppAction {
@@ -1016,5 +1130,156 @@ mod tests {
         handle_input(&mut s, Input::Key(key(KeyCode::Char('s'))), at(0));
         // sort criterion unchanged.
         assert_eq!(s.ui.sort, prior_sort);
+    }
+
+    // ----- Workers tab navigation + modal (Phase 5b) -----
+
+    use crate::state::WorkerSort;
+    use migration_coord::schema::WorkerId as TestWorkerId;
+
+    fn worker_joined(seq: u64, job: &str, wid: TestWorkerId, host: &str) -> EventEnvelope {
+        EventEnvelope {
+            seq,
+            at: at(seq as i64),
+            schema_version: SCHEMA_VERSION,
+            worker_at: None,
+            kind: EventKind::WorkerJoined {
+                worker_id: wid,
+                job_id: jid(job),
+                host: host.into(),
+                pid: 1000 + (seq as u32),
+                start_time: at(0),
+                version: "0.6.0".into(),
+            },
+        }
+    }
+
+    fn seed_job_with_workers() -> (AppState, [TestWorkerId; 3]) {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+        let w1 = TestWorkerId::new();
+        let w2 = TestWorkerId::new();
+        let w3 = TestWorkerId::new();
+        s.apply_envelope(&worker_joined(2, "alpha", w1, "host-1"));
+        s.apply_envelope(&worker_joined(3, "alpha", w2, "host-2"));
+        s.apply_envelope(&worker_joined(4, "alpha", w3, "host-3"));
+        s.ui.selected_job = Some(jid("alpha"));
+        // Enter detail and switch to Workers tab.
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Tab)), at(0));
+        (s, [w1, w2, w3])
+    }
+
+    fn assert_workers_tab(s: &AppState) {
+        match &s.ui.view {
+            View::Detail { tab, .. } => assert_eq!(*tab, Tab::Workers),
+            View::List => panic!("expected Detail view"),
+        }
+    }
+
+    #[test]
+    fn down_arrow_in_workers_tab_selects_from_none_then_moves() {
+        let (mut s, _wids) = seed_job_with_workers();
+        assert_workers_tab(&s);
+        assert!(s.ui.selected_worker.is_none());
+        handle_input(&mut s, Input::Key(key(KeyCode::Down)), at(0));
+        assert!(s.ui.selected_worker.is_some(), "Down must select a worker");
+    }
+
+    #[test]
+    fn worker_selection_wraps_around_top_and_bottom() {
+        let (mut s, _) = seed_job_with_workers();
+        handle_input(&mut s, Input::Key(key(KeyCode::Home)), at(0));
+        let first = s.ui.selected_worker.unwrap();
+        handle_input(&mut s, Input::Key(key(KeyCode::End)), at(0));
+        let last = s.ui.selected_worker.unwrap();
+        assert_ne!(first, last);
+        // Down from last → wraps to first.
+        handle_input(&mut s, Input::Key(key(KeyCode::Down)), at(0));
+        assert_eq!(s.ui.selected_worker, Some(first));
+        // Up from first → wraps to last.
+        handle_input(&mut s, Input::Key(key(KeyCode::Up)), at(0));
+        assert_eq!(s.ui.selected_worker, Some(last));
+    }
+
+    #[test]
+    fn s_in_workers_tab_cycles_worker_sort_not_job_sort() {
+        let (mut s, _) = seed_job_with_workers();
+        let prior_job_sort = s.ui.sort;
+        assert_eq!(s.ui.worker_sort, WorkerSort::ByMbpsDesc);
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('s'))), at(0));
+        assert_eq!(s.ui.worker_sort, WorkerSort::ByFilesDesc);
+        assert_eq!(s.ui.sort, prior_job_sort, "job sort must NOT change");
+    }
+
+    #[test]
+    fn enter_in_workers_tab_opens_modal_on_selected_worker() {
+        let (mut s, _) = seed_job_with_workers();
+        // Auto-select first via Home.
+        handle_input(&mut s, Input::Key(key(KeyCode::Home)), at(0));
+        let sel = s.ui.selected_worker.unwrap();
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        match &s.ui.modal {
+            Some(Modal::WorkerDetail { worker_id }) => assert_eq!(*worker_id, sel),
+            None => panic!("modal not opened"),
+        }
+    }
+
+    #[test]
+    fn enter_with_no_selection_auto_selects_first_then_opens_modal() {
+        let (mut s, _) = seed_job_with_workers();
+        assert!(s.ui.selected_worker.is_none());
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        // Both modal AND selection should now be set.
+        assert!(s.ui.selected_worker.is_some());
+        assert!(s.ui.modal.is_some());
+    }
+
+    #[test]
+    fn esc_with_modal_open_closes_modal_not_view() {
+        let (mut s, _) = seed_job_with_workers();
+        handle_input(&mut s, Input::Key(key(KeyCode::Home)), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        assert!(s.ui.modal.is_some());
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Esc)), at(0));
+        assert_eq!(action, AppAction::Continue);
+        assert!(s.ui.modal.is_none(), "Esc must close modal");
+        assert_workers_tab(&s);
+    }
+
+    #[test]
+    fn navigation_keys_inert_when_modal_open() {
+        // Up/Down/Tab/'s' must not affect anything while a modal is
+        // up — the modal owns the input.
+        let (mut s, _) = seed_job_with_workers();
+        handle_input(&mut s, Input::Key(key(KeyCode::Home)), at(0));
+        let pre_selection = s.ui.selected_worker;
+        let pre_sort = s.ui.worker_sort;
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        assert!(s.ui.modal.is_some());
+
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Char('s'),
+            KeyCode::Char('/'),
+        ] {
+            handle_input(&mut s, Input::Key(key(code)), at(0));
+        }
+        // Modal still open, no state change.
+        assert!(s.ui.modal.is_some(), "modal must stay open across navs");
+        assert_eq!(s.ui.selected_worker, pre_selection);
+        assert_eq!(s.ui.worker_sort, pre_sort);
+        assert_workers_tab(&s);
+    }
+
+    #[test]
+    fn q_with_modal_open_still_quits() {
+        let (mut s, _) = seed_job_with_workers();
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Char('q'))), at(0));
+        assert_eq!(action, AppAction::Quit);
     }
 }

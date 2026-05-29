@@ -82,6 +82,27 @@ pub struct UiState {
     /// dispatches on this; the event loop reads it to decide which
     /// keybindings are active.
     pub view: View,
+    /// Sort criterion for the Workers tab of the detail view.
+    /// `s` cycles this when the active tab is Workers (List view's
+    /// `s` continues to cycle `sort` instead — different tabs,
+    /// different sorts).
+    pub worker_sort: WorkerSort,
+    /// Selected worker id in the Workers tab. Independent of
+    /// `selected_job` so leaving and re-entering Detail preserves
+    /// each cursor.
+    pub selected_worker: Option<WorkerId>,
+    /// Active modal overlay, if any. When `Some`, the event loop
+    /// intercepts input (Esc closes, q quits, else no-op) and the
+    /// render layer paints the modal over whatever's underneath.
+    pub modal: Option<Modal>,
+}
+
+/// Modal overlay variants. v1 has one — the worker drill-down
+/// invoked from the Workers tab; later phases can add more
+/// (confirm-destructive, command palette, etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Modal {
+    WorkerDetail { worker_id: WorkerId },
 }
 
 /// Top-level view dispatcher. Phase 4 had only the jobs list;
@@ -225,6 +246,44 @@ impl JobSort {
             Self::ByPhase => "phase",
             Self::ByProgressDesc => "progress",
             Self::ByErrorsDesc => "errors",
+        }
+    }
+}
+
+/// Sort criterion for the Workers tab of the detail view.
+///
+/// Default is `ByMbpsDesc` — operators ranking workers usually
+/// want the throughput leaderboard up top so a degraded node is
+/// visible at a glance (it sinks to the bottom).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkerSort {
+    /// Highest bytes-per-second first. Default.
+    #[default]
+    ByMbpsDesc,
+    /// Highest files-per-second first.
+    ByFilesDesc,
+    /// Highest errors-per-minute first — surface degraded workers.
+    ByErrorsDesc,
+    /// Alphabetical by host. Stable fallback.
+    ByHost,
+}
+
+impl WorkerSort {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::ByMbpsDesc => Self::ByFilesDesc,
+            Self::ByFilesDesc => Self::ByErrorsDesc,
+            Self::ByErrorsDesc => Self::ByHost,
+            Self::ByHost => Self::ByMbpsDesc,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ByMbpsDesc => "mb/s",
+            Self::ByFilesDesc => "files/s",
+            Self::ByErrorsDesc => "errors",
+            Self::ByHost => "host",
         }
     }
 }
@@ -852,5 +911,57 @@ mod tests {
                 Tab::Verify,
             ]
         );
+    }
+
+    // ----- WorkerSort (Phase 5b) -----
+
+    #[test]
+    fn worker_sort_default_is_mbps_desc() {
+        // Operator-leaderboard default — degraded nodes sink so a
+        // quick glance at the Workers tab surfaces the laggard.
+        let s = WorkerSort::default();
+        assert_eq!(s, WorkerSort::ByMbpsDesc);
+    }
+
+    #[test]
+    fn worker_sort_cycle_walks_all_four_then_wraps() {
+        let order = [
+            WorkerSort::ByMbpsDesc,
+            WorkerSort::ByFilesDesc,
+            WorkerSort::ByErrorsDesc,
+            WorkerSort::ByHost,
+        ];
+        let mut cur = order[0];
+        for next in order.iter().skip(1) {
+            cur = cur.cycle();
+            assert_eq!(cur, *next);
+        }
+        cur = cur.cycle();
+        assert_eq!(cur, WorkerSort::ByMbpsDesc, "must wrap");
+    }
+
+    #[test]
+    fn worker_sort_labels_are_distinct_and_short() {
+        let labels: Vec<&'static str> = [
+            WorkerSort::ByMbpsDesc.label(),
+            WorkerSort::ByFilesDesc.label(),
+            WorkerSort::ByErrorsDesc.label(),
+            WorkerSort::ByHost.label(),
+        ]
+        .to_vec();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 4);
+        for l in labels {
+            assert!(l.len() <= 10);
+            assert!(!l.is_empty());
+        }
+    }
+
+    #[test]
+    fn modal_default_is_none() {
+        let ui = UiState::default();
+        assert!(ui.modal.is_none());
     }
 }

@@ -22,13 +22,13 @@
 //! ```
 
 use crate::format::{format_bytes, format_count, format_elapsed, format_pct};
-use crate::state::{AppState, ConnectionStatus, JobSort, Tab, UiState, View};
+use crate::state::{AppState, ConnectionStatus, JobSort, Modal, Tab, UiState, View, WorkerSort};
 use chrono::{DateTime, Utc};
-use migration_coord::schema::{Job, JobId, Phase};
+use migration_coord::schema::{Job, JobId, Phase, Worker, WorkerId, WorkerState};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, Tabs};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Tabs};
 use ratatui::Frame;
 
 // =============================================================================
@@ -84,6 +84,14 @@ fn render_detail(
     render_tab_bar(frame, chunks[1], tab);
     render_tab_body(frame, chunks[2], state, job_id, tab, now);
     render_bottom_hints(frame, chunks[3], state, now);
+
+    // Modal overlays the tab body — render AFTER the body so the
+    // modal frame paints on top. The body content underneath is
+    // dimmed only by the modal's opaque Clear region; the operator
+    // can still see the surrounding banner / tab bar / hints.
+    if let Some(modal) = &state.ui.modal {
+        render_modal(frame, chunks[2], state, modal, now);
+    }
 }
 
 // =============================================================================
@@ -423,7 +431,7 @@ fn render_tab_body(
     };
     match tab {
         Tab::Overview => render_overview_tab(frame, area, state, job, now),
-        Tab::Workers => render_placeholder_tab(frame, area, "Workers", "step 5b"),
+        Tab::Workers => render_workers_tab(frame, area, state, job, now),
         Tab::Errors => render_placeholder_tab(frame, area, "Errors", "step 5c"),
         Tab::Plan => render_placeholder_tab(frame, area, "Plan", "step 5d"),
         Tab::Verify => render_placeholder_tab(frame, area, "Verify", "step 5d"),
@@ -496,6 +504,280 @@ fn render_overview_tab(
 
     let para = Paragraph::new(Text::from(lines));
     frame.render_widget(para, area);
+}
+
+// =============================================================================
+// Workers tab
+// =============================================================================
+
+fn render_workers_tab(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    job: &Job,
+    now: DateTime<Utc>,
+) {
+    let workers = visible_workers(state, &job.id);
+    if workers.is_empty() {
+        let text = Text::from(vec![
+            Line::from(Span::styled(
+                "No workers assigned to this job.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::raw(""),
+            Line::from(Span::raw("When a worker registers it will appear here.")),
+        ]);
+        frame.render_widget(Paragraph::new(text), area);
+        return;
+    }
+
+    // Carve a one-line legend off the top so the operator knows
+    // which sort is active. The rest is the workers table.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+
+    let legend = Line::from(vec![
+        Span::styled(
+            format!("{} workers", workers.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  ·  sort:"),
+        Span::styled(
+            state.ui.worker_sort.label(),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("  ·  press 's' to cycle, Enter to drill in"),
+    ]);
+    frame.render_widget(Paragraph::new(legend), chunks[0]);
+
+    let header = Row::new(vec![
+        Cell::from(Span::styled("Host", header_style())),
+        Cell::from(Span::styled("State", header_style())),
+        Cell::from(Span::styled("MB/s", header_style())),
+        Cell::from(Span::styled("Files/s", header_style())),
+        Cell::from(Span::styled("Errs/min", header_style())),
+        Cell::from(Span::styled("Inflight", header_style())),
+        Cell::from(Span::styled("Queue", header_style())),
+        Cell::from(Span::styled("LastHB", header_style())),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = workers.iter().map(|w| worker_row(w, state, now)).collect();
+
+    let widths = [
+        Constraint::Min(12),    // Host (flex)
+        Constraint::Length(12), // State
+        Constraint::Length(8),  // MB/s
+        Constraint::Length(8),  // Files/s
+        Constraint::Length(8),  // Errs/min
+        Constraint::Length(8),  // Inflight
+        Constraint::Length(6),  // Queue
+        Constraint::Length(7),  // LastHB
+    ];
+    let table = Table::new(rows, widths).header(header).column_spacing(1);
+    frame.render_widget(table, chunks[1]);
+}
+
+fn worker_row<'a>(w: &'a Worker, state: &AppState, now: DateTime<Utc>) -> Row<'a> {
+    let selected = state.ui.selected_worker.as_ref() == Some(&w.id);
+    let base_style = if selected {
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let host = if w.host.is_empty() {
+        "(unknown)".to_string()
+    } else {
+        w.host.clone()
+    };
+    Row::new(vec![
+        Cell::from(host),
+        Cell::from(worker_state_span(w.state)),
+        Cell::from(format_bytes(w.counters.bytes_per_sec as u64)),
+        Cell::from(format!("{:.1}", w.counters.files_per_sec)),
+        Cell::from(format!("{:.1}", w.counters.errors_per_min)),
+        Cell::from(format!("{}", w.inflight_ops)),
+        Cell::from(format!("{}", w.queue_depth)),
+        Cell::from(format_elapsed(w.last_heartbeat, now)),
+    ])
+    .style(base_style)
+}
+
+fn worker_state_span(s: WorkerState) -> Span<'static> {
+    let (label, color) = match s {
+        WorkerState::Idle => ("Idle", Color::Gray),
+        WorkerState::Scanning => ("Scanning", Color::Cyan),
+        WorkerState::Copying => ("Copying", Color::Green),
+        WorkerState::Verifying => ("Verifying", Color::Cyan),
+        WorkerState::Draining => ("Draining", Color::Yellow),
+        WorkerState::Fenced => ("Fenced", Color::Red),
+        WorkerState::Failed => ("Failed", Color::Red),
+        WorkerState::Disconnected => ("Discon.", Color::DarkGray),
+    };
+    Span::styled(label, Style::default().fg(color))
+}
+
+/// Apply the Workers-tab sort criterion to the job's assigned
+/// workers and return the resulting borrow slice. Each call walks
+/// the snapshot once; the caller's loop reads stable references.
+pub fn visible_workers<'a>(state: &'a AppState, job_id: &JobId) -> Vec<&'a Worker> {
+    let mut workers = state.workers_for_job(job_id);
+    sort_workers(&mut workers, state.ui.worker_sort);
+    workers
+}
+
+fn sort_workers(workers: &mut Vec<&Worker>, sort: WorkerSort) {
+    use std::cmp::Ordering;
+    workers.sort_by(|a, b| {
+        let primary = match sort {
+            WorkerSort::ByMbpsDesc => b
+                .counters
+                .bytes_per_sec
+                .partial_cmp(&a.counters.bytes_per_sec)
+                .unwrap_or(Ordering::Equal),
+            WorkerSort::ByFilesDesc => b
+                .counters
+                .files_per_sec
+                .partial_cmp(&a.counters.files_per_sec)
+                .unwrap_or(Ordering::Equal),
+            WorkerSort::ByErrorsDesc => b
+                .counters
+                .errors_per_min
+                .partial_cmp(&a.counters.errors_per_min)
+                .unwrap_or(Ordering::Equal),
+            WorkerSort::ByHost => a.host.cmp(&b.host),
+        };
+        // Stable tiebreaker on host so the table doesn't shuffle
+        // identical-throughput workers on every render.
+        primary.then_with(|| a.host.cmp(&b.host))
+    });
+}
+
+// =============================================================================
+// Worker-detail modal
+// =============================================================================
+
+fn render_modal(
+    frame: &mut Frame,
+    body_area: Rect,
+    state: &AppState,
+    modal: &Modal,
+    now: DateTime<Utc>,
+) {
+    match modal {
+        Modal::WorkerDetail { worker_id } => {
+            render_worker_modal(frame, body_area, state, worker_id, now)
+        }
+    }
+}
+
+fn render_worker_modal(
+    frame: &mut Frame,
+    body_area: Rect,
+    state: &AppState,
+    worker_id: &WorkerId,
+    now: DateTime<Utc>,
+) {
+    let area = centered_rect(70, 70, body_area);
+    // Clear under the modal so the workers table beneath doesn't
+    // bleed through.
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Worker detail (Esc to close) ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(w) = state.worker(worker_id) else {
+        let text = Text::from(vec![
+            Line::from(Span::styled(
+                format!("Worker '{worker_id}' not found."),
+                Style::default().fg(Color::Red),
+            )),
+            Line::raw(""),
+            Line::from(Span::raw("Press Esc to close.")),
+        ]);
+        frame.render_widget(Paragraph::new(text), inner);
+        return;
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(section_header("Identity"));
+    lines.push(kv_line("ID", w.id.to_string()));
+    lines.push(kv_line("Host", w.host.clone()));
+    lines.push(kv_line("PID", format!("{}", w.pid)));
+    lines.push(kv_line("Version", w.version.clone()));
+    lines.push(kv_line("Started", format_elapsed(w.start_time, now)));
+    lines.push(kv_line("Joined", format_elapsed(w.joined_at, now)));
+    lines.push(Line::raw(""));
+
+    lines.push(section_header("State"));
+    lines.push(Line::from(vec![
+        kv_key("State"),
+        worker_state_span(w.state),
+    ]));
+    lines.push(kv_line("Last HB", format_elapsed(w.last_heartbeat, now)));
+    lines.push(kv_line("Inflight", format!("{} ops", w.inflight_ops)));
+    lines.push(kv_line("Queue depth", format!("{}", w.queue_depth)));
+    if let Some(shard) = &w.assigned_shard {
+        lines.push(kv_line("Shard", shard.0.clone()));
+    }
+    lines.push(Line::raw(""));
+
+    lines.push(section_header("Counters"));
+    lines.push(kv_line(
+        "Throughput",
+        format!("{}/s", format_bytes(w.counters.bytes_per_sec as u64)),
+    ));
+    lines.push(kv_line(
+        "Files/s",
+        format!("{:.2}", w.counters.files_per_sec),
+    ));
+    lines.push(kv_line(
+        "Errs/min",
+        format!("{:.2}", w.counters.errors_per_min),
+    ));
+
+    if w.last_error.is_some() || w.fence_reason.is_some() {
+        lines.push(Line::raw(""));
+        lines.push(section_header("Diagnostics"));
+        if let Some(err) = &w.last_error {
+            lines.push(kv_line("Last error", err.clone()));
+        }
+        if let Some(reason) = &w.fence_reason {
+            lines.push(Line::from(vec![
+                kv_key("Fenced"),
+                Span::styled(reason.clone(), Style::default().fg(Color::Red)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Centered rectangle helper. Standard ratatui pattern for modal
+/// overlays. `percent_x` / `percent_y` are 0-100.
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let vchunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vchunks[1])[1]
 }
 
 fn render_placeholder_tab(frame: &mut Frame, area: Rect, name: &str, milestone: &str) {
@@ -1102,15 +1384,16 @@ mod tests {
 
     #[test]
     fn detail_placeholder_tabs_render_without_panicking() {
+        // Workers tab landed in step 5b and is no longer a
+        // placeholder. Remaining placeholders fill in across
+        // steps 5c (Errors) and 5d (Plan / Verify).
         let mut s = AppState::empty(at(0));
         s.mark_connected(at(0));
         s.apply_envelope(&job_created_evt(1, 0, "alpha"));
-        for tab in [Tab::Workers, Tab::Errors, Tab::Plan, Tab::Verify] {
+        for tab in [Tab::Errors, Tab::Plan, Tab::Verify] {
             enter_detail(&mut s, "alpha", tab);
             let buf = render_to_buffer(&s, at(0), 100, 16);
             let text = buffer_text(&buf);
-            // The placeholder body labels the tab and notes the
-            // milestone — both should appear.
             assert!(
                 text.contains(tab.label()),
                 "tab body missing label for {:?}: \n{text}",
@@ -1118,5 +1401,159 @@ mod tests {
             );
             assert!(text.contains("Coming in P5"));
         }
+    }
+
+    // ----- Workers tab + modal (Phase 5b) -----
+
+    fn worker_joined_evt(
+        seq: u64,
+        secs: i64,
+        job: &str,
+        wid: WorkerId,
+        host: &str,
+    ) -> EventEnvelope {
+        env(
+            seq,
+            secs,
+            EventKind::WorkerJoined {
+                worker_id: wid,
+                job_id: jid(job),
+                host: host.into(),
+                pid: 1000 + (seq as u32),
+                start_time: at(0),
+                version: "0.6.0".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn workers_tab_renders_header_and_rows() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        let w1 = WorkerId::new();
+        let w2 = WorkerId::new();
+        s.apply_envelope(&worker_joined_evt(2, 0, "alpha", w1, "host-1"));
+        s.apply_envelope(&worker_joined_evt(3, 0, "alpha", w2, "host-2"));
+        enter_detail(&mut s, "alpha", Tab::Workers);
+        let buf = render_to_buffer(&s, at(0), 120, 16);
+        let text = buffer_text(&buf);
+        // Header columns appear.
+        for col in [
+            "Host", "State", "MB/s", "Files/s", "Errs/min", "Inflight", "Queue",
+        ] {
+            assert!(text.contains(col), "missing column '{col}'");
+        }
+        // Both worker hosts appear.
+        assert!(text.contains("host-1"));
+        assert!(text.contains("host-2"));
+        // Header legend exposes the sort criterion.
+        assert!(text.contains("sort:"));
+        assert!(text.contains("mb/s"));
+    }
+
+    #[test]
+    fn workers_tab_with_zero_workers_shows_empty_message() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        enter_detail(&mut s, "alpha", Tab::Workers);
+        let buf = render_to_buffer(&s, at(0), 100, 16);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("No workers assigned"),
+            "expected empty-state hint, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn workers_table_sorted_by_mbps_desc_by_default() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        let w_slow = WorkerId::new();
+        let w_fast = WorkerId::new();
+        s.apply_envelope(&worker_joined_evt(2, 0, "alpha", w_slow, "slow"));
+        s.apply_envelope(&worker_joined_evt(3, 0, "alpha", w_fast, "fast"));
+        // Drive heartbeats — coord assigns the counters; here we
+        // poke the snapshot directly because we're testing the
+        // render layer in isolation.
+        s.snapshot
+            .workers
+            .get_mut(&w_slow)
+            .unwrap()
+            .counters
+            .bytes_per_sec = 1_000.0;
+        s.snapshot
+            .workers
+            .get_mut(&w_fast)
+            .unwrap()
+            .counters
+            .bytes_per_sec = 50_000_000.0;
+        enter_detail(&mut s, "alpha", Tab::Workers);
+
+        let workers = visible_workers(&s, &jid("alpha"));
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[0].host, "fast", "highest mbps must lead");
+        assert_eq!(workers[1].host, "slow");
+    }
+
+    #[test]
+    fn workers_table_sorted_by_host_when_set() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        for (i, h) in ["zoo", "ant", "moo"].iter().enumerate() {
+            let w = WorkerId::new();
+            s.apply_envelope(&worker_joined_evt(2 + i as u64, 0, "alpha", w, h));
+        }
+        s.ui.worker_sort = crate::state::WorkerSort::ByHost;
+        let hosts: Vec<&str> = visible_workers(&s, &jid("alpha"))
+            .iter()
+            .map(|w| w.host.as_str())
+            .collect();
+        assert_eq!(hosts, ["ant", "moo", "zoo"]);
+    }
+
+    #[test]
+    fn modal_renders_over_workers_tab_with_worker_fields() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        let wid = WorkerId::new();
+        s.apply_envelope(&worker_joined_evt(2, 0, "alpha", wid, "host-A"));
+        enter_detail(&mut s, "alpha", Tab::Workers);
+        s.ui.selected_worker = Some(wid);
+        s.ui.modal = Some(crate::state::Modal::WorkerDetail { worker_id: wid });
+
+        // Use a taller buffer so the 70%-height modal can fit all
+        // three sections (Identity / State / Counters) without
+        // clipping the bottom one.
+        let buf = render_to_buffer(&s, at(0), 120, 36);
+        let text = buffer_text(&buf);
+        // Modal title + Esc hint.
+        assert!(text.contains("Worker detail"));
+        assert!(text.contains("Esc to close"));
+        // Worker identity exposed.
+        assert!(text.contains("host-A"));
+        // Section headers appear.
+        assert!(text.contains("Identity"));
+        assert!(text.contains("State"));
+        assert!(text.contains("Counters"));
+    }
+
+    #[test]
+    fn modal_with_unknown_worker_shows_not_found() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        enter_detail(&mut s, "alpha", Tab::Workers);
+        let ghost = WorkerId::new();
+        s.ui.modal = Some(crate::state::Modal::WorkerDetail { worker_id: ghost });
+
+        let buf = render_to_buffer(&s, at(0), 120, 24);
+        let text = buffer_text(&buf);
+        assert!(text.contains("not found"));
+        assert!(text.contains("Esc to close"));
     }
 }
