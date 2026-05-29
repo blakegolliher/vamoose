@@ -176,6 +176,7 @@ async fn worker_endpoint_rejects_missing_cluster_secret() {
         "job_id": "bobby",
         "host": "h",
         "pid": 1,
+        "start_time": "2026-01-01T00:00:00Z",
         "version": "0.6",
     });
     let req = Request::builder()
@@ -197,6 +198,7 @@ async fn worker_endpoint_rejects_wrong_cluster_secret() {
         "job_id": "bobby",
         "host": "h",
         "pid": 1,
+        "start_time": "2026-01-01T00:00:00Z",
         "version": "0.6",
     });
     let req = Request::builder()
@@ -219,6 +221,7 @@ async fn worker_endpoint_accepts_correct_cluster_secret() {
         "job_id": "bobby",
         "host": "h",
         "pid": 1,
+        "start_time": "2026-01-01T00:00:00Z",
         "version": "0.6",
     });
     let req = Request::builder()
@@ -256,6 +259,7 @@ async fn dev_mode_passes_through_worker_endpoints() {
         "job_id": "bobby",
         "host": "h",
         "pid": 1,
+        "start_time": "2026-01-01T00:00:00Z",
         "version": "0.6",
     });
     let req = Request::builder()

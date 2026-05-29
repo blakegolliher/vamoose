@@ -174,14 +174,17 @@ impl Snapshot {
                 job_id,
                 host,
                 pid,
+                start_time,
                 version,
             } => {
                 self.workers.insert(
                     *worker_id,
                     Worker {
                         id: *worker_id,
+                        job_id: job_id.clone(),
                         host: host.clone(),
                         pid: *pid,
+                        start_time: *start_time,
                         version: version.clone(),
                         joined_at: env.at,
                         last_heartbeat: env.at,
@@ -684,6 +687,7 @@ mod tests {
                 job_id: jid("bobby"),
                 host: "h".into(),
                 pid: 42,
+                start_time: at(0),
                 version: "0.6".into(),
             },
         ));
@@ -918,6 +922,7 @@ mod tests {
                     job_id: jid("bobby"),
                     host: "h".into(),
                     pid: 1,
+                    start_time: at(0),
                     version: "0.6".into(),
                 },
             ),

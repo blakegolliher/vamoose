@@ -104,6 +104,7 @@ async fn register_returns_worker_id_and_emits_join_event() {
             "job_id": "bobby",
             "host": "host-a",
             "pid": 4242,
+            "start_time": "2026-05-29T14:31:55Z",
             "version": "0.6.0",
         }),
     )
@@ -129,6 +130,7 @@ async fn register_404s_on_unknown_job() {
             "job_id": "ghost",
             "host": "h",
             "pid": 1,
+            "start_time": "2026-05-29T14:31:55Z",
             "version": "0.6",
         }),
     )
@@ -147,12 +149,114 @@ async fn register_400s_on_bad_job_id() {
             "job_id": "",
             "host": "h",
             "pid": 1,
+            "start_time": "2026-05-29T14:31:55Z",
             "version": "0.6",
         }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "invalid_job_id");
+}
+
+// =============================================================================
+// register — dedup
+// =============================================================================
+
+#[tokio::test]
+async fn reregister_same_host_supersedes_prior_worker() {
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+
+    // First register.
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/workers/register",
+        serde_json::json!({
+            "job_id": "bobby",
+            "host": "host-a",
+            "pid": 100,
+            "start_time": "2026-05-29T14:00:00Z",
+            "version": "0.6.0",
+        }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    let first = WorkerId(Uuid::parse_str(b1["worker_id"].as_str().unwrap()).unwrap());
+    // No prior workers to supersede on the first registration.
+    assert!(b1
+        .get("superseded")
+        .map(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(true))
+        .unwrap_or(true));
+
+    // Re-register from same host with a different pid + start_time.
+    // Simulates a worker process restart.
+    let (s2, b2) = post_json(
+        app,
+        "/workers/register",
+        serde_json::json!({
+            "job_id": "bobby",
+            "host": "host-a",
+            "pid": 200,
+            "start_time": "2026-05-29T14:05:00Z",
+            "version": "0.6.0",
+        }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    let second = WorkerId(Uuid::parse_str(b2["worker_id"].as_str().unwrap()).unwrap());
+    assert_ne!(first, second, "re-register must mint a new WorkerId");
+
+    // `superseded` reports the first worker.
+    let superseded: Vec<String> = b2["superseded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(superseded, vec![first.to_string()]);
+
+    // Prior worker flipped to Disconnected; new worker is Idle.
+    let snap = rt.state().await;
+    assert_eq!(
+        snap.workers[&first].state,
+        WorkerState::Disconnected,
+        "prior worker must be Disconnected after re-register"
+    );
+    assert_eq!(
+        snap.workers[&first].last_error.as_deref(),
+        Some("reregister")
+    );
+    assert_eq!(snap.workers[&second].state, WorkerState::Idle);
+}
+
+#[tokio::test]
+async fn reregister_identical_tuple_is_a_no_op_dedup() {
+    // Same (host, pid, start_time) means "the same worker process
+    // re-asserting itself" — coord should NOT mark anything stale.
+    // It still mints a fresh WorkerId (that's the contract for any
+    // register call), but no WorkerLeft is emitted.
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+
+    let payload = serde_json::json!({
+        "job_id": "bobby",
+        "host": "host-a",
+        "pid": 100,
+        "start_time": "2026-05-29T14:00:00Z",
+        "version": "0.6.0",
+    });
+    let (_, b1) = post_json(app.clone(), "/workers/register", payload.clone()).await;
+    let first = WorkerId(Uuid::parse_str(b1["worker_id"].as_str().unwrap()).unwrap());
+
+    let (s2, b2) = post_json(app, "/workers/register", payload).await;
+    assert_eq!(s2, StatusCode::OK);
+
+    let superseded = b2["superseded"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(superseded, 0, "identical tuple must not supersede");
+
+    // First worker stays Idle.
+    let snap = rt.state().await;
+    assert_eq!(snap.workers[&first].state, WorkerState::Idle);
 }
 
 // =============================================================================
@@ -167,6 +271,7 @@ async fn register_one(app: &axum::Router, job: &str) -> WorkerId {
             "job_id": job,
             "host": "h",
             "pid": 1,
+            "start_time": "2026-05-29T14:31:55Z",
             "version": "0.6",
         }),
     )
@@ -176,13 +281,13 @@ async fn register_one(app: &axum::Router, job: &str) -> WorkerId {
 }
 
 #[tokio::test]
-async fn heartbeat_updates_state_without_event() {
+async fn heartbeat_updates_state_and_returns_control_envelope() {
     let (app, rt, _store) = fresh_app().await;
     rt.ingest(job_created("bobby")).await.unwrap();
     let wid = register_one(&app, "bobby").await;
     let last_seq_before = rt.last_seq().await;
 
-    let (status, _) = post_json(
+    let (status, body) = post_json(
         app,
         &format!("/workers/{wid}/heartbeat"),
         serde_json::json!({
@@ -195,7 +300,11 @@ async fn heartbeat_updates_state_without_event() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
+    // Response shape: control envelope + last_seq + server_time.
+    assert_eq!(body["control"]["mode"], "run");
+    assert_eq!(body["last_seq"].as_u64().unwrap(), last_seq_before);
+    assert!(body["server_time"].is_string());
 
     // No event added — heartbeat is intentionally not in the event log.
     assert_eq!(rt.last_seq().await, last_seq_before);
@@ -207,6 +316,69 @@ async fn heartbeat_updates_state_without_event() {
     assert_eq!(w.inflight_ops, 7);
     assert_eq!(w.queue_depth, 100);
     assert!((w.counters.files_per_sec - 12.5).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn heartbeat_control_mode_tracks_job_phase() {
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+
+    // Baseline: brand-new job is Planned → ControlMode::Run.
+    let (status, body) = post_json(
+        app.clone(),
+        &format!("/workers/{wid}/heartbeat"),
+        serde_json::json!({ "state": "Idle" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["control"]["mode"], "run");
+
+    // Pause the job. Next heartbeat must report "pause".
+    rt.ingest(EventKind::JobPaused {
+        job_id: jid("bobby"),
+        reason: "operator".into(),
+    })
+    .await
+    .unwrap();
+    let (status, body) = post_json(
+        app.clone(),
+        &format!("/workers/{wid}/heartbeat"),
+        serde_json::json!({ "state": "Idle" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["control"]["mode"], "pause");
+
+    // Resume puts it back to "run".
+    rt.ingest(EventKind::JobResumed {
+        job_id: jid("bobby"),
+        reason: "operator".into(),
+    })
+    .await
+    .unwrap();
+    let (_, body) = post_json(
+        app.clone(),
+        &format!("/workers/{wid}/heartbeat"),
+        serde_json::json!({ "state": "Idle" }),
+    )
+    .await;
+    assert_eq!(body["control"]["mode"], "run");
+
+    // Cancel is terminal → "cancel".
+    rt.ingest(EventKind::JobCancelled {
+        job_id: jid("bobby"),
+        reason: "operator".into(),
+    })
+    .await
+    .unwrap();
+    let (_, body) = post_json(
+        app,
+        &format!("/workers/{wid}/heartbeat"),
+        serde_json::json!({ "state": "Idle" }),
+    )
+    .await;
+    assert_eq!(body["control"]["mode"], "cancel");
 }
 
 #[tokio::test]

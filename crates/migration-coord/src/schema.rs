@@ -367,11 +367,60 @@ pub struct WorkerCounters {
     pub errors_per_min: f64,
 }
 
+/// Control mode returned by the coord in every heartbeat response.
+/// The worker flips its local `RunControl` to match; the coord does
+/// not retry — the next heartbeat carries the same mode if it is still
+/// in effect.
+///
+/// Mapping from job phase:
+/// - `Phase::Paused` → `Pause` (operator can resume)
+/// - `Phase::Cancelled | Failed` → `Cancel` (terminal, worker exits)
+/// - everything else → `Run`
+///
+/// `Drain` is reserved for a future distinct "finish in-flight, then
+/// exit cleanly" phase. v1 routes drain through `JobPaused` (matches
+/// the Phase 2 caveat) so workers see it as `Pause`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ControlMode {
+    Run,
+    Pause,
+    Drain,
+    Cancel,
+}
+
+impl ControlMode {
+    /// Derive the control mode the worker should observe for a job
+    /// currently in `phase`. Terminal phases (`Completed`, `Failed`,
+    /// `Cancelled`) all map to `Cancel` — if a worker is still
+    /// heartbeating after the job's terminal transition it's a stale
+    /// process, and the right answer is "exit cleanly".
+    pub fn for_phase(phase: Phase) -> Self {
+        match phase {
+            Phase::Paused => Self::Pause,
+            Phase::Completed | Phase::Failed | Phase::Cancelled => Self::Cancel,
+            Phase::Planned
+            | Phase::Scanning
+            | Phase::Copying
+            | Phase::Verifying
+            | Phase::Cutover => Self::Run,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Worker {
     pub id: WorkerId,
+    /// Job the worker registered against. Set by the reducer from the
+    /// `WorkerJoined` event's `job_id`. Denormalized for O(1) lookup
+    /// in the heartbeat path (which needs the job's phase to derive
+    /// the control envelope).
+    pub job_id: JobId,
     pub host: String,
     pub pid: u32,
+    /// Worker-process start time. Used together with `host` and `pid`
+    /// to detect stale registrations on re-register.
+    pub start_time: DateTime<Utc>,
     pub version: String,
     pub joined_at: DateTime<Utc>,
     pub last_heartbeat: DateTime<Utc>,
@@ -438,7 +487,8 @@ pub const ERROR_SAMPLE_CAP: usize = 10;
 ///
 /// ```json
 /// {"seq":17,"at":"2026-05-29T14:32:00Z","schema_version":1,
-///  "kind":"WorkerJoined","worker_id":"...","host":"host-a","pid":42,"version":"0.6.0"}
+///  "kind":"WorkerJoined","worker_id":"...","host":"host-a","pid":42,
+///  "start_time":"2026-05-29T14:31:55Z","version":"0.6.0"}
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
@@ -506,6 +556,11 @@ pub enum EventKind {
         job_id: JobId,
         host: String,
         pid: u32,
+        /// Worker-process start time. Combined with `host` and `pid`,
+        /// uniquely identifies a worker instance across restarts —
+        /// the coord uses this triple to detect stale registrations
+        /// and mark prior WorkerIds as Disconnected.
+        start_time: DateTime<Utc>,
         version: String,
     },
     WorkerLeft {
@@ -884,6 +939,7 @@ mod tests {
                 job_id: job.clone(),
                 host: "h".into(),
                 pid: 1,
+                start_time: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
                 version: "0.6.0".into(),
             },
             EventKind::WorkerLeft {
@@ -986,8 +1042,10 @@ mod tests {
     fn worker_round_trip_with_optional_fields() {
         let w = Worker {
             id: wid(),
+            job_id: JobId::new("bobby").unwrap(),
             host: "h".into(),
             pid: 42,
+            start_time: at(),
             version: "0.6.0".into(),
             joined_at: at(),
             last_heartbeat: at(),

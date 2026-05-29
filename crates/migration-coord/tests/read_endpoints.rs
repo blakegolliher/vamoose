@@ -88,6 +88,7 @@ fn worker_joined(job: &str, wid: WorkerId) -> EventKind {
         job_id: jid(job),
         host: "h".into(),
         pid: 42,
+        start_time: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
         version: "0.6".into(),
     }
 }

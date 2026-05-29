@@ -5,16 +5,22 @@
 //! handlers in that mode.
 //!
 //! - **POST /workers/register** — bootstrap. Body: `{job_id, host,
-//!   pid, version}`. Coord mints a `WorkerId`, emits `WorkerJoined`
-//!   (so the SSE stream observes the join), and returns
-//!   `{worker_id}`.
+//!   pid, start_time, version}`. Coord mints a fresh `WorkerId`,
+//!   walks `(job_id, host)` for any prior worker whose `(pid,
+//!   start_time)` differs and emits `WorkerLeft{reason:"reregister"}`
+//!   for each, then emits `WorkerJoined`. Returns
+//!   `{worker_id, superseded}`. `superseded` is the list of stale
+//!   WorkerIds the coord just disconnected.
 //!
 //! - **POST /workers/{id}/heartbeat** — counters + state. Body:
 //!   `{state, files_per_sec, bytes_per_sec, errors_per_min,
 //!   inflight_ops, queue_depth}`. Coord calls
 //!   [`crate::runtime::CoordRuntime::record_heartbeat`] — NO event
 //!   ingested (heartbeats deliberately stay out of the event log
-//!   per the build prompt). 404 if `worker_id` is unknown.
+//!   per the build prompt). Response: `{control: {mode}, last_seq,
+//!   server_time}`. The worker reads `control.mode` and flips its
+//!   local `RunControl` on every heartbeat (Phase 3.5). 404 if
+//!   `worker_id` is unknown.
 //!
 //! - **POST /workers/{id}/events** — batched event submission.
 //!   Body: `{events: [{kind, ...payload, worker_at?}]}`. Each entry
@@ -26,7 +32,7 @@
 //!   worker's state.
 
 use super::{ApiError, AppState};
-use crate::schema::{EventKind, JobId, WorkerCounters, WorkerId, WorkerState};
+use crate::schema::{ControlMode, EventKind, JobId, WorkerCounters, WorkerId, WorkerState};
 use axum::extract::{Path, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -41,12 +47,21 @@ pub struct RegisterBody {
     pub job_id: String,
     pub host: String,
     pub pid: u32,
+    /// Worker-process start time. Coord pairs `(host, pid, start_time)`
+    /// to detect stale registrations across restarts.
+    pub start_time: DateTime<Utc>,
     pub version: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RegisterResponse {
     pub worker_id: WorkerId,
+    /// WorkerIds the coord marked Disconnected as a side effect of
+    /// this register — any prior workers on `(job_id, host)` whose
+    /// `(pid, start_time)` differs from the new registration. The
+    /// caller can use this for debugging; clients ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<WorkerId>,
 }
 
 pub async fn register(
@@ -61,6 +76,28 @@ pub async fn register(
             format!("no such job: {job_id}"),
         ));
     }
+
+    // Dedup: any prior worker on (job_id, host) whose (pid, start_time)
+    // differs from the new registration is stale. Mark each one
+    // Disconnected before emitting the new WorkerJoined so the order
+    // on the wire is "old leaves, then new joins".
+    let stale = state
+        .runtime
+        .stale_workers_for_register(&job_id, &body.host, body.pid, body.start_time)
+        .await;
+    let mut superseded = Vec::with_capacity(stale.len());
+    for prior in stale {
+        state
+            .runtime
+            .ingest(EventKind::WorkerLeft {
+                worker_id: prior,
+                reason: "reregister".into(),
+            })
+            .await
+            .map_err(ApiError::storage)?;
+        superseded.push(prior);
+    }
+
     let worker_id = WorkerId::new();
     state
         .runtime
@@ -69,11 +106,15 @@ pub async fn register(
             job_id,
             host: body.host,
             pid: body.pid,
+            start_time: body.start_time,
             version: body.version,
         })
         .await
         .map_err(ApiError::storage)?;
-    Ok(Json(RegisterResponse { worker_id }))
+    Ok(Json(RegisterResponse {
+        worker_id,
+        superseded,
+    }))
 }
 
 // =============================================================================
@@ -95,6 +136,24 @@ pub struct HeartbeatBody {
     pub queue_depth: u32,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ControlEnvelope {
+    pub mode: ControlMode,
+}
+
+/// Body of the heartbeat response. The worker reads `control.mode`
+/// and flips its local `RunControl` to match on every heartbeat.
+/// `last_seq` lets the worker spot a coord restart (a backwards jump
+/// is the trigger to flush its event buffer). `server_time` is
+/// echoed for clock-skew diagnostics — workers never use it for
+/// fence decisions.
+#[derive(Debug, Serialize)]
+pub struct HeartbeatResponse {
+    pub control: ControlEnvelope,
+    pub last_seq: u64,
+    pub server_time: DateTime<Utc>,
+}
+
 fn parse_worker_id(raw: String) -> Result<WorkerId, ApiError> {
     uuid::Uuid::parse_str(&raw)
         .map(WorkerId)
@@ -105,7 +164,7 @@ pub async fn heartbeat(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<HeartbeatBody>,
-) -> Result<axum::http::StatusCode, ApiError> {
+) -> Result<Json<HeartbeatResponse>, ApiError> {
     let worker_id = parse_worker_id(id)?;
     let counters = WorkerCounters {
         files_per_sec: body.files_per_sec,
@@ -123,14 +182,28 @@ pub async fn heartbeat(
         )
         .await
         .map_err(ApiError::storage)?;
-    if updated {
-        Ok(axum::http::StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::not_found(
+    if !updated {
+        return Err(ApiError::not_found(
             "worker_not_found",
             format!("no such worker: {worker_id}"),
-        ))
+        ));
     }
+    // record_heartbeat already verified the worker exists; the lookup
+    // here is the same guard one more time so a worker that vanished
+    // between record_heartbeat and the control read (impossible today,
+    // but cheap insurance) does not return a stale Cancel.
+    let (mode, last_seq, server_time) = state
+        .runtime
+        .control_for_worker(worker_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::not_found("worker_not_found", format!("no such worker: {worker_id}"))
+        })?;
+    Ok(Json(HeartbeatResponse {
+        control: ControlEnvelope { mode },
+        last_seq,
+        server_time,
+    }))
 }
 
 // =============================================================================

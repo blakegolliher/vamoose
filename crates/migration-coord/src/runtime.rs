@@ -331,6 +331,71 @@ impl CoordRuntime {
         })
     }
 
+    /// Compute the [`ControlMode`] the coord wants this worker to
+    /// observe, plus the current `last_seq` and the coord's wall
+    /// clock. Used by the heartbeat handler to build the response
+    /// envelope.
+    ///
+    /// Returns `None` if the worker is unknown — the caller raises
+    /// 404. Returns `Some(ControlMode::Cancel)` for a worker whose
+    /// job no longer exists (shouldn't happen, defensive).
+    pub async fn control_for_worker(
+        &self,
+        worker_id: crate::schema::WorkerId,
+    ) -> Option<(
+        crate::schema::ControlMode,
+        u64,
+        chrono::DateTime<chrono::Utc>,
+    )> {
+        let guard = self.inner.lock().await;
+        let worker = guard.state.workers.get(&worker_id)?;
+        let mode = guard
+            .state
+            .jobs
+            .get(&worker.job_id)
+            .map(|j| crate::schema::ControlMode::for_phase(j.phase))
+            .unwrap_or(crate::schema::ControlMode::Cancel);
+        Some((mode, guard.state.last_seq, self.clock.now()))
+    }
+
+    /// Find WorkerIds on `(job_id, host)` whose `(pid, start_time)`
+    /// does NOT match the incoming `(pid, start_time)` and that are
+    /// still in a live state. The register handler emits a
+    /// `WorkerLeft{reason:"reregister"}` for each returned id before
+    /// minting the new `WorkerId`.
+    ///
+    /// Already-Disconnected workers are skipped — re-emitting
+    /// `WorkerLeft` for a worker that already left is noise without
+    /// information.
+    pub async fn stale_workers_for_register(
+        &self,
+        job_id: &crate::schema::JobId,
+        host: &str,
+        pid: u32,
+        start_time: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<crate::schema::WorkerId> {
+        let guard = self.inner.lock().await;
+        let Some(job) = guard.state.jobs.get(job_id) else {
+            return Vec::new();
+        };
+        job.assigned_workers
+            .iter()
+            .filter_map(|wid| {
+                let w = guard.state.workers.get(wid)?;
+                if w.host != host {
+                    return None;
+                }
+                if w.pid == pid && w.start_time == start_time {
+                    return None;
+                }
+                if w.state == crate::schema::WorkerState::Disconnected {
+                    return None;
+                }
+                Some(*wid)
+            })
+            .collect()
+    }
+
     /// Error buckets for a job. Returns `Some(vec![])` for a job
     /// with no errors yet, `None` for an unknown job.
     pub async fn errors_view_for_job(
