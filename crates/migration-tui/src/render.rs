@@ -225,9 +225,26 @@ fn job_row<'a>(job: &'a Job, state: &AppState, now: DateTime<Utc>) -> Row<'a> {
 
 fn progress_cell(job: &Job) -> Cell<'static> {
     let p = &job.progress;
-    let pct_text = format_pct(p.files_done, p.files_total);
     let bar = progress_bar(p.files_done, p.files_total, 10);
-    Cell::from(format!("{bar} {pct_text}"))
+    // Pick a right-hand label by what we actually know:
+    //
+    // - `files_total > 0` → percentage (the normal steady-state once
+    //   a totals event has landed; bar fills proportionally).
+    // - `files_total == 0 && files_done > 0` → running file count.
+    //   The coord schema has no "scan completed" event today, so
+    //   pre-scan progress would otherwise read a flat ` -- ` next to
+    //   a flat bar even while events stream in. The compact count
+    //   surfaces motion until a denominator arrives.
+    // - both zero → ` -- ` placeholder so the column stays width-
+    //   stable when nothing's happened.
+    let rhs = if p.files_total > 0 {
+        format_pct(p.files_done, p.files_total)
+    } else if p.files_done > 0 {
+        format_count(p.files_done)
+    } else {
+        format_pct(0, 0)
+    };
+    Cell::from(format!("{bar} {rhs}"))
 }
 
 /// ASCII progress bar of `width` cells (full ▓, empty ░). Caller is
@@ -618,6 +635,36 @@ mod tests {
         // ASCII bar should have both filled and empty cells.
         assert!(text.contains('▓'));
         assert!(text.contains('░'));
+    }
+
+    #[test]
+    fn job_row_shows_running_count_when_total_unknown() {
+        // No event in the coord schema today sets `files_total`,
+        // so a job that's actively streaming ProgressDelta will
+        // have files_done > 0 and files_total == 0. The render
+        // surfaces the running count instead of stranding the
+        // operator on a flat " -- " placeholder.
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        set_progress(&mut s, "alpha", 0, 1234, 5000);
+        let buf = render_to_buffer(&s, at(100), 100, 8);
+        let text = buffer_text(&buf);
+        // format_count(1234) = "1.23k".
+        assert!(text.contains("1.23k"), "expected count, got:\n{text}");
+        // No percentage when the denominator is missing.
+        assert!(!text.contains("%"));
+    }
+
+    #[test]
+    fn job_row_keeps_placeholder_when_truly_empty() {
+        // Job exists but nothing has progressed yet — column still
+        // renders the " -- " placeholder so width stays stable
+        // across rows.
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        let buf = render_to_buffer(&s, at(100), 100, 8);
+        let text = buffer_text(&buf);
+        assert!(text.contains(" -- "), "expected placeholder, got:\n{text}");
     }
 
     #[test]
