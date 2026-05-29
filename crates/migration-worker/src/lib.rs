@@ -9,5 +9,6 @@ pub mod config;
 pub mod coord_client;
 pub mod heartbeat;
 pub mod orchestrator;
+pub mod run_control;
 pub mod shard_processor;
 pub mod throughput;
