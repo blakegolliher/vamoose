@@ -32,12 +32,13 @@
 //! holds the skeleton + documentation so the crate keeps compiling
 //! as each piece arrives.
 
+pub mod command;
 pub mod read;
 pub mod stream;
 
 use crate::runtime::CoordRuntime;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use http::StatusCode;
 use serde::Serialize;
@@ -68,6 +69,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/jobs/{id}/workers", get(read::list_workers))
         .route("/jobs/{id}/errors", get(read::list_errors))
         .route("/jobs/{id}/events", get(read::list_events))
+        .route("/jobs/{id}/pause", post(command::pause))
+        .route("/jobs/{id}/resume", post(command::resume))
+        .route("/jobs/{id}/cancel", post(command::cancel))
+        .route("/jobs/{id}/drain", post(command::drain))
+        .route("/jobs/{id}/retry-failed", post(command::retry_failed))
         .route("/events", get(read::list_all_events))
         .with_state(state)
 }

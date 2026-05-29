@@ -678,6 +678,37 @@ impl Snapshot {
 }
 
 // =============================================================================
+// Audit
+// =============================================================================
+
+/// One line of the audit log. Written to
+/// `audit/<YYYY-MM-DD>/<seq:020>.jsonl` — one entry per file (the
+/// `seq` portion of the key is the per-day audit sequence the
+/// snapshot persists).
+///
+/// `token_label` is the admin-token *label* (never the token
+/// itself); the auth middleware materializes it from the bearer
+/// header.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub at: DateTime<Utc>,
+    pub command_id: String,
+    pub token_label: String,
+    pub action: String,
+    pub target: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+    pub result: AuditResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "detail")]
+pub enum AuditResult {
+    Accepted,
+    Rejected(String),
+}
+
+// =============================================================================
 // Tests — round-trip JSON for every variant the reducer or wire layer
 // will see.
 // =============================================================================

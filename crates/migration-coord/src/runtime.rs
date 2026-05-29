@@ -353,6 +353,59 @@ impl CoordRuntime {
         )
     }
 
+    /// Write one audit entry. The caller has already established
+    /// authorization; this method assigns the per-day seq, writes
+    /// the JSON line to `audit/<YYYY-MM-DD>/<seq:020>.jsonl`, and
+    /// returns the assigned `command_id` (UUID v4).
+    ///
+    /// On UTC date rollover the counter resets — the snapshot
+    /// persists `(audit_seq_today, audit_seq_date)` so a coord
+    /// restart on the same day continues the day's numbering
+    /// rather than racing previously-written keys.
+    pub async fn record_audit(
+        &self,
+        token_label: impl Into<String>,
+        action: impl Into<String>,
+        target: impl Into<String>,
+        args: serde_json::Value,
+        result: crate::schema::AuditResult,
+    ) -> Result<String> {
+        let now = self.clock.now();
+        let date = now.format("%Y-%m-%d").to_string();
+        let command_id = uuid::Uuid::new_v4().to_string();
+
+        let (key, body) = {
+            let mut guard = self.inner.lock().await;
+            if guard.lease_lost {
+                return Err(Error::LeaseLost);
+            }
+            // Rollover: reset on a new UTC day.
+            if guard.state.audit_seq_date != date {
+                guard.state.audit_seq_date = date.clone();
+                guard.state.audit_seq_today = 0;
+            }
+            guard.state.audit_seq_today += 1;
+            let seq = guard.state.audit_seq_today;
+            let key = crate::layout::audit_chunk_key(&date, seq);
+
+            let entry = crate::schema::AuditEntry {
+                at: now,
+                command_id: command_id.clone(),
+                token_label: token_label.into(),
+                action: action.into(),
+                target: target.into(),
+                args,
+                result,
+            };
+            let mut body = serde_json::to_vec(&entry)?;
+            body.push(b'\n');
+            (key, body)
+        };
+
+        self.store.put(&key, body).await?;
+        Ok(command_id)
+    }
+
     /// Subscribe to live events. Returns a `broadcast::Receiver`;
     /// the SSE handler typically wraps it in a stream and emits
     /// each envelope as a wire frame.
