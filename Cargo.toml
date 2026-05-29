@@ -92,6 +92,13 @@ crossterm = "0.28"
 prometheus = "0.13"
 hyper      = { version = "1", features = ["server", "http1"] }
 
+# Coord HTTP layer (REST + SSE)
+axum        = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "macros", "matched-path"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+tower       = { version = "0.5", default-features = false, features = ["util"] }
+tower-http  = { version = "0.6", default-features = false, features = ["trace", "timeout"] }
+http        = "1"
+
 # libnfs FFI (see migration-mover/build.rs)
 libc = "0.2"
 

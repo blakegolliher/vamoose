@@ -38,6 +38,7 @@ pub mod events;
 pub mod layout;
 pub mod lease;
 pub mod schema;
+pub mod server;
 pub mod snapshot;
 pub mod state;
 pub mod store;
