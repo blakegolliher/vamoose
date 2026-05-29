@@ -20,7 +20,7 @@
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use migration_coord::schema::{
-    ErrorBucket, EventEnvelope, EventKind, Job, JobId, Snapshot, Worker, WorkerId,
+    ErrorBucket, ErrorClass, EventEnvelope, EventKind, Job, JobId, Snapshot, Worker, WorkerId,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -289,6 +289,63 @@ impl WorkerSort {
 }
 
 // =============================================================================
+// Per-job recent-errors tail
+// =============================================================================
+
+/// How many recent errors per job the TUI keeps. The coord's
+/// [`ErrorBucket`] aggregation captures totals + sample paths, but
+/// the Errors tab needs a chronological tail for the operator to
+/// scan — and the tail can't be reconstructed from the bucket
+/// (`sample_paths` is unordered, deduped, and capped). So the
+/// client maintains its own.
+pub const RECENT_ERRORS_PER_JOB: usize = 50;
+
+/// One captured `ErrorEmitted` event, materialized client-side so
+/// the Errors tab's recent tail has the full payload without
+/// re-querying the coord.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentError {
+    pub at: DateTime<Utc>,
+    pub worker_id: WorkerId,
+    pub class: ErrorClass,
+    pub path: String,
+    pub retryable: bool,
+    pub message: String,
+}
+
+/// Bounded ring of [`RecentError`]s, oldest first. Pushes that
+/// would exceed [`RECENT_ERRORS_PER_JOB`] drop the head.
+#[derive(Debug, Clone, Default)]
+pub struct RecentErrors {
+    entries: VecDeque<RecentError>,
+}
+
+impl RecentErrors {
+    pub fn push(&mut self, e: RecentError) {
+        if self.entries.len() >= RECENT_ERRORS_PER_JOB {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(e);
+    }
+
+    /// Tail of `n` most-recent entries, newest LAST (matches the
+    /// internal order so callers can iterate normally and have the
+    /// most recent at the bottom of the table).
+    pub fn tail(&self, n: usize) -> impl Iterator<Item = &RecentError> {
+        let skip = self.entries.len().saturating_sub(n);
+        self.entries.iter().skip(skip)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+// =============================================================================
 // Rolling per-job throughput windows
 // =============================================================================
 
@@ -363,6 +420,10 @@ pub struct AppState {
     /// Per-job rolling throughput history derived from
     /// `ProgressDelta` events. Pruned to 5 min on every push.
     pub progress_windows: HashMap<JobId, ProgressDeltaHistory>,
+    /// Per-job recent-errors tail. The coord aggregates totals into
+    /// `ErrorBucket`s on the snapshot; the TUI keeps a chronological
+    /// ring so the Errors tab can show recent activity.
+    pub recent_errors: HashMap<JobId, RecentErrors>,
 }
 
 impl AppState {
@@ -380,6 +441,7 @@ impl AppState {
             ui: UiState::default(),
             last_seen_seq: 0,
             progress_windows: HashMap::new(),
+            recent_errors: HashMap::new(),
         }
     }
 
@@ -413,7 +475,38 @@ impl AppState {
                 .or_default()
                 .push(envelope.at, *bytes_delta);
         }
+        // Side-effect: append to the per-job recent-errors ring when
+        // this was an `ErrorEmitted`. The dedup is implicit — we
+        // only reach this branch after the early-return seq guard,
+        // so a replayed event will never double-push.
+        if let EventKind::ErrorEmitted {
+            job_id,
+            worker_id,
+            class,
+            path,
+            retryable,
+            message,
+        } = &envelope.kind
+        {
+            self.recent_errors
+                .entry(job_id.clone())
+                .or_default()
+                .push(RecentError {
+                    at: envelope.at,
+                    worker_id: *worker_id,
+                    class: class.clone(),
+                    path: path.clone(),
+                    retryable: *retryable,
+                    message: message.clone(),
+                });
+        }
         true
+    }
+
+    /// Per-job recent-errors ring. Returns `None` for a job that has
+    /// never emitted an error.
+    pub fn recent_errors_for_job(&self, id: &JobId) -> Option<&RecentErrors> {
+        self.recent_errors.get(id)
     }
 
     /// Total bytes-per-second across all jobs over the given
@@ -963,5 +1056,98 @@ mod tests {
     fn modal_default_is_none() {
         let ui = UiState::default();
         assert!(ui.modal.is_none());
+    }
+
+    // ----- RecentErrors ring (Phase 5c) -----
+
+    fn err_evt(seq: u64, job: &str, path: &str, message: &str) -> EventEnvelope {
+        EventEnvelope {
+            seq,
+            at: at(seq as i64),
+            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            worker_at: None,
+            kind: EventKind::ErrorEmitted {
+                job_id: jid(job),
+                worker_id: WorkerId::new(),
+                class: ErrorClass::Permission,
+                path: path.into(),
+                retryable: false,
+                message: message.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn recent_errors_push_caps_at_limit() {
+        let mut r = RecentErrors::default();
+        for i in 0..(RECENT_ERRORS_PER_JOB + 10) {
+            r.push(RecentError {
+                at: at(i as i64),
+                worker_id: WorkerId::new(),
+                class: ErrorClass::Other(format!("k{i}")),
+                path: format!("/p/{i}"),
+                retryable: false,
+                message: format!("m{i}"),
+            });
+        }
+        assert_eq!(r.len(), RECENT_ERRORS_PER_JOB);
+        // Oldest (entries 0..9) should have dropped; the FIRST item
+        // in the tail is now entry 10.
+        let tail: Vec<_> = r.tail(usize::MAX).collect();
+        assert_eq!(tail.first().unwrap().path, "/p/10");
+        assert_eq!(
+            tail.last().unwrap().path,
+            format!("/p/{}", RECENT_ERRORS_PER_JOB + 9)
+        );
+    }
+
+    #[test]
+    fn recent_errors_tail_n_returns_last_n_newest_last() {
+        let mut r = RecentErrors::default();
+        for i in 0..5 {
+            r.push(RecentError {
+                at: at(i),
+                worker_id: WorkerId::new(),
+                class: ErrorClass::Permission,
+                path: format!("/p/{i}"),
+                retryable: false,
+                message: "m".into(),
+            });
+        }
+        let last3: Vec<_> = r.tail(3).collect();
+        assert_eq!(last3.len(), 3);
+        assert_eq!(last3[0].path, "/p/2");
+        assert_eq!(last3[2].path, "/p/4");
+    }
+
+    #[test]
+    fn appstate_apply_envelope_feeds_recent_errors() {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+        s.apply_envelope(&err_evt(2, "alpha", "/path/a", "perm denied"));
+        s.apply_envelope(&err_evt(3, "alpha", "/path/b", "another"));
+        let r = s.recent_errors_for_job(&jid("alpha")).expect("ring");
+        assert_eq!(r.len(), 2);
+        let tail: Vec<_> = r.tail(usize::MAX).collect();
+        assert_eq!(tail[0].path, "/path/a");
+        assert_eq!(tail[0].message, "perm denied");
+        assert_eq!(tail[1].path, "/path/b");
+    }
+
+    #[test]
+    fn appstate_duplicate_envelope_does_not_double_push_recent_errors() {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+        s.apply_envelope(&err_evt(2, "alpha", "/p/x", "boom"));
+        // Replay same seq — dedup at apply_envelope blocks it.
+        s.apply_envelope(&err_evt(2, "alpha", "/p/x", "boom"));
+        let r = s.recent_errors_for_job(&jid("alpha")).expect("ring");
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn appstate_recent_errors_for_job_returns_none_when_unseen() {
+        let s = AppState::empty(at(0));
+        assert!(s.recent_errors_for_job(&jid("alpha")).is_none());
     }
 }

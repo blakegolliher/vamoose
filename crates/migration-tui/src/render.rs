@@ -22,9 +22,13 @@
 //! ```
 
 use crate::format::{format_bytes, format_count, format_elapsed, format_pct};
-use crate::state::{AppState, ConnectionStatus, JobSort, Modal, Tab, UiState, View, WorkerSort};
+use crate::state::{
+    AppState, ConnectionStatus, JobSort, Modal, RecentError, Tab, UiState, View, WorkerSort,
+};
 use chrono::{DateTime, Utc};
-use migration_coord::schema::{Job, JobId, Phase, Worker, WorkerId, WorkerState};
+use migration_coord::schema::{
+    ErrorBucket, ErrorClass, Job, JobId, Phase, Worker, WorkerId, WorkerState,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -432,7 +436,7 @@ fn render_tab_body(
     match tab {
         Tab::Overview => render_overview_tab(frame, area, state, job, now),
         Tab::Workers => render_workers_tab(frame, area, state, job, now),
-        Tab::Errors => render_placeholder_tab(frame, area, "Errors", "step 5c"),
+        Tab::Errors => render_errors_tab(frame, area, state, job, now),
         Tab::Plan => render_placeholder_tab(frame, area, "Plan", "step 5d"),
         Tab::Verify => render_placeholder_tab(frame, area, "Verify", "step 5d"),
     }
@@ -504,6 +508,192 @@ fn render_overview_tab(
 
     let para = Paragraph::new(Text::from(lines));
     frame.render_widget(para, area);
+}
+
+// =============================================================================
+// Errors tab
+// =============================================================================
+
+fn render_errors_tab(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    job: &Job,
+    now: DateTime<Utc>,
+) {
+    // Sort buckets by count desc so the loudest class lands on top.
+    let mut buckets: Vec<&ErrorBucket> = state.errors_for_job(&job.id).iter().collect();
+    buckets.sort_by(|a, b| b.count.cmp(&a.count));
+    let tail = state
+        .recent_errors_for_job(&job.id)
+        .map(|r| r.tail(15).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    if buckets.is_empty() && tail.is_empty() {
+        let text = Text::from(vec![
+            Line::from(Span::styled(
+                "No errors recorded for this job.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::raw(""),
+            Line::from(Span::raw(
+                "ErrorEmitted events will appear here as they stream in.",
+            )),
+        ]);
+        frame.render_widget(Paragraph::new(text), area);
+        return;
+    }
+
+    // Split the body: buckets table on top, recent tail underneath.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),                                       // legend
+            Constraint::Length((buckets.len() as u16 + 1).clamp(2, 10)), // header + rows, capped
+            Constraint::Length(1),                                       // tail header
+            Constraint::Min(0),                                          // tail
+        ])
+        .split(area);
+
+    let total_count: u64 = buckets.iter().map(|b| b.count).sum();
+    let legend = Line::from(vec![
+        Span::styled(
+            format!("{} error classes", buckets.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  ·  "),
+        Span::styled(
+            format!("{} total errors", total_count),
+            Style::default().fg(Color::Red),
+        ),
+        Span::raw("  ·  recent tail below"),
+    ]);
+    frame.render_widget(Paragraph::new(legend), chunks[0]);
+
+    render_error_buckets_table(frame, chunks[1], &buckets, now);
+
+    let tail_header = Line::from(vec![
+        Span::styled(
+            "Recent",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  ({} shown, newest last)", tail.len())),
+    ]);
+    frame.render_widget(Paragraph::new(tail_header), chunks[2]);
+
+    render_recent_errors_tail(frame, chunks[3], &tail, now);
+}
+
+fn render_error_buckets_table(
+    frame: &mut Frame,
+    area: Rect,
+    buckets: &[&ErrorBucket],
+    now: DateTime<Utc>,
+) {
+    let header = Row::new(vec![
+        Cell::from(Span::styled("Class", header_style())),
+        Cell::from(Span::styled("Count", header_style())),
+        Cell::from(Span::styled("First", header_style())),
+        Cell::from(Span::styled("Last", header_style())),
+        Cell::from(Span::styled("Retry", header_style())),
+        Cell::from(Span::styled("Sample path", header_style())),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = buckets
+        .iter()
+        .map(|b| {
+            let sample = b
+                .sample_paths
+                .first()
+                .map(|s| s.clone())
+                .unwrap_or_else(|| "—".to_string());
+            let retry_label = if b.retryable { "yes" } else { "no" };
+            let retry_style = if b.retryable {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Red)
+            };
+            Row::new(vec![
+                Cell::from(format_error_class(&b.class)),
+                Cell::from(Span::styled(
+                    format!("{}", b.count),
+                    Style::default().fg(Color::Red),
+                )),
+                Cell::from(format_elapsed(b.first_seen, now)),
+                Cell::from(format_elapsed(b.last_seen, now)),
+                Cell::from(Span::styled(retry_label.to_string(), retry_style)),
+                Cell::from(sample),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(18), // Class
+        Constraint::Length(6),  // Count
+        Constraint::Length(6),  // First
+        Constraint::Length(6),  // Last
+        Constraint::Length(5),  // Retry
+        Constraint::Min(20),    // Sample path
+    ];
+    let table = Table::new(rows, widths).header(header).column_spacing(1);
+    frame.render_widget(table, area);
+}
+
+fn render_recent_errors_tail(
+    frame: &mut Frame,
+    area: Rect,
+    tail: &[&RecentError],
+    now: DateTime<Utc>,
+) {
+    if tail.is_empty() {
+        let p = Paragraph::new(Span::styled(
+            "(no recent errors)",
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(p, area);
+        return;
+    }
+    let header = Row::new(vec![
+        Cell::from(Span::styled("When", header_style())),
+        Cell::from(Span::styled("Class", header_style())),
+        Cell::from(Span::styled("Path", header_style())),
+        Cell::from(Span::styled("Message", header_style())),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = tail
+        .iter()
+        .map(|e| {
+            Row::new(vec![
+                Cell::from(format_elapsed(e.at, now)),
+                Cell::from(format_error_class(&e.class)),
+                Cell::from(e.path.clone()),
+                Cell::from(e.message.clone()),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(6),  // When
+        Constraint::Length(18), // Class
+        Constraint::Length(30), // Path
+        Constraint::Min(20),    // Message
+    ];
+    let table = Table::new(rows, widths).header(header).column_spacing(1);
+    frame.render_widget(table, area);
+}
+
+fn format_error_class(c: &ErrorClass) -> String {
+    match c {
+        ErrorClass::Nfs3Err(code) => format!("nfs3:{code}"),
+        ErrorClass::ClaimConflict => "claim-conflict".into(),
+        ErrorClass::Permission => "permission".into(),
+        ErrorClass::Timeout => "timeout".into(),
+        ErrorClass::ChecksumMismatch => "checksum".into(),
+        ErrorClass::Other(s) => format!("other:{s}"),
+    }
 }
 
 // =============================================================================
@@ -1384,13 +1574,12 @@ mod tests {
 
     #[test]
     fn detail_placeholder_tabs_render_without_panicking() {
-        // Workers tab landed in step 5b and is no longer a
-        // placeholder. Remaining placeholders fill in across
-        // steps 5c (Errors) and 5d (Plan / Verify).
+        // Workers (5b) and Errors (5c) are no longer placeholders.
+        // Remaining placeholders land in step 5d (Plan / Verify).
         let mut s = AppState::empty(at(0));
         s.mark_connected(at(0));
         s.apply_envelope(&job_created_evt(1, 0, "alpha"));
-        for tab in [Tab::Errors, Tab::Plan, Tab::Verify] {
+        for tab in [Tab::Plan, Tab::Verify] {
             enter_detail(&mut s, "alpha", tab);
             let buf = render_to_buffer(&s, at(0), 100, 16);
             let text = buffer_text(&buf);
@@ -1555,5 +1744,153 @@ mod tests {
         let text = buffer_text(&buf);
         assert!(text.contains("not found"));
         assert!(text.contains("Esc to close"));
+    }
+
+    // ----- Errors tab (Phase 5c) -----
+
+    fn error_emitted_evt(
+        seq: u64,
+        secs: i64,
+        job: &str,
+        class: ErrorClass,
+        path: &str,
+        message: &str,
+        retryable: bool,
+    ) -> EventEnvelope {
+        env(
+            seq,
+            secs,
+            EventKind::ErrorEmitted {
+                job_id: jid(job),
+                worker_id: WorkerId::new(),
+                class,
+                path: path.into(),
+                retryable,
+                message: message.into(),
+            },
+        )
+    }
+
+    #[test]
+    fn errors_tab_empty_state_when_no_errors() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        enter_detail(&mut s, "alpha", Tab::Errors);
+        let buf = render_to_buffer(&s, at(0), 100, 20);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("No errors recorded"),
+            "expected empty state, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn errors_tab_renders_buckets_and_recent_tail() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        s.apply_envelope(&error_emitted_evt(
+            2,
+            10,
+            "alpha",
+            ErrorClass::Permission,
+            "/data/file1",
+            "EACCES",
+            false,
+        ));
+        s.apply_envelope(&error_emitted_evt(
+            3,
+            20,
+            "alpha",
+            ErrorClass::Nfs3Err(13),
+            "/data/file2",
+            "NFSERR_ACCES",
+            true,
+        ));
+        enter_detail(&mut s, "alpha", Tab::Errors);
+
+        let buf = render_to_buffer(&s, at(100), 120, 20);
+        let text = buffer_text(&buf);
+        // Legend
+        assert!(text.contains("error classes"));
+        assert!(text.contains("total errors"));
+        // Bucket table headers
+        for col in ["Class", "Count", "First", "Last", "Retry", "Sample path"] {
+            assert!(text.contains(col), "missing bucket col '{col}'");
+        }
+        // Class formatting surfaces
+        assert!(text.contains("permission"));
+        assert!(text.contains("nfs3:13"));
+        // Recent tail header
+        assert!(text.contains("Recent"));
+        // Recent tail column headers
+        for col in ["When", "Class", "Path", "Message"] {
+            assert!(text.contains(col), "missing tail col '{col}'");
+        }
+        // Specific error messages from the events appear in the tail
+        assert!(text.contains("EACCES"));
+        assert!(text.contains("NFSERR_ACCES"));
+        assert!(text.contains("/data/file1"));
+        assert!(text.contains("/data/file2"));
+    }
+
+    #[test]
+    fn errors_tab_buckets_sorted_by_count_desc() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        // 1x Permission, 3x Timeout — Timeout should lead the table.
+        s.apply_envelope(&error_emitted_evt(
+            2,
+            10,
+            "alpha",
+            ErrorClass::Permission,
+            "/p/a",
+            "perm",
+            false,
+        ));
+        for i in 0..3 {
+            s.apply_envelope(&error_emitted_evt(
+                3 + i,
+                15 + i as i64,
+                "alpha",
+                ErrorClass::Timeout,
+                &format!("/p/t{i}"),
+                "timeout",
+                true,
+            ));
+        }
+        enter_detail(&mut s, "alpha", Tab::Errors);
+
+        let buf = render_to_buffer(&s, at(100), 120, 20);
+        let text = buffer_text(&buf);
+        // "timeout" must appear before "permission" in the bucket
+        // table (count 3 > count 1 → sort desc puts it on top).
+        let timeout_pos = text.find("timeout").unwrap();
+        let perm_pos = text.find("permission").unwrap();
+        assert!(
+            timeout_pos < perm_pos,
+            "expected timeout to appear before permission; got positions {timeout_pos} vs {perm_pos}",
+        );
+    }
+
+    #[test]
+    fn error_class_formatter_covers_all_variants() {
+        assert_eq!(format_error_class(&ErrorClass::Nfs3Err(13)), "nfs3:13");
+        assert_eq!(
+            format_error_class(&ErrorClass::ClaimConflict),
+            "claim-conflict"
+        );
+        assert_eq!(format_error_class(&ErrorClass::Permission), "permission");
+        assert_eq!(format_error_class(&ErrorClass::Timeout), "timeout");
+        assert_eq!(
+            format_error_class(&ErrorClass::ChecksumMismatch),
+            "checksum"
+        );
+        assert_eq!(
+            format_error_class(&ErrorClass::Other("foo".into())),
+            "other:foo"
+        );
     }
 }
