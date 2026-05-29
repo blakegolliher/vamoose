@@ -34,5 +34,6 @@
 
 pub mod errors;
 pub mod layout;
+pub mod schema;
 
 pub use errors::{Error, Result};
