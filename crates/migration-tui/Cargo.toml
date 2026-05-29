@@ -17,6 +17,7 @@ path = "src/lib.rs"
 migration-coord = { workspace = true }
 
 tokio       = { workspace = true }
+tokio-util  = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 anyhow      = { workspace = true }
@@ -31,9 +32,11 @@ reqwest = { workspace = true }
 bytes   = { workspace = true }
 
 # Rendering layer — wired in step 4b, declared here so the workspace
-# resolves them in one shot.
+# resolves them in one shot. The `event-stream` feature enables
+# crossterm::event::EventStream so the TUI loop can `select!` on
+# keyboard input alongside the SSE channel and the render tick.
 ratatui   = { workspace = true }
-crossterm = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

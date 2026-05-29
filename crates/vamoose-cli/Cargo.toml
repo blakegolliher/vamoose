@@ -14,6 +14,7 @@ path = "src/main.rs"
 migration-core   = { workspace = true }
 migration-mover  = { workspace = true }
 migration-coord  = { workspace = true }
+migration-tui    = { workspace = true }
 migration-worker = { path = "../migration-worker" }
 # migration-aggr is binary-only today; add it back when the `vamoose
 # aggr` subcommand drops the stub and calls into a (future) lib.
@@ -31,3 +32,7 @@ serde_json         = { workspace = true }
 toml               = { workspace = true }
 hostname           = { workspace = true }
 chrono             = { workspace = true }
+
+[dev-dependencies]
+# Used by tui::resolve_token tests for fixture files.
+tempfile = "3"

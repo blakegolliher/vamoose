@@ -20,6 +20,7 @@
 //! the terminal and event loop. Headless callers can drive
 //! [`state::AppState`] directly for tests.
 
+pub mod app;
 pub mod client;
 pub mod format;
 pub mod render;

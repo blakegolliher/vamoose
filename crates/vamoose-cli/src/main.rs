@@ -53,6 +53,8 @@ enum Command {
     Run(cmd::run::Args),
     /// Control-plane HTTP daemon (REST + SSE).
     Coord(cmd::coord::Args),
+    /// Operator dashboard (terminal UI). Connects to a running coord.
+    Tui(cmd::tui::Args),
 }
 
 fn build_filter(arg: Option<&str>) -> tracing_subscriber::EnvFilter {
@@ -105,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Init(a) => cmd::init::run(a, cli.config).await,
         Command::Run(a) => cmd::run::run(a, cli.config).await,
         Command::Coord(a) => cmd::coord::run(a, cli.config).await,
+        Command::Tui(a) => cmd::tui::run(a, cli.config).await,
     };
 
     if let Some(handle) = log_handle {
