@@ -34,6 +34,7 @@
 
 pub mod auth;
 pub mod command;
+pub mod listen;
 pub mod read;
 pub mod stream;
 pub mod worker;
@@ -114,10 +115,18 @@ pub fn build_router(state: AppState) -> Router {
             auth::require_cluster_secret,
         ));
 
+    let stream_route = Router::new()
+        .route("/stream", get(stream::handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_admin,
+        ));
+
     Router::new()
         .route("/healthz", get(read::healthz))
         .merge(admin)
         .merge(workers)
+        .merge(stream_route)
         .with_state(state)
 }
 

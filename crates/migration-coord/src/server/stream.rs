@@ -169,6 +169,80 @@ pub fn sse_stream(
     }
 }
 
+// =============================================================================
+// axum wire layer
+// =============================================================================
+
+use super::{ApiError, AppState};
+use axum::extract::{Query, State};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::IntoResponse;
+use futures::TryStreamExt;
+use http::HeaderMap;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+pub struct StreamParams {
+    /// Per-job filter. None → cluster-wide stream.
+    pub job_id: Option<String>,
+}
+
+/// GET /stream and GET /stream?job_id={id}
+///
+/// Headers honored:
+/// - `Last-Event-ID: <seq>` → catch-up from log (seq > the header)
+///   before switching to live.
+pub async fn handler(
+    State(state): State<AppState>,
+    Query(params): Query<StreamParams>,
+    headers: HeaderMap,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    let filter = match params.job_id {
+        Some(s) => {
+            let id = crate::schema::JobId::new(s)
+                .map_err(|e| ApiError::bad_request("invalid_job_id", e.to_string()))?;
+            // 404 on unknown — clients ask for a job they can browse.
+            if state.runtime.job_view(&id).await.is_none() {
+                return Err(ApiError::not_found(
+                    "job_not_found",
+                    format!("no such job: {id}"),
+                ));
+            }
+            JobFilter::Job(id)
+        }
+        None => JobFilter::All,
+    };
+
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let stream = sse_stream(
+        state.runtime.clone(),
+        last_event_id,
+        filter,
+        StreamConfig::default(),
+    )
+    .map_ok(|frame| match frame {
+        StreamFrame::Event(env) => {
+            let kind_name = env.kind.name();
+            let data = serde_json::to_string(&env).unwrap_or_else(|_| "{}".to_string());
+            SseEvent::default()
+                .event(kind_name)
+                .id(env.seq.to_string())
+                .data(data)
+        }
+        StreamFrame::Resync { skipped } => SseEvent::default()
+            .event("Resync")
+            .data(format!("{{\"skipped\":{skipped}}}")),
+        StreamFrame::Keepalive => SseEvent::default().comment("ping"),
+    })
+    .map_err(|e| std::io::Error::other(e.to_string()));
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
