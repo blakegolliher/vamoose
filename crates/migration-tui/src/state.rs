@@ -320,6 +320,58 @@ pub struct RecentErrors {
     entries: VecDeque<RecentError>,
 }
 
+/// One captured `VerifyFileMismatch` event. The coord doesn't keep
+/// these on the snapshot (Phase 1 reducer just streams them) — the
+/// TUI keeps a chronological ring so the Verify tab can show the
+/// recent picture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentVerifyMismatch {
+    pub at: DateTime<Utc>,
+    pub path: String,
+    pub expected: String,
+    pub got: String,
+}
+
+/// Per-job verify mismatches ring. Same bounded shape as
+/// [`RecentErrors`]; oldest pushed out at the cap.
+pub const RECENT_VERIFY_MISMATCHES_PER_JOB: usize = 50;
+
+#[derive(Debug, Clone, Default)]
+pub struct RecentVerifyMismatches {
+    entries: VecDeque<RecentVerifyMismatch>,
+}
+
+impl RecentVerifyMismatches {
+    pub fn push(&mut self, e: RecentVerifyMismatch) {
+        if self.entries.len() >= RECENT_VERIFY_MISMATCHES_PER_JOB {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(e);
+    }
+    pub fn tail(&self, n: usize) -> impl Iterator<Item = &RecentVerifyMismatch> {
+        let skip = self.entries.len().saturating_sub(n);
+        self.entries.iter().skip(skip)
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Last observed verify lifecycle for a job. The coord drives the
+/// phase transition via `VerifyCompleted`'s mismatch count but
+/// doesn't keep the timestamps + counts on the snapshot — those
+/// are captured here so the Verify tab can show "started Xs ago,
+/// completed with N mismatches".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifyStatus {
+    pub last_started: Option<DateTime<Utc>>,
+    pub last_completed: Option<DateTime<Utc>>,
+    pub last_mismatches: Option<u64>,
+}
+
 impl RecentErrors {
     pub fn push(&mut self, e: RecentError) {
         if self.entries.len() >= RECENT_ERRORS_PER_JOB {
@@ -424,6 +476,12 @@ pub struct AppState {
     /// `ErrorBucket`s on the snapshot; the TUI keeps a chronological
     /// ring so the Errors tab can show recent activity.
     pub recent_errors: HashMap<JobId, RecentErrors>,
+    /// Per-job tail of `VerifyFileMismatch` events. The coord's
+    /// Phase 1 reducer just streams these; the TUI captures them so
+    /// the Verify tab has a recent-activity table.
+    pub recent_verify_mismatches: HashMap<JobId, RecentVerifyMismatches>,
+    /// Per-job verify lifecycle status (last start / complete / count).
+    pub verify_status: HashMap<JobId, VerifyStatus>,
 }
 
 impl AppState {
@@ -442,6 +500,8 @@ impl AppState {
             last_seen_seq: 0,
             progress_windows: HashMap::new(),
             recent_errors: HashMap::new(),
+            recent_verify_mismatches: HashMap::new(),
+            verify_status: HashMap::new(),
         }
     }
 
@@ -500,6 +560,40 @@ impl AppState {
                     message: message.clone(),
                 });
         }
+        // Verify lifecycle bookkeeping. The coord drives phase
+        // transitions but doesn't keep timestamps / counts on the
+        // snapshot — those are captured here so the Verify tab can
+        // narrate "started Xs ago, completed with N mismatches".
+        match &envelope.kind {
+            EventKind::VerifyStarted { job_id } => {
+                self.verify_status
+                    .entry(job_id.clone())
+                    .or_default()
+                    .last_started = Some(envelope.at);
+            }
+            EventKind::VerifyCompleted { job_id, mismatches } => {
+                let s = self.verify_status.entry(job_id.clone()).or_default();
+                s.last_completed = Some(envelope.at);
+                s.last_mismatches = Some(*mismatches);
+            }
+            EventKind::VerifyFileMismatch {
+                job_id,
+                path,
+                expected,
+                got,
+            } => {
+                self.recent_verify_mismatches
+                    .entry(job_id.clone())
+                    .or_default()
+                    .push(RecentVerifyMismatch {
+                        at: envelope.at,
+                        path: path.clone(),
+                        expected: expected.clone(),
+                        got: got.clone(),
+                    });
+            }
+            _ => {}
+        }
         true
     }
 
@@ -507,6 +601,21 @@ impl AppState {
     /// never emitted an error.
     pub fn recent_errors_for_job(&self, id: &JobId) -> Option<&RecentErrors> {
         self.recent_errors.get(id)
+    }
+
+    /// Per-job recent verify mismatches ring. `None` when no
+    /// VerifyFileMismatch has streamed for the job yet.
+    pub fn recent_verify_mismatches_for_job(&self, id: &JobId) -> Option<&RecentVerifyMismatches> {
+        self.recent_verify_mismatches.get(id)
+    }
+
+    /// Per-job verify lifecycle status (last start, last complete,
+    /// mismatch count from the last completion). Returns a zero-
+    /// initialized `VerifyStatus` when no verify events have
+    /// touched the job — the renderer treats absence and
+    /// all-None the same.
+    pub fn verify_status_for_job(&self, id: &JobId) -> VerifyStatus {
+        self.verify_status.get(id).cloned().unwrap_or_default()
     }
 
     /// Total bytes-per-second across all jobs over the given
@@ -1149,5 +1258,116 @@ mod tests {
     fn appstate_recent_errors_for_job_returns_none_when_unseen() {
         let s = AppState::empty(at(0));
         assert!(s.recent_errors_for_job(&jid("alpha")).is_none());
+    }
+
+    // ----- Verify lifecycle + mismatches ring (Phase 5d) -----
+
+    fn verify_mismatch_evt(
+        seq: u64,
+        secs: i64,
+        job: &str,
+        path: &str,
+        expected: &str,
+        got: &str,
+    ) -> EventEnvelope {
+        EventEnvelope {
+            seq,
+            at: at(secs),
+            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            worker_at: None,
+            kind: EventKind::VerifyFileMismatch {
+                job_id: jid(job),
+                path: path.into(),
+                expected: expected.into(),
+                got: got.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn appstate_verify_started_then_completed_records_timestamps_and_count() {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+        s.apply_envelope(&EventEnvelope {
+            seq: 2,
+            at: at(100),
+            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            worker_at: None,
+            kind: EventKind::VerifyStarted {
+                job_id: jid("alpha"),
+            },
+        });
+        s.apply_envelope(&EventEnvelope {
+            seq: 3,
+            at: at(200),
+            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            worker_at: None,
+            kind: EventKind::VerifyCompleted {
+                job_id: jid("alpha"),
+                mismatches: 7,
+            },
+        });
+        let st = s.verify_status_for_job(&jid("alpha"));
+        assert_eq!(st.last_started, Some(at(100)));
+        assert_eq!(st.last_completed, Some(at(200)));
+        assert_eq!(st.last_mismatches, Some(7));
+    }
+
+    #[test]
+    fn appstate_verify_mismatch_events_feed_ring() {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+        s.apply_envelope(&verify_mismatch_evt(
+            2, 10, "alpha", "/p/a", "size:100", "size:101",
+        ));
+        s.apply_envelope(&verify_mismatch_evt(
+            3, 20, "alpha", "/p/b", "size:200", "size:0",
+        ));
+        let r = s
+            .recent_verify_mismatches_for_job(&jid("alpha"))
+            .expect("ring");
+        assert_eq!(r.len(), 2);
+        let tail: Vec<_> = r.tail(usize::MAX).collect();
+        assert_eq!(tail[0].path, "/p/a");
+        assert_eq!(tail[0].expected, "size:100");
+        assert_eq!(tail[1].path, "/p/b");
+        assert_eq!(tail[1].got, "size:0");
+    }
+
+    #[test]
+    fn recent_verify_mismatches_ring_caps_at_limit() {
+        let mut r = RecentVerifyMismatches::default();
+        for i in 0..(RECENT_VERIFY_MISMATCHES_PER_JOB + 5) {
+            r.push(RecentVerifyMismatch {
+                at: at(i as i64),
+                path: format!("/p/{i}"),
+                expected: "x".into(),
+                got: "y".into(),
+            });
+        }
+        assert_eq!(r.len(), RECENT_VERIFY_MISMATCHES_PER_JOB);
+        // Oldest 5 dropped → first surviving entry is index 5.
+        let tail: Vec<_> = r.tail(usize::MAX).collect();
+        assert_eq!(tail.first().unwrap().path, "/p/5");
+    }
+
+    #[test]
+    fn verify_status_for_unseen_job_is_all_none() {
+        let s = AppState::empty(at(0));
+        let st = s.verify_status_for_job(&jid("alpha"));
+        assert_eq!(st, VerifyStatus::default());
+    }
+
+    #[test]
+    fn duplicate_verify_envelope_does_not_double_push_ring() {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+        s.apply_envelope(&verify_mismatch_evt(2, 10, "alpha", "/p/x", "e", "g"));
+        // Replay same seq.
+        s.apply_envelope(&verify_mismatch_evt(2, 10, "alpha", "/p/x", "e", "g"));
+        let r = s
+            .recent_verify_mismatches_for_job(&jid("alpha"))
+            .expect("ring");
+        assert_eq!(r.len(), 1);
     }
 }

@@ -23,7 +23,8 @@
 
 use crate::format::{format_bytes, format_count, format_elapsed, format_pct};
 use crate::state::{
-    AppState, ConnectionStatus, JobSort, Modal, RecentError, Tab, UiState, View, WorkerSort,
+    AppState, ConnectionStatus, JobSort, Modal, RecentError, RecentVerifyMismatch, Tab, UiState,
+    VerifyStatus, View, WorkerSort,
 };
 use chrono::{DateTime, Utc};
 use migration_coord::schema::{
@@ -437,8 +438,8 @@ fn render_tab_body(
         Tab::Overview => render_overview_tab(frame, area, state, job, now),
         Tab::Workers => render_workers_tab(frame, area, state, job, now),
         Tab::Errors => render_errors_tab(frame, area, state, job, now),
-        Tab::Plan => render_placeholder_tab(frame, area, "Plan", "step 5d"),
-        Tab::Verify => render_placeholder_tab(frame, area, "Verify", "step 5d"),
+        Tab::Plan => render_plan_tab(frame, area, job),
+        Tab::Verify => render_verify_tab(frame, area, state, job, now),
     }
 }
 
@@ -694,6 +695,191 @@ fn format_error_class(c: &ErrorClass) -> String {
         ErrorClass::ChecksumMismatch => "checksum".into(),
         ErrorClass::Other(s) => format!("other:{s}"),
     }
+}
+
+// =============================================================================
+// Plan tab
+// =============================================================================
+
+fn render_plan_tab(frame: &mut Frame, area: Rect, job: &Job) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Config hash up top — operators correlate this with the
+    // worker's `[coord].job_id` to confirm they're looking at the
+    // same plan.
+    lines.push(section_header("Config hash"));
+    lines.push(Line::from(vec![
+        kv_key("Hash"),
+        Span::styled(
+            job.config_hash.0.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+
+    // Pretty JSON of the full JobConfig. The render layer is
+    // line-oriented so split on '\n'; if serialization fails (it
+    // can't with our types but we cover it defensively) fall back
+    // to the Debug repr.
+    lines.push(section_header("JobConfig"));
+    let json = match serde_json::to_string_pretty(&job.config) {
+        Ok(s) => s,
+        Err(e) => format!("(failed to serialize: {e}) — {:?}", job.config),
+    };
+    for raw in json.lines() {
+        lines.push(Line::raw(format!("  {raw}")));
+    }
+
+    let para = Paragraph::new(Text::from(lines));
+    frame.render_widget(para, area);
+}
+
+// =============================================================================
+// Verify tab
+// =============================================================================
+
+fn render_verify_tab(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    job: &Job,
+    now: DateTime<Utc>,
+) {
+    let status = state.verify_status_for_job(&job.id);
+    let mismatches = state
+        .recent_verify_mismatches_for_job(&job.id)
+        .map(|r| r.tail(15).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let never_run =
+        status.last_started.is_none() && status.last_completed.is_none() && mismatches.is_empty();
+
+    if never_run {
+        let text = Text::from(vec![
+            Line::from(Span::styled(
+                "Verify phase has not run for this job.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::raw(""),
+            Line::from(Span::raw(
+                "When VerifyStarted streams in, status will appear here.",
+            )),
+            Line::raw(""),
+            Line::from(Span::raw("Current phase: ")),
+            Line::from(vec![Span::raw("  "), phase_span(job.phase)]),
+        ]);
+        frame.render_widget(Paragraph::new(text), area);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8), // status panel
+            Constraint::Length(1), // tail header
+            Constraint::Min(0),    // mismatches tail
+        ])
+        .split(area);
+
+    render_verify_status_panel(frame, chunks[0], &status, job, now);
+
+    let tail_header = Line::from(vec![
+        Span::styled(
+            "Recent mismatches",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  ({} shown, newest last)", mismatches.len())),
+    ]);
+    frame.render_widget(Paragraph::new(tail_header), chunks[1]);
+    render_verify_mismatches_tail(frame, chunks[2], &mismatches, now);
+}
+
+fn render_verify_status_panel(
+    frame: &mut Frame,
+    area: Rect,
+    status: &VerifyStatus,
+    job: &Job,
+    now: DateTime<Utc>,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(section_header("Status"));
+    lines.push(Line::from(vec![kv_key("Phase"), phase_span(job.phase)]));
+    let started = status
+        .last_started
+        .map(|t| format_elapsed(t, now))
+        .unwrap_or_else(|| "(never)".into());
+    lines.push(kv_line("Started", started));
+    let completed = status
+        .last_completed
+        .map(|t| format_elapsed(t, now))
+        .unwrap_or_else(|| "(in progress or never)".into());
+    lines.push(kv_line("Completed", completed));
+    let result_line: Line<'static> = match status.last_mismatches {
+        None => Line::from(vec![
+            kv_key("Result"),
+            Span::styled("(pending)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Some(0) => Line::from(vec![
+            kv_key("Result"),
+            Span::styled(
+                "0 mismatches — verify ok".to_string(),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
+        Some(n) => Line::from(vec![
+            kv_key("Result"),
+            Span::styled(format!("{n} mismatches"), Style::default().fg(Color::Red)),
+        ]),
+    };
+    lines.push(result_line);
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn render_verify_mismatches_tail(
+    frame: &mut Frame,
+    area: Rect,
+    tail: &[&RecentVerifyMismatch],
+    now: DateTime<Utc>,
+) {
+    if tail.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "(no individual mismatches captured yet)",
+                Style::default().fg(Color::DarkGray),
+            )),
+            area,
+        );
+        return;
+    }
+    let header = Row::new(vec![
+        Cell::from(Span::styled("When", header_style())),
+        Cell::from(Span::styled("Path", header_style())),
+        Cell::from(Span::styled("Expected", header_style())),
+        Cell::from(Span::styled("Got", header_style())),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows: Vec<Row> = tail
+        .iter()
+        .map(|m| {
+            Row::new(vec![
+                Cell::from(format_elapsed(m.at, now)),
+                Cell::from(m.path.clone()),
+                Cell::from(m.expected.clone()),
+                Cell::from(m.got.clone()),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(6),
+        Constraint::Min(20),
+        Constraint::Length(20),
+        Constraint::Length(20),
+    ];
+    let table = Table::new(rows, widths).header(header).column_spacing(1);
+    frame.render_widget(table, area);
 }
 
 // =============================================================================
@@ -968,23 +1154,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vchunks[1])[1]
-}
-
-fn render_placeholder_tab(frame: &mut Frame, area: Rect, name: &str, milestone: &str) {
-    let lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled(
-            format!("{name} tab"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("Coming in P5 {milestone}."),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 // ----- small helpers for the Overview layout -----
@@ -1572,26 +1741,6 @@ mod tests {
         assert!(text.contains("Press Esc"));
     }
 
-    #[test]
-    fn detail_placeholder_tabs_render_without_panicking() {
-        // Workers (5b) and Errors (5c) are no longer placeholders.
-        // Remaining placeholders land in step 5d (Plan / Verify).
-        let mut s = AppState::empty(at(0));
-        s.mark_connected(at(0));
-        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
-        for tab in [Tab::Plan, Tab::Verify] {
-            enter_detail(&mut s, "alpha", tab);
-            let buf = render_to_buffer(&s, at(0), 100, 16);
-            let text = buffer_text(&buf);
-            assert!(
-                text.contains(tab.label()),
-                "tab body missing label for {:?}: \n{text}",
-                tab
-            );
-            assert!(text.contains("Coming in P5"));
-        }
-    }
-
     // ----- Workers tab + modal (Phase 5b) -----
 
     fn worker_joined_evt(
@@ -1892,5 +2041,151 @@ mod tests {
             format_error_class(&ErrorClass::Other("foo".into())),
             "other:foo"
         );
+    }
+
+    // ----- Plan tab (Phase 5d) -----
+
+    #[test]
+    fn plan_tab_shows_config_hash_and_jobconfig_fields() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        enter_detail(&mut s, "alpha", Tab::Plan);
+        let buf = render_to_buffer(&s, at(0), 120, 30);
+        let text = buffer_text(&buf);
+        // Section headers + the config hash itself.
+        assert!(text.contains("Config hash"));
+        assert!(text.contains("JobConfig"));
+        // job_created_evt seeds config_hash = "ab" via ConfigHash.
+        assert!(
+            text.contains("ab"),
+            "expected config hash in output:\n{text}"
+        );
+        // JSON pretty-print exposes JobConfig fields.
+        for field in ["source", "dest", "claim_version", "verify_mode"] {
+            assert!(
+                text.contains(field),
+                "expected JobConfig field '{field}' in:\n{text}"
+            );
+        }
+    }
+
+    // ----- Verify tab (Phase 5d) -----
+
+    #[test]
+    fn verify_tab_empty_state_when_no_verify_events() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        enter_detail(&mut s, "alpha", Tab::Verify);
+        let buf = render_to_buffer(&s, at(0), 100, 20);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("Verify phase has not run"),
+            "expected empty state, got:\n{text}"
+        );
+        // Current phase still surfaces.
+        assert!(text.contains("Planned"));
+    }
+
+    #[test]
+    fn verify_tab_shows_status_after_started_and_completed() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        s.apply_envelope(&env(
+            2,
+            10,
+            EventKind::VerifyStarted {
+                job_id: jid("alpha"),
+            },
+        ));
+        s.apply_envelope(&env(
+            3,
+            20,
+            EventKind::VerifyCompleted {
+                job_id: jid("alpha"),
+                mismatches: 3,
+            },
+        ));
+        enter_detail(&mut s, "alpha", Tab::Verify);
+        let buf = render_to_buffer(&s, at(100), 120, 24);
+        let text = buffer_text(&buf);
+        assert!(text.contains("Status"));
+        assert!(text.contains("Started"));
+        assert!(text.contains("Completed"));
+        // 3 mismatches → red "3 mismatches" line.
+        assert!(text.contains("3 mismatches"));
+        // Recent mismatches section header still rendered even
+        // though no VerifyFileMismatch events have streamed.
+        assert!(text.contains("Recent mismatches"));
+    }
+
+    #[test]
+    fn verify_tab_shows_verify_ok_when_zero_mismatches() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        s.apply_envelope(&env(
+            2,
+            10,
+            EventKind::VerifyStarted {
+                job_id: jid("alpha"),
+            },
+        ));
+        s.apply_envelope(&env(
+            3,
+            20,
+            EventKind::VerifyCompleted {
+                job_id: jid("alpha"),
+                mismatches: 0,
+            },
+        ));
+        enter_detail(&mut s, "alpha", Tab::Verify);
+        let buf = render_to_buffer(&s, at(100), 120, 24);
+        let text = buffer_text(&buf);
+        assert!(text.contains("0 mismatches"));
+        assert!(text.contains("verify ok"));
+    }
+
+    #[test]
+    fn verify_tab_renders_mismatches_tail_with_paths() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        s.apply_envelope(&env(
+            2,
+            10,
+            EventKind::VerifyStarted {
+                job_id: jid("alpha"),
+            },
+        ));
+        // Stream two mismatches.
+        for (seq, p, e, g) in [
+            (3u64, "/data/file1", "size:100", "size:101"),
+            (4u64, "/data/file2", "checksum:abc", "checksum:xyz"),
+        ] {
+            s.apply_envelope(&env(
+                seq,
+                seq as i64,
+                EventKind::VerifyFileMismatch {
+                    job_id: jid("alpha"),
+                    path: p.into(),
+                    expected: e.into(),
+                    got: g.into(),
+                },
+            ));
+        }
+        enter_detail(&mut s, "alpha", Tab::Verify);
+        let buf = render_to_buffer(&s, at(100), 120, 30);
+        let text = buffer_text(&buf);
+        // Tail headers + per-row contents.
+        for col in ["When", "Path", "Expected", "Got"] {
+            assert!(text.contains(col), "missing tail col '{col}'");
+        }
+        assert!(text.contains("/data/file1"));
+        assert!(text.contains("/data/file2"));
+        assert!(text.contains("size:100"));
+        assert!(text.contains("checksum:xyz"));
     }
 }
