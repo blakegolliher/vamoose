@@ -2278,6 +2278,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
  "chrono",
  "futures",
  "hex",
