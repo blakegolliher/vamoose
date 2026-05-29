@@ -32,6 +32,7 @@
 // crate scope, matching the parent crate's policy.
 #![allow(clippy::result_large_err)]
 
+pub mod archive;
 pub mod errors;
 pub mod events;
 pub mod layout;
