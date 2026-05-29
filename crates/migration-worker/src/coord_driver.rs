@@ -49,10 +49,18 @@ pub struct CoordDriverHandle {
 /// Read-only inputs the driver samples for each heartbeat. The
 /// driver does NOT mutate these — orchestration and shard processing
 /// own the writes.
+///
+/// `fence_rx` is the consumer end of the heartbeat task's
+/// `coord_fence` channel — when the heartbeat raises a self-fence
+/// at one of its R6/R7/R8 sites it forwards the reason here, and
+/// the driver loop POSTs `/workers/{id}/fence` with that reason
+/// before shutting down. `None` when the worker runs in legacy
+/// S3-only mode.
 pub struct DriverInputs {
     pub progress: Arc<RwLock<ProgressState>>,
     pub throughput: ThroughputCounter,
     pub fence: Fence,
+    pub fence_rx: Option<tokio::sync::mpsc::Receiver<String>>,
 }
 
 /// Build the [`CoordClient`] from config (resolving the cluster
@@ -129,7 +137,7 @@ struct DriverParams {
 async fn driver_loop(
     client: CoordClient,
     params: DriverParams,
-    inputs: DriverInputs,
+    mut inputs: DriverInputs,
     run_control: RunControl,
     worker_id_tx: watch::Sender<Option<WorkerId>>,
     cancel: CancellationToken,
@@ -151,7 +159,11 @@ async fn driver_loop(
     // ----------------------------------------------------------------
     // Phase B — heartbeat loop. Sleep `heartbeat` on success;
     // sleep backoff.current() and step() on failure. Both sleeps are
-    // cancellable.
+    // cancellable. A signal on `fence_rx` (set when the heartbeat
+    // task tripped a self-fence) wins over the sleep — we POST
+    // `/workers/{id}/fence` immediately, then exit. The orchestrator
+    // sees the fence trip via its own `fence.is_valid()` check on the
+    // next loop iteration; the coord POST is purely informational.
     // ----------------------------------------------------------------
     let mut backoff = Backoff::default_schedule();
     let mut consecutive_failures: u64 = 0;
@@ -161,10 +173,47 @@ async fn driver_loop(
         } else {
             backoff.current()
         };
+        // Take ownership of fence_rx via Option::as_mut so the
+        // select! can await it. When fence_rx is None we still need
+        // a future to put in the arm; a `pending()` future that
+        // never resolves is the simplest way to disable the arm
+        // without restructuring the select.
+        let fence_fut = async {
+            match inputs.fence_rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending::<Option<String>>().await,
+            }
+        };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 tracing::info!("coord_driver: cancelled; exiting heartbeat loop");
+                return Ok(());
+            }
+            reason_opt = fence_fut => {
+                // None means the heartbeat task's sender was dropped
+                // without sending — treat as a regular shutdown.
+                let Some(reason) = reason_opt else {
+                    tracing::info!("coord_driver: fence channel closed without trip; exiting");
+                    return Ok(());
+                };
+                tracing::warn!(reason = %reason,
+                    "coord_driver: heartbeat self-fenced; posting /fence");
+                match client.fence(worker_id, reason.clone()).await {
+                    Ok(resp) => {
+                        tracing::info!(seq = resp.seq,
+                            "coord_driver: /fence accepted");
+                    }
+                    Err(e) => {
+                        // Fence is already in effect locally; coord
+                        // missing the announcement is non-fatal —
+                        // the operator may need to mark the worker
+                        // disconnected manually but the worker
+                        // itself is safely fenced regardless.
+                        tracing::warn!(error = %e,
+                            "coord_driver: /fence POST failed (non-fatal); exiting");
+                    }
+                }
                 return Ok(());
             }
             _ = tokio::time::sleep(delay) => {}
@@ -301,6 +350,7 @@ mod tests {
             progress,
             throughput,
             fence,
+            fence_rx: None,
         };
         let rc = RunControl::new();
         let body = sample_heartbeat(&inputs, &rc).await;
@@ -316,6 +366,7 @@ mod tests {
             progress,
             throughput,
             fence,
+            fence_rx: None,
         };
         let rc = RunControl::with_mode(crate::coord_client::ControlMode::Drain);
         let body = sample_heartbeat(&inputs, &rc).await;
@@ -336,6 +387,7 @@ mod tests {
             progress,
             throughput,
             fence,
+            fence_rx: None,
         };
         let rc = RunControl::new();
         let body = sample_heartbeat(&inputs, &rc).await;
@@ -351,6 +403,7 @@ mod tests {
             progress,
             throughput,
             fence,
+            fence_rx: None,
         };
         let rc = RunControl::new();
         let body = sample_heartbeat(&inputs, &rc).await;

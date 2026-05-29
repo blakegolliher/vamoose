@@ -237,6 +237,21 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         large_stripe_depth: 0,
     });
 
+    // Bounded channel for the heartbeat task to notify the
+    // coord_driver of a self-fence trip. Created here so both
+    // HeartbeatTask (sender) and coord_driver (receiver) can be
+    // wired with matching halves. Only allocated when [coord] is
+    // configured — legacy mode passes None to both sides.
+    let (coord_fence_tx, coord_fence_rx): (
+        Option<tokio::sync::mpsc::Sender<String>>,
+        Option<tokio::sync::mpsc::Receiver<String>>,
+    ) = if cfg.coord.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(1);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let hb = HeartbeatTask {
         store: s3.clone() as Arc<dyn ClaimStore>,
         fence: fence.clone(),
@@ -247,6 +262,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         progress: progress.clone(),
         throughput: throughput.clone(),
         throughput_window_secs: 60,
+        coord_fence: coord_fence_tx,
     };
     let hb_handle = tokio::spawn(async move { hb.run().await });
 
@@ -267,6 +283,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
                 progress: progress.clone(),
                 throughput: throughput.clone(),
                 fence: fence.clone(),
+                fence_rx: coord_fence_rx,
             };
             match coord_driver::spawn(
                 c,
