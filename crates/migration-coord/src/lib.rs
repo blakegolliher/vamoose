@@ -33,9 +33,11 @@
 #![allow(clippy::result_large_err)]
 
 pub mod errors;
+pub mod events;
 pub mod layout;
 pub mod lease;
 pub mod schema;
+pub mod snapshot;
 pub mod store;
 
 pub use errors::{Error, Result};

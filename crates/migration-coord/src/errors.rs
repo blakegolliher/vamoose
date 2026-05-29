@@ -42,6 +42,16 @@ pub enum Error {
     #[error("event log gap: expected seq {expected}, found {found}")]
     EventLogGap { expected: u64, found: u64 },
 
+    /// An event-log chunk is present but a line cannot be parsed at
+    /// the current schema_version, or carries a schema_version newer
+    /// than supported.
+    #[error("event chunk {key} malformed at line {line}: {detail}")]
+    ChunkMalformed {
+        key: String,
+        line: usize,
+        detail: String,
+    },
+
     /// Underlying storage call failed.
     #[error("storage: {0}")]
     Storage(#[from] migration_core::Error),
