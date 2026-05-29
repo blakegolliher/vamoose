@@ -18,8 +18,11 @@
 //! envelope received from the SSE stream — it routes through
 //! `Snapshot::apply` and updates `last_seen_seq`.
 
-use chrono::{DateTime, Utc};
-use migration_coord::schema::{ErrorBucket, EventEnvelope, Job, JobId, Snapshot, Worker, WorkerId};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use migration_coord::schema::{
+    ErrorBucket, EventEnvelope, EventKind, Job, JobId, Snapshot, Worker, WorkerId,
+};
+use std::collections::{HashMap, VecDeque};
 
 /// Health of the SSE link.
 ///
@@ -62,12 +65,43 @@ pub struct UiState {
     /// selection (e.g. empty list, or operator hasn't moved the
     /// cursor yet).
     pub selected_job: Option<JobId>,
-    /// Case-insensitive substring filter over job name. Empty
-    /// matches everything.
+    /// Case-insensitive substring filter over job id + name. Empty
+    /// matches everything. Updated live while in
+    /// [`InputMode::Filter`] so the visible table tracks the typed
+    /// buffer; committed to here permanently on Enter.
     pub filter: String,
     /// Sort criterion for the jobs list. The render layer applies
     /// this to the filtered set.
     pub sort: JobSort,
+    /// What the next keypress means. `Normal` is operator
+    /// navigation; `Filter` captures typed characters into the
+    /// filter buffer.
+    pub input_mode: InputMode,
+}
+
+/// Modal dispatcher for keypresses. Normal = jobs-list navigation;
+/// Filter = capturing typed characters into `filter`. The render
+/// layer reads this to know whether to show the live buffer (with
+/// a cursor glyph) in the banner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    Filter {
+        /// Live edit buffer; appended on Char, popped on Backspace.
+        /// The `UiState.filter` field is updated to match this on
+        /// every keypress so the visible jobs list tracks the
+        /// typed string in real time.
+        buffer: String,
+        /// Snapshot of `UiState.filter` from when the operator
+        /// pressed `/`. Esc restores this; Enter discards it.
+        prior: String,
+    },
+}
+
+impl Default for InputMode {
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -85,6 +119,90 @@ pub enum JobSort {
     ByErrorsDesc,
 }
 
+impl JobSort {
+    /// Cycle to the next sort criterion. Hooked to the `s` key.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::ById => Self::ByPhase,
+            Self::ByPhase => Self::ByProgressDesc,
+            Self::ByProgressDesc => Self::ByErrorsDesc,
+            Self::ByErrorsDesc => Self::ById,
+        }
+    }
+
+    /// Single-word label shown in the banner so the operator can
+    /// see at a glance which sort is active.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ById => "id",
+            Self::ByPhase => "phase",
+            Self::ByProgressDesc => "progress",
+            Self::ByErrorsDesc => "errors",
+        }
+    }
+}
+
+// =============================================================================
+// Rolling per-job throughput windows
+// =============================================================================
+
+/// Longest window the TUI tracks. Samples older than this are
+/// pruned on every push so the buffer stays bounded.
+const MAX_WINDOW_SECS: i64 = 5 * 60;
+
+/// Per-job rolling samples of `ProgressDelta` events for client-
+/// side throughput estimation. The TUI computes rolling 1s / 1m /
+/// 5m windows from this rather than having the coord ship a wider
+/// per-tick payload.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressDeltaHistory {
+    /// Bounded ring of `(wall_clock, bytes_delta)`. Sorted oldest-
+    /// first so pruning is a single `pop_front` per stale entry.
+    samples: VecDeque<(DateTime<Utc>, u64)>,
+}
+
+impl ProgressDeltaHistory {
+    /// Record one ProgressDelta. Prunes anything older than the
+    /// longest window the TUI maintains.
+    pub fn push(&mut self, at: DateTime<Utc>, bytes_delta: u64) {
+        let cutoff = at - ChronoDuration::seconds(MAX_WINDOW_SECS);
+        while let Some(&(t, _)) = self.samples.front() {
+            if t < cutoff {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.samples.push_back((at, bytes_delta));
+    }
+
+    /// Bytes-per-second over the most recent `window_secs`. Returns
+    /// 0.0 when the window is empty (no samples yet, or all pruned
+    /// because the worker stopped emitting).
+    pub fn bytes_per_sec(&self, window_secs: i64, now: DateTime<Utc>) -> f64 {
+        if window_secs <= 0 {
+            return 0.0;
+        }
+        let cutoff = now - ChronoDuration::seconds(window_secs);
+        let total: u64 = self
+            .samples
+            .iter()
+            .filter(|(t, _)| *t >= cutoff)
+            .map(|(_, b)| *b)
+            .sum();
+        total as f64 / window_secs as f64
+    }
+
+    /// Sample count (mostly for tests and diagnostics).
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+}
+
 /// Whole client-side state. `Snapshot` is the derived data model
 /// (jobs, workers, errors, last_seq); the rest is TUI-only.
 #[derive(Debug, Clone)]
@@ -96,6 +214,9 @@ pub struct AppState {
     /// snapshot's `last_seq` (the reducer also updates that field
     /// in-place). The resume cursor on reconnect is this value.
     pub last_seen_seq: u64,
+    /// Per-job rolling throughput history derived from
+    /// `ProgressDelta` events. Pruned to 5 min on every push.
+    pub progress_windows: HashMap<JobId, ProgressDeltaHistory>,
 }
 
 impl AppState {
@@ -112,6 +233,7 @@ impl AppState {
             },
             ui: UiState::default(),
             last_seen_seq: 0,
+            progress_windows: HashMap::new(),
         }
     }
 
@@ -131,7 +253,46 @@ impl AppState {
         }
         self.snapshot.apply(envelope);
         self.last_seen_seq = envelope.seq;
+        // Side-effect: feed the per-job throughput window if this
+        // was a ProgressDelta. Pruning happens inside `push` so the
+        // sample VecDeque stays bounded by the 5-min window.
+        if let EventKind::ProgressDelta {
+            job_id,
+            bytes_delta,
+            ..
+        } = &envelope.kind
+        {
+            self.progress_windows
+                .entry(job_id.clone())
+                .or_default()
+                .push(envelope.at, *bytes_delta);
+        }
         true
+    }
+
+    /// Total bytes-per-second across all jobs over the given
+    /// rolling `window_secs`. Used by the banner's aggregate line.
+    pub fn total_bytes_per_sec(&self, window_secs: i64, now: DateTime<Utc>) -> f64 {
+        self.progress_windows
+            .values()
+            .map(|h| h.bytes_per_sec(window_secs, now))
+            .sum()
+    }
+
+    /// Per-job bytes-per-second over `window_secs`. None means no
+    /// samples yet (most likely a job that hasn't started
+    /// transferring; the render layer shows ` -- ` instead of 0
+    /// for visual clarity).
+    pub fn job_bytes_per_sec(
+        &self,
+        id: &JobId,
+        window_secs: i64,
+        now: DateTime<Utc>,
+    ) -> Option<f64> {
+        self.progress_windows
+            .get(id)
+            .filter(|h| !h.is_empty())
+            .map(|h| h.bytes_per_sec(window_secs, now))
     }
 
     /// Replace the entire derived state with a freshly-fetched
@@ -382,5 +543,156 @@ mod tests {
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].id, w1);
         assert_eq!(s.worker(&w1).map(|w| &w.host[..]), Some("h"));
+    }
+
+    // ----- JobSort cycle + label -----
+
+    #[test]
+    fn jobsort_cycle_visits_all_four_then_wraps() {
+        let order = [
+            JobSort::ById,
+            JobSort::ByPhase,
+            JobSort::ByProgressDesc,
+            JobSort::ByErrorsDesc,
+        ];
+        let mut cur = order[0];
+        for next in order.iter().skip(1) {
+            cur = cur.cycle();
+            assert_eq!(cur, *next);
+        }
+        cur = cur.cycle();
+        assert_eq!(cur, JobSort::ById, "must wrap from last back to first");
+    }
+
+    #[test]
+    fn jobsort_labels_are_distinct_single_words() {
+        let labels = [
+            JobSort::ById.label(),
+            JobSort::ByPhase.label(),
+            JobSort::ByProgressDesc.label(),
+            JobSort::ByErrorsDesc.label(),
+        ];
+        // No duplicates.
+        let mut sorted: Vec<&str> = labels.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 4);
+        // Each fits within ~10 characters for the banner.
+        for l in labels {
+            assert!(l.len() <= 10, "label too long: {l:?}");
+            assert!(!l.contains(' '), "label has spaces: {l:?}");
+        }
+    }
+
+    // ----- ProgressDeltaHistory + AppState wiring -----
+
+    fn prog_at(seq: u64, secs: i64, job: &str, bytes: u64) -> EventEnvelope {
+        EventEnvelope {
+            seq,
+            at: at(secs),
+            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            worker_at: None,
+            kind: EventKind::ProgressDelta {
+                job_id: jid(job),
+                worker_id: WorkerId::new(),
+                files_delta: 1,
+                bytes_delta: bytes,
+                errors_delta: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn history_push_then_bytes_per_sec_sums_within_window() {
+        let mut h = ProgressDeltaHistory::default();
+        h.push(at(0), 1000);
+        h.push(at(1), 2000);
+        h.push(at(2), 3000);
+        // 6000 bytes over the last 10 seconds → 600 B/s.
+        assert!((h.bytes_per_sec(10, at(10)) - 600.0).abs() < 0.0001);
+        // Inclusive window: at now=at(2), the 2-second window is
+        // [at(0), at(2)] — all three samples fall in it. 6000 B
+        // over 2 s = 3000 B/s.
+        let v = h.bytes_per_sec(2, at(2));
+        assert!((v - 3000.0).abs() < 0.0001, "got {v}");
+        // A tighter 1-second window at now=at(2) includes only
+        // samples at t ≥ at(1): 2000 + 3000 = 5000 over 1 s.
+        let v = h.bytes_per_sec(1, at(2));
+        assert!((v - 5000.0).abs() < 0.0001, "got {v}");
+    }
+
+    #[test]
+    fn history_prunes_entries_older_than_max_window() {
+        let mut h = ProgressDeltaHistory::default();
+        // First entry far in the past.
+        h.push(at(0), 100);
+        // Push enough later that the first is dropped.
+        h.push(at(MAX_WINDOW_SECS + 1), 200);
+        assert_eq!(h.len(), 1, "history pruned to 1 entry");
+        // Only the surviving entry contributes to the window.
+        assert!((h.bytes_per_sec(10, at(MAX_WINDOW_SECS + 1)) - 20.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn history_empty_window_yields_zero() {
+        let h = ProgressDeltaHistory::default();
+        assert_eq!(h.bytes_per_sec(10, at(0)), 0.0);
+        assert_eq!(h.bytes_per_sec(60, at(0)), 0.0);
+    }
+
+    #[test]
+    fn history_window_secs_zero_or_negative_yields_zero() {
+        let mut h = ProgressDeltaHistory::default();
+        h.push(at(0), 1000);
+        assert_eq!(h.bytes_per_sec(0, at(0)), 0.0);
+        assert_eq!(h.bytes_per_sec(-5, at(0)), 0.0);
+    }
+
+    #[test]
+    fn appstate_apply_envelope_feeds_progress_window() {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "bobby"));
+        // No progress yet — no window for this job.
+        assert!(s.progress_windows.get(&jid("bobby")).is_none());
+        s.apply_envelope(&prog_at(2, 1, "bobby", 1024));
+        s.apply_envelope(&prog_at(3, 2, "bobby", 2048));
+        // Window now exists with 2 samples, totaling 3072 bytes.
+        let h = s.progress_windows.get(&jid("bobby")).expect("window");
+        assert_eq!(h.len(), 2);
+        let rate = s.job_bytes_per_sec(&jid("bobby"), 10, at(10));
+        assert!(rate.is_some());
+        assert!((rate.unwrap() - 307.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn appstate_duplicate_envelope_does_not_double_count_window() {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "bobby"));
+        s.apply_envelope(&prog_at(2, 1, "bobby", 1024));
+        // Re-applying same seq must be dropped at apply_envelope
+        // level — window must not gain a second sample.
+        s.apply_envelope(&prog_at(2, 1, "bobby", 1024));
+        let h = s.progress_windows.get(&jid("bobby")).expect("window");
+        assert_eq!(h.len(), 1);
+    }
+
+    #[test]
+    fn appstate_total_bytes_per_sec_sums_across_jobs() {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+        s.apply_envelope(&job_created(2, "bravo"));
+        s.apply_envelope(&prog_at(3, 0, "alpha", 1000));
+        s.apply_envelope(&prog_at(4, 0, "bravo", 2000));
+        // Over the last 10 seconds, alpha=100, bravo=200 → total=300.
+        let total = s.total_bytes_per_sec(10, at(10));
+        assert!((total - 300.0).abs() < 0.0001, "got {total}");
+    }
+
+    // ----- InputMode default -----
+
+    #[test]
+    fn default_input_mode_is_normal() {
+        let ui = UiState::default();
+        assert!(matches!(ui.input_mode, InputMode::Normal));
     }
 }

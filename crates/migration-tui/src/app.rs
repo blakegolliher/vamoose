@@ -16,7 +16,7 @@
 
 use crate::client::{Client, ClientError, SseFrame};
 use crate::render;
-use crate::state::AppState;
+use crate::state::{AppState, InputMode};
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use migration_coord::schema::JobId;
@@ -122,6 +122,13 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> AppAction {
     if matches!(key.kind, KeyEventKind::Release) {
         return AppAction::Continue;
     }
+    match &state.ui.input_mode {
+        InputMode::Normal => handle_key_normal(state, key),
+        InputMode::Filter { .. } => handle_key_filter(state, key),
+    }
+}
+
+fn handle_key_normal(state: &mut AppState, key: KeyEvent) -> AppAction {
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => AppAction::Quit,
         KeyCode::Up => {
@@ -144,8 +151,69 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> AppAction {
             }
             AppAction::Continue
         }
+        KeyCode::Char('/') => {
+            // Enter filter-input mode. Capture the current filter as
+            // `prior` so Esc reverts cleanly.
+            let prior = state.ui.filter.clone();
+            state.ui.input_mode = InputMode::Filter {
+                buffer: state.ui.filter.clone(),
+                prior,
+            };
+            AppAction::Continue
+        }
+        KeyCode::Char('s') => {
+            state.ui.sort = state.ui.sort.cycle();
+            AppAction::Continue
+        }
         _ => AppAction::Continue,
     }
+}
+
+fn handle_key_filter(state: &mut AppState, key: KeyEvent) -> AppAction {
+    // Take the mode out so we can mutate the buffer in place
+    // without holding two `&mut state` borrows.
+    let mode = std::mem::replace(&mut state.ui.input_mode, InputMode::Normal);
+    let InputMode::Filter { mut buffer, prior } = mode else {
+        // Shouldn't happen — the dispatcher already matched Filter.
+        return AppAction::Continue;
+    };
+    match key.code {
+        KeyCode::Enter => {
+            // Commit: filter already tracks buffer (we update it
+            // live below), so just leave Normal mode.
+            state.ui.filter = buffer;
+            // Reset selection if the previously-selected job no
+            // longer matches the filter — otherwise the operator
+            // sees an empty highlight.
+            if let Some(sel) = state.ui.selected_job.clone() {
+                let still_visible = render::visible_jobs(state).iter().any(|j| j.id == sel);
+                if !still_visible {
+                    state.ui.selected_job =
+                        render::visible_jobs(state).first().map(|j| j.id.clone());
+                }
+            }
+        }
+        KeyCode::Esc => {
+            // Cancel: restore the filter that was in effect before
+            // the operator pressed `/`.
+            state.ui.filter = prior;
+        }
+        KeyCode::Backspace => {
+            buffer.pop();
+            state.ui.filter = buffer.clone();
+            state.ui.input_mode = InputMode::Filter { buffer, prior };
+        }
+        KeyCode::Char(c) => {
+            buffer.push(c);
+            state.ui.filter = buffer.clone();
+            state.ui.input_mode = InputMode::Filter { buffer, prior };
+        }
+        _ => {
+            // Unknown key in filter mode — stay in mode, no edits.
+            state.ui.input_mode = InputMode::Filter { buffer, prior };
+        }
+    }
+    AppAction::Continue
 }
 
 fn visible_ids(state: &AppState) -> Vec<JobId> {
@@ -645,5 +713,128 @@ mod tests {
             handle_input(&mut s, Input::Tick, at(0)),
             AppAction::Continue
         );
+    }
+
+    // ----- sort cycling -----
+
+    #[test]
+    fn s_key_cycles_sort_in_normal_mode() {
+        let mut s = AppState::empty(at(0));
+        assert_eq!(s.ui.sort, crate::state::JobSort::ById);
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('s'))), at(0));
+        assert_eq!(s.ui.sort, crate::state::JobSort::ByPhase);
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('s'))), at(0));
+        assert_eq!(s.ui.sort, crate::state::JobSort::ByProgressDesc);
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('s'))), at(0));
+        assert_eq!(s.ui.sort, crate::state::JobSort::ByErrorsDesc);
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('s'))), at(0));
+        assert_eq!(s.ui.sort, crate::state::JobSort::ById, "wraps");
+    }
+
+    // ----- filter mode UX -----
+
+    fn assert_normal(s: &AppState) {
+        assert!(matches!(s.ui.input_mode, InputMode::Normal));
+    }
+
+    fn assert_filter_buffer(s: &AppState, expected: &str) {
+        match &s.ui.input_mode {
+            InputMode::Filter { buffer, .. } => assert_eq!(buffer, expected),
+            _ => panic!("expected Filter mode, got {:?}", s.ui.input_mode),
+        }
+    }
+
+    #[test]
+    fn slash_enters_filter_mode_and_seeds_buffer_from_current_filter() {
+        let mut s = AppState::empty(at(0));
+        s.ui.filter = "prod".into();
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('/'))), at(0));
+        assert_filter_buffer(&s, "prod");
+    }
+
+    #[test]
+    fn filter_mode_appends_chars_and_updates_live_filter() {
+        let mut s = AppState::empty(at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('/'))), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('a'))), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('b'))), at(0));
+        assert_filter_buffer(&s, "ab");
+        // Live update — visible jobs apply this NOW, no Enter needed.
+        assert_eq!(s.ui.filter, "ab");
+    }
+
+    #[test]
+    fn filter_mode_backspace_pops_last_char() {
+        let mut s = AppState::empty(at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('/'))), at(0));
+        for c in ['a', 'b', 'c'] {
+            handle_input(&mut s, Input::Key(key(KeyCode::Char(c))), at(0));
+        }
+        handle_input(&mut s, Input::Key(key(KeyCode::Backspace)), at(0));
+        assert_filter_buffer(&s, "ab");
+        assert_eq!(s.ui.filter, "ab");
+        // Backspace on empty is a no-op.
+        for _ in 0..5 {
+            handle_input(&mut s, Input::Key(key(KeyCode::Backspace)), at(0));
+        }
+        assert_filter_buffer(&s, "");
+        assert_eq!(s.ui.filter, "");
+    }
+
+    #[test]
+    fn filter_mode_enter_commits_and_returns_to_normal() {
+        let mut s = AppState::empty(at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('/'))), at(0));
+        for c in ['p', 'r', 'o', 'd'] {
+            handle_input(&mut s, Input::Key(key(KeyCode::Char(c))), at(0));
+        }
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        assert_normal(&s);
+        assert_eq!(s.ui.filter, "prod");
+    }
+
+    #[test]
+    fn filter_mode_esc_reverts_filter_to_prior() {
+        let mut s = AppState::empty(at(0));
+        s.ui.filter = "alpha".into();
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('/'))), at(0));
+        // Live edit — filter changes as we type.
+        for c in ['b', 'r', 'a', 'v', 'o'] {
+            handle_input(&mut s, Input::Key(key(KeyCode::Char(c))), at(0));
+        }
+        assert_eq!(s.ui.filter, "alphabravo");
+        handle_input(&mut s, Input::Key(key(KeyCode::Esc)), at(0));
+        // Esc must NOT quit in filter mode — it cancels.
+        assert_normal(&s);
+        assert_eq!(s.ui.filter, "alpha", "Esc restores prior filter");
+    }
+
+    #[test]
+    fn q_in_filter_mode_is_a_literal_q_not_quit() {
+        let mut s = AppState::empty(at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('/'))), at(0));
+        // 'q' should append to the buffer, not return Quit.
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Char('q'))), at(0));
+        assert_eq!(action, AppAction::Continue);
+        assert_filter_buffer(&s, "q");
+    }
+
+    #[test]
+    fn filter_commit_resets_selection_when_selected_falls_out_of_view() {
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+        s.apply_envelope(&job_created(2, "bravo"));
+        s.apply_envelope(&job_created(3, "charlie"));
+        s.ui.selected_job = Some(jid("charlie"));
+        // Filter to "br" — only bravo matches; charlie does NOT
+        // contain that substring (charlie does contain 'a' so a
+        // single-letter filter like "a" would still match it).
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('/'))), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('b'))), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('r'))), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        // selected_job must have moved off charlie onto the now-
+        // visible bravo.
+        assert_eq!(s.ui.selected_job, Some(jid("bravo")));
     }
 }

@@ -59,28 +59,66 @@ pub fn render(frame: &mut Frame, state: &AppState, now: DateTime<Utc>) {
 fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateTime<Utc>) {
     let agg = aggregate_counts(state);
     let conn = connection_label(&state.connection, now);
+    // 1-min total throughput across all jobs. Append "/s" so the
+    // unit is unambiguous even when the value rounds to 0.
+    let total_bps = state.total_bytes_per_sec(60, now);
+    let throughput_label = if total_bps > 0.0 {
+        format!(" · {}/s", format_bytes(total_bps as u64))
+    } else {
+        String::new()
+    };
+
     let mut spans = vec![
         Span::styled("vamoose", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" · "),
         conn,
         Span::raw(" · "),
         Span::raw(format!(
-            "{} jobs ({} run, {} pause, {} done) · {} files · {}",
+            "{} jobs ({} run, {} pause, {} done) · {} files · {}{}",
             agg.total,
             agg.running,
             agg.paused,
             agg.terminal,
             format_count(agg.files_done),
             format_bytes(agg.bytes_done),
+            throughput_label,
         )),
     ];
-    if !state.ui.filter.is_empty() {
-        spans.push(Span::raw(" · filter:"));
-        spans.push(Span::styled(
-            state.ui.filter.clone(),
-            Style::default().fg(Color::Yellow),
-        ));
+
+    // Filter span — show the live edit buffer with a cursor glyph
+    // while in filter mode, or the committed filter otherwise.
+    match &state.ui.input_mode {
+        crate::state::InputMode::Filter { buffer, .. } => {
+            spans.push(Span::raw(" · filter:"));
+            // Cursor glyph after the buffer so the operator can see
+            // where their next character will land.
+            spans.push(Span::styled(
+                format!("{buffer}_"),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        crate::state::InputMode::Normal => {
+            if !state.ui.filter.is_empty() {
+                spans.push(Span::raw(" · filter:"));
+                spans.push(Span::styled(
+                    state.ui.filter.clone(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
     }
+
+    // Sort label is always shown so the operator knows what `s`
+    // will cycle to next.
+    spans.push(Span::raw(" · sort:"));
+    spans.push(Span::styled(
+        state.ui.sort.label(),
+        Style::default().fg(Color::Cyan),
+    ));
+
     let para = Paragraph::new(Line::from(spans));
     frame.render_widget(para, area);
 }
@@ -237,18 +275,35 @@ fn header_style() -> Style {
 // Bottom hints
 // =============================================================================
 
-fn render_bottom_hints(frame: &mut Frame, area: Rect, _state: &AppState, _now: DateTime<Utc>) {
-    let hints = vec![
-        key_hint("q", "quit"),
-        Span::raw("  "),
-        key_hint("/", "filter"),
-        Span::raw("  "),
-        key_hint("s", "sort"),
-        Span::raw("  "),
-        key_hint("↑↓", "select"),
-        Span::raw("  "),
-        key_hint("Enter", "details"),
-    ];
+fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: DateTime<Utc>) {
+    // Context-aware hints: filter mode swaps to "Enter apply / Esc
+    // cancel / Backspace delete" since the normal-mode bindings
+    // would mislead the operator (q would append, not quit).
+    let hints: Vec<Span<'static>> = match &state.ui.input_mode {
+        crate::state::InputMode::Filter { .. } => vec![
+            key_hint("Enter", "apply"),
+            Span::raw("  "),
+            key_hint("Esc", "cancel"),
+            Span::raw("  "),
+            key_hint("Backspace", "delete"),
+            Span::raw("  "),
+            Span::styled(
+                "(typing builds filter)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ],
+        crate::state::InputMode::Normal => vec![
+            key_hint("q", "quit"),
+            Span::raw("  "),
+            key_hint("/", "filter"),
+            Span::raw("  "),
+            key_hint("s", "sort"),
+            Span::raw("  "),
+            key_hint("↑↓", "select"),
+            Span::raw("  "),
+            key_hint("Enter", "details"),
+        ],
+    };
     let para = Paragraph::new(Line::from(hints));
     frame.render_widget(para, area);
 }
@@ -598,5 +653,87 @@ mod tests {
             "banner without 'filter:' was:\n>>>{banner}<<<"
         );
         assert!(banner.contains("prod"));
+    }
+
+    #[test]
+    fn sort_label_always_visible_in_banner() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        let buf = render_to_buffer(&s, at(0), 100, 8);
+        let banner = buffer_row(&buf, 0);
+        // Default sort = id.
+        assert!(
+            banner.contains("sort:id"),
+            "banner missing 'sort:id': >>>{banner}<<<"
+        );
+        // Cycle to phase and re-render.
+        s.ui.sort = crate::state::JobSort::ByPhase;
+        let buf = render_to_buffer(&s, at(0), 100, 8);
+        let banner = buffer_row(&buf, 0);
+        assert!(banner.contains("sort:phase"));
+    }
+
+    #[test]
+    fn banner_shows_live_filter_buffer_with_cursor_in_filter_mode() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.ui.input_mode = crate::state::InputMode::Filter {
+            buffer: "prod".into(),
+            prior: String::new(),
+        };
+        s.ui.filter = "prod".into();
+        let buf = render_to_buffer(&s, at(0), 100, 8);
+        let banner = buffer_row(&buf, 0);
+        assert!(banner.contains("filter:"));
+        assert!(banner.contains("prod"));
+        // Cursor glyph rendered after the buffer.
+        assert!(
+            banner.contains("prod_"),
+            "expected cursor glyph after buffer; got >>>{banner}<<<"
+        );
+    }
+
+    #[test]
+    fn banner_shows_throughput_when_progress_recorded() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        // Push a ProgressDelta of 60 MiB right at "now" so the
+        // 60-second window yields exactly 1 MiB/s.
+        s.apply_envelope(&EventEnvelope {
+            seq: 2,
+            at: at(0),
+            schema_version: SCHEMA_VERSION,
+            worker_at: None,
+            kind: EventKind::ProgressDelta {
+                job_id: jid("alpha"),
+                worker_id: WorkerId::new(),
+                files_delta: 1,
+                bytes_delta: 60 * 1024 * 1024,
+                errors_delta: 0,
+            },
+        });
+        let buf = render_to_buffer(&s, at(0), 120, 8);
+        let banner = buffer_row(&buf, 0);
+        // 60 MiB over 60 s = 1 MiB/s → format_bytes(1 MiB) = "1.00MiB" + "/s".
+        assert!(
+            banner.contains("/s"),
+            "throughput unit missing from banner: >>>{banner}<<<"
+        );
+    }
+
+    #[test]
+    fn bottom_hints_switch_in_filter_mode() {
+        let mut s = AppState::empty(at(0));
+        s.ui.input_mode = crate::state::InputMode::Filter {
+            buffer: String::new(),
+            prior: String::new(),
+        };
+        let buf = render_to_buffer(&s, at(0), 80, 8);
+        let last = buffer_row(&buf, buf.area.height - 1);
+        assert!(last.contains("Enter apply"));
+        assert!(last.contains("Esc cancel"));
+        // Normal-mode hints should NOT be present.
+        assert!(!last.contains("q quit"));
     }
 }
