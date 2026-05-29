@@ -86,7 +86,8 @@ fn render_detail(
         .split(frame.area());
 
     render_top_banner(frame, chunks[0], state, now);
-    render_tab_bar(frame, chunks[1], tab);
+    let counts = tab_counts(state, job_id);
+    render_tab_bar(frame, chunks[1], tab, &counts);
     render_tab_body(frame, chunks[2], state, job_id, tab, now);
     render_bottom_hints(frame, chunks[3], state, now);
 
@@ -388,10 +389,34 @@ fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: Da
 // Detail view: tab bar + per-tab bodies
 // =============================================================================
 
-fn render_tab_bar(frame: &mut Frame, area: Rect, current: Tab) {
+/// Live counters surfaced in the tab bar so the operator knows
+/// where activity is happening without switching tabs. Computed
+/// once per render against the current job's state.
+#[derive(Debug, Default, Clone, Copy)]
+struct TabCounts {
+    workers: usize,
+    error_classes: usize,
+    verify_mismatches: usize,
+}
+
+fn tab_counts(state: &AppState, job_id: &JobId) -> TabCounts {
+    let workers = state.workers_for_job(job_id).len();
+    let error_classes = state.errors_for_job(job_id).len();
+    let verify_mismatches = state
+        .recent_verify_mismatches_for_job(job_id)
+        .map(|r| r.len())
+        .unwrap_or(0);
+    TabCounts {
+        workers,
+        error_classes,
+        verify_mismatches,
+    }
+}
+
+fn render_tab_bar(frame: &mut Frame, area: Rect, current: Tab, counts: &TabCounts) {
     let titles: Vec<Line<'static>> = Tab::all()
         .into_iter()
-        .map(|t| Line::from(Span::raw(t.label())))
+        .map(|t| tab_label_with_counter(t, counts))
         .collect();
     let selected = Tab::all()
         .into_iter()
@@ -406,6 +431,44 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, current: Tab) {
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         );
     frame.render_widget(tabs, area);
+}
+
+/// Build the styled label for one tab: "Workers (3)" with the
+/// counter parenthetical color-coded (red on Errors when nonzero,
+/// yellow on Verify when nonzero, default otherwise). Tabs with no
+/// natural counter (Overview, Plan) render plain.
+fn tab_label_with_counter(t: Tab, c: &TabCounts) -> Line<'static> {
+    let (n, color) = match t {
+        Tab::Overview | Tab::Plan => (None, Color::Reset),
+        Tab::Workers => (Some(c.workers), Color::Reset),
+        Tab::Errors => {
+            let style = if c.error_classes > 0 {
+                Color::Red
+            } else {
+                Color::Reset
+            };
+            (Some(c.error_classes), style)
+        }
+        Tab::Verify => {
+            let style = if c.verify_mismatches > 0 {
+                Color::Yellow
+            } else {
+                Color::Reset
+            };
+            (Some(c.verify_mismatches), style)
+        }
+    };
+    let mut spans = vec![Span::raw(t.label())];
+    if let Some(n) = n {
+        if n == 0 {
+            // No count shown when zero — keeps the bar clean for
+            // freshly-opened jobs.
+        } else {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!("({n})"), Style::default().fg(color)));
+        }
+    }
+    Line::from(spans)
 }
 
 fn render_tab_body(
@@ -2187,5 +2250,133 @@ mod tests {
         assert!(text.contains("/data/file2"));
         assert!(text.contains("size:100"));
         assert!(text.contains("checksum:xyz"));
+    }
+
+    // ----- Live tab-label counters (Phase 5e) -----
+
+    /// Lift just the tab-bar row out of a rendered Detail view so
+    /// label-counter assertions don't false-match against the tab
+    /// body content underneath. The Detail layout puts the tab bar
+    /// at row 1 (banner is row 0).
+    fn tab_bar_row(buf: &ratatui::buffer::Buffer) -> String {
+        buffer_row(buf, 1)
+    }
+
+    #[test]
+    fn tab_bar_omits_counters_when_everything_is_zero() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        enter_detail(&mut s, "alpha", Tab::Overview);
+        let buf = render_to_buffer(&s, at(0), 120, 16);
+        let bar = tab_bar_row(&buf);
+        // Workers / Errors / Verify all read as plain labels — no
+        // "(N)" since the counters are zero.
+        for label in ["Overview", "Workers", "Errors", "Plan", "Verify"] {
+            assert!(bar.contains(label), "missing '{label}' in:\n{bar}");
+        }
+        assert!(
+            !bar.contains("("),
+            "expected no parenthetical counters, got:\n{bar}"
+        );
+    }
+
+    #[test]
+    fn tab_bar_shows_workers_counter_when_workers_join() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        let w1 = WorkerId::new();
+        let w2 = WorkerId::new();
+        s.apply_envelope(&worker_joined_evt(2, 0, "alpha", w1, "host-1"));
+        s.apply_envelope(&worker_joined_evt(3, 0, "alpha", w2, "host-2"));
+        enter_detail(&mut s, "alpha", Tab::Overview);
+        let buf = render_to_buffer(&s, at(0), 120, 16);
+        let bar = tab_bar_row(&buf);
+        assert!(
+            bar.contains("Workers (2)"),
+            "expected 'Workers (2)' in:\n{bar}"
+        );
+        // Errors / Verify counters still absent.
+        assert!(!bar.contains("Errors ("));
+        assert!(!bar.contains("Verify ("));
+    }
+
+    #[test]
+    fn tab_bar_shows_errors_counter_when_classes_appear() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        // Two distinct error classes → bucket count = 2.
+        s.apply_envelope(&error_emitted_evt(
+            2,
+            0,
+            "alpha",
+            ErrorClass::Permission,
+            "/p/a",
+            "perm",
+            false,
+        ));
+        s.apply_envelope(&error_emitted_evt(
+            3,
+            0,
+            "alpha",
+            ErrorClass::Timeout,
+            "/p/b",
+            "to",
+            true,
+        ));
+        enter_detail(&mut s, "alpha", Tab::Overview);
+        let buf = render_to_buffer(&s, at(0), 120, 16);
+        let bar = tab_bar_row(&buf);
+        assert!(
+            bar.contains("Errors (2)"),
+            "expected 'Errors (2)' in:\n{bar}"
+        );
+    }
+
+    #[test]
+    fn tab_bar_shows_verify_counter_when_mismatches_arrive() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        for (seq, p) in [(2u64, "/m/a"), (3u64, "/m/b"), (4u64, "/m/c")] {
+            s.apply_envelope(&env(
+                seq,
+                seq as i64,
+                EventKind::VerifyFileMismatch {
+                    job_id: jid("alpha"),
+                    path: p.into(),
+                    expected: "e".into(),
+                    got: "g".into(),
+                },
+            ));
+        }
+        enter_detail(&mut s, "alpha", Tab::Overview);
+        let buf = render_to_buffer(&s, at(0), 120, 16);
+        let bar = tab_bar_row(&buf);
+        assert!(
+            bar.contains("Verify (3)"),
+            "expected 'Verify (3)' in:\n{bar}"
+        );
+    }
+
+    #[test]
+    fn tab_bar_counters_update_after_new_events() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        let w1 = WorkerId::new();
+        s.apply_envelope(&worker_joined_evt(2, 0, "alpha", w1, "host-1"));
+        enter_detail(&mut s, "alpha", Tab::Overview);
+
+        let buf = render_to_buffer(&s, at(0), 120, 16);
+        assert!(tab_bar_row(&buf).contains("Workers (1)"));
+
+        // Second worker joins.
+        let w2 = WorkerId::new();
+        s.apply_envelope(&worker_joined_evt(3, 0, "alpha", w2, "host-2"));
+        let buf = render_to_buffer(&s, at(0), 120, 16);
+        assert!(tab_bar_row(&buf).contains("Workers (2)"));
     }
 }
