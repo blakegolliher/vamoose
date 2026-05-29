@@ -3890,6 +3890,7 @@ dependencies = [
  "clap",
  "file-rotate",
  "hostname",
+ "migration-coord",
  "migration-core",
  "migration-mover",
  "migration-worker",

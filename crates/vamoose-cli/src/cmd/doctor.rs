@@ -32,7 +32,11 @@ struct Checks {
 
 impl Checks {
     fn new() -> Self {
-        Self { pass: 0, warn: 0, fail: 0 }
+        Self {
+            pass: 0,
+            warn: 0,
+            fail: 0,
+        }
     }
     fn record(&mut self, status: Status, label: &str, detail: impl AsRef<str>) {
         let tag = match status {
@@ -56,7 +60,11 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()
 
     let (cfg, cfg_path) = match Config::load_with_path(config_path) {
         Ok(p) => {
-            checks.record(Status::Pass, "config", format!("{} parsed cleanly", p.1.display()));
+            checks.record(
+                Status::Pass,
+                "config",
+                format!("{} parsed cleanly", p.1.display()),
+            );
             p
         }
         Err(e) => {
@@ -282,7 +290,11 @@ async fn build_s3(cfg: &Config) -> anyhow::Result<Arc<S3Client>> {
 
 fn check_nfs_url(checks: &mut Checks, label: &str, url: &str) {
     if let Some(rest) = url.strip_prefix("nfs://") {
-        if rest.split('/').next().map(|h| !h.is_empty()).unwrap_or(false)
+        if rest
+            .split('/')
+            .next()
+            .map(|h| !h.is_empty())
+            .unwrap_or(false)
             && rest.contains('/')
         {
             checks.record(Status::Pass, label, url);
@@ -319,11 +331,7 @@ fn check_mount(checks: &mut Checks, label: &str, mount: &str, writable: bool) {
                 checks.record(Status::Pass, label, format!("{mount} mounted, writable"));
             }
             Err(e) => {
-                checks.record(
-                    Status::Fail,
-                    label,
-                    format!("{mount} not writable: {e}"),
-                );
+                checks.record(Status::Fail, label, format!("{mount} not writable: {e}"));
             }
         }
     } else {
@@ -332,17 +340,10 @@ fn check_mount(checks: &mut Checks, label: &str, mount: &str, writable: bool) {
 }
 
 fn check_walker(checks: &mut Checks, cfg: &Config) {
-    let configured = cfg
-        .walker
-        .as_ref()
-        .and_then(|w| w.binary_path.clone());
+    let configured = cfg.walker.as_ref().and_then(|w| w.binary_path.clone());
     if let Some(path) = configured {
         if path.is_file() {
-            checks.record(
-                Status::Pass,
-                "walker binary",
-                format!("{}", path.display()),
-            );
+            checks.record(Status::Pass, "walker binary", format!("{}", path.display()));
         } else {
             checks.record(
                 Status::Fail,
@@ -353,7 +354,11 @@ fn check_walker(checks: &mut Checks, cfg: &Config) {
         return;
     }
     if let Ok(found) = which("nfs-walker") {
-        checks.record(Status::Pass, "walker binary", format!("{}", found.display()));
+        checks.record(
+            Status::Pass,
+            "walker binary",
+            format!("{}", found.display()),
+        );
     } else {
         checks.record(
             Status::Warn,

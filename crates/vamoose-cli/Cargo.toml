@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 migration-core   = { workspace = true }
 migration-mover  = { workspace = true }
+migration-coord  = { workspace = true }
 migration-worker = { path = "../migration-worker" }
 # migration-aggr is binary-only today; add it back when the `vamoose
 # aggr` subcommand drops the stub and calls into a (future) lib.

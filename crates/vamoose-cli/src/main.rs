@@ -10,12 +10,16 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
 
-mod config;
 mod cmd;
+mod config;
 mod logging;
 
 #[derive(Parser)]
-#[command(name = "vamoose", version, about = "Distributed NFS migration with S3 coordination")]
+#[command(
+    name = "vamoose",
+    version,
+    about = "Distributed NFS migration with S3 coordination"
+)]
 struct Cli {
     /// Path to config file (default: vamoose.toml in CWD).
     #[arg(short, long, env = "VAMOOSE_CONFIG", global = true)]
@@ -47,6 +51,8 @@ enum Command {
     Init(cmd::init::Args),
     /// End-to-end pipeline: walker + rewrite + workers.
     Run(cmd::run::Args),
+    /// Control-plane HTTP daemon (REST + SSE).
+    Coord(cmd::coord::Args),
 }
 
 fn build_filter(arg: Option<&str>) -> tracing_subscriber::EnvFilter {
@@ -81,20 +87,24 @@ async fn main() -> anyhow::Result<()> {
             // No config (yet) — install a minimal stderr subscriber so
             // the eventual error surfaces. Subcommands that need the
             // config will re-load it and produce their own error.
-            tracing_subscriber::fmt().with_env_filter(filter).try_init().ok();
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .try_init()
+                .ok();
             None
         }
     };
 
     let result = match cli.command {
-        Command::Worker(a)  => cmd::worker::run(a, cli.config).await,
-        Command::Walker(a)  => cmd::walker::run(a, cli.config).await,
+        Command::Worker(a) => cmd::worker::run(a, cli.config).await,
+        Command::Walker(a) => cmd::walker::run(a, cli.config).await,
         Command::Rewrite(a) => cmd::rewrite::run(a, cli.config).await,
-        Command::Aggr(a)    => cmd::aggr::run(a, cli.config).await,
-        Command::Status(a)  => cmd::status::run(a, cli.config).await,
-        Command::Doctor(a)  => cmd::doctor::run(a, cli.config).await,
-        Command::Init(a)    => cmd::init::run(a, cli.config).await,
-        Command::Run(a)     => cmd::run::run(a, cli.config).await,
+        Command::Aggr(a) => cmd::aggr::run(a, cli.config).await,
+        Command::Status(a) => cmd::status::run(a, cli.config).await,
+        Command::Doctor(a) => cmd::doctor::run(a, cli.config).await,
+        Command::Init(a) => cmd::init::run(a, cli.config).await,
+        Command::Run(a) => cmd::run::run(a, cli.config).await,
+        Command::Coord(a) => cmd::coord::run(a, cli.config).await,
     };
 
     if let Some(handle) = log_handle {
