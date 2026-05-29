@@ -17,6 +17,10 @@ path = "src/main.rs"
 [dependencies]
 migration-core  = { workspace = true }
 migration-mover = { workspace = true }
+# Schema types (EventKind, WorkerId, RegisterBody shape) shared with
+# the coord. Drift between worker wire calls and coord handlers is
+# caught at compile time by reusing the same types.
+migration-coord = { workspace = true }
 
 tokio    = { workspace = true }
 tokio-util = { workspace = true }
@@ -34,3 +38,14 @@ toml     = { workspace = true }
 hostname = { workspace = true }
 getrandom = { workspace = true }
 libc     = { workspace = true }
+uuid     = { workspace = true }
+
+# HTTP client for the coord-facing wire layer (Phase 3).
+reqwest = { workspace = true }
+
+[dev-dependencies]
+# Used by tests/coord_client_integration.rs to bring up an in-process
+# coord (router + axum_server bind) and drive it from the client.
+axum-server = { workspace = true }
+http = { workspace = true }
+axum = { workspace = true }

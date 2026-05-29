@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 // POST /workers/register
 // =============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterBody {
     pub job_id: String,
     pub host: String,
@@ -53,7 +53,7 @@ pub struct RegisterBody {
     pub version: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterResponse {
     pub worker_id: WorkerId,
     /// WorkerIds the coord marked Disconnected as a side effect of
@@ -121,7 +121,7 @@ pub async fn register(
 // POST /workers/{id}/heartbeat
 // =============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HeartbeatBody {
     pub state: WorkerState,
     #[serde(default)]
@@ -136,7 +136,7 @@ pub struct HeartbeatBody {
     pub queue_depth: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ControlEnvelope {
     pub mode: ControlMode,
 }
@@ -147,7 +147,7 @@ pub struct ControlEnvelope {
 /// is the trigger to flush its event buffer). `server_time` is
 /// echoed for clock-skew diagnostics — workers never use it for
 /// fence decisions.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
     pub control: ControlEnvelope,
     pub last_seq: u64,
@@ -210,7 +210,7 @@ pub async fn heartbeat(
 // POST /workers/{id}/events
 // =============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct WorkerEventEntry {
     #[serde(flatten)]
     pub kind: EventKind,
@@ -218,12 +218,12 @@ pub struct WorkerEventEntry {
     pub worker_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EventsBatchBody {
     pub events: Vec<WorkerEventEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EventsBatchResponse {
     /// Seqs assigned to each event in order. Matches `events.len()`.
     pub seqs: Vec<u64>,
@@ -261,12 +261,12 @@ pub async fn events_batch(
 // POST /workers/{id}/fence
 // =============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FenceBody {
     pub reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FenceResponse {
     pub seq: u64,
 }

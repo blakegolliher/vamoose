@@ -2503,15 +2503,20 @@ name = "migration-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "axum-server",
  "chrono",
  "clap",
  "crossbeam-channel",
  "getrandom 0.2.17",
  "hex",
  "hostname",
+ "http 1.4.0",
  "libc",
+ "migration-coord",
  "migration-core",
  "migration-mover",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2520,6 +2525,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
