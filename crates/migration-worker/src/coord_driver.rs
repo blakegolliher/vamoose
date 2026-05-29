@@ -50,17 +50,103 @@ pub struct CoordDriverHandle {
 /// driver does NOT mutate these — orchestration and shard processing
 /// own the writes.
 ///
-/// `fence_rx` is the consumer end of the heartbeat task's
-/// `coord_fence` channel — when the heartbeat raises a self-fence
-/// at one of its R6/R7/R8 sites it forwards the reason here, and
-/// the driver loop POSTs `/workers/{id}/fence` with that reason
-/// before shutting down. `None` when the worker runs in legacy
-/// S3-only mode.
+/// - `fence_rx` is the consumer end of the heartbeat task's
+///   `coord_fence` channel — when the heartbeat raises a self-fence
+///   at one of its R6/R7/R8 sites it forwards the reason here, and
+///   the driver loop POSTs `/workers/{id}/fence` with that reason
+///   before shutting down. `None` when the worker runs in legacy
+///   S3-only mode.
+///
+/// - `events_rx` is the consumer end of the in-process events
+///   channel. The shard processor pushes [`WorkerEventDraft`]s here
+///   as files succeed / fail / get fenced; the driver coalesces them
+///   over a 1s window and POSTs to `/workers/{id}/events`. `None`
+///   when the worker runs in legacy mode.
 pub struct DriverInputs {
     pub progress: Arc<RwLock<ProgressState>>,
     pub throughput: ThroughputCounter,
     pub fence: Fence,
     pub fence_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    pub events_rx: Option<tokio::sync::mpsc::Receiver<WorkerEventDraft>>,
+}
+
+/// In-process event the shard processor (and any future caller)
+/// hands to the coord_driver for forwarding to the coord. The
+/// processor does NOT carry `worker_id` — it isn't known at
+/// processor-construction time (register completes asynchronously).
+/// The driver materializes the full [`EventKind`] envelope by
+/// attaching `worker_id` and `job_id` at POST time.
+///
+/// v1 only emits per-file progress counts (Ok / Failed / Fenced).
+/// Richer detail (`ErrorEmitted` with class + path) can be added in
+/// a follow-on step without changing the channel shape — just add a
+/// new variant.
+#[derive(Debug, Clone)]
+pub enum WorkerEventDraft {
+    /// One file completed successfully — fold into the next
+    /// coalesced `ProgressDelta`.
+    ProgressOk { bytes: u64 },
+    /// One file failed (per-file failure, not a fence trip). Folded
+    /// into `errors_delta` on the next ProgressDelta. The full
+    /// `ErrorEmitted` event (class, path) is a future enhancement.
+    ProgressFailed,
+    /// One file bailed out at the mover's R8 fence check. Surfaced
+    /// to coord as `errors_delta` for visibility but not flagged as
+    /// a worker failure — the next reclaimer copies the row.
+    ProgressFenced,
+}
+
+/// Sender-side handle wrapping `Option<Sender<WorkerEventDraft>>`.
+/// Construct with [`EventEmitter::disabled`] for legacy / no-coord
+/// mode — every call becomes a no-op. Construct via
+/// [`EventEmitter::from_sender`] when the orchestrator has wired the
+/// channel.
+///
+/// All methods use `try_send` so the caller (shard processor) is
+/// never blocked. On full channel the draft is dropped and a counter
+/// could be bumped (deferred to a future revision — for now the
+/// coord just sees lower progress numbers).
+#[derive(Debug, Clone)]
+pub struct EventEmitter {
+    tx: Option<tokio::sync::mpsc::Sender<WorkerEventDraft>>,
+}
+
+impl EventEmitter {
+    pub fn disabled() -> Self {
+        Self { tx: None }
+    }
+
+    pub fn from_sender(tx: tokio::sync::mpsc::Sender<WorkerEventDraft>) -> Self {
+        Self { tx: Some(tx) }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.tx.is_some()
+    }
+
+    pub fn progress_ok(&self, bytes: u64) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(WorkerEventDraft::ProgressOk { bytes });
+        }
+    }
+
+    pub fn progress_failed(&self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(WorkerEventDraft::ProgressFailed);
+        }
+    }
+
+    pub fn progress_fenced(&self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(WorkerEventDraft::ProgressFenced);
+        }
+    }
+}
+
+impl Default for EventEmitter {
+    fn default() -> Self {
+        Self::disabled()
+    }
 }
 
 /// Build the [`CoordClient`] from config (resolving the cluster
@@ -111,6 +197,8 @@ pub fn spawn(
             process_start,
             version,
             heartbeat: Duration::from_secs(cfg.heartbeat_sec),
+            events_flush: Duration::from_secs(cfg.events_flush_sec.max(1)),
+            buffer_max_bytes: cfg.buffer_max_bytes as usize,
         },
         inputs,
         run_control.clone(),
@@ -132,6 +220,8 @@ struct DriverParams {
     process_start: DateTime<Utc>,
     version: String,
     heartbeat: Duration,
+    events_flush: Duration,
+    buffer_max_bytes: usize,
 }
 
 async fn driver_loop(
@@ -157,6 +247,30 @@ async fn driver_loop(
     tracing::info!(worker_id = %worker_id, "coord_driver: registered");
 
     // ----------------------------------------------------------------
+    // Phase A.5 — spawn the events drainer if a channel is wired.
+    //
+    // The drainer has its own cancellation token so the heartbeat
+    // loop's exit path can stop it independently of the outer
+    // `cancel` (which the orchestrator may not have tripped yet on
+    // a fence-driven shutdown). Heartbeat-loop exit ALWAYS cancels
+    // and joins the drainer via the cleanup block at the end.
+    // ----------------------------------------------------------------
+    let drainer_cancel = CancellationToken::new();
+    let drainer_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
+        match inputs.events_rx.take() {
+            Some(events_rx) => Some(tokio::spawn(events_drainer(
+                client.clone(),
+                worker_id,
+                params.job_id.clone(),
+                events_rx,
+                params.events_flush,
+                params.buffer_max_bytes,
+                drainer_cancel.clone(),
+            ))),
+            None => None,
+        };
+
+    // ----------------------------------------------------------------
     // Phase B — heartbeat loop. Sleep `heartbeat` on success;
     // sleep backoff.current() and step() on failure. Both sleeps are
     // cancellable. A signal on `fence_rx` (set when the heartbeat
@@ -165,6 +279,44 @@ async fn driver_loop(
     // sees the fence trip via its own `fence.is_valid()` check on the
     // next loop iteration; the coord POST is purely informational.
     // ----------------------------------------------------------------
+    let outcome = heartbeat_loop(
+        &client,
+        worker_id,
+        &params,
+        &mut inputs,
+        &run_control,
+        &cancel,
+    )
+    .await;
+
+    // ----------------------------------------------------------------
+    // Phase C — tear down the drainer. Cancel its token (so it
+    // stops accepting new ticks) and bound the join so a wedged
+    // HTTP connection cannot hold the driver task open forever.
+    // The drainer still drains anything already-buffered before
+    // observing the cancel, so per-file progress emitted right
+    // before exit still has a chance to land at the coord.
+    // ----------------------------------------------------------------
+    drainer_cancel.cancel();
+    if let Some(t) = drainer_task {
+        match tokio::time::timeout(Duration::from_secs(5), t).await {
+            Ok(Ok(Ok(()))) => tracing::debug!("events_drainer: clean exit"),
+            Ok(Ok(Err(e))) => tracing::warn!(error = %e, "events_drainer returned error"),
+            Ok(Err(e)) => tracing::warn!(join_error = %e, "events_drainer join failed"),
+            Err(_) => tracing::warn!("events_drainer did not exit within 5s"),
+        }
+    }
+    outcome
+}
+
+async fn heartbeat_loop(
+    client: &CoordClient,
+    worker_id: WorkerId,
+    params: &DriverParams,
+    inputs: &mut DriverInputs,
+    run_control: &RunControl,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
     let mut backoff = Backoff::default_schedule();
     let mut consecutive_failures: u64 = 0;
     loop {
@@ -219,7 +371,7 @@ async fn driver_loop(
             _ = tokio::time::sleep(delay) => {}
         }
 
-        let body = sample_heartbeat(&inputs, &run_control).await;
+        let body = sample_heartbeat(inputs, run_control).await;
         match client.heartbeat(worker_id, body).await {
             Ok(resp) => {
                 let prev = run_control.mode();
@@ -248,6 +400,175 @@ async fn driver_loop(
                     "coord_driver: heartbeat failed; will retry",
                 );
             }
+        }
+    }
+}
+
+// =============================================================================
+// Events drainer — coalesce ProgressDelta drafts into ~1Hz POSTs.
+// =============================================================================
+
+/// Per-window accumulator. Folds incoming drafts into running sums;
+/// `flush` materializes the running sums as one `EventEnvelope`
+/// (or `None` if no drafts arrived since the last flush).
+#[derive(Debug, Default)]
+struct ProgressAccum {
+    files_delta: u64,
+    bytes_delta: u64,
+    errors_delta: u64,
+}
+
+impl ProgressAccum {
+    fn absorb(&mut self, draft: WorkerEventDraft) {
+        match draft {
+            WorkerEventDraft::ProgressOk { bytes } => {
+                self.files_delta = self.files_delta.saturating_add(1);
+                self.bytes_delta = self.bytes_delta.saturating_add(bytes);
+            }
+            WorkerEventDraft::ProgressFailed | WorkerEventDraft::ProgressFenced => {
+                self.errors_delta = self.errors_delta.saturating_add(1);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.files_delta == 0 && self.bytes_delta == 0 && self.errors_delta == 0
+    }
+
+    fn take_envelope(
+        &mut self,
+        job_id: JobId,
+        worker_id: WorkerId,
+        at: DateTime<Utc>,
+    ) -> Option<migration_coord::schema::EventEnvelope> {
+        if self.is_empty() {
+            return None;
+        }
+        let env = migration_coord::schema::EventEnvelope {
+            seq: 0, // coord assigns
+            at,
+            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            worker_at: Some(at),
+            kind: migration_coord::schema::EventKind::ProgressDelta {
+                job_id,
+                worker_id,
+                files_delta: self.files_delta,
+                bytes_delta: self.bytes_delta,
+                errors_delta: self.errors_delta,
+            },
+        };
+        *self = Self::default();
+        Some(env)
+    }
+}
+
+/// Drainer task body. Owns `events_rx`, `buffer`, and the periodic
+/// flusher. Exits cleanly when `cancel` fires OR the sender is
+/// dropped (orchestrator hands the EventEmitter to ShardProcessor;
+/// when that drops, the channel closes here and we drain the rest).
+async fn events_drainer(
+    client: CoordClient,
+    worker_id: WorkerId,
+    job_id: JobId,
+    mut events_rx: tokio::sync::mpsc::Receiver<WorkerEventDraft>,
+    flush_interval: Duration,
+    buffer_max_bytes: usize,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let mut buffer = crate::coord_client::EventBuffer::new(buffer_max_bytes);
+    let mut accum = ProgressAccum::default();
+    let mut ticker = tokio::time::interval(flush_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the first immediate tick that interval() fires — we want
+    // the first flush to wait the full interval after start.
+    ticker.tick().await;
+
+    let mut channel_closed = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                tracing::debug!("events_drainer: cancelled");
+                break;
+            }
+            maybe = events_rx.recv(), if !channel_closed => {
+                match maybe {
+                    Some(draft) => {
+                        accum.absorb(draft);
+                        // Drain anything else immediately available so a
+                        // burst from the processor doesn't require many
+                        // round-trips through select!.
+                        while let Ok(d) = events_rx.try_recv() {
+                            accum.absorb(d);
+                        }
+                    }
+                    None => {
+                        // Sender side dropped — no more drafts will
+                        // arrive. Disable this arm and keep ticking
+                        // until the buffer drains, then exit.
+                        channel_closed = true;
+                        tracing::debug!("events_drainer: channel closed; draining remaining");
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                if let Some(env) = accum.take_envelope(job_id.clone(), worker_id, chrono::Utc::now()) {
+                    buffer.push(env);
+                }
+                if !buffer.is_empty() {
+                    drain_one_batch(&client, worker_id, &mut buffer).await;
+                }
+                if channel_closed && buffer.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Final flush — absorb any drafts still in the channel, materialize
+    // the accumulator, and try to ship one more batch. Best-effort: a
+    // wedged coord here doesn't block the bounded outer join.
+    while let Ok(d) = events_rx.try_recv() {
+        accum.absorb(d);
+    }
+    if let Some(env) = accum.take_envelope(job_id, worker_id, chrono::Utc::now()) {
+        buffer.push(env);
+    }
+    if !buffer.is_empty() {
+        drain_one_batch(&client, worker_id, &mut buffer).await;
+    }
+    Ok(())
+}
+
+/// POST one batch of events. On failure, requeue the batch to the
+/// front of the buffer so order is preserved for the next attempt.
+/// Caller is responsible for the ticker-driven cadence between calls.
+async fn drain_one_batch(
+    client: &CoordClient,
+    worker_id: WorkerId,
+    buffer: &mut crate::coord_client::EventBuffer,
+) {
+    const MAX_BATCH: usize = 64;
+    let batch = buffer.drain_batch(MAX_BATCH);
+    if batch.is_empty() {
+        return;
+    }
+    match client.events_batch(worker_id, batch.clone()).await {
+        Ok(seqs) => {
+            tracing::debug!(
+                n = seqs.len(),
+                first_seq = seqs.first().copied().unwrap_or(0),
+                last_seq = seqs.last().copied().unwrap_or(0),
+                "events_drainer: batch posted",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                n = batch.len(),
+                "events_drainer: POST failed; requeuing for next tick",
+            );
+            buffer.requeue_front(batch);
         }
     }
 }
@@ -351,6 +672,7 @@ mod tests {
             throughput,
             fence,
             fence_rx: None,
+            events_rx: None,
         };
         let rc = RunControl::new();
         let body = sample_heartbeat(&inputs, &rc).await;
@@ -367,6 +689,7 @@ mod tests {
             throughput,
             fence,
             fence_rx: None,
+            events_rx: None,
         };
         let rc = RunControl::with_mode(crate::coord_client::ControlMode::Drain);
         let body = sample_heartbeat(&inputs, &rc).await;
@@ -388,6 +711,7 @@ mod tests {
             throughput,
             fence,
             fence_rx: None,
+            events_rx: None,
         };
         let rc = RunControl::new();
         let body = sample_heartbeat(&inputs, &rc).await;
@@ -404,9 +728,139 @@ mod tests {
             throughput,
             fence,
             fence_rx: None,
+            events_rx: None,
         };
         let rc = RunControl::new();
         let body = sample_heartbeat(&inputs, &rc).await;
         assert!(matches!(body.state, WorkerState::Idle));
+    }
+
+    // =========================================================================
+    // EventEmitter — disabled / enabled / drop behavior
+    // =========================================================================
+
+    #[test]
+    fn disabled_emitter_silently_swallows_drafts() {
+        let e = EventEmitter::disabled();
+        assert!(!e.is_enabled());
+        // None of these should panic or block.
+        e.progress_ok(1024);
+        e.progress_failed();
+        e.progress_fenced();
+    }
+
+    #[tokio::test]
+    async fn enabled_emitter_pushes_drafts_to_channel() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let e = EventEmitter::from_sender(tx);
+        assert!(e.is_enabled());
+        e.progress_ok(1024);
+        e.progress_ok(2048);
+        e.progress_failed();
+        e.progress_fenced();
+
+        let mut got = Vec::new();
+        while let Ok(d) = rx.try_recv() {
+            got.push(d);
+        }
+        assert_eq!(got.len(), 4);
+        assert!(matches!(
+            got[0],
+            WorkerEventDraft::ProgressOk { bytes: 1024 }
+        ));
+        assert!(matches!(
+            got[1],
+            WorkerEventDraft::ProgressOk { bytes: 2048 }
+        ));
+        assert!(matches!(got[2], WorkerEventDraft::ProgressFailed));
+        assert!(matches!(got[3], WorkerEventDraft::ProgressFenced));
+    }
+
+    #[tokio::test]
+    async fn full_channel_drops_drafts_without_blocking() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let e = EventEmitter::from_sender(tx);
+        // Fill the channel.
+        e.progress_ok(1);
+        e.progress_ok(2);
+        // These should silently drop.
+        e.progress_ok(3);
+        e.progress_ok(4);
+
+        let mut got = 0;
+        while rx.try_recv().is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, 2, "exactly the channel capacity should land");
+    }
+
+    // =========================================================================
+    // ProgressAccum — coalesce semantics
+    // =========================================================================
+
+    fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, 0).unwrap()
+    }
+
+    fn jid(s: &str) -> JobId {
+        JobId::new(s).unwrap()
+    }
+
+    #[test]
+    fn empty_accum_yields_no_envelope() {
+        let mut a = ProgressAccum::default();
+        assert!(a.is_empty());
+        assert!(a
+            .take_envelope(jid("bobby"), WorkerId::new(), at(0))
+            .is_none());
+    }
+
+    #[test]
+    fn accum_sums_drafts_and_resets_on_take() {
+        let mut a = ProgressAccum::default();
+        a.absorb(WorkerEventDraft::ProgressOk { bytes: 1000 });
+        a.absorb(WorkerEventDraft::ProgressOk { bytes: 2000 });
+        a.absorb(WorkerEventDraft::ProgressOk { bytes: 500 });
+        a.absorb(WorkerEventDraft::ProgressFailed);
+        a.absorb(WorkerEventDraft::ProgressFenced);
+        assert_eq!(a.files_delta, 3);
+        assert_eq!(a.bytes_delta, 3500);
+        assert_eq!(a.errors_delta, 2);
+
+        let wid = WorkerId::new();
+        let env = a
+            .take_envelope(jid("bobby"), wid, at(42))
+            .expect("envelope");
+        match env.kind {
+            migration_coord::schema::EventKind::ProgressDelta {
+                job_id,
+                worker_id,
+                files_delta,
+                bytes_delta,
+                errors_delta,
+            } => {
+                assert_eq!(job_id, jid("bobby"));
+                assert_eq!(worker_id, wid);
+                assert_eq!(files_delta, 3);
+                assert_eq!(bytes_delta, 3500);
+                assert_eq!(errors_delta, 2);
+            }
+            other => panic!("unexpected event kind: {other:?}"),
+        }
+        // Accumulator must reset after take.
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn accum_saturating_add_does_not_panic_on_overflow() {
+        let mut a = ProgressAccum {
+            files_delta: u64::MAX,
+            bytes_delta: u64::MAX - 100,
+            errors_delta: 0,
+        };
+        // Overflow path — should saturate, not panic.
+        a.absorb(WorkerEventDraft::ProgressOk { bytes: 500 });
+        assert_eq!(a.files_delta, u64::MAX);
+        assert_eq!(a.bytes_delta, u64::MAX);
     }
 }

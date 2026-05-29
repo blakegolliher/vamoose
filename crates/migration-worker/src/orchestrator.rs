@@ -252,6 +252,27 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         (None, None)
     };
 
+    // Bounded channel for the shard processor to push per-file
+    // event drafts to the coord_driver. Capacity intentionally
+    // generous (4096) — a bursty shard can produce ~1000 outcomes/s
+    // and the drainer flushes at events_flush_sec (default 1s). On
+    // overflow the processor's try_send drops the draft and the
+    // coord sees lower numbers; preferable to blocking the copy
+    // loop on a momentary backlog.
+    let (coord_events_tx, coord_events_rx): (
+        Option<tokio::sync::mpsc::Sender<crate::coord_driver::WorkerEventDraft>>,
+        Option<tokio::sync::mpsc::Receiver<crate::coord_driver::WorkerEventDraft>>,
+    ) = if cfg.coord.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let event_emitter = match coord_events_tx {
+        Some(tx) => crate::coord_driver::EventEmitter::from_sender(tx),
+        None => crate::coord_driver::EventEmitter::disabled(),
+    };
+
     let hb = HeartbeatTask {
         store: s3.clone() as Arc<dyn ClaimStore>,
         fence: fence.clone(),
@@ -284,6 +305,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
                 throughput: throughput.clone(),
                 fence: fence.clone(),
                 fence_rx: coord_fence_rx,
+                events_rx: coord_events_rx,
             };
             match coord_driver::spawn(
                 c,
@@ -568,6 +590,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
             failures: failures.clone(),
             throughput: throughput.clone(),
             fsid_fallback_warned: false,
+            emitter: event_emitter.clone(),
         };
         let outcome = match processor.process(&scratch).await {
             Ok(o) => o,
