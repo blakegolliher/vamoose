@@ -47,3 +47,6 @@ aws-config = { workspace = true }
 
 # In-process router tests via tower::ServiceExt::oneshot
 http-body-util = "0.1"
+
+# End-to-end SSE wire test (binds a real listener, reads frames).
+reqwest = { workspace = true }

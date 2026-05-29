@@ -111,6 +111,9 @@ async-trait = "0.1"
 # Imperative async stream construction (SSE handler)
 async-stream = "0.3"
 
+# HTTP client (Phase 3 worker, Phase 4 TUI, Phase 2 acceptance tests)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
 [profile.release]
 lto = true
 codegen-units = 1
