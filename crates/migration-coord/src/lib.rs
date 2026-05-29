@@ -34,6 +34,7 @@
 
 pub mod errors;
 pub mod layout;
+pub mod lease;
 pub mod schema;
 pub mod store;
 
