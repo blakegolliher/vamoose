@@ -62,7 +62,16 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 /// [`Client::stream`] for the SSE consumer.
 #[derive(Debug, Clone)]
 pub struct Client {
+    /// Client for REST round-trips. Has a per-request timeout so a
+    /// dead coord doesn't wedge the snapshot fetch.
     http: reqwest::Client,
+    /// Separate client for SSE streaming. NO request timeout — the
+    /// stream is meant to stay open for the life of the TUI; reusing
+    /// the REST client would kill the connection every
+    /// `request_timeout` seconds, making the banner flicker between
+    /// connected and reconnecting on a perfectly healthy coord.
+    /// Connect timeout still bounds the initial handshake.
+    stream_http: reqwest::Client,
     base_url: String,
 }
 
@@ -79,28 +88,31 @@ impl Client {
         verify_tls: bool,
         request_timeout: Duration,
     ) -> Result<Self> {
-        let mut headers = HeaderMap::new();
-        if let Some(t) = admin_token {
-            let value = format!("Bearer {t}");
-            let mut v = HeaderValue::from_str(&value).map_err(|_| ClientError::Http {
-                status: reqwest::StatusCode::BAD_REQUEST,
-                body: "admin token contains non-ASCII".into(),
-            })?;
-            v.set_sensitive(true);
-            headers.insert("authorization", v);
-        }
+        let headers = build_default_headers(admin_token)?;
+
+        // REST client: full per-request timeout so a dead coord
+        // doesn't hang the snapshot fetch on the render thread.
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(!verify_tls)
-            .default_headers(headers)
+            .default_headers(headers.clone())
             .timeout(request_timeout)
-            // SSE keeps a connection open indefinitely; the .timeout
-            // above is per-request and would interrupt long streams.
-            // We use a separate no-timeout client for the stream so
-            // long-running connections stay alive — built lazily in
-            // `stream`.
             .build()?;
+
+        // Stream client: NO request timeout. SSE connections are
+        // meant to stay open for the life of the TUI; the coord
+        // sends periodic `: ping` keepalives so the link stays
+        // live even when no events are flowing. Connect timeout is
+        // kept (defaults to reqwest's internal value) so a bad
+        // host still fails fast on the initial handshake.
+        let stream_http = reqwest::Client::builder()
+            .danger_accept_invalid_certs(!verify_tls)
+            .default_headers(headers)
+            .connect_timeout(request_timeout)
+            .build()?;
+
         Ok(Self {
             http,
+            stream_http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
         })
     }
@@ -194,7 +206,11 @@ impl Client {
         if let Some(job) = job_filter {
             url = format!("{url}?job_id={job}");
         }
-        let mut req = self.http.get(&url);
+        // Uses the dedicated stream client — NO per-request
+        // timeout. If we used `self.http` here the connection would
+        // be killed every `request_timeout` seconds and the banner
+        // would flicker connected → reconnecting on a healthy coord.
+        let mut req = self.stream_http.get(&url);
         if let Some(seq) = last_event_id {
             req = req.header("last-event-id", seq.to_string());
         }
@@ -203,6 +219,20 @@ impl Client {
         let byte_stream = resp.bytes_stream();
         Ok(Box::pin(parse_sse_stream(byte_stream)))
     }
+}
+
+fn build_default_headers(admin_token: Option<&str>) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    if let Some(t) = admin_token {
+        let value = format!("Bearer {t}");
+        let mut v = HeaderValue::from_str(&value).map_err(|_| ClientError::Http {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "admin token contains non-ASCII".into(),
+        })?;
+        v.set_sensitive(true);
+        headers.insert("authorization", v);
+    }
+    Ok(headers)
 }
 
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {

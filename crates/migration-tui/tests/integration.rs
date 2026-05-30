@@ -430,3 +430,68 @@ async fn marker_mark_connected_then_event_keeps_connected() {
 
     shutdown.cancel();
 }
+
+#[tokio::test]
+async fn sse_stream_survives_past_rest_request_timeout() {
+    // Regression for the smoke-test report "connected goes to
+    // unconnected frequently". The fix split the reqwest client in
+    // two: REST keeps a per-request timeout, but the SSE stream
+    // uses a separate client with NO request timeout. Without
+    // the fix, this test would fail after `request_timeout` —
+    // the stream would error out and the second frame would never
+    // arrive.
+    let (rt, addr, shutdown) = spawn_coord().await;
+    rt.ingest(job_created("alpha")).await.unwrap();
+    rt.flush_log().await.unwrap();
+
+    // Deliberately short REST timeout — well under the gap
+    // between the two events we feed in.
+    let client = Client::new(
+        format!("http://{addr}"),
+        None,
+        true,
+        Duration::from_millis(500),
+    )
+    .expect("Client::new");
+
+    let stream = client.stream(Some(0), None).await.expect("stream");
+    tokio::pin!(stream);
+
+    // Drain the first catch-up event.
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("first frame")
+        .expect("not closed")
+        .expect("ok");
+    assert!(matches!(first, SseFrame::Event { .. }));
+
+    // Idle for longer than the REST timeout. If the stream client
+    // were sharing the REST client's timeout, the connection
+    // would be killed during this sleep and the next stream.next()
+    // would yield an error instead of a fresh event.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+
+    // Now ingest another event and verify the same stream still
+    // delivers it without disconnecting.
+    rt.ingest(EventKind::ProgressDelta {
+        job_id: jid("alpha"),
+        worker_id: WorkerId::new(),
+        files_delta: 1,
+        bytes_delta: 100,
+        errors_delta: 0,
+    })
+    .await
+    .unwrap();
+
+    let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("second frame within 5s of ingest")
+        .expect("stream still open")
+        .expect("frame ok");
+    assert!(
+        matches!(next, SseFrame::Event { .. } | SseFrame::Keepalive),
+        "expected Event or Keepalive, got {next:?}"
+    );
+
+    shutdown.cancel();
+}
