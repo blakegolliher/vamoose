@@ -699,7 +699,10 @@ pub async fn run(client: Client, opts: RunOpts) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app_state = Arc::new(Mutex::new(AppState::empty(Utc::now())));
+    // Pick up theme from NO_COLOR / VAMOOSE_THEME at app start so
+    // `NO_COLOR=1 vamoose tui ...` is a single-flag toggle.
+    let theme = crate::theme::Theme::from_env();
+    let app_state = Arc::new(Mutex::new(AppState::empty(Utc::now()).with_theme(theme)));
     let cancel = CancellationToken::new();
     let (tx, mut rx) = mpsc::channel::<Input>(256);
 

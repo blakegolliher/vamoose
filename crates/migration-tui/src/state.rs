@@ -18,6 +18,7 @@
 //! envelope received from the SSE stream — it routes through
 //! `Snapshot::apply` and updates `last_seen_seq`.
 
+use crate::theme::Theme;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use migration_coord::schema::{
     ErrorBucket, ErrorClass, EventEnvelope, EventKind, Job, JobId, Snapshot, Worker, WorkerId,
@@ -525,6 +526,11 @@ pub struct AppState {
     /// (the renderer checks `now - at >= COMMAND_STATUS_TTL` and
     /// drops the field on render).
     pub command_status: Option<CommandStatus>,
+    /// Color palette consumed by the render layer. Resolved at
+    /// startup from `NO_COLOR` / `VAMOOSE_THEME`; preserved across
+    /// reconnects so a `NO_COLOR=1` session never accidentally
+    /// flashes color when the SSE link reconnects.
+    pub theme: Theme,
 }
 
 /// Toast surfaced in the top banner after a palette command runs.
@@ -570,7 +576,16 @@ impl AppState {
             recent_verify_mismatches: HashMap::new(),
             verify_status: HashMap::new(),
             command_status: None,
+            theme: Theme::default(),
         }
+    }
+
+    /// Replace the active theme. `vamoose tui` calls this with
+    /// [`Theme::from_env`] right after constructing the initial
+    /// state.
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
     }
 
     /// Record a successful command-status toast. The renderer

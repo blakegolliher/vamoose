@@ -26,6 +26,7 @@ use crate::state::{
     AppState, ConnectionStatus, JobSort, Modal, RecentError, RecentVerifyMismatch, Tab, UiState,
     VerifyStatus, View, WorkerSort,
 };
+use crate::theme::Theme;
 use chrono::{DateTime, Utc};
 use migration_coord::schema::{
     ErrorBucket, ErrorClass, Job, JobId, Phase, Worker, WorkerId, WorkerState,
@@ -98,7 +99,7 @@ fn render_detail(
 
     render_top_banner(frame, chunks[0], state, now);
     let counts = tab_counts(state, job_id);
-    render_tab_bar(frame, chunks[1], tab, &counts);
+    render_tab_bar(frame, chunks[1], tab, &counts, &state.theme);
     render_tab_body(frame, chunks[2], state, job_id, tab, now);
     render_bottom_hints(frame, chunks[3], state, now);
     // Modal rendering happens in the top-level `render()` so it
@@ -110,8 +111,9 @@ fn render_detail(
 // =============================================================================
 
 fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateTime<Utc>) {
+    let theme = &state.theme;
     let agg = aggregate_counts(state);
-    let conn = connection_label(&state.connection, now);
+    let conn = connection_label(&state.connection, now, theme);
     // 1-min total throughput across all jobs. Append "/s" so the
     // unit is unambiguous even when the value rounds to 0.
     let total_bps = state.total_bytes_per_sec(60, now);
@@ -151,8 +153,8 @@ fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateT
             spans.push(Span::styled(
                 format!("{buffer}_"),
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
+                    .fg(theme.cursor_fg)
+                    .bg(theme.cursor_bg)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -161,7 +163,7 @@ fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateT
                 spans.push(Span::raw(" · filter:"));
                 spans.push(Span::styled(
                     state.ui.filter.clone(),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme.warn),
                 ));
             }
         }
@@ -172,7 +174,7 @@ fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateT
     spans.push(Span::raw(" · sort:"));
     spans.push(Span::styled(
         state.ui.sort.label(),
-        Style::default().fg(Color::Cyan),
+        Style::default().fg(theme.accent),
     ));
 
     // Command-result toast — appended to the right of the banner
@@ -181,8 +183,8 @@ fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateT
     // before each render); here we just surface whatever is set.
     if let Some(s) = &state.command_status {
         let (glyph, color) = match s.kind {
-            crate::state::CommandStatusKind::Ok => ("✓", Color::Green),
-            crate::state::CommandStatusKind::Error => ("✗", Color::Red),
+            crate::state::CommandStatusKind::Ok => ("✓", theme.ok),
+            crate::state::CommandStatusKind::Error => ("✗", theme.err),
         };
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -195,11 +197,11 @@ fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateT
     frame.render_widget(para, area);
 }
 
-fn connection_label(status: &ConnectionStatus, now: DateTime<Utc>) -> Span<'static> {
+fn connection_label(status: &ConnectionStatus, now: DateTime<Utc>, theme: &Theme) -> Span<'static> {
     match status {
         ConnectionStatus::Connected { last_traffic } => Span::styled(
             format!("● connected ({})", format_elapsed(*last_traffic, now)),
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme.ok),
         ),
         ConnectionStatus::Reconnecting { since, last_error } => Span::styled(
             format!(
@@ -207,11 +209,11 @@ fn connection_label(status: &ConnectionStatus, now: DateTime<Utc>) -> Span<'stat
                 format_elapsed(*since, now),
                 last_error
             ),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warn),
         ),
         ConnectionStatus::Disconnected { reason } => Span::styled(
             format!("● offline — {reason}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.err),
         ),
     }
 }
@@ -255,20 +257,21 @@ fn render_jobs_table(frame: &mut Frame, area: Rect, state: &AppState, now: DateT
 }
 
 fn job_row<'a>(job: &'a Job, state: &AppState, now: DateTime<Utc>) -> Row<'a> {
+    let theme = &state.theme;
     let selected = state.ui.selected_job.as_ref() == Some(&job.id);
     let base_style = if selected {
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(theme.selection_bg)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
 
     let progress_cell = progress_cell(job);
-    let phase_span = phase_span(job.phase);
+    let phase_span = phase_span(job.phase, theme);
     let errs = job.progress.errors_total;
     let errs_style = if errs > 0 {
-        Style::default().fg(Color::Red)
+        Style::default().fg(theme.err)
     } else {
         Style::default()
     };
@@ -339,25 +342,26 @@ fn progress_bar(done: u64, total: u64, width: usize) -> String {
     s
 }
 
-fn phase_span(phase: Phase) -> Span<'static> {
+fn phase_span(phase: Phase, theme: &Theme) -> Span<'static> {
     let (label, color) = match phase {
-        Phase::Planned => ("Planned", Color::Gray),
-        Phase::Scanning => ("Scanning", Color::Cyan),
-        Phase::Copying => ("Copying", Color::Green),
-        Phase::Verifying => ("Verifying", Color::Cyan),
-        Phase::Cutover => ("Cutover", Color::Cyan),
-        Phase::Paused => ("Paused", Color::Yellow),
-        Phase::Completed => ("Completed", Color::Green),
-        Phase::Failed => ("Failed", Color::Red),
-        Phase::Cancelled => ("Cancelled", Color::Red),
+        Phase::Planned => ("Planned", theme.phase_planned),
+        Phase::Scanning => ("Scanning", theme.phase_scanning),
+        Phase::Copying => ("Copying", theme.phase_copying),
+        Phase::Verifying => ("Verifying", theme.phase_verifying),
+        Phase::Cutover => ("Cutover", theme.phase_cutover),
+        Phase::Paused => ("Paused", theme.phase_paused),
+        Phase::Completed => ("Completed", theme.phase_completed),
+        Phase::Failed => ("Failed", theme.phase_failed),
+        Phase::Cancelled => ("Cancelled", theme.phase_cancelled),
     };
     Span::styled(label, Style::default().fg(color))
 }
 
 fn header_style() -> Style {
-    Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD)
+    // Column headers stay bold-default; bold + terminal foreground
+    // reads well on both dark and light terminals without needing
+    // a theme-specific override.
+    Style::default().add_modifier(Modifier::BOLD)
 }
 
 // =============================================================================
@@ -365,6 +369,7 @@ fn header_style() -> Style {
 // =============================================================================
 
 fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: DateTime<Utc>) {
+    let theme = &state.theme;
     // Three-way switch: Filter mode wins (the only mode that takes
     // typed characters as literal input). Otherwise dispatch by view
     // — List shows the navigation bindings; Detail shows "back +
@@ -379,10 +384,7 @@ fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: Da
             Span::raw("  "),
             key_hint("Backspace", "delete"),
             Span::raw("  "),
-            Span::styled(
-                "(typing builds filter)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("(typing builds filter)", Style::default().fg(theme.muted)),
         ],
         (InputMode::Palette { buffer, .. }, _) => {
             // The palette owns the bottom row while it's active:
@@ -392,14 +394,14 @@ fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: Da
                 Span::styled(
                     ":",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{buffer}_"),
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
+                        .fg(theme.cursor_fg)
+                        .bg(theme.cursor_bg)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
@@ -469,10 +471,10 @@ fn tab_counts(state: &AppState, job_id: &JobId) -> TabCounts {
     }
 }
 
-fn render_tab_bar(frame: &mut Frame, area: Rect, current: Tab, counts: &TabCounts) {
+fn render_tab_bar(frame: &mut Frame, area: Rect, current: Tab, counts: &TabCounts, theme: &Theme) {
     let titles: Vec<Line<'static>> = Tab::all()
         .into_iter()
-        .map(|t| tab_label_with_counter(t, counts))
+        .map(|t| tab_label_with_counter(t, counts, theme))
         .collect();
     let selected = Tab::all()
         .into_iter()
@@ -483,7 +485,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, current: Tab, counts: &TabCount
         .divider("│")
         .highlight_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         );
     frame.render_widget(tabs, area);
@@ -493,13 +495,13 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, current: Tab, counts: &TabCount
 /// counter parenthetical color-coded (red on Errors when nonzero,
 /// yellow on Verify when nonzero, default otherwise). Tabs with no
 /// natural counter (Overview, Plan) render plain.
-fn tab_label_with_counter(t: Tab, c: &TabCounts) -> Line<'static> {
+fn tab_label_with_counter(t: Tab, c: &TabCounts, theme: &Theme) -> Line<'static> {
     let (n, color) = match t {
         Tab::Overview | Tab::Plan => (None, Color::Reset),
         Tab::Workers => (Some(c.workers), Color::Reset),
         Tab::Errors => {
             let style = if c.error_classes > 0 {
-                Color::Red
+                theme.err
             } else {
                 Color::Reset
             };
@@ -507,7 +509,7 @@ fn tab_label_with_counter(t: Tab, c: &TabCounts) -> Line<'static> {
         }
         Tab::Verify => {
             let style = if c.verify_mismatches > 0 {
-                Color::Yellow
+                theme.warn
             } else {
                 Color::Reset
             };
@@ -535,6 +537,7 @@ fn render_tab_body(
     tab: Tab,
     now: DateTime<Utc>,
 ) {
+    let theme = &state.theme;
     let job = match state.job(job_id) {
         Some(j) => j,
         None => {
@@ -544,7 +547,7 @@ fn render_tab_body(
             let text = Text::from(vec![
                 Line::from(Span::styled(
                     format!("Job '{}' not found.", job_id.as_str()),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(theme.err),
                 )),
                 Line::raw(""),
                 Line::from(Span::raw("Press Esc to return to the jobs list.")),
@@ -557,7 +560,7 @@ fn render_tab_body(
         Tab::Overview => render_overview_tab(frame, area, state, job, now),
         Tab::Workers => render_workers_tab(frame, area, state, job, now),
         Tab::Errors => render_errors_tab(frame, area, state, job, now),
-        Tab::Plan => render_plan_tab(frame, area, job),
+        Tab::Plan => render_plan_tab(frame, area, job, theme),
         Tab::Verify => render_verify_tab(frame, area, state, job, now),
     }
 }
@@ -569,6 +572,7 @@ fn render_overview_tab(
     job: &Job,
     now: DateTime<Utc>,
 ) {
+    let theme = &state.theme;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // ---- Identity --------------------------------------------------
@@ -594,7 +598,10 @@ fn render_overview_tab(
 
     // ---- Status ---------------------------------------------------
     lines.push(section_header("Status"));
-    lines.push(Line::from(vec![kv_key("Phase"), phase_span(job.phase)]));
+    lines.push(Line::from(vec![
+        kv_key("Phase"),
+        phase_span(job.phase, theme),
+    ]));
     lines.push(kv_line("Files", files_summary(job)));
     lines.push(kv_line("Bytes", bytes_summary(job)));
     lines.push(kv_line("Errors", format!("{}", job.progress.errors_total)));
@@ -641,6 +648,7 @@ fn render_errors_tab(
     job: &Job,
     now: DateTime<Utc>,
 ) {
+    let theme = &state.theme;
     // Sort buckets by count desc so the loudest class lands on top.
     let mut buckets: Vec<&ErrorBucket> = state.errors_for_job(&job.id).iter().collect();
     buckets.sort_by(|a, b| b.count.cmp(&a.count));
@@ -653,7 +661,7 @@ fn render_errors_tab(
         let text = Text::from(vec![
             Line::from(Span::styled(
                 "No errors recorded for this job.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             )),
             Line::raw(""),
             Line::from(Span::raw(
@@ -684,26 +692,26 @@ fn render_errors_tab(
         Span::raw("  ·  "),
         Span::styled(
             format!("{} total errors", total_count),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.err),
         ),
         Span::raw("  ·  recent tail below"),
     ]);
     frame.render_widget(Paragraph::new(legend), chunks[0]);
 
-    render_error_buckets_table(frame, chunks[1], &buckets, now);
+    render_error_buckets_table(frame, chunks[1], &buckets, now, theme);
 
     let tail_header = Line::from(vec![
         Span::styled(
             "Recent",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!("  ({} shown, newest last)", tail.len())),
     ]);
     frame.render_widget(Paragraph::new(tail_header), chunks[2]);
 
-    render_recent_errors_tail(frame, chunks[3], &tail, now);
+    render_recent_errors_tail(frame, chunks[3], &tail, now, theme);
 }
 
 fn render_error_buckets_table(
@@ -711,6 +719,7 @@ fn render_error_buckets_table(
     area: Rect,
     buckets: &[&ErrorBucket],
     now: DateTime<Utc>,
+    theme: &Theme,
 ) {
     let header = Row::new(vec![
         Cell::from(Span::styled("Class", header_style())),
@@ -732,15 +741,15 @@ fn render_error_buckets_table(
                 .unwrap_or_else(|| "—".to_string());
             let retry_label = if b.retryable { "yes" } else { "no" };
             let retry_style = if b.retryable {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(theme.warn)
             } else {
-                Style::default().fg(Color::Red)
+                Style::default().fg(theme.err)
             };
             Row::new(vec![
                 Cell::from(format_error_class(&b.class)),
                 Cell::from(Span::styled(
                     format!("{}", b.count),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(theme.err),
                 )),
                 Cell::from(format_elapsed(b.first_seen, now)),
                 Cell::from(format_elapsed(b.last_seen, now)),
@@ -767,11 +776,12 @@ fn render_recent_errors_tail(
     area: Rect,
     tail: &[&RecentError],
     now: DateTime<Utc>,
+    theme: &Theme,
 ) {
     if tail.is_empty() {
         let p = Paragraph::new(Span::styled(
             "(no recent errors)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         ));
         frame.render_widget(p, area);
         return;
@@ -820,7 +830,7 @@ fn format_error_class(c: &ErrorClass) -> String {
 // Plan tab
 // =============================================================================
 
-fn render_plan_tab(frame: &mut Frame, area: Rect, job: &Job) {
+fn render_plan_tab(frame: &mut Frame, area: Rect, job: &Job, theme: &Theme) {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // Config hash up top — operators correlate this with the
@@ -832,7 +842,7 @@ fn render_plan_tab(frame: &mut Frame, area: Rect, job: &Job) {
         Span::styled(
             job.config_hash.0.clone(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -866,6 +876,7 @@ fn render_verify_tab(
     job: &Job,
     now: DateTime<Utc>,
 ) {
+    let theme = &state.theme;
     let status = state.verify_status_for_job(&job.id);
     let mismatches = state
         .recent_verify_mismatches_for_job(&job.id)
@@ -878,7 +889,7 @@ fn render_verify_tab(
         let text = Text::from(vec![
             Line::from(Span::styled(
                 "Verify phase has not run for this job.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             )),
             Line::raw(""),
             Line::from(Span::raw(
@@ -886,7 +897,7 @@ fn render_verify_tab(
             )),
             Line::raw(""),
             Line::from(Span::raw("Current phase: ")),
-            Line::from(vec![Span::raw("  "), phase_span(job.phase)]),
+            Line::from(vec![Span::raw("  "), phase_span(job.phase, theme)]),
         ]);
         frame.render_widget(Paragraph::new(text), area);
         return;
@@ -901,19 +912,19 @@ fn render_verify_tab(
         ])
         .split(area);
 
-    render_verify_status_panel(frame, chunks[0], &status, job, now);
+    render_verify_status_panel(frame, chunks[0], &status, job, now, theme);
 
     let tail_header = Line::from(vec![
         Span::styled(
             "Recent mismatches",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!("  ({} shown, newest last)", mismatches.len())),
     ]);
     frame.render_widget(Paragraph::new(tail_header), chunks[1]);
-    render_verify_mismatches_tail(frame, chunks[2], &mismatches, now);
+    render_verify_mismatches_tail(frame, chunks[2], &mismatches, now, theme);
 }
 
 fn render_verify_status_panel(
@@ -922,10 +933,14 @@ fn render_verify_status_panel(
     status: &VerifyStatus,
     job: &Job,
     now: DateTime<Utc>,
+    theme: &Theme,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(section_header("Status"));
-    lines.push(Line::from(vec![kv_key("Phase"), phase_span(job.phase)]));
+    lines.push(Line::from(vec![
+        kv_key("Phase"),
+        phase_span(job.phase, theme),
+    ]));
     let started = status
         .last_started
         .map(|t| format_elapsed(t, now))
@@ -939,18 +954,18 @@ fn render_verify_status_panel(
     let result_line: Line<'static> = match status.last_mismatches {
         None => Line::from(vec![
             kv_key("Result"),
-            Span::styled("(pending)", Style::default().fg(Color::DarkGray)),
+            Span::styled("(pending)", Style::default().fg(theme.muted)),
         ]),
         Some(0) => Line::from(vec![
             kv_key("Result"),
             Span::styled(
                 "0 mismatches — verify ok".to_string(),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.ok),
             ),
         ]),
         Some(n) => Line::from(vec![
             kv_key("Result"),
-            Span::styled(format!("{n} mismatches"), Style::default().fg(Color::Red)),
+            Span::styled(format!("{n} mismatches"), Style::default().fg(theme.err)),
         ]),
     };
     lines.push(result_line);
@@ -962,12 +977,13 @@ fn render_verify_mismatches_tail(
     area: Rect,
     tail: &[&RecentVerifyMismatch],
     now: DateTime<Utc>,
+    theme: &Theme,
 ) {
     if tail.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "(no individual mismatches captured yet)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             )),
             area,
         );
@@ -1012,12 +1028,13 @@ fn render_workers_tab(
     job: &Job,
     now: DateTime<Utc>,
 ) {
+    let theme = &state.theme;
     let workers = visible_workers(state, &job.id);
     if workers.is_empty() {
         let text = Text::from(vec![
             Line::from(Span::styled(
                 "No workers assigned to this job.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             )),
             Line::raw(""),
             Line::from(Span::raw("When a worker registers it will appear here.")),
@@ -1041,7 +1058,7 @@ fn render_workers_tab(
         Span::raw("  ·  sort:"),
         Span::styled(
             state.ui.worker_sort.label(),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.accent),
         ),
         Span::raw("  ·  press 's' to cycle, Enter to drill in"),
     ]);
@@ -1076,10 +1093,11 @@ fn render_workers_tab(
 }
 
 fn worker_row<'a>(w: &'a Worker, state: &AppState, now: DateTime<Utc>) -> Row<'a> {
+    let theme = &state.theme;
     let selected = state.ui.selected_worker.as_ref() == Some(&w.id);
     let base_style = if selected {
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(theme.selection_bg)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -1091,7 +1109,7 @@ fn worker_row<'a>(w: &'a Worker, state: &AppState, now: DateTime<Utc>) -> Row<'a
     };
     Row::new(vec![
         Cell::from(host),
-        Cell::from(worker_state_span(w.state)),
+        Cell::from(worker_state_span(w.state, theme)),
         Cell::from(format_bytes(w.counters.bytes_per_sec as u64)),
         Cell::from(format!("{:.1}", w.counters.files_per_sec)),
         Cell::from(format!("{:.1}", w.counters.errors_per_min)),
@@ -1102,16 +1120,16 @@ fn worker_row<'a>(w: &'a Worker, state: &AppState, now: DateTime<Utc>) -> Row<'a
     .style(base_style)
 }
 
-fn worker_state_span(s: WorkerState) -> Span<'static> {
+fn worker_state_span(s: WorkerState, theme: &Theme) -> Span<'static> {
     let (label, color) = match s {
-        WorkerState::Idle => ("Idle", Color::Gray),
-        WorkerState::Scanning => ("Scanning", Color::Cyan),
-        WorkerState::Copying => ("Copying", Color::Green),
-        WorkerState::Verifying => ("Verifying", Color::Cyan),
-        WorkerState::Draining => ("Draining", Color::Yellow),
-        WorkerState::Fenced => ("Fenced", Color::Red),
-        WorkerState::Failed => ("Failed", Color::Red),
-        WorkerState::Disconnected => ("Discon.", Color::DarkGray),
+        WorkerState::Idle => ("Idle", theme.worker_idle),
+        WorkerState::Scanning => ("Scanning", theme.worker_scanning),
+        WorkerState::Copying => ("Copying", theme.worker_copying),
+        WorkerState::Verifying => ("Verifying", theme.worker_verifying),
+        WorkerState::Draining => ("Draining", theme.worker_draining),
+        WorkerState::Fenced => ("Fenced", theme.worker_fenced),
+        WorkerState::Failed => ("Failed", theme.worker_failed),
+        WorkerState::Disconnected => ("Discon.", theme.worker_disconnected),
     };
     Span::styled(label, Style::default().fg(color))
 }
@@ -1163,18 +1181,19 @@ fn render_modal(
     modal: &Modal,
     now: DateTime<Utc>,
 ) {
+    let theme = &state.theme;
     match modal {
         Modal::WorkerDetail { worker_id } => {
             render_worker_modal(frame, body_area, state, worker_id, now)
         }
         Modal::ConfirmCommand { command, summary } => {
-            render_confirm_command_modal(frame, body_area, command, summary)
+            render_confirm_command_modal(frame, body_area, command, summary, theme)
         }
-        Modal::Help => render_help_modal(frame, body_area),
+        Modal::Help => render_help_modal(frame, body_area, theme),
     }
 }
 
-fn render_help_modal(frame: &mut Frame, body_area: Rect) {
+fn render_help_modal(frame: &mut Frame, body_area: Rect, theme: &Theme) {
     // 90% tall on purpose — five binding sections + section
     // separators run ~28 lines; clipping is the worst possible UX
     // for a reference card.
@@ -1183,7 +1202,7 @@ fn render_help_modal(frame: &mut Frame, body_area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Help: keybindings (Esc to close) ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1193,13 +1212,13 @@ fn render_help_modal(frame: &mut Frame, body_area: Rect) {
         lines.push(Line::from(Span::styled(
             title.to_string(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )));
     };
     let push_kv = |lines: &mut Vec<Line<'static>>, key: &str, desc: &str| {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {key:<14}"), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("  {key:<14}"), Style::default().fg(theme.warn)),
             Span::raw(desc.to_string()),
         ]));
     };
@@ -1261,6 +1280,7 @@ fn render_confirm_command_modal(
     body_area: Rect,
     command: &crate::palette::PaletteCommand,
     summary: &str,
+    theme: &Theme,
 ) {
     // 60% wide is enough for one-line summaries; 60% tall fits the
     // borders + 6 body lines (summary + "this will change…" hint +
@@ -1270,7 +1290,7 @@ fn render_confirm_command_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" Confirm: {} ", command.verb()))
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(theme.warn));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1283,21 +1303,19 @@ fn render_confirm_command_modal(
         Line::raw(""),
         Line::from(Span::styled(
             "This action will change job state on the coord.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.muted),
         )),
         Line::raw(""),
         Line::from(vec![
             Span::raw("Proceed? "),
             Span::styled(
                 "y",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.ok).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" / "),
             Span::styled(
                 "n",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" (Esc also cancels)"),
         ]),
@@ -1312,6 +1330,7 @@ fn render_worker_modal(
     worker_id: &WorkerId,
     now: DateTime<Utc>,
 ) {
+    let theme = &state.theme;
     let area = centered_rect(70, 70, body_area);
     // Clear under the modal so the workers table beneath doesn't
     // bleed through.
@@ -1319,7 +1338,7 @@ fn render_worker_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Worker detail (Esc to close) ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1327,7 +1346,7 @@ fn render_worker_modal(
         let text = Text::from(vec![
             Line::from(Span::styled(
                 format!("Worker '{worker_id}' not found."),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.err),
             )),
             Line::raw(""),
             Line::from(Span::raw("Press Esc to close.")),
@@ -1349,7 +1368,7 @@ fn render_worker_modal(
     lines.push(section_header("State"));
     lines.push(Line::from(vec![
         kv_key("State"),
-        worker_state_span(w.state),
+        worker_state_span(w.state, theme),
     ]));
     lines.push(kv_line("Last HB", format_elapsed(w.last_heartbeat, now)));
     lines.push(kv_line("Inflight", format!("{} ops", w.inflight_ops)));
@@ -1382,7 +1401,7 @@ fn render_worker_modal(
         if let Some(reason) = &w.fence_reason {
             lines.push(Line::from(vec![
                 kv_key("Fenced"),
-                Span::styled(reason.clone(), Style::default().fg(Color::Red)),
+                Span::styled(reason.clone(), Style::default().fg(theme.err)),
             ]));
         }
     }
@@ -1413,20 +1432,20 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 // ----- small helpers for the Overview layout -----
 
 fn section_header(label: &str) -> Line<'static> {
+    // Section headers are styled bold only — the theme accent
+    // varies between dark / light / NO_COLOR and we want the
+    // header to stand out without relying on a specific color.
     Line::from(Span::styled(
         label.to_string(),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        Style::default().add_modifier(Modifier::BOLD),
     ))
 }
 
 fn kv_key(label: &str) -> Span<'static> {
     // 13-char column for the key so values align across lines.
-    Span::styled(
-        format!("  {label:<11}"),
-        Style::default().fg(Color::DarkGray),
-    )
+    // Color-less: the dimmer terminal-default already separates
+    // key from value visually.
+    Span::raw(format!("  {label:<11}"))
 }
 
 fn kv_line(label: &str, value: impl Into<String>) -> Line<'static> {
@@ -1462,10 +1481,11 @@ fn bytes_summary(job: &Job) -> String {
 }
 
 fn key_hint(key: &str, label: &str) -> Span<'static> {
-    Span::styled(
-        format!("{key} {label}"),
-        Style::default().fg(Color::DarkGray),
-    )
+    // Bottom-row hints use terminal-default rather than a muted
+    // theme color so the readability is consistent across NO_COLOR
+    // sessions (where a dim DarkGray would otherwise render
+    // invisibly on dark terminals).
+    Span::raw(format!("{key} {label}"))
 }
 
 // =============================================================================
@@ -2689,5 +2709,77 @@ mod tests {
         assert!(text.contains("y"));
         assert!(text.contains("n"));
         assert!(text.contains("Esc also cancels"));
+    }
+
+    // ----- Theme (Phase 6c) -----
+
+    /// Scan every cell in the buffer for any non-Reset foreground
+    /// or background color. Used to assert that NO_COLOR truly
+    /// neutralized the output.
+    fn any_color_set(buf: &ratatui::buffer::Buffer) -> bool {
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = buf.cell((x, y)).unwrap();
+                if cell.style().fg.unwrap_or(ratatui::style::Color::Reset)
+                    != ratatui::style::Color::Reset
+                {
+                    return true;
+                }
+                if cell.style().bg.unwrap_or(ratatui::style::Color::Reset)
+                    != ratatui::style::Color::Reset
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn no_color_theme_renders_with_zero_colored_cells() {
+        // Force the NO_COLOR palette on state and verify every cell
+        // of the rendered buffer comes out with Color::Reset for
+        // both foreground and background.
+        let mut s = AppState::empty(at(0)).with_theme(crate::theme::Theme::no_color());
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        // Throw some color-bearing state into the mix: a Paused
+        // job (yellow under the dark theme), some errors (red),
+        // a selected row (DarkGray bg), and a non-empty filter
+        // (yellow). All of these MUST come out neutral.
+        s.apply_envelope(&env(
+            2,
+            10,
+            EventKind::JobPaused {
+                job_id: jid("alpha"),
+                reason: "x".into(),
+            },
+        ));
+        s.ui.selected_job = Some(jid("alpha"));
+        s.ui.filter = "alpha".into();
+        s.set_command_ok("pause ok", at(0));
+
+        let buf = render_to_buffer(&s, at(0), 120, 16);
+        assert!(
+            !any_color_set(&buf),
+            "NO_COLOR palette must render zero colored cells"
+        );
+    }
+
+    #[test]
+    fn default_dark_theme_renders_at_least_one_colored_cell() {
+        // Companion sanity check — if the dark theme ALSO ended up
+        // neutral, no_color_theme_renders_with_zero_colored_cells
+        // would trivially pass even after a regression that broke
+        // theme threading. The dark theme must put SOME color
+        // somewhere on a populated state.
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        let buf = render_to_buffer(&s, at(0), 120, 16);
+        assert!(
+            any_color_set(&buf),
+            "dark theme must render at least one colored cell"
+        );
     }
 }
