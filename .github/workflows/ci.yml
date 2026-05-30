@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build + run the test suite.
+  # ---------------------------------------------------------------------------
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install libnfs build deps
+        # migration-mover's build.rs links against libnfs. Match the
+        # versions the lab cluster uses.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnfs-dev pkg-config
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo build
+        run: cargo build --workspace --all-targets
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  # ---------------------------------------------------------------------------
+  # cargo-deny: license allowlist, advisory db, banned wildcards,
+  # crates.io-only sources. Config in deny.toml.
+  # ---------------------------------------------------------------------------
+  deny:
+    name: cargo deny check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  # ---------------------------------------------------------------------------
+  # cargo-about: produce THIRD_PARTY_LICENSES.md and ship it as a
+  # workflow artifact. Config in about.toml + about.hbs.
+  # ---------------------------------------------------------------------------
+  licenses:
+    name: third-party licenses
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      - name: Generate THIRD_PARTY_LICENSES.md
+        # `cargo about generate` walks the workspace dependency
+        # graph, materializes each crate's license text, and
+        # renders it through about.hbs.
+        run: cargo about generate about.hbs > THIRD_PARTY_LICENSES.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: third-party-licenses
+          path: THIRD_PARTY_LICENSES.md
+          if-no-files-found: error
+          retention-days: 90

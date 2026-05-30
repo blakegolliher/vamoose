@@ -1,0 +1,81 @@
+# cargo-deny configuration.
+#
+# Run locally:
+#   cargo install --locked cargo-deny
+#   cargo deny check
+#
+# CI runs this on every PR via .github/workflows/ci.yml.
+
+# -----------------------------------------------------------------------------
+# Advisories — block any dependency with an open RustSec advisory.
+# -----------------------------------------------------------------------------
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# `ignore = ["RUSTSEC-XXXX-YYYY"]` is the escape hatch — leave empty
+# until something forces a temporary exception. Every entry should
+# have a comment with the justification + a deadline.
+ignore = []
+
+# -----------------------------------------------------------------------------
+# Licenses — what's allowed to ship inside vamoose binaries.
+#
+# vamoose itself is AGPL-3.0-only (per workspace Cargo.toml). The
+# deps allowlist is the small set of widely-permissive licenses
+# we've already seen in the dependency tree. Anything outside this
+# list needs a deliberate exception via `exceptions` below + a
+# reviewer note explaining why.
+# -----------------------------------------------------------------------------
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    # `ring` and a few crypto crates use a hybrid OpenSSL/ISC-style
+    # license that SPDX names "OpenSSL". Required by hyper-rustls.
+    "OpenSSL",
+]
+
+# Per-crate exceptions — keep this empty by default. Use only when a
+# critical dep has a non-standard license that's been reviewed.
+exceptions = []
+
+# -----------------------------------------------------------------------------
+# Bans — duplicate versions, wildcard requirements, banned crates.
+# -----------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Skip the duplicate-versions check for common ecosystem churn where
+# we can't easily unify (e.g. hashbrown / windows-sys / etc).
+skip = []
+skip-tree = []
+
+# Crates we never want to depend on — leave empty until a concrete
+# ban is needed.
+deny = []
+
+# -----------------------------------------------------------------------------
+# Sources — only crates.io. Git deps are flagged unless explicitly
+# allowed.
+# -----------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
