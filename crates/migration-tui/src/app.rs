@@ -145,6 +145,11 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> AppAction {
     if let Some(Modal::ConfirmCommand { .. }) = &state.ui.modal {
         return handle_key_confirm_command(state, key);
     }
+    // Help modal: same "intercept first" treatment so its Esc
+    // closes itself and doesn't bubble up to "back / quit".
+    if let Some(Modal::Help) = &state.ui.modal {
+        return handle_key_help_modal(state, key);
+    }
     match &state.ui.input_mode {
         InputMode::Normal => handle_key_normal(state, key),
         InputMode::Filter { .. } => handle_key_filter(state, key),
@@ -154,6 +159,18 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> AppAction {
 
 /// Confirm-command modal handler. Intercepts BEFORE view dispatch
 /// so y/n can't accidentally activate underlying tab navigation.
+fn handle_key_help_modal(state: &mut AppState, key: KeyEvent) -> AppAction {
+    match key.code {
+        // `q` still quits — emergency-exit ergonomics.
+        KeyCode::Char('q') | KeyCode::Char('Q') => AppAction::Quit,
+        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('?') => {
+            state.ui.modal = None;
+            AppAction::Continue
+        }
+        _ => AppAction::Continue,
+    }
+}
+
 fn handle_key_confirm_command(state: &mut AppState, key: KeyEvent) -> AppAction {
     // Pull the command out so we can fire it on confirm without
     // borrowing state through the match guard.
@@ -390,6 +407,10 @@ fn handle_key_list_normal(state: &mut AppState, key: KeyEvent) -> AppAction {
             };
             AppAction::Continue
         }
+        KeyCode::Char('?') => {
+            state.ui.modal = Some(Modal::Help);
+            AppAction::Continue
+        }
         KeyCode::Char('s') => {
             state.ui.sort = state.ui.sort.cycle();
             AppAction::Continue
@@ -512,6 +533,10 @@ fn handle_key_detail_base(state: &mut AppState, key: KeyEvent) -> AppAction {
                 buffer: String::new(),
                 completion_idx: 0,
             };
+            AppAction::Continue
+        }
+        KeyCode::Char('?') => {
+            state.ui.modal = Some(Modal::Help);
             AppAction::Continue
         }
         _ => AppAction::Continue,
@@ -1781,6 +1806,64 @@ mod tests {
         });
         handle_input(&mut s, Input::Key(key(KeyCode::Esc)), at(0));
         assert!(s.ui.modal.is_none());
+    }
+
+    // ----- Help overlay (Phase 6b) -----
+
+    #[test]
+    fn question_mark_opens_help_modal_from_list() {
+        let mut s = seed_two_jobs();
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('?'))), at(0));
+        assert!(matches!(s.ui.modal, Some(Modal::Help)));
+    }
+
+    #[test]
+    fn question_mark_opens_help_modal_from_detail() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("alpha"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('?'))), at(0));
+        assert!(matches!(s.ui.modal, Some(Modal::Help)));
+    }
+
+    #[test]
+    fn esc_closes_help_modal_without_quitting() {
+        let mut s = seed_two_jobs();
+        s.ui.modal = Some(Modal::Help);
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Esc)), at(0));
+        assert_eq!(action, AppAction::Continue);
+        assert!(s.ui.modal.is_none());
+    }
+
+    #[test]
+    fn question_mark_in_help_also_closes_it() {
+        let mut s = seed_two_jobs();
+        s.ui.modal = Some(Modal::Help);
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('?'))), at(0));
+        assert!(s.ui.modal.is_none());
+    }
+
+    #[test]
+    fn q_with_help_modal_still_quits() {
+        let mut s = seed_two_jobs();
+        s.ui.modal = Some(Modal::Help);
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Char('q'))), at(0));
+        assert_eq!(action, AppAction::Quit);
+    }
+
+    #[test]
+    fn nav_keys_inert_when_help_modal_open() {
+        let mut s = seed_two_jobs();
+        s.ui.modal = Some(Modal::Help);
+        s.ui.selected_job = Some(jid("alpha"));
+        let before = s.ui.selected_job.clone();
+        handle_input(&mut s, Input::Key(key(KeyCode::Down)), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Tab)), at(0));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char('s'))), at(0));
+        // Selection / sort / view untouched.
+        assert_eq!(s.ui.selected_job, before);
+        assert!(matches!(s.ui.view, View::List));
+        assert!(s.ui.modal.is_some(), "help modal must stay open");
     }
 
     #[test]

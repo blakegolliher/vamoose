@@ -51,6 +51,17 @@ pub fn render(frame: &mut Frame, state: &AppState, now: DateTime<Utc>) {
         View::List => render_list(frame, state, now),
         View::Detail { job_id, tab } => render_detail(frame, state, now, job_id, *tab),
     }
+    // Modal overlays render LAST so they sit over whichever view
+    // is underneath. Help is reachable from both List and Detail,
+    // so it can't live inside the Detail-only `render_detail`
+    // branch — and even modals that originate in Detail (like
+    // WorkerDetail) gain robustness from being drawn here: if a
+    // future code path leaves a modal set while the view switches,
+    // the operator still sees it instead of a silently-empty
+    // background.
+    if let Some(modal) = &state.ui.modal {
+        render_modal(frame, frame.area(), state, modal, now);
+    }
 }
 
 fn render_list(frame: &mut Frame, state: &AppState, now: DateTime<Utc>) {
@@ -90,14 +101,8 @@ fn render_detail(
     render_tab_bar(frame, chunks[1], tab, &counts);
     render_tab_body(frame, chunks[2], state, job_id, tab, now);
     render_bottom_hints(frame, chunks[3], state, now);
-
-    // Modal overlays the tab body — render AFTER the body so the
-    // modal frame paints on top. The body content underneath is
-    // dimmed only by the modal's opaque Clear region; the operator
-    // can still see the surrounding banner / tab bar / hints.
-    if let Some(modal) = &state.ui.modal {
-        render_modal(frame, chunks[2], state, modal, now);
-    }
+    // Modal rendering happens in the top-level `render()` so it
+    // also applies to the List view's Help overlay.
 }
 
 // =============================================================================
@@ -411,6 +416,8 @@ fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: Da
             key_hint("/", "filter"),
             Span::raw("  "),
             key_hint(":", "command"),
+            Span::raw("  "),
+            key_hint("?", "help"),
             Span::raw("  "),
             key_hint("s", "sort"),
             Span::raw("  "),
@@ -1163,7 +1170,90 @@ fn render_modal(
         Modal::ConfirmCommand { command, summary } => {
             render_confirm_command_modal(frame, body_area, command, summary)
         }
+        Modal::Help => render_help_modal(frame, body_area),
     }
+}
+
+fn render_help_modal(frame: &mut Frame, body_area: Rect) {
+    // 90% tall on purpose — five binding sections + section
+    // separators run ~28 lines; clipping is the worst possible UX
+    // for a reference card.
+    let area = centered_rect(70, 90, body_area);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Help: keybindings (Esc to close) ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let push_section = |lines: &mut Vec<Line<'static>>, title: &str| {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+    };
+    let push_kv = |lines: &mut Vec<Line<'static>>, key: &str, desc: &str| {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key:<14}"), Style::default().fg(Color::Yellow)),
+            Span::raw(desc.to_string()),
+        ]));
+    };
+
+    push_section(&mut lines, "Navigation (Jobs list)");
+    push_kv(&mut lines, "↑ / ↓", "move cursor");
+    push_kv(&mut lines, "Home / End", "jump to first / last job");
+    push_kv(&mut lines, "Enter", "open job detail view");
+    push_kv(&mut lines, "q / Q / Esc", "quit");
+
+    push_section(&mut lines, "Filter & sort (Jobs list)");
+    push_kv(&mut lines, "/", "enter filter mode (live)");
+    push_kv(
+        &mut lines,
+        "s",
+        "cycle sort: id → phase → progress → errors",
+    );
+    push_kv(&mut lines, "Enter (filter)", "commit filter");
+    push_kv(
+        &mut lines,
+        "Esc (filter)",
+        "cancel — revert to prior filter",
+    );
+
+    push_section(&mut lines, "Detail view");
+    push_kv(&mut lines, "Esc / Backspace", "back to jobs list");
+    push_kv(&mut lines, "Tab", "next tab");
+    push_kv(&mut lines, "Shift-Tab", "previous tab");
+
+    push_section(&mut lines, "Workers tab");
+    push_kv(&mut lines, "↑ / ↓", "move worker cursor (wraps)");
+    push_kv(
+        &mut lines,
+        "s",
+        "cycle sort: mb/s → files/s → errors → host",
+    );
+    push_kv(&mut lines, "Enter", "open worker drill-down modal");
+
+    push_section(&mut lines, "Command palette");
+    push_kv(&mut lines, ":", "open palette");
+    push_kv(&mut lines, "Tab", "cycle completions");
+    push_kv(&mut lines, "Enter", "run (destructive verbs prompt y/n)");
+    push_kv(&mut lines, "Esc", "cancel");
+    push_kv(
+        &mut lines,
+        "verbs",
+        "pause / resume / cancel / drain / retry-failed",
+    );
+    push_kv(&mut lines, "local verbs", "help, quit");
+
+    push_section(&mut lines, "Other");
+    push_kv(&mut lines, "?", "this help overlay");
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn render_confirm_command_modal(
@@ -2534,6 +2624,49 @@ mod tests {
         let banner = buffer_row(&buf, 0);
         assert!(banner.contains("✗"));
         assert!(banner.contains("401"));
+    }
+
+    #[test]
+    fn help_modal_renders_with_section_headers() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.ui.modal = Some(crate::state::Modal::Help);
+        // Tall buffer so the bottom Command palette + Other
+        // sections fit without clipping. Real terminals are
+        // routinely 24+ rows; on those the modal scrolls cleanly
+        // because the body is a Paragraph that wraps to the
+        // available area.
+        let buf = render_to_buffer(&s, at(0), 100, 40);
+        let text = buffer_text(&buf);
+        assert!(text.contains("Help: keybindings"));
+        // All section headers present.
+        for section in [
+            "Navigation (Jobs list)",
+            "Filter & sort",
+            "Detail view",
+            "Workers tab",
+            "Command palette",
+        ] {
+            assert!(
+                text.contains(section),
+                "missing help section '{section}' in:\n{text}"
+            );
+        }
+        // Spot-check a few bindings.
+        assert!(text.contains("open job detail"));
+        assert!(text.contains("open palette"));
+        assert!(text.contains("pause / resume / cancel"));
+    }
+
+    #[test]
+    fn normal_bottom_hints_advertise_question_mark_for_help() {
+        let s = AppState::empty(at(0));
+        let buf = render_to_buffer(&s, at(0), 100, 8);
+        let last = buffer_row(&buf, buf.area.height - 1);
+        assert!(
+            last.contains("? help"),
+            "expected '? help' hint in: >>>{last}<<<"
+        );
     }
 
     #[test]

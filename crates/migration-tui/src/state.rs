@@ -104,6 +104,8 @@ pub struct UiState {
 ///   of destructive verbs (cancel, drain, retry-failed). On `y`
 ///   the event loop dispatches the command; on `n`/Esc it closes
 ///   without sending anything.
+/// - `Help` — reference card listing every keybinding. Opened with
+///   `?` from any Normal-mode view; closed with Esc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     WorkerDetail {
@@ -121,6 +123,7 @@ pub enum Modal {
         /// transitions can't desync the title from the action.
         summary: String,
     },
+    Help,
 }
 
 /// Top-level view dispatcher. Phase 4 had only the jobs list;
