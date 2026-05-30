@@ -376,6 +376,35 @@ impl S3Client {
         })
     }
 
+    /// Delete an object unconditionally. The coord uses this on the
+    /// archive path (after copying an `events/<job>/` chunk into
+    /// `archivelogs/<job>/`, the source chunk is removed). Workers do
+    /// not use this — claim deletes go through `delete_if_match` for
+    /// the v2 protocol's safety.
+    ///
+    /// Treats `404 NoSuchKey` as success: idempotent retry of an
+    /// already-deleted key is harmless and the caller (archive)
+    /// should not have to special-case it.
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        match self
+            .inner
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(SdkError::ServiceError(svc))
+                if svc.raw().status().as_u16() == 404
+                    || svc.err().meta().code().unwrap_or_default() == "NoSuchKey" =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(Error::Other(anyhow::anyhow!("S3 DELETE {key}: {e:?}"))),
+        }
+    }
+
     /// Upload an object unconditionally. Used for progress, batches,
     /// failures — anything that isn't a claim.
     pub async fn put(&self, key: &str, body: Vec<u8>) -> Result<String> {

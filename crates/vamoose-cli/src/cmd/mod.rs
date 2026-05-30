@@ -1,8 +1,10 @@
 pub mod aggr;
+pub mod coord;
 pub mod doctor;
 pub mod init;
 pub mod rewrite;
 pub mod run;
 pub mod status;
+pub mod tui;
 pub mod walker;
 pub mod worker;

@@ -1,0 +1,52 @@
+[package]
+name        = "migration-coord"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "Control-plane coordinator: schema, S3-backed event log + snapshot + lease"
+
+[features]
+# Re-exports a small set of `assert_*` self-check helpers (currently
+# only `state::assert_replay_is_idempotent`) so an integration test in
+# tests/ — and the future `vamoose coord doctor` subcommand — can run
+# them. Unit tests inside the crate get the same items via
+# `#[cfg(test)]` without needing the feature.
+test-helpers = []
+
+[dependencies]
+migration-core = { workspace = true }
+
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+chrono      = { workspace = true }
+uuid        = { workspace = true }
+async-trait = { workspace = true }
+async-stream = { workspace = true }
+futures     = { workspace = true }
+hex         = { workspace = true }
+
+# HTTP layer (Phase 2)
+axum        = { workspace = true }
+axum-server = { workspace = true }
+tower       = { workspace = true }
+tower-http  = { workspace = true }
+http        = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+# VAST integration tests (gated by env vars; #[ignore]'d by default).
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+
+# In-process router tests via tower::ServiceExt::oneshot
+http-body-util = "0.1"
+
+# End-to-end SSE wire test (binds a real listener, reads frames).
+reqwest = { workspace = true }

@@ -146,6 +146,11 @@ fn build_worker_config(cfg: &Config) -> anyhow::Result<wcfg::Config> {
             failure_pct_threshold: 5.0,
             throughput_floor_mb_s: 100,
         },
+        // Coord wiring is not exposed in the unified vamoose.toml
+        // yet (Phase 3.5). Operators opt in via `mig-worker` with a
+        // worker.toml `[coord]` block until the unified config grows
+        // a [coord] section of its own.
+        coord: None,
     })
 }
 

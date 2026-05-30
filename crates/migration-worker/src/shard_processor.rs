@@ -65,6 +65,11 @@ pub struct ShardProcessor {
     /// Set true the first time we see an `inode`-bearing row with no
     /// `fsid`; gates the one-shot WARN + `FsidUngrouped` downgrade.
     pub fsid_fallback_warned: bool,
+    /// Coord event emitter. Disabled in legacy S3-only mode (every
+    /// call is a no-op); when enabled, `record_outcome` pushes a
+    /// `WorkerEventDraft` per file outcome so the coord_driver can
+    /// coalesce a `ProgressDelta` for `/workers/{id}/events`.
+    pub emitter: crate::coord_driver::EventEmitter,
 }
 
 impl ShardProcessor {
@@ -233,7 +238,14 @@ impl ShardProcessor {
     }
 
     fn record(&mut self, row: &RowView, mo: MoveOutcome, outcome: &mut ProcessOutcome) {
-        record_outcome(&row.path, mo, outcome, &self.failures, &self.throughput);
+        record_outcome(
+            &row.path,
+            mo,
+            outcome,
+            &self.failures,
+            &self.throughput,
+            &self.emitter,
+        );
     }
 }
 
@@ -247,12 +259,16 @@ fn record_outcome(
     outcome: &mut ProcessOutcome,
     failures: &FailureSink,
     throughput: &ThroughputCounter,
+    emitter: &crate::coord_driver::EventEmitter,
 ) {
     match mo.result {
         Ok(()) => {
             outcome.files_ok += 1;
             outcome.bytes_moved = outcome.bytes_moved.saturating_add(mo.bytes_moved);
             throughput.add(mo.bytes_moved);
+            // Best-effort: push a per-file event draft. Disabled in
+            // legacy mode; never blocks the processor.
+            emitter.progress_ok(mo.bytes_moved);
         }
         // R8: a Fenced row is not a per-file failure. The mover saw
         // the fence trip immediately before its commit-point op
@@ -269,6 +285,7 @@ fn record_outcome(
                 error = %e.error,
                 "row fenced before commit; will be picked up after reclaim",
             );
+            emitter.progress_fenced();
         }
         Err(e) => {
             outcome.files_failed += 1;
@@ -280,6 +297,7 @@ fn record_outcome(
                 "file failed",
             );
             failures.record(mo.row_id, row_path, e.phase, e.error);
+            emitter.progress_failed();
         }
     }
 }
@@ -479,7 +497,7 @@ mod tests {
             result: Err(fenced_err()),
         };
 
-        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput);
+        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput, &crate::coord_driver::EventEmitter::disabled());
 
         assert_eq!(outcome.files_fenced, 1, "Fenced must bump files_fenced");
         assert_eq!(outcome.files_failed, 0, "Fenced must NOT bump files_failed");
@@ -505,7 +523,7 @@ mod tests {
             result: Err(MoveError::new(FailurePhase::Write, "ENOSPC")),
         };
 
-        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput);
+        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput, &crate::coord_driver::EventEmitter::disabled());
 
         assert_eq!(outcome.files_failed, 1);
         assert_eq!(outcome.files_fenced, 0);
@@ -526,7 +544,7 @@ mod tests {
             result: Ok(()),
         };
 
-        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput);
+        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput, &crate::coord_driver::EventEmitter::disabled());
 
         assert_eq!(outcome.files_ok, 1);
         assert_eq!(outcome.files_failed, 0);

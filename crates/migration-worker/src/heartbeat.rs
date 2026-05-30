@@ -32,6 +32,14 @@ pub struct HeartbeatTask {
     pub fence: Fence,
     pub host_id: String,
     pub interval: Duration,
+    /// Coord notification channel. When Some, every R6/R7/R8 fence
+    /// trip in this task fires `try_send(reason)` on the sender
+    /// BEFORE calling `fence.trip(reason)`. Best-effort — a full or
+    /// closed channel is silently ignored. The fence trip itself is
+    /// the source of truth; the channel exists only so the
+    /// `coord_driver` can POST `/workers/{id}/fence` with the same
+    /// reason. None when the worker runs in legacy S3-only mode.
+    pub coord_fence: Option<tokio::sync::mpsc::Sender<String>>,
     /// Lease window. Used by two fence-trip guards in addition to the
     /// HEAD-and-compare path:
     ///   - R6 retry budget: if HEAD has been failing for at least one
@@ -100,6 +108,18 @@ impl Default for ProgressState {
 }
 
 impl HeartbeatTask {
+    /// Best-effort: forward the fence-trip reason to the coord_driver
+    /// over `coord_fence` if it is configured. Always called BEFORE
+    /// `self.fence.trip(reason)` at each R6/R7/R8 site, never instead
+    /// of it. A full or closed channel is silently ignored — the
+    /// fence trip is the source of truth and never depends on this
+    /// notification reaching the coord.
+    fn notify_coord_fence(&self, reason: &str) {
+        if let Some(tx) = &self.coord_fence {
+            let _ = tx.try_send(reason.to_string());
+        }
+    }
+
     pub async fn run(self) {
         let mut ticker = tokio::time::interval(self.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -147,9 +167,11 @@ impl HeartbeatTask {
                 .num_seconds();
             let drift_secs = (wall_secs - mono_secs).abs();
             if drift_secs > max_drift_secs {
-                self.fence.trip(format!(
+                let reason = format!(
                     "clock jump detected: wall-mono drift {drift_secs}s > lease/2 ({max_drift_secs}s); self-fencing"
-                ));
+                );
+                self.notify_coord_fence(&reason);
+                self.fence.trip(reason);
                 self.write_progress_bounded("fenced", None).await;
                 break;
             }
@@ -212,10 +234,12 @@ impl HeartbeatTask {
                             expected_etag = %held.etag,
                             "refresh: claim lost (claim object replaced under us)"
                         );
-                        self.fence.trip(format!(
+                        let reason = format!(
                             "claim refresh: HEAD shows different etag, claim was reclaimed (shard {})",
                             held.shard
-                        ));
+                        );
+                        self.notify_coord_fence(&reason);
+                        self.fence.trip(reason);
                         self.write_progress_bounded("fenced", None).await;
                         break;
                     }
@@ -236,9 +260,11 @@ impl HeartbeatTask {
                             "heartbeat refresh failed (transient)",
                         );
                         if consec_failures >= retry_budget {
-                            self.fence.trip(format!(
+                            let reason = format!(
                                 "heartbeat HEAD failing for {consec_failures} consecutive ticks (>= lease window); self-fencing"
-                            ));
+                            );
+                            self.notify_coord_fence(&reason);
+                            self.fence.trip(reason);
                             self.write_progress_bounded("fenced", None).await;
                             break;
                         }

@@ -227,7 +227,11 @@ fn spawn_uploader(logging: &Logging, s3_cfg: &S3, bucket: &str) -> Result<Upload
 
     let handle = tokio::spawn(async move {
         let s3 = match migration_core::s3::S3Client::from_config(
-            &endpoint, &region, &bucket, profile.as_deref(), verify_tls,
+            &endpoint,
+            &region,
+            &bucket,
+            profile.as_deref(),
+            verify_tls,
         )
         .await
         {
@@ -344,7 +348,10 @@ async fn upload_final_active(
     // by max_bytes) and gunzip is unnecessary to read it.
     let key = format!("{prefix_root}/final.log");
     if let Err(e) = s3.put(&key, plain).await {
-        let _ = writeln!(io::stderr(), "vamoose log uploader: final upload failed: {e}");
+        let _ = writeln!(
+            io::stderr(),
+            "vamoose log uploader: final upload failed: {e}"
+        );
     }
 }
 
@@ -366,10 +373,7 @@ fn build_prefix(configured: &str) -> String {
         .unwrap_or_else(|| "unknown-host".to_string());
     let pid = std::process::id();
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ");
-    format!(
-        "{}/{host}-{pid}/{ts}",
-        configured.trim_matches('/'),
-    )
+    format!("{}/{host}-{pid}/{ts}", configured.trim_matches('/'),)
 }
 
 /// Tiny size-string parser matching the one in
@@ -395,4 +399,3 @@ fn parse_size(s: &str) -> Option<u64> {
     };
     n.checked_mul(mult)
 }
-

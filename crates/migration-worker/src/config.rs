@@ -14,6 +14,12 @@ pub struct Config {
     pub batch: BatchCfg,
     pub copy: CopyCfg,
     pub backpressure: BackpressureCfg,
+    /// Coord wiring. When absent, the worker runs in legacy S3-only
+    /// mode (heartbeat to S3, no HTTP traffic). When present, the
+    /// worker registers with the coord and observes pause/resume
+    /// commands via the heartbeat response.
+    #[serde(default)]
+    pub coord: Option<CoordCfg>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +222,59 @@ fn default_throughput_floor() -> u64 {
     100
 }
 
+/// Coord wiring. Optional — when `[coord]` is omitted from the TOML
+/// the worker runs in legacy S3-only mode (existing behavior, no HTTP
+/// traffic to a coord). When present, the worker registers with the
+/// coord on startup and consults the heartbeat response's control
+/// envelope to decide whether to keep claiming new shards.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CoordCfg {
+    /// Coord base URL, e.g. `https://coord.example:8443`.
+    pub url: String,
+    /// Job the worker is associated with. The coord enforces that
+    /// this job exists (404s register otherwise).
+    pub job_id: String,
+    /// Env var holding the worker cluster secret. The variable's
+    /// value is sent as `X-Cluster-Secret` on every request. When
+    /// None, no secret header is set — matches coord dev mode.
+    #[serde(default)]
+    pub cluster_secret_env: Option<String>,
+    /// Heartbeat cadence (seconds). Coord-driven pause/resume
+    /// commands are observed within one tick.
+    #[serde(default = "default_coord_heartbeat_sec")]
+    pub heartbeat_sec: u64,
+    /// Event-batch flush cadence (seconds). The driver pulls events
+    /// from the in-process channel and POSTs them once per tick.
+    #[serde(default = "default_coord_events_flush_sec")]
+    pub events_flush_sec: u64,
+    /// Cap on the outbound event buffer in serialized bytes. On
+    /// overflow oldest events are dropped (with a counter); losing
+    /// tail telemetry is preferable to wedging the copy loop.
+    #[serde(default = "default_coord_buffer_max_bytes")]
+    pub buffer_max_bytes: u64,
+    /// TLS certificate verification. Default true. Set false for
+    /// lab/dev with self-signed coord certs.
+    #[serde(default = "t")]
+    pub verify_tls: bool,
+    /// Per-request HTTP timeout (seconds). The driver retries on
+    /// timeout (treated as a transport error).
+    #[serde(default = "default_coord_request_timeout_sec")]
+    pub request_timeout_sec: u64,
+}
+
+fn default_coord_heartbeat_sec() -> u64 {
+    5
+}
+fn default_coord_events_flush_sec() -> u64 {
+    1
+}
+fn default_coord_buffer_max_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+fn default_coord_request_timeout_sec() -> u64 {
+    10
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let s = std::fs::read_to_string(path)
@@ -288,6 +347,51 @@ mod tests {
         );
         assert_eq!(cfg.run.profile.as_deref(), Some("var204"));
         assert!(!cfg.run.verify_tls);
+        // The example does not declare [coord] today, so the optional
+        // field defaults to None. Existing operator configs must
+        // continue to parse without edits.
+        assert!(cfg.coord.is_none());
+    }
+
+    #[test]
+    fn coord_cfg_defaults_when_only_required_fields_set() {
+        let toml_str = r#"
+            url    = "https://coord.example:8443"
+            job_id = "bobby-mig"
+        "#;
+        let c: CoordCfg = toml::from_str(toml_str).unwrap();
+        assert_eq!(c.url, "https://coord.example:8443");
+        assert_eq!(c.job_id, "bobby-mig");
+        assert_eq!(c.cluster_secret_env, None);
+        assert_eq!(c.heartbeat_sec, 5);
+        assert_eq!(c.events_flush_sec, 1);
+        assert_eq!(c.buffer_max_bytes, 64 * 1024 * 1024);
+        assert!(c.verify_tls);
+        assert_eq!(c.request_timeout_sec, 10);
+    }
+
+    #[test]
+    fn coord_cfg_picks_up_overrides() {
+        let toml_str = r#"
+            url                  = "https://coord:8443"
+            job_id               = "bobby-mig"
+            cluster_secret_env   = "VAMOOSE_CLUSTER_SECRET"
+            heartbeat_sec        = 30
+            events_flush_sec     = 2
+            buffer_max_bytes     = 16384
+            verify_tls           = false
+            request_timeout_sec  = 5
+        "#;
+        let c: CoordCfg = toml::from_str(toml_str).unwrap();
+        assert_eq!(c.heartbeat_sec, 30);
+        assert_eq!(c.events_flush_sec, 2);
+        assert_eq!(c.buffer_max_bytes, 16_384);
+        assert!(!c.verify_tls);
+        assert_eq!(
+            c.cluster_secret_env.as_deref(),
+            Some("VAMOOSE_CLUSTER_SECRET")
+        );
+        assert_eq!(c.request_timeout_sec, 5);
     }
 
     #[test]

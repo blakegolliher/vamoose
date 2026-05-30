@@ -5,6 +5,8 @@ members = [
     "crates/migration-mover",
     "crates/migration-worker",
     "crates/migration-aggr",
+    "crates/migration-coord",
+    "crates/migration-tui",
     "crates/mig-walker-rewrite",
     "crates/vamoose-cli",
 ]
@@ -23,6 +25,8 @@ readme = "README.md"
 # Internal
 migration-core  = { path = "crates/migration-core" }
 migration-mover = { path = "crates/migration-mover" }
+migration-coord = { path = "crates/migration-coord" }
+migration-tui   = { path = "crates/migration-tui" }
 
 # AWS / S3
 aws-sdk-s3   = "1"
@@ -67,7 +71,7 @@ chrono     = { version = "0.4", features = ["serde"] }
 base64     = "0.22"
 bytes      = "1"
 humansize  = "2"
-uuid       = { version = "1", features = ["v4"] }
+uuid       = { version = "1", features = ["v4", "serde"] }
 hex        = "0.4"
 toml       = "0.8"
 hostname   = "0.4"
@@ -90,6 +94,13 @@ crossterm = "0.28"
 prometheus = "0.13"
 hyper      = { version = "1", features = ["server", "http1"] }
 
+# Coord HTTP layer (REST + SSE)
+axum        = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "macros", "matched-path"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+tower       = { version = "0.5", default-features = false, features = ["util"] }
+tower-http  = { version = "0.6", default-features = false, features = ["trace", "timeout"] }
+http        = "1"
+
 # libnfs FFI (see migration-mover/build.rs)
 libc = "0.2"
 
@@ -98,6 +109,12 @@ io-uring = "0.6"
 
 # trait async fns over dyn
 async-trait = "0.1"
+
+# Imperative async stream construction (SSE handler)
+async-stream = "0.3"
+
+# HTTP client (Phase 3 worker, Phase 4 TUI, Phase 2 acceptance tests)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 [profile.release]
 lto = true

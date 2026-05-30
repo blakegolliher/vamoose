@@ -92,7 +92,9 @@ async fn collect_status(store: &Arc<dyn ClaimStore>) -> anyhow::Result<Snapshot>
         if !e.key.ends_with(layout::CLAIM_SUFFIX) {
             continue;
         }
-        let Some((body, _)) = store.get(&e.key).await? else { continue };
+        let Some((body, _)) = store.get(&e.key).await? else {
+            continue;
+        };
         let Ok(rec) = serde_json::from_slice::<ClaimRecord>(&body) else {
             continue;
         };
@@ -112,7 +114,9 @@ async fn collect_status(store: &Arc<dyn ClaimStore>) -> anyhow::Result<Snapshot>
         if !e.key.ends_with(".json") {
             continue;
         }
-        let Some((body, _)) = store.get(&e.key).await? else { continue };
+        let Some((body, _)) = store.get(&e.key).await? else {
+            continue;
+        };
         let Ok(p) = serde_json::from_slice::<ProgressRecord>(&body) else {
             continue;
         };
@@ -144,7 +148,10 @@ fn render(s: &Snapshot, interval: u64, watch: bool) {
         s.total_shards, s.completed, s.in_progress, s.unclaimed,
     );
     if s.workers.is_empty() {
-        println!("Workers: (none — no progress objects in s3://.../{})", layout::PROGRESS_PREFIX);
+        println!(
+            "Workers: (none — no progress objects in s3://.../{})",
+            layout::PROGRESS_PREFIX
+        );
     } else {
         println!("Workers:");
         for w in &s.workers {
