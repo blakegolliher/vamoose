@@ -432,6 +432,63 @@ async fn marker_mark_connected_then_event_keeps_connected() {
 }
 
 #[tokio::test]
+async fn command_methods_round_trip_through_coord() {
+    let (rt, addr, shutdown) = spawn_coord().await;
+    rt.ingest(job_created("alpha")).await.unwrap();
+    let client = client_for(addr);
+
+    // pause → coord acks with a command_id and emits JobPaused.
+    let r = client.pause("alpha", Some("smoke")).await.expect("pause");
+    assert!(!r.command_id.is_empty());
+    let job = rt.job_view(&jid("alpha")).await.unwrap();
+    assert_eq!(job.phase, migration_coord::schema::Phase::Paused);
+
+    // resume.
+    let r = client.resume("alpha", None).await.expect("resume");
+    assert!(!r.command_id.is_empty());
+
+    // drain (currently routes through JobPaused per Phase 2 caveat).
+    let r = client
+        .drain("alpha", Some("end of shift"))
+        .await
+        .expect("drain");
+    assert!(!r.command_id.is_empty());
+
+    // resume again so we can cancel cleanly.
+    client.resume("alpha", None).await.expect("resume");
+
+    // cancel → terminal.
+    let r = client
+        .cancel("alpha", Some("operator"))
+        .await
+        .expect("cancel");
+    assert!(!r.command_id.is_empty());
+    let job = rt.job_view(&jid("alpha")).await.unwrap();
+    assert_eq!(job.phase, migration_coord::schema::Phase::Cancelled);
+
+    // retry-failed is audit-only today; should still 200.
+    let r = client
+        .retry_failed("alpha", None)
+        .await
+        .expect("retry-failed");
+    assert!(!r.command_id.is_empty());
+
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn unknown_job_command_returns_404() {
+    let (_rt, addr, shutdown) = spawn_coord().await;
+    let client = client_for(addr);
+    let err = client.pause("ghost", None).await.expect_err("must 404");
+    let migration_tui::client::ClientError::Http { status, .. } = err else {
+        panic!("expected Http error");
+    };
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn sse_stream_survives_past_rest_request_timeout() {
     // Regression for the smoke-test report "connected goes to
     // unconnected frequently". The fix split the reqwest client in

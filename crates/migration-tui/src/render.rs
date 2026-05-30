@@ -135,6 +135,9 @@ fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateT
 
     // Filter span — show the live edit buffer with a cursor glyph
     // while in filter mode, or the committed filter otherwise.
+    // Palette mode doesn't touch the filter (it uses the bottom
+    // line for its own input echo) — fall through to the Normal
+    // arm so the previously-committed filter still surfaces.
     match &state.ui.input_mode {
         crate::state::InputMode::Filter { buffer, .. } => {
             spans.push(Span::raw(" · filter:"));
@@ -148,7 +151,7 @@ fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateT
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        crate::state::InputMode::Normal => {
+        crate::state::InputMode::Normal | crate::state::InputMode::Palette { .. } => {
             if !state.ui.filter.is_empty() {
                 spans.push(Span::raw(" · filter:"));
                 spans.push(Span::styled(
@@ -166,6 +169,22 @@ fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateT
         state.ui.sort.label(),
         Style::default().fg(Color::Cyan),
     ));
+
+    // Command-result toast — appended to the right of the banner
+    // so it's visible whichever view the operator is on. The TTL
+    // tick that drops the toast lives in the event loop (called
+    // before each render); here we just surface whatever is set.
+    if let Some(s) = &state.command_status {
+        let (glyph, color) = match s.kind {
+            crate::state::CommandStatusKind::Ok => ("✓", Color::Green),
+            crate::state::CommandStatusKind::Error => ("✗", Color::Red),
+        };
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{glyph} {}", s.message),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
 
     let para = Paragraph::new(Line::from(spans));
     frame.render_widget(para, area);
@@ -360,10 +379,38 @@ fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: Da
                 Style::default().fg(Color::DarkGray),
             ),
         ],
+        (InputMode::Palette { buffer, .. }, _) => {
+            // The palette owns the bottom row while it's active:
+            // we render the leading colon + the operator's buffer
+            // + a cursor glyph, then a short key-binding hint set.
+            vec![
+                Span::styled(
+                    ":",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{buffer}_"),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                key_hint("Tab", "complete"),
+                Span::raw("  "),
+                key_hint("Enter", "run"),
+                Span::raw("  "),
+                key_hint("Esc", "cancel"),
+            ]
+        }
         (InputMode::Normal, View::List) => vec![
             key_hint("q", "quit"),
             Span::raw("  "),
             key_hint("/", "filter"),
+            Span::raw("  "),
+            key_hint(":", "command"),
             Span::raw("  "),
             key_hint("s", "sort"),
             Span::raw("  "),
@@ -377,6 +424,8 @@ fn render_bottom_hints(frame: &mut Frame, area: Rect, state: &AppState, _now: Da
             key_hint("Tab", "next"),
             Span::raw("  "),
             key_hint("Shift-Tab", "prev"),
+            Span::raw("  "),
+            key_hint(":", "command"),
             Span::raw("  "),
             key_hint("q", "quit"),
         ],
@@ -1111,7 +1160,59 @@ fn render_modal(
         Modal::WorkerDetail { worker_id } => {
             render_worker_modal(frame, body_area, state, worker_id, now)
         }
+        Modal::ConfirmCommand { command, summary } => {
+            render_confirm_command_modal(frame, body_area, command, summary)
+        }
     }
+}
+
+fn render_confirm_command_modal(
+    frame: &mut Frame,
+    body_area: Rect,
+    command: &crate::palette::PaletteCommand,
+    summary: &str,
+) {
+    // 60% wide is enough for one-line summaries; 60% tall fits the
+    // borders + 6 body lines (summary + "this will change…" hint +
+    // y/n prompt) without clipping on a 24-row terminal.
+    let area = centered_rect(60, 60, body_area);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Confirm: {} ", command.verb()))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let text = Text::from(vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            summary.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "This action will change job state on the coord.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("Proceed? "),
+            Span::styled(
+                "y",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" / "),
+            Span::styled(
+                "n",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" (Esc also cancels)"),
+        ]),
+    ]);
+    frame.render_widget(Paragraph::new(text), inner);
 }
 
 fn render_worker_modal(
@@ -2378,5 +2479,82 @@ mod tests {
         s.apply_envelope(&worker_joined_evt(3, 0, "alpha", w2, "host-2"));
         let buf = render_to_buffer(&s, at(0), 120, 16);
         assert!(tab_bar_row(&buf).contains("Workers (2)"));
+    }
+
+    // ----- Palette + confirm modal + toast (Phase 6a) -----
+
+    #[test]
+    fn bottom_row_shows_palette_buffer_when_in_palette_mode() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.ui.input_mode = crate::state::InputMode::Palette {
+            buffer: "pause alpha".into(),
+            completion_idx: 0,
+        };
+        let buf = render_to_buffer(&s, at(0), 100, 8);
+        let last = buffer_row(&buf, buf.area.height - 1);
+        assert!(
+            last.starts_with(':'),
+            "expected leading colon, got: >>>{last}<<<"
+        );
+        assert!(last.contains("pause alpha"));
+        // Hints visible.
+        assert!(last.contains("Tab complete"));
+        assert!(last.contains("Enter run"));
+    }
+
+    #[test]
+    fn normal_bottom_hints_advertise_colon_for_command() {
+        let s = AppState::empty(at(0));
+        let buf = render_to_buffer(&s, at(0), 100, 8);
+        let last = buffer_row(&buf, buf.area.height - 1);
+        assert!(
+            last.contains(": command"),
+            "expected ': command' hint in: >>>{last}<<<"
+        );
+    }
+
+    #[test]
+    fn banner_shows_ok_toast_when_command_status_set() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.set_command_ok("pause 'alpha' ok", at(0));
+        let buf = render_to_buffer(&s, at(0), 120, 8);
+        let banner = buffer_row(&buf, 0);
+        assert!(banner.contains("✓"));
+        assert!(banner.contains("pause 'alpha' ok"));
+    }
+
+    #[test]
+    fn banner_shows_error_toast_when_command_status_failed() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.set_command_error("pause: 401 Unauthorized", at(0));
+        let buf = render_to_buffer(&s, at(0), 120, 8);
+        let banner = buffer_row(&buf, 0);
+        assert!(banner.contains("✗"));
+        assert!(banner.contains("401"));
+    }
+
+    #[test]
+    fn confirm_command_modal_renders_centered_with_summary() {
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+        enter_detail(&mut s, "alpha", Tab::Overview);
+        s.ui.modal = Some(crate::state::Modal::ConfirmCommand {
+            command: crate::palette::PaletteCommand::Cancel {
+                job_id: jid("alpha"),
+            },
+            summary: "cancel job 'alpha'?".into(),
+        });
+        let buf = render_to_buffer(&s, at(0), 120, 24);
+        let text = buffer_text(&buf);
+        // Title carries the verb; body shows the summary line + y/n prompt.
+        assert!(text.contains("Confirm: cancel"));
+        assert!(text.contains("cancel job 'alpha'?"));
+        assert!(text.contains("y"));
+        assert!(text.contains("n"));
+        assert!(text.contains("Esc also cancels"));
     }
 }

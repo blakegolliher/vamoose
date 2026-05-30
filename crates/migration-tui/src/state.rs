@@ -97,12 +97,30 @@ pub struct UiState {
     pub modal: Option<Modal>,
 }
 
-/// Modal overlay variants. v1 has one — the worker drill-down
-/// invoked from the Workers tab; later phases can add more
-/// (confirm-destructive, command palette, etc.).
+/// Modal overlay variants.
+///
+/// - `WorkerDetail` — drill-down invoked from the Workers tab.
+/// - `ConfirmCommand` — y/n gate that the palette injects in front
+///   of destructive verbs (cancel, drain, retry-failed). On `y`
+///   the event loop dispatches the command; on `n`/Esc it closes
+///   without sending anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
-    WorkerDetail { worker_id: WorkerId },
+    WorkerDetail {
+        worker_id: WorkerId,
+    },
+    ConfirmCommand {
+        /// The fully-parsed command sitting behind the prompt.
+        /// Reusing [`crate::palette::PaletteCommand`] keeps the
+        /// modal and the actual dispatch path looking at the same
+        /// value — no risk of "the modal said X but Enter ran Y".
+        command: crate::palette::PaletteCommand,
+        /// Human-readable summary line — what the operator sees in
+        /// the modal title. The renderer derives this from
+        /// `command` at construction time so subsequent state
+        /// transitions can't desync the title from the action.
+        summary: String,
+    },
 }
 
 /// Top-level view dispatcher. Phase 4 had only the jobs list;
@@ -187,10 +205,13 @@ impl Tab {
     }
 }
 
-/// Modal dispatcher for keypresses. Normal = jobs-list navigation;
-/// Filter = capturing typed characters into `filter`. The render
-/// layer reads this to know whether to show the live buffer (with
-/// a cursor glyph) in the banner.
+/// Modal dispatcher for keypresses.
+///
+/// - `Normal` — jobs-list navigation (or detail-view nav).
+/// - `Filter` — capturing typed characters into `UiState.filter`
+///   (entered via `/` from List view).
+/// - `Palette` — command palette (entered via `:`). The buffer
+///   feeds [`crate::palette::parse`] on Enter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -203,6 +224,20 @@ pub enum InputMode {
         /// Snapshot of `UiState.filter` from when the operator
         /// pressed `/`. Esc restores this; Enter discards it.
         prior: String,
+    },
+    /// Command-palette input. Captures whatever the operator types
+    /// after `:`. Enter parses and dispatches (with confirm-modal
+    /// gating for destructive verbs); Esc closes without action.
+    Palette {
+        /// Live edit buffer. The render layer shows it on the
+        /// bottom-hints row with a cursor glyph and the current
+        /// completion in dim text.
+        buffer: String,
+        /// Cycle index into the most recent
+        /// [`crate::palette::complete`] suggestion list. Tab
+        /// advances; the renderer surfaces `suggestions[idx]` as
+        /// the ghost-text completion.
+        completion_idx: usize,
     },
 }
 
@@ -482,7 +517,36 @@ pub struct AppState {
     pub recent_verify_mismatches: HashMap<JobId, RecentVerifyMismatches>,
     /// Per-job verify lifecycle status (last start / complete / count).
     pub verify_status: HashMap<JobId, VerifyStatus>,
+    /// Most recent palette-command result. Shown as a banner toast
+    /// for a few seconds, then auto-cleared by the render layer
+    /// (the renderer checks `now - at >= COMMAND_STATUS_TTL` and
+    /// drops the field on render).
+    pub command_status: Option<CommandStatus>,
 }
+
+/// Toast surfaced in the top banner after a palette command runs.
+///
+/// `kind` selects the color (green ok / red error). The render
+/// layer also displays a short message; on auto-clear it's wiped
+/// from `AppState.command_status` at the next render tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandStatus {
+    pub kind: CommandStatusKind,
+    pub message: String,
+    pub at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandStatusKind {
+    Ok,
+    Error,
+}
+
+/// How long a command-status toast stays on screen before the
+/// renderer auto-clears it. 5 seconds is long enough for the
+/// operator to read but short enough that it doesn't linger past
+/// the next likely command.
+pub const COMMAND_STATUS_TTL_SECS: i64 = 5;
 
 impl AppState {
     /// Construct an empty state, before any traffic has arrived.
@@ -502,6 +566,37 @@ impl AppState {
             recent_errors: HashMap::new(),
             recent_verify_mismatches: HashMap::new(),
             verify_status: HashMap::new(),
+            command_status: None,
+        }
+    }
+
+    /// Record a successful command-status toast. The renderer
+    /// auto-clears after [`COMMAND_STATUS_TTL_SECS`] seconds.
+    pub fn set_command_ok(&mut self, message: impl Into<String>, now: DateTime<Utc>) {
+        self.command_status = Some(CommandStatus {
+            kind: CommandStatusKind::Ok,
+            message: message.into(),
+            at: now,
+        });
+    }
+
+    /// Record an error command-status toast.
+    pub fn set_command_error(&mut self, message: impl Into<String>, now: DateTime<Utc>) {
+        self.command_status = Some(CommandStatus {
+            kind: CommandStatusKind::Error,
+            message: message.into(),
+            at: now,
+        });
+    }
+
+    /// Called by the render layer before drawing the banner. Drops
+    /// the toast when it has been on screen longer than the TTL.
+    pub fn tick_command_status(&mut self, now: DateTime<Utc>) {
+        if let Some(s) = &self.command_status {
+            let elapsed = now.signed_duration_since(s.at).num_seconds();
+            if elapsed >= COMMAND_STATUS_TTL_SECS {
+                self.command_status = None;
+            }
         }
     }
 
@@ -1369,5 +1464,44 @@ mod tests {
             .recent_verify_mismatches_for_job(&jid("alpha"))
             .expect("ring");
         assert_eq!(r.len(), 1);
+    }
+
+    // ----- Command status toast (Phase 6a) -----
+
+    #[test]
+    fn set_command_ok_records_a_green_toast() {
+        let mut s = AppState::empty(at(0));
+        s.set_command_ok("pause 'alpha' ok", at(100));
+        let cs = s.command_status.expect("set");
+        assert_eq!(cs.kind, CommandStatusKind::Ok);
+        assert_eq!(cs.message, "pause 'alpha' ok");
+        assert_eq!(cs.at, at(100));
+    }
+
+    #[test]
+    fn set_command_error_records_a_red_toast() {
+        let mut s = AppState::empty(at(0));
+        s.set_command_error("pause failed: 401", at(100));
+        let cs = s.command_status.expect("set");
+        assert_eq!(cs.kind, CommandStatusKind::Error);
+    }
+
+    #[test]
+    fn tick_command_status_clears_after_ttl() {
+        let mut s = AppState::empty(at(0));
+        s.set_command_ok("ok", at(100));
+        // 1s after — still present.
+        s.tick_command_status(at(101));
+        assert!(s.command_status.is_some());
+        // 5s exactly — TTL hit, cleared.
+        s.tick_command_status(at(100 + COMMAND_STATUS_TTL_SECS));
+        assert!(s.command_status.is_none());
+    }
+
+    #[test]
+    fn tick_command_status_idempotent_when_unset() {
+        let mut s = AppState::empty(at(0));
+        s.tick_command_status(at(100));
+        assert!(s.command_status.is_none());
     }
 }

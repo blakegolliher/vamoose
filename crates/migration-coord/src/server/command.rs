@@ -33,12 +33,12 @@ use axum::extract::{Extension, Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CommandAccepted {
     pub command_id: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ReasonBody {
     /// Optional human-readable reason. Defaults to "operator" in
     /// the audit row and the phase_history if not supplied.

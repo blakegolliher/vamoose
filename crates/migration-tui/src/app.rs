@@ -51,19 +51,34 @@ pub enum Input {
     /// Periodic render tick — used to advance elapsed-time labels
     /// in the banner even when no events are arriving.
     Tick,
+    /// Result of a palette-dispatched command, surfaced as a
+    /// banner toast. `ok=true` colors green; `ok=false` colors red.
+    CommandResult { ok: bool, message: String },
 }
 
-/// Whether the loop should keep running after handling an input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Whether the loop should keep running after handling an input,
+/// plus an `Execute` arm the main loop reacts to by spawning an
+/// HTTP POST against the coord. The handler stays pure — the
+/// network call lives in the event loop's `select!` branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
     Continue,
     Quit,
+    Execute(crate::palette::PaletteCommand),
 }
 
 /// Apply one [`Input`] to `state`. The render layer treats `now`
 /// as the current wall clock (passed in so tests are deterministic).
 pub fn handle_input(state: &mut AppState, input: Input, now: DateTime<Utc>) -> AppAction {
     match input {
+        Input::CommandResult { ok, message } => {
+            if ok {
+                state.set_command_ok(message, now);
+            } else {
+                state.set_command_error(message, now);
+            }
+            AppAction::Continue
+        }
         Input::SseConnected => {
             state.mark_connected(now);
             AppAction::Continue
@@ -123,9 +138,193 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> AppAction {
     if matches!(key.kind, KeyEventKind::Release) {
         return AppAction::Continue;
     }
+    // The confirm-command modal interceptor runs FIRST so y/n
+    // don't fall through to the underlying view's bindings. The
+    // worker-detail modal is handled later in handle_key_detail
+    // because it's view-scoped.
+    if let Some(Modal::ConfirmCommand { .. }) = &state.ui.modal {
+        return handle_key_confirm_command(state, key);
+    }
     match &state.ui.input_mode {
         InputMode::Normal => handle_key_normal(state, key),
         InputMode::Filter { .. } => handle_key_filter(state, key),
+        InputMode::Palette { .. } => handle_key_palette(state, key),
+    }
+}
+
+/// Confirm-command modal handler. Intercepts BEFORE view dispatch
+/// so y/n can't accidentally activate underlying tab navigation.
+fn handle_key_confirm_command(state: &mut AppState, key: KeyEvent) -> AppAction {
+    // Pull the command out so we can fire it on confirm without
+    // borrowing state through the match guard.
+    let cmd = if let Some(Modal::ConfirmCommand { command, .. }) = &state.ui.modal {
+        command.clone()
+    } else {
+        return AppAction::Continue;
+    };
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            state.ui.modal = None;
+            AppAction::Execute(cmd)
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Backspace => {
+            state.ui.modal = None;
+            AppAction::Continue
+        }
+        _ => AppAction::Continue,
+    }
+}
+
+fn handle_key_palette(state: &mut AppState, key: KeyEvent) -> AppAction {
+    // Take the mode out so we can mutate the buffer in place.
+    let mode = std::mem::replace(&mut state.ui.input_mode, InputMode::Normal);
+    let InputMode::Palette {
+        mut buffer,
+        mut completion_idx,
+    } = mode
+    else {
+        return AppAction::Continue;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            // Bail out — operator changed their mind. Drop the
+            // mode and the buffer.
+            AppAction::Continue
+        }
+        KeyCode::Enter => match parse_palette_buffer(state, &buffer) {
+            Ok(cmd) => match cmd {
+                crate::palette::PaletteCommand::Quit => AppAction::Quit,
+                _ if cmd.is_destructive() => {
+                    state.ui.modal = Some(Modal::ConfirmCommand {
+                        summary: confirm_summary(&cmd),
+                        command: cmd,
+                    });
+                    AppAction::Continue
+                }
+                _ => AppAction::Execute(cmd),
+            },
+            Err(err) => {
+                // Surface the parse error as a toast; leave palette
+                // closed so the operator can immediately retry.
+                state.set_command_error(err.to_string(), chrono::Utc::now());
+                AppAction::Continue
+            }
+        },
+        KeyCode::Tab => {
+            // Cycle through completion suggestions. First Tab on a
+            // fresh buffer picks suggestion 0; subsequent Tabs
+            // advance only when the buffer matches the previously-
+            // selected suggestion (so typing after a Tab and
+            // pressing Tab again starts a fresh round, not "skip
+            // one").
+            let suggestions = palette_suggestions(state, &buffer);
+            if !suggestions.is_empty() {
+                let current_idx = suggestions.iter().position(|s| s == &buffer);
+                let next = match current_idx {
+                    Some(i) => (i + 1) % suggestions.len(),
+                    None => 0,
+                };
+                buffer = suggestions[next].clone();
+                completion_idx = next;
+            }
+            state.ui.input_mode = InputMode::Palette {
+                buffer,
+                completion_idx,
+            };
+            AppAction::Continue
+        }
+        KeyCode::Backspace => {
+            buffer.pop();
+            completion_idx = 0;
+            state.ui.input_mode = InputMode::Palette {
+                buffer,
+                completion_idx,
+            };
+            AppAction::Continue
+        }
+        KeyCode::Char(c) => {
+            buffer.push(c);
+            completion_idx = 0;
+            state.ui.input_mode = InputMode::Palette {
+                buffer,
+                completion_idx,
+            };
+            AppAction::Continue
+        }
+        _ => {
+            // Unknown key in palette mode — stay in mode, no edits.
+            state.ui.input_mode = InputMode::Palette {
+                buffer,
+                completion_idx,
+            };
+            AppAction::Continue
+        }
+    }
+}
+
+fn parse_palette_buffer(
+    state: &AppState,
+    buffer: &str,
+) -> Result<crate::palette::PaletteCommand, crate::palette::ParseError> {
+    let default = default_palette_job_id(state);
+    crate::palette::parse(buffer, default.as_ref())
+}
+
+fn palette_suggestions(state: &AppState, buffer: &str) -> Vec<String> {
+    let ids: Vec<String> = state
+        .snapshot
+        .jobs
+        .values()
+        .map(|j| j.id.as_str().to_string())
+        .collect();
+    palette_tab_cycle_list(buffer, &ids)
+}
+
+/// Suggestion list for Tab cycling. Differs from
+/// [`crate::palette::complete`] when the buffer is already a fully-
+/// typed verb or "verb <full-job-id>": in those cases we return
+/// the full verb / job list (Tab cycles through ALL of them) rather
+/// than the single prefix match the strict completer would return.
+fn palette_tab_cycle_list(buffer: &str, visible_job_ids: &[String]) -> Vec<String> {
+    let space = buffer.find(char::is_whitespace);
+    match space {
+        None => {
+            if crate::palette::VERBS.contains(&buffer) {
+                crate::palette::VERBS
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect()
+            } else {
+                crate::palette::complete(buffer, visible_job_ids)
+            }
+        }
+        Some(idx) => {
+            let verb = &buffer[..idx];
+            let after = buffer[idx..].trim_start();
+            if visible_job_ids.iter().any(|j| j == after) {
+                visible_job_ids
+                    .iter()
+                    .map(|j| format!("{verb} {j}"))
+                    .collect()
+            } else {
+                crate::palette::complete(buffer, visible_job_ids)
+            }
+        }
+    }
+}
+
+fn default_palette_job_id(state: &AppState) -> Option<JobId> {
+    match &state.ui.view {
+        View::Detail { job_id, .. } => Some(job_id.clone()),
+        View::List => state.ui.selected_job.clone(),
+    }
+}
+
+fn confirm_summary(cmd: &crate::palette::PaletteCommand) -> String {
+    let verb = cmd.verb();
+    match cmd.job_id() {
+        Some(j) => format!("{verb} job '{}'?", j.as_str()),
+        None => format!("{verb}?"),
     }
 }
 
@@ -181,6 +380,13 @@ fn handle_key_list_normal(state: &mut AppState, key: KeyEvent) -> AppAction {
             state.ui.input_mode = InputMode::Filter {
                 buffer: state.ui.filter.clone(),
                 prior,
+            };
+            AppAction::Continue
+        }
+        KeyCode::Char(':') => {
+            state.ui.input_mode = InputMode::Palette {
+                buffer: String::new(),
+                completion_idx: 0,
             };
             AppAction::Continue
         }
@@ -299,6 +505,13 @@ fn handle_key_detail_base(state: &mut AppState, key: KeyEvent) -> AppAction {
                     tab: tab.cycle_prev(),
                 };
             }
+            AppAction::Continue
+        }
+        KeyCode::Char(':') => {
+            state.ui.input_mode = InputMode::Palette {
+                buffer: String::new(),
+                completion_idx: 0,
+            };
             AppAction::Continue
         }
         _ => AppAction::Continue,
@@ -470,10 +683,13 @@ pub async fn run(client: Client, opts: RunOpts) -> anyhow::Result<()> {
     let sse_cancel = cancel.clone();
     let sse_tx = tx.clone();
     let sse_opts = opts.clone();
-    let sse_handle =
-        tokio::spawn(
-            async move { sse_driver(client, sse_state, sse_tx, sse_cancel, sse_opts).await },
-        );
+    // `client` stays in scope so the main loop can clone it for
+    // each palette-dispatched command. The SSE driver gets its own
+    // clone via the spawned task.
+    let sse_client = client.clone();
+    let sse_handle = tokio::spawn(async move {
+        sse_driver(sse_client, sse_state, sse_tx, sse_cancel, sse_opts).await
+    });
 
     // Key event task — async stream from crossterm.
     let key_cancel = cancel.clone();
@@ -499,14 +715,40 @@ pub async fn run(client: Client, opts: RunOpts) -> anyhow::Result<()> {
             input = rx.recv() => {
                 let Some(input) = input else { break };
                 let mut state = app_state.lock().await;
-                if handle_input(&mut state, input, Utc::now()) == AppAction::Quit {
-                    break;
+                let action = handle_input(&mut state, input, Utc::now());
+                match action {
+                    AppAction::Quit => break,
+                    AppAction::Execute(cmd) => {
+                        // Drop the state lock BEFORE spawning the
+                        // dispatch task so the HTTP call doesn't
+                        // hold the render-loop's lock during a
+                        // network round trip.
+                        drop(state);
+                        spawn_command_dispatch(
+                            client.clone(),
+                            cmd,
+                            tx.clone(),
+                            cancel.clone(),
+                        );
+                        let mut state = app_state.lock().await;
+                        let now = Utc::now();
+                        state.tick_command_status(now);
+                        terminal.draw(|f| render::render(f, &state, now))?;
+                    }
+                    AppAction::Continue => {
+                        {
+                    let now = Utc::now();
+                    state.tick_command_status(now);
+                    terminal.draw(|f| render::render(f, &state, now))?;
                 }
-                terminal.draw(|f| render::render(f, &state, Utc::now()))?;
+                    }
+                }
             }
             _ = tick.tick() => {
-                let state = app_state.lock().await;
-                terminal.draw(|f| render::render(f, &state, Utc::now()))?;
+                let mut state = app_state.lock().await;
+                let now = Utc::now();
+                state.tick_command_status(now);
+                terminal.draw(|f| render::render(f, &state, now))?;
             }
         }
     }
@@ -609,6 +851,78 @@ async fn sse_driver(
 }
 
 /// Key event task: pulls Crossterm events asynchronously and
+/// Fire-and-forget HTTP dispatch for a parsed [`PaletteCommand`].
+/// Runs in its own tokio task so the render loop never blocks on a
+/// slow coord. On completion sends `Input::CommandResult` back
+/// through the main channel so the operator gets a banner toast.
+fn spawn_command_dispatch(
+    client: Client,
+    cmd: crate::palette::PaletteCommand,
+    tx: mpsc::Sender<Input>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let result = run_command(&client, &cmd, &cancel).await;
+        let _ = tx.send(result).await;
+    });
+}
+
+async fn run_command(
+    client: &Client,
+    cmd: &crate::palette::PaletteCommand,
+    cancel: &CancellationToken,
+) -> Input {
+    use crate::palette::PaletteCommand as PC;
+    let dispatch = async {
+        let resp = match cmd {
+            PC::Pause { job_id } => client.pause(job_id.as_str(), None).await,
+            PC::Resume { job_id } => client.resume(job_id.as_str(), None).await,
+            PC::Cancel { job_id } => client.cancel(job_id.as_str(), None).await,
+            PC::Drain { job_id } => client.drain(job_id.as_str(), None).await,
+            PC::RetryFailed { job_id } => client.retry_failed(job_id.as_str(), None).await,
+            // Help / Quit are handled by the event loop, not here —
+            // mark as an internal bug if they reach run_command.
+            PC::Help => {
+                return Input::CommandResult {
+                    ok: false,
+                    message: "':help' is local; this should not have dispatched".into(),
+                };
+            }
+            PC::Quit => {
+                return Input::CommandResult {
+                    ok: false,
+                    message: "':quit' is local; this should not have dispatched".into(),
+                };
+            }
+        };
+        match resp {
+            Ok(_) => {
+                let verb = cmd.verb();
+                let target = cmd
+                    .job_id()
+                    .map(|j| format!(" '{}'", j.as_str()))
+                    .unwrap_or_default();
+                Input::CommandResult {
+                    ok: true,
+                    message: format!("{verb}{target} ok"),
+                }
+            }
+            Err(e) => Input::CommandResult {
+                ok: false,
+                message: format!("{}: {e}", cmd.verb()),
+            },
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Input::CommandResult {
+            ok: false,
+            message: format!("{}: cancelled", cmd.verb()),
+        },
+        out = dispatch => out,
+    }
+}
+
 /// forwards Key events to the main loop. Resize / mouse / focus
 /// events are dropped on the floor for now — the render layer
 /// re-lays-out on every tick regardless.
@@ -1221,6 +1535,7 @@ mod tests {
         handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
         match &s.ui.modal {
             Some(Modal::WorkerDetail { worker_id }) => assert_eq!(*worker_id, sel),
+            Some(other) => panic!("unexpected modal variant: {other:?}"),
             None => panic!("modal not opened"),
         }
     }
@@ -1281,5 +1596,206 @@ mod tests {
         handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
         let action = handle_input(&mut s, Input::Key(key(KeyCode::Char('q'))), at(0));
         assert_eq!(action, AppAction::Quit);
+    }
+
+    // ----- Palette + confirm modal (Phase 6a) -----
+
+    use crate::palette::PaletteCommand;
+
+    fn assert_palette(s: &AppState) {
+        assert!(
+            matches!(s.ui.input_mode, InputMode::Palette { .. }),
+            "expected Palette mode, got {:?}",
+            s.ui.input_mode
+        );
+    }
+
+    fn palette_buffer(s: &AppState) -> String {
+        match &s.ui.input_mode {
+            InputMode::Palette { buffer, .. } => buffer.clone(),
+            _ => panic!("not in palette mode"),
+        }
+    }
+
+    #[test]
+    fn colon_opens_palette_from_list() {
+        let mut s = seed_two_jobs();
+        handle_input(&mut s, Input::Key(key(KeyCode::Char(':'))), at(0));
+        assert_palette(&s);
+        assert_eq!(palette_buffer(&s), "");
+    }
+
+    #[test]
+    fn colon_opens_palette_from_detail() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("alpha"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        // Now in Detail.
+        handle_input(&mut s, Input::Key(key(KeyCode::Char(':'))), at(0));
+        assert_palette(&s);
+    }
+
+    #[test]
+    fn palette_chars_build_buffer() {
+        let mut s = seed_two_jobs();
+        handle_input(&mut s, Input::Key(key(KeyCode::Char(':'))), at(0));
+        for c in ['p', 'a', 'u', 's', 'e'] {
+            handle_input(&mut s, Input::Key(key(KeyCode::Char(c))), at(0));
+        }
+        assert_eq!(palette_buffer(&s), "pause");
+    }
+
+    #[test]
+    fn palette_backspace_pops_chars() {
+        let mut s = seed_two_jobs();
+        handle_input(&mut s, Input::Key(key(KeyCode::Char(':'))), at(0));
+        for c in ['p', 'a', 'u'] {
+            handle_input(&mut s, Input::Key(key(KeyCode::Char(c))), at(0));
+        }
+        handle_input(&mut s, Input::Key(key(KeyCode::Backspace)), at(0));
+        assert_eq!(palette_buffer(&s), "pa");
+    }
+
+    #[test]
+    fn palette_tab_cycles_completion_from_empty_buffer() {
+        let mut s = seed_two_jobs();
+        handle_input(&mut s, Input::Key(key(KeyCode::Char(':'))), at(0));
+        // First Tab → first verb in canonical order = "pause".
+        handle_input(&mut s, Input::Key(key(KeyCode::Tab)), at(0));
+        assert_eq!(palette_buffer(&s), "pause");
+        // Next Tab → "resume".
+        handle_input(&mut s, Input::Key(key(KeyCode::Tab)), at(0));
+        assert_eq!(palette_buffer(&s), "resume");
+    }
+
+    #[test]
+    fn palette_esc_cancels_back_to_normal() {
+        let mut s = seed_two_jobs();
+        handle_input(&mut s, Input::Key(key(KeyCode::Char(':'))), at(0));
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Esc)), at(0));
+        assert_eq!(action, AppAction::Continue);
+        assert!(matches!(s.ui.input_mode, InputMode::Normal));
+    }
+
+    #[test]
+    fn palette_enter_on_pause_with_default_dispatches_execute() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("alpha"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char(':'))), at(0));
+        for c in ['p', 'a', 'u', 's', 'e'] {
+            handle_input(&mut s, Input::Key(key(KeyCode::Char(c))), at(0));
+        }
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        match action {
+            AppAction::Execute(PaletteCommand::Pause { job_id }) => {
+                assert_eq!(job_id, jid("alpha"));
+            }
+            other => panic!("expected Execute(Pause), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn palette_enter_on_cancel_opens_confirm_modal() {
+        let mut s = seed_two_jobs();
+        s.ui.selected_job = Some(jid("alpha"));
+        handle_input(&mut s, Input::Key(key(KeyCode::Char(':'))), at(0));
+        for c in ['c', 'a', 'n', 'c', 'e', 'l'] {
+            handle_input(&mut s, Input::Key(key(KeyCode::Char(c))), at(0));
+        }
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        assert_eq!(action, AppAction::Continue);
+        match &s.ui.modal {
+            Some(Modal::ConfirmCommand { command, .. }) => {
+                assert!(matches!(command, PaletteCommand::Cancel { .. }));
+            }
+            other => panic!("expected ConfirmCommand modal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn palette_enter_on_quit_returns_quit() {
+        let mut s = seed_two_jobs();
+        handle_input(&mut s, Input::Key(key(KeyCode::Char(':'))), at(0));
+        for c in ['q', 'u', 'i', 't'] {
+            handle_input(&mut s, Input::Key(key(KeyCode::Char(c))), at(0));
+        }
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        assert_eq!(action, AppAction::Quit);
+    }
+
+    #[test]
+    fn palette_parse_error_surfaces_as_command_status() {
+        let mut s = seed_two_jobs();
+        handle_input(&mut s, Input::Key(key(KeyCode::Char(':'))), at(0));
+        for c in ['n', 'u', 'k', 'e'] {
+            handle_input(&mut s, Input::Key(key(KeyCode::Char(c))), at(0));
+        }
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Enter)), at(0));
+        assert_eq!(action, AppAction::Continue);
+        let cs = s.command_status.as_ref().expect("status set");
+        assert_eq!(cs.kind, crate::state::CommandStatusKind::Error);
+        assert!(cs.message.contains("unknown command"));
+    }
+
+    #[test]
+    fn confirm_modal_y_executes_command() {
+        let mut s = seed_two_jobs();
+        s.ui.modal = Some(Modal::ConfirmCommand {
+            command: PaletteCommand::Cancel {
+                job_id: jid("alpha"),
+            },
+            summary: "cancel job 'alpha'?".into(),
+        });
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Char('y'))), at(0));
+        match action {
+            AppAction::Execute(PaletteCommand::Cancel { job_id }) => {
+                assert_eq!(job_id, jid("alpha"));
+            }
+            other => panic!("expected Execute, got {other:?}"),
+        }
+        assert!(s.ui.modal.is_none(), "modal must close on confirm");
+    }
+
+    #[test]
+    fn confirm_modal_n_cancels_without_execute() {
+        let mut s = seed_two_jobs();
+        s.ui.modal = Some(Modal::ConfirmCommand {
+            command: PaletteCommand::Cancel {
+                job_id: jid("alpha"),
+            },
+            summary: "x".into(),
+        });
+        let action = handle_input(&mut s, Input::Key(key(KeyCode::Char('n'))), at(0));
+        assert_eq!(action, AppAction::Continue);
+        assert!(s.ui.modal.is_none());
+    }
+
+    #[test]
+    fn confirm_modal_esc_also_cancels() {
+        let mut s = seed_two_jobs();
+        s.ui.modal = Some(Modal::ConfirmCommand {
+            command: PaletteCommand::Drain {
+                job_id: jid("alpha"),
+            },
+            summary: "x".into(),
+        });
+        handle_input(&mut s, Input::Key(key(KeyCode::Esc)), at(0));
+        assert!(s.ui.modal.is_none());
+    }
+
+    #[test]
+    fn command_result_input_updates_banner_toast() {
+        let mut s = seed_two_jobs();
+        handle_input(
+            &mut s,
+            Input::CommandResult {
+                ok: true,
+                message: "pause 'alpha' ok".into(),
+            },
+            at(0),
+        );
+        let cs = s.command_status.as_ref().expect("status");
+        assert_eq!(cs.kind, crate::state::CommandStatusKind::Ok);
+        assert_eq!(cs.message, "pause 'alpha' ok");
     }
 }

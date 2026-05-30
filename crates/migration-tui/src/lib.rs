@@ -23,5 +23,6 @@
 pub mod app;
 pub mod client;
 pub mod format;
+pub mod palette;
 pub mod render;
 pub mod state;

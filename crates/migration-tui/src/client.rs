@@ -20,6 +20,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use migration_coord::schema::EventEnvelope;
 use migration_coord::schema::Job;
+use migration_coord::server::command::{CommandAccepted, ReasonBody};
 use migration_coord::server::read::{
     HealthzResponse, ListErrorsResponse, ListEventsResponse, ListJobsResponse, ListWorkersResponse,
 };
@@ -185,6 +186,52 @@ impl Client {
             .http
             .get(self.url(&format!("/jobs/{id}/events")))
             .query(&[("since", since)])
+            .send()
+            .await?;
+        check_status(resp).await?.json().await.map_err(Into::into)
+    }
+
+    // ----- Admin commands (POST /jobs/{id}/<action>) -----
+    //
+    // Each calls the matching coord handler with an optional
+    // human-readable `reason` (defaults coord-side to "operator").
+    // Bearer auth is set on the default headers; without an admin
+    // token these will 401 (or 200 on a coord running in dev
+    // mode). Returns the audit `command_id` on success.
+
+    pub async fn pause(&self, id: &str, reason: Option<&str>) -> Result<CommandAccepted> {
+        self.post_command(id, "pause", reason).await
+    }
+
+    pub async fn resume(&self, id: &str, reason: Option<&str>) -> Result<CommandAccepted> {
+        self.post_command(id, "resume", reason).await
+    }
+
+    pub async fn cancel(&self, id: &str, reason: Option<&str>) -> Result<CommandAccepted> {
+        self.post_command(id, "cancel", reason).await
+    }
+
+    pub async fn drain(&self, id: &str, reason: Option<&str>) -> Result<CommandAccepted> {
+        self.post_command(id, "drain", reason).await
+    }
+
+    pub async fn retry_failed(&self, id: &str, reason: Option<&str>) -> Result<CommandAccepted> {
+        self.post_command(id, "retry-failed", reason).await
+    }
+
+    async fn post_command(
+        &self,
+        id: &str,
+        action: &str,
+        reason: Option<&str>,
+    ) -> Result<CommandAccepted> {
+        let body = ReasonBody {
+            reason: reason.map(|s| s.to_string()),
+        };
+        let resp = self
+            .http
+            .post(self.url(&format!("/jobs/{id}/{action}")))
+            .json(&body)
             .send()
             .await?;
         check_status(resp).await?.json().await.map_err(Into::into)
