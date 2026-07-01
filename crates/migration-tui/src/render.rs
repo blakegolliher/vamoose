@@ -651,7 +651,7 @@ fn render_errors_tab(
     let theme = &state.theme;
     // Sort buckets by count desc so the loudest class lands on top.
     let mut buckets: Vec<&ErrorBucket> = state.errors_for_job(&job.id).iter().collect();
-    buckets.sort_by(|a, b| b.count.cmp(&a.count));
+    buckets.sort_by_key(|b| std::cmp::Reverse(b.count));
     let tail = state
         .recent_errors_for_job(&job.id)
         .map(|r| r.tail(15).collect::<Vec<_>>())

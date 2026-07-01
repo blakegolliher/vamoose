@@ -482,7 +482,7 @@ fn translate_batch(
 
     let mut all_fields: Vec<Field> = Vec::with_capacity(canonical_arrays.len() + legacy.len());
     let mut all_arrays: Vec<ArrayRef> = Vec::with_capacity(canonical_arrays.len() + legacy.len());
-    for (f, a) in canonical_arrays.into_iter().chain(legacy.into_iter()) {
+    for (f, a) in canonical_arrays.into_iter().chain(legacy) {
         all_fields.push(f);
         all_arrays.push(a);
     }
