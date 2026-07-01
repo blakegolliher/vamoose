@@ -300,7 +300,7 @@ async fn snapshot_write_load_round_trip() {
         .await
         .expect("write 2");
     let history = snapshot::list_history(&store).await.expect("history");
-    assert!(history.len() >= 1);
+    assert!(!history.is_empty());
 
     cleanup(&store, &prefix).await;
 }

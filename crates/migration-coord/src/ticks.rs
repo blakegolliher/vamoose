@@ -14,6 +14,7 @@
 //!   - `now - last_snapshot_at >= snapshot_interval` (default 5min),
 //!   - `last_seq - last_snapshot_seq >= snapshot_events` (default
 //!     1000).
+//!
 //!   Either firing writes a snapshot (and history copy, pruned to
 //!   `history_keep`). Both counters reset.
 //!

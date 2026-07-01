@@ -5,6 +5,7 @@ edition     = { workspace = true }
 authors     = { workspace = true }
 license     = { workspace = true }
 description = "Throwaway shim: nfs-walker parquet → canonical migration schema"
+publish     = false
 
 [[bin]]
 name = "mig-walker-rewrite"

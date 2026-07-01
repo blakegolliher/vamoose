@@ -2,8 +2,11 @@
 
 Status: Phase 0 prerequisite (`docs/work-items/LIBNFS_ASYNC_FORK.md`)
 closed 2026-05-18 — `AsyncNfsContext` is shipped at
-`crates/migration-mover/src/libnfs/asyncio/`. Phase 1 (bucketed pool)
-ready to begin. The async-surface deltas from the closing note have
+`crates/migration-mover/src/libnfs/asyncio/`. Phases 1–2 (bucketed
+pool, pipelined single-pass copy) are delivered
+(`bucketed_pool.rs`, `pipelined_copy.rs`, `file_mover.rs`); Phases
+3–8 (pass driver, `vamoose pass`, PASS_DRIVER_SEMANTICS) are not
+started. The async-surface deltas from the closing note have
 been threaded into the `BUCKETS` table, the `pipelined_copy` sketch,
 and the cutover-pass language below; in summary: `nconnect>1` is
 rejected at mount, `libnfs_readahead` is gone, `fsync` is whole-file

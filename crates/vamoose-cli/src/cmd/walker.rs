@@ -4,9 +4,9 @@
 //! now invoke `nfs-walker` and `mig-walker-rewrite` directly.
 //!
 //! Walker is post-RocksDB-removal, so the workflow is single-step:
-//!   nfs-walker <nfs-url> -o <out>.parquet
-//! produces `<out>.parquet/scans/<scan_id>/part-rNN-SSSSS.parquet`
-//! + `metadata.json` directly. There is no longer a rocks intermediate
+//! `nfs-walker <nfs-url> -o <out>.parquet` produces
+//! `<out>.parquet/scans/<scan_id>/part-rNN-SSSSS.parquet` +
+//! `metadata.json` directly. There is no longer a rocks intermediate
 //! or `export-parquet` follow-up step. See
 //! scripts/m5-self-fence-test.sh for the shape this stub will
 //! eventually replace.

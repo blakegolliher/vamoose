@@ -1,5 +1,18 @@
 # Distributed NFS File Migration System — Design (v2)
 
+> **Freshness note (2026-07-01).** This doc predates several shipped
+> changes; where it disagrees with the following, the following win:
+> - Claim protocol: the claim/heartbeat/reclaim mechanics described
+>   below are the *v1* design (`PUT If-Match` heartbeats). The shipped
+>   protocol is v2 delete-then-create — see `docs/CLAIM_PROTOCOL.md`.
+> - Workspace: the crate list below predates `migration-coord`,
+>   `migration-tui`, `mig-walker-rewrite`, and `vamoose-cli` (the
+>   operator plane) — see `README.md`.
+> - M4 (NFSv4.2 server-side COPY) is cancelled; `strategy::pick`
+>   never selects it. M2/M3/M5 are verified complete.
+> - io_uring is still deferred (M3.5); the data plane is async libnfs.
+> - `mig-aggr` subcommands (incl. `clean-partials`) are stubs.
+
 ## Goal
 
 Migrate large numbers of files between POSIX/NFS shares at **wire rate**,

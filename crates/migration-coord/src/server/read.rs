@@ -61,8 +61,7 @@ pub async fn list_jobs(
     let limit = params
         .limit
         .unwrap_or(DEFAULT_PAGE_LIMIT)
-        .min(MAX_PAGE_LIMIT)
-        .max(1);
+        .clamp(1, MAX_PAGE_LIMIT);
     let page = state.runtime.jobs_view(cursor.as_ref(), limit).await;
     Ok(Json(ListJobsResponse {
         jobs: page.jobs,
@@ -171,8 +170,7 @@ pub async fn list_events(
     let limit = params
         .limit
         .unwrap_or(DEFAULT_EVENTS_LIMIT)
-        .min(MAX_EVENTS_LIMIT)
-        .max(1);
+        .clamp(1, MAX_EVENTS_LIMIT);
 
     // Per-job catch-up: walk events/{job_id}/<chunks> in seq order.
     let mut all = crate::state::read_job_events(state.runtime.store().as_ref(), &id, since)
@@ -200,8 +198,7 @@ pub async fn list_all_events(
     let limit = params
         .limit
         .unwrap_or(DEFAULT_EVENTS_LIMIT)
-        .min(MAX_EVENTS_LIMIT)
-        .max(1);
+        .clamp(1, MAX_EVENTS_LIMIT);
     let mut all = read_all_events_since(state.runtime.store().as_ref(), since)
         .await
         .map_err(ApiError::storage)?;

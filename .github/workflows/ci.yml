@@ -7,11 +7,44 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# A newer push to the same branch/PR supersedes the running build.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Fast lint gate: formatting + clippy. Split from build+test so a
+  # style failure never masks the test signal.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install libnfs build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnfs-dev pkg-config
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   # ---------------------------------------------------------------------------
   # Build + run the test suite.
   # ---------------------------------------------------------------------------
@@ -23,8 +56,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -35,14 +66,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libnfs-dev pkg-config
 
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
       - name: cargo build
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
 
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   # ---------------------------------------------------------------------------
   # cargo-deny: license allowlist, advisory db, banned wildcards,
@@ -60,8 +88,8 @@ jobs:
           arguments: --all-features
 
   # ---------------------------------------------------------------------------
-  # cargo-about: produce THIRD_PARTY_LICENSES.md and ship it as a
-  # workflow artifact. Config in about.toml + about.hbs.
+  # cargo-about: regenerate THIRD_PARTY_LICENSES.md and fail if the
+  # committed copy has drifted. Config in about.toml + about.hbs.
   # ---------------------------------------------------------------------------
   licenses:
     name: third-party licenses
@@ -75,15 +103,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-about
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-about
+        # Not taiki-e/install-action: cargo-about 0.9.1 has no prebuilt
+        # binary there, and its source build omits the `cli` feature
+        # that gates the binary — the install "succeeds" with nothing
+        # installed. Pin the version so the committed bundle stays
+        # byte-reproducible.
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
 
       - name: Generate THIRD_PARTY_LICENSES.md
         # `cargo about generate` walks the workspace dependency
         # graph, materializes each crate's license text, and
         # renders it through about.hbs.
         run: cargo about generate about.hbs > THIRD_PARTY_LICENSES.md
+
+      - name: Fail on license drift
+        # The bundle is committed; regeneration must be a no-op.
+        # If this fails, run the generate command above locally and
+        # commit the result.
+        run: git diff --exit-code THIRD_PARTY_LICENSES.md
 
       - uses: actions/upload-artifact@v4
         with:

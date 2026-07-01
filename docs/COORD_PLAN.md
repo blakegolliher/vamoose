@@ -1,5 +1,10 @@
 # vamoose Coordinator + TUI — 6-Phase Build Plan
 
+> **Status: delivered.** All six phases shipped and merged to `main`
+> (PR #7, 2026-05-30). This document remains the design record for
+> the coord daemon, the TUI, and the supply-chain CI wiring; the
+> forward-looking phrasing below is historical.
+
 This document is the working plan for `vamoose coord` (control plane) and
 `vamoose tui` (operator UI). It is paired with the build prompt; this is the
 internal-engineering view that records decisions, conflicts with existing

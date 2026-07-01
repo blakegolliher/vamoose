@@ -1,6 +1,6 @@
 # mtime parity fix — libnfs FFI gap against VAST NFSv3
 
-Status: in progress, branch `phase-1-bucketed-pool`.
+Status: closed 2026-05-19 (see the closing notes below).
 
 ## Header-survey findings (2026-05-19, slice 0)
 

@@ -30,11 +30,11 @@ pub const CONTRACT_VERSION: u32 = 1;
 // "Parquet file metadata (KV footer)".
 // =============================================================================
 
-pub const KV_FORMAT_VERSION:   &str = "migration.format_version";
+pub const KV_FORMAT_VERSION: &str = "migration.format_version";
 pub const KV_CONTRACT_VERSION: &str = "migration.contract_version";
-pub const KV_SHARD_INDEX:      &str = "migration.shard_index";
-pub const KV_WALKER_VERSION:   &str = "migration.walker_version";
-pub const KV_ROW_COUNT:        &str = "migration.row_count";
+pub const KV_SHARD_INDEX: &str = "migration.shard_index";
+pub const KV_WALKER_VERSION: &str = "migration.walker_version";
+pub const KV_ROW_COUNT: &str = "migration.row_count";
 
 // =============================================================================
 // Column names — use these constants everywhere, never literal strings.
@@ -60,13 +60,7 @@ pub const COL_FILE_TYPE: &str = "file_type";
 /// Columns the mover *requires* to function. If any are missing from a
 /// shard's actual schema, the mover refuses the shard with
 /// `Error::MissingColumn`.
-pub const REQUIRED_COLUMNS: &[&str] = &[
-    COL_ROW_ID,
-    COL_PATH,
-    COL_SIZE,
-    COL_MODE,
-    COL_FILE_TYPE,
-];
+pub const REQUIRED_COLUMNS: &[&str] = &[COL_ROW_ID, COL_PATH, COL_SIZE, COL_MODE, COL_FILE_TYPE];
 
 // =============================================================================
 // File-type tag values — must match what the walker emits.

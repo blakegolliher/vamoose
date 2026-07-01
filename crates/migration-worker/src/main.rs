@@ -5,17 +5,7 @@
 //! Heartbeats every 30s, self-fences on claim loss.
 
 use clap::Parser;
-
-mod backpressure;
-mod caps;
-mod config;
-mod coord_client;
-mod coord_driver;
-mod heartbeat;
-mod orchestrator;
-mod run_control;
-mod shard_processor;
-mod throughput;
+use migration_worker::{config, orchestrator};
 
 #[derive(Debug, Parser)]
 #[command(name = "mig-worker", version)]

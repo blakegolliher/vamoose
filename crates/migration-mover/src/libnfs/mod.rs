@@ -195,6 +195,11 @@ extern "C" {
 }
 
 /// Last error string from a context, as a borrowed `&str`.
+///
+/// Deliberately not `unsafe fn`: every caller passes a context pointer
+/// it owns (or just null-checked), and the body null-checks both the
+/// context and the returned string before dereferencing.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn last_error<'a>(ctx: *mut nfs_context) -> &'a str {
     if ctx.is_null() {
         return "<null context>";

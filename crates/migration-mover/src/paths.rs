@@ -93,7 +93,7 @@ pub fn partial_path(path: &[u8], host: &str, pid: u32) -> Result<Vec<u8>, MoveEr
         // Keep the trailing slash on dir so we can concat without
         // re-adding it: `/foo/` + `.bar` = `/foo/.bar`.
         Some(i) => (&path[..=i], &path[i + 1..]),
-        None => (&[][..], &path[..]),
+        None => (&[][..], path),
     };
     if base.is_empty() {
         return Err(MoveError::new(FailurePhase::Open, "EINVAL"));

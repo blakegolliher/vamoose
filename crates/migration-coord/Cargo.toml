@@ -5,6 +5,7 @@ edition     = { workspace = true }
 authors     = { workspace = true }
 license     = { workspace = true }
 description = "Control-plane coordinator: schema, S3-backed event log + snapshot + lease"
+publish     = false
 
 [features]
 # Re-exports a small set of `assert_*` self-check helpers (currently

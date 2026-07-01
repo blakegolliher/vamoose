@@ -3,8 +3,11 @@
 Design spec for revising vamoose's shard-claim protocol so that
 every ownership transition is gated by a conditional primitive that
 VAST S3 actually enforces. Spawned out of M5_NOTES.md "What the
-harness reveals about the protocol". Status: design only — no code
-in this work-item, just the shape v2 needs to take. The two
+harness reveals about the protocol". Status: implemented and
+verified — v2 is the shipped protocol in `migration-core/src/claim.rs`
+/ `s3.rs`, and the M5 self-fence harness passed against it on real
+VAST hardware (2026-05; see M5_NOTES.md "Pass record", tag
+`m5-pass-v2-claim-protocol`). Kept as the protocol spec. The two
 companion docs are `M5_NOTES.md` (the finding) and
 `M5_HARNESS_VERIFIED.md` (the test harness that will validate v2
 once it lands).

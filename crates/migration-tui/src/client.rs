@@ -324,8 +324,7 @@ where
         while let Some(chunk_res) = stream.next().await {
             let chunk = chunk_res?;
             leftover.extend_from_slice(&chunk);
-            loop {
-                let Some(pos) = leftover.iter().position(|&b| b == b'\n') else { break };
+            while let Some(pos) = leftover.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = leftover.drain(..=pos).take(pos).collect();
                 let line = std::str::from_utf8(&line).unwrap_or("").trim_end_matches('\r');
                 if line.is_empty() {

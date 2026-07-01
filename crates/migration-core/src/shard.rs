@@ -325,56 +325,113 @@ fn type_err(col: &'static str) -> Error {
 
 fn req_u64(batch: &RecordBatch, name: &'static str, row: usize) -> Result<u64> {
     let arr = col(batch, name).ok_or(Error::MissingColumn(name))?;
-    let arr = arr.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| type_err(name))?;
+    let arr = arr
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| type_err(name))?;
     Ok(arr.value(row))
 }
 
 fn req_u32(batch: &RecordBatch, name: &'static str, row: usize) -> Result<u32> {
     let arr = col(batch, name).ok_or(Error::MissingColumn(name))?;
-    let arr = arr.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| type_err(name))?;
+    let arr = arr
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| type_err(name))?;
     Ok(arr.value(row))
 }
 
 fn req_u8(batch: &RecordBatch, name: &'static str, row: usize) -> Result<u8> {
     let arr = col(batch, name).ok_or(Error::MissingColumn(name))?;
-    let arr = arr.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| type_err(name))?;
+    let arr = arr
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .ok_or_else(|| type_err(name))?;
     Ok(arr.value(row))
 }
 
 fn req_bin(batch: &RecordBatch, name: &'static str, row: usize) -> Result<Vec<u8>> {
     let arr = col(batch, name).ok_or(Error::MissingColumn(name))?;
-    let arr = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| type_err(name))?;
+    let arr = arr
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| type_err(name))?;
     Ok(arr.value(row).to_vec())
 }
 
 fn opt_u32(batch: &RecordBatch, name: &'static str, row: usize) -> Result<Option<u32>> {
-    let Some(arr) = col(batch, name) else { return Ok(None) };
-    let arr = arr.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| type_err(name))?;
-    Ok(if arr.is_null(row) { None } else { Some(arr.value(row)) })
+    let Some(arr) = col(batch, name) else {
+        return Ok(None);
+    };
+    let arr = arr
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| type_err(name))?;
+    Ok(if arr.is_null(row) {
+        None
+    } else {
+        Some(arr.value(row))
+    })
 }
 
 fn opt_u64(batch: &RecordBatch, name: &'static str, row: usize) -> Result<Option<u64>> {
-    let Some(arr) = col(batch, name) else { return Ok(None) };
-    let arr = arr.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| type_err(name))?;
-    Ok(if arr.is_null(row) { None } else { Some(arr.value(row)) })
+    let Some(arr) = col(batch, name) else {
+        return Ok(None);
+    };
+    let arr = arr
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| type_err(name))?;
+    Ok(if arr.is_null(row) {
+        None
+    } else {
+        Some(arr.value(row))
+    })
 }
 
 fn opt_i32(batch: &RecordBatch, name: &'static str, row: usize) -> Result<Option<i32>> {
-    let Some(arr) = col(batch, name) else { return Ok(None) };
-    let arr = arr.as_any().downcast_ref::<Int32Array>().ok_or_else(|| type_err(name))?;
-    Ok(if arr.is_null(row) { None } else { Some(arr.value(row)) })
+    let Some(arr) = col(batch, name) else {
+        return Ok(None);
+    };
+    let arr = arr
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| type_err(name))?;
+    Ok(if arr.is_null(row) {
+        None
+    } else {
+        Some(arr.value(row))
+    })
 }
 
 fn opt_i64(batch: &RecordBatch, name: &'static str, row: usize) -> Result<Option<i64>> {
-    let Some(arr) = col(batch, name) else { return Ok(None) };
-    let arr = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| type_err(name))?;
-    Ok(if arr.is_null(row) { None } else { Some(arr.value(row)) })
+    let Some(arr) = col(batch, name) else {
+        return Ok(None);
+    };
+    let arr = arr
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| type_err(name))?;
+    Ok(if arr.is_null(row) {
+        None
+    } else {
+        Some(arr.value(row))
+    })
 }
 
 fn opt_bin(batch: &RecordBatch, name: &'static str, row: usize) -> Result<Option<Vec<u8>>> {
-    let Some(arr) = col(batch, name) else { return Ok(None) };
-    let arr = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| type_err(name))?;
-    Ok(if arr.is_null(row) { None } else { Some(arr.value(row).to_vec()) })
+    let Some(arr) = col(batch, name) else {
+        return Ok(None);
+    };
+    let arr = arr
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| type_err(name))?;
+    Ok(if arr.is_null(row) {
+        None
+    } else {
+        Some(arr.value(row).to_vec())
+    })
 }
 
 #[cfg(test)]

@@ -90,10 +90,6 @@ memmap2 = "0.9"
 ratatui = "0.28"
 crossterm = "0.28"
 
-# Prometheus exporter
-prometheus = "0.13"
-hyper      = { version = "1", features = ["server", "http1"] }
-
 # Coord HTTP layer (REST + SSE)
 axum        = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "macros", "matched-path"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }

@@ -737,7 +737,7 @@ fn render_error_buckets_table(
             let sample = b
                 .sample_paths
                 .first()
-                .map(|s| s.clone())
+                .cloned()
                 .unwrap_or_else(|| "—".to_string());
             let retry_label = if b.retryable { "yes" } else { "no" };
             let retry_style = if b.retryable {
@@ -831,12 +831,10 @@ fn format_error_class(c: &ErrorClass) -> String {
 // =============================================================================
 
 fn render_plan_tab(frame: &mut Frame, area: Rect, job: &Job, theme: &Theme) {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
     // Config hash up top — operators correlate this with the
     // worker's `[coord].job_id` to confirm they're looking at the
     // same plan.
-    lines.push(section_header("Config hash"));
+    let mut lines: Vec<Line<'static>> = vec![section_header("Config hash")];
     lines.push(Line::from(vec![
         kv_key("Hash"),
         Span::styled(

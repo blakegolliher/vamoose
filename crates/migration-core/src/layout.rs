@@ -17,11 +17,11 @@
 
 pub const MANIFEST_KEY: &str = "manifest.json";
 
-pub const INDEX_PREFIX:      &str = "index/";
-pub const SHARDS_PREFIX:     &str = "shards/";
-pub const PROGRESS_PREFIX:   &str = "progress/";
-pub const BATCHES_PREFIX:    &str = "batches/";
-pub const FAILURES_PREFIX:   &str = "failures/";
+pub const INDEX_PREFIX: &str = "index/";
+pub const SHARDS_PREFIX: &str = "shards/";
+pub const PROGRESS_PREFIX: &str = "progress/";
+pub const BATCHES_PREFIX: &str = "batches/";
+pub const FAILURES_PREFIX: &str = "failures/";
 pub const DOWNGRADES_PREFIX: &str = "downgrades/";
 
 pub const CLAIM_SUFFIX: &str = ".claim";

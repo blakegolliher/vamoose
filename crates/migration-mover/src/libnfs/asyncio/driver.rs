@@ -417,7 +417,7 @@ fn issue(ctx: *mut nfs_context, req: Request) {
             // and hands it back at completion.
             let mut buf = vec![0u8; len];
             let buf_ptr = buf.as_mut_ptr() as *mut _;
-            let pd = Box::into_raw(Box::new(PendingPread { tx, buf })) as *mut PendingPread;
+            let pd = Box::into_raw(Box::new(PendingPread { tx, buf }));
             let rc = unsafe {
                 ffi::nfs_pread_async(ctx, fh.0, buf_ptr, len, offset, pread_cb, pd as *mut _)
             };
@@ -433,7 +433,7 @@ fn issue(ctx: *mut nfs_context, req: Request) {
             tx,
         } => {
             let len = buf.len();
-            let pd = Box::into_raw(Box::new(PendingWrite { tx, _buf: buf })) as *mut PendingWrite;
+            let pd = Box::into_raw(Box::new(PendingWrite { tx, _buf: buf }));
             let buf_ptr = unsafe { (*pd)._buf.as_ptr() } as *const _;
             let rc = unsafe {
                 ffi::nfs_pwrite_async(ctx, fh.0, buf_ptr, len, offset, pwrite_cb, pd as *mut _)

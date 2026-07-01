@@ -129,8 +129,9 @@ pub enum Modal {
 
 /// Top-level view dispatcher. Phase 4 had only the jobs list;
 /// Phase 5 adds a per-job detail view with five tabs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum View {
+    #[default]
     List,
     Detail {
         /// Job currently being inspected. The render layer fetches
@@ -141,12 +142,6 @@ pub enum View {
         /// hooked to Tab / Shift-Tab in the event loop.
         tab: Tab,
     },
-}
-
-impl Default for View {
-    fn default() -> Self {
-        Self::List
-    }
 }
 
 /// Five-tab dispatcher for the per-job detail view.
@@ -216,8 +211,9 @@ impl Tab {
 ///   (entered via `/` from List view).
 /// - `Palette` — command palette (entered via `:`). The buffer
 ///   feeds [`crate::palette::parse`] on Enter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum InputMode {
+    #[default]
     Normal,
     Filter {
         /// Live edit buffer; appended on Char, popped on Backspace.
@@ -243,12 +239,6 @@ pub enum InputMode {
         /// the ghost-text completion.
         completion_idx: usize,
     },
-}
-
-impl Default for InputMode {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1114,7 +1104,7 @@ mod tests {
         let mut s = AppState::empty(at(0));
         s.apply_envelope(&job_created(1, "bobby"));
         // No progress yet — no window for this job.
-        assert!(s.progress_windows.get(&jid("bobby")).is_none());
+        assert!(!s.progress_windows.contains_key(&jid("bobby")));
         s.apply_envelope(&prog_at(2, 1, "bobby", 1024));
         s.apply_envelope(&prog_at(3, 2, "bobby", 2048));
         // Window now exists with 2 samples, totaling 3072 bytes.

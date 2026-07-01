@@ -1,4 +1,3 @@
-cat > ~/projects/vamoose/migration/docs/work-items/PR2_HARDENING.md <<'PR2_EOF'
 # PR 2: libnfs FFI hardening + verification narrative
 
 Follow-up to PR 1 (the urgent FFI fix, already applied in the
@@ -329,12 +328,3 @@ Single-line comment near the top of `libnfs/mod.rs`:
 4. Re-run M2/M3 manual verification. Confirm "CONTENT MATCHES"
    with no `EARLY_EOF` records.
 5. Mark M2 and M3 complete in M2_NOTES.md.
-PR2_EOF
-
-# Verify it landed
-ls -la ~/projects/vamoose/migration/docs/work-items/
-wc -l ~/projects/vamoose/migration/docs/work-items/PR2_HARDENING.md
-
-# Stage but don't commit yet — review the doc, then commit as part of PR2.
-cd ~/projects/vamoose/migration
-git status

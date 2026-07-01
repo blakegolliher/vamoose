@@ -25,6 +25,7 @@ accepted = [
     "Unicode-DFS-2016",
     "Zlib",
     "OpenSSL",
+    "CDLA-Permissive-2.0",
 ]
 
 # Walk transitive dependencies — we ship them, so we credit them.
@@ -32,8 +33,11 @@ ignore-build-dependencies = true
 ignore-dev-dependencies = true
 ignore-transitive-dependencies = false
 
-# Treat workspace crates as private — they're vamoose's own code,
-# not "third party". cargo-about's `private` knob hides them from
-# the generated bundle.
-[workarounds]
-# Reserved for future per-crate license overrides.
+# Named upstream workarounds for crates whose license files need
+# special handling. `ring` is in the tree via the legacy-rustls-ring
+# feature of aws-smithy-http-client.
+workarounds = ["ring"]
+
+# Workspace crates are `publish = false`; skip them — they're
+# vamoose's own code, not third party.
+private = { ignore = true }

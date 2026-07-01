@@ -30,10 +30,8 @@ use std::env;
 #[tokio::test]
 #[ignore]
 async fn nfs_pread_returns_actual_bytes() {
-    let url = env::var("VAMOOSE_TEST_NFS_URL")
-        .expect("VAMOOSE_TEST_NFS_URL not set");
-    let path = env::var("VAMOOSE_TEST_NFS_PATH")
-        .expect("VAMOOSE_TEST_NFS_PATH not set");
+    let url = env::var("VAMOOSE_TEST_NFS_URL").expect("VAMOOSE_TEST_NFS_URL not set");
+    let path = env::var("VAMOOSE_TEST_NFS_PATH").expect("VAMOOSE_TEST_NFS_PATH not set");
     let expected_size: u64 = env::var("VAMOOSE_TEST_NFS_EXPECTED_SIZE")
         .expect("VAMOOSE_TEST_NFS_EXPECTED_SIZE not set")
         .parse()
@@ -59,8 +57,7 @@ async fn nfs_pread_returns_actual_bytes() {
     // return Ok(0) here — which is exactly the silent data-loss
     // failure mode this test exists to catch.
     let mut buf = vec![0u8; 1024];
-    let n = ops::pread(pair.src(), &fh, 0, &mut buf)
-        .expect("nfs_pread returned an error");
+    let n = ops::pread(pair.src(), &fh, 0, &mut buf).expect("nfs_pread returned an error");
 
     ops::close_quietly(pair.src(), fh);
 

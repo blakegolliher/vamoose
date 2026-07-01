@@ -33,7 +33,7 @@ use std::time::Instant;
 // to 1 MiB × 32 = 32 MiB so the existing var204 100 MiB
 // `large.bin` works as the source. The relative async-vs-sync
 // throughput ratio is the load-bearing number for the closing note.
-const READ_SIZE: usize = 1 * 1024 * 1024;
+const READ_SIZE: usize = 1024 * 1024;
 const CONCURRENCY: usize = 32;
 
 fn env_url() -> String {

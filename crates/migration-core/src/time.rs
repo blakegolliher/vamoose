@@ -24,7 +24,11 @@ impl UtcTime {
 impl std::fmt::Display for UtcTime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // RFC 3339 with Z suffix.
-        write!(f, "{}", self.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        write!(
+            f,
+            "{}",
+            self.0.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        )
     }
 }
 

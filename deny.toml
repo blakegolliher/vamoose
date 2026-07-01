@@ -13,10 +13,26 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-# `ignore = ["RUSTSEC-XXXX-YYYY"]` is the escape hatch — leave empty
-# until something forces a temporary exception. Every entry should
-# have a comment with the justification + a deadline.
-ignore = []
+# `ignore` is the escape hatch. Every entry needs a justification and
+# a condition for removal.
+ignore = [
+    # `paste` is unmaintained (not vulnerable). Compile-time-only
+    # proc-macro, pulled in by arrow/parquet 54. No runtime code ships.
+    # Remove when the arrow family drops it (check on major bumps).
+    "RUSTSEC-2024-0436",
+    # The next three are rustls-webpki 0.101 certificate-VALIDATION
+    # bugs. That crate only enters the tree via the pinned rustls
+    # 0.21 / hyper-rustls 0.24 legacy stack, which exists solely to
+    # implement `verify_tls = false` (see workspace Cargo.toml and
+    # migration-core/src/s3.rs): on that path certificate validation
+    # is deliberately skipped, so the vulnerable code never runs. The
+    # default `verify_tls = true` path uses the AWS SDK's current
+    # rustls. Remove all three when smithy exposes a supported
+    # skip-verification knob and the legacy stack is dropped.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+]
 
 # -----------------------------------------------------------------------------
 # Licenses — what's allowed to ship inside vamoose binaries.
@@ -47,6 +63,9 @@ allow = [
     # `ring` and a few crypto crates use a hybrid OpenSSL/ISC-style
     # license that SPDX names "OpenSSL". Required by hyper-rustls.
     "OpenSSL",
+    # `webpki-roots` ships the Mozilla/CCADB root-certificate data
+    # under the Community Data License Agreement (permissive).
+    "CDLA-Permissive-2.0",
 ]
 
 # Per-crate exceptions — keep this empty by default. Use only when a
@@ -59,6 +78,10 @@ exceptions = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace-internal `{ path = ... }` deps carry no version field and
+# would otherwise count as wildcards. All workspace crates are
+# `publish = false`, which is what makes this exemption apply.
+allow-wildcard-paths = true
 highlight = "all"
 
 # Skip the duplicate-versions check for common ecosystem churn where

@@ -208,7 +208,7 @@ Exits when `fence.is_valid() == false` or every shard is terminal.
 ## Self-fencing
 
 The fence is the single most important correctness primitive in the
-worker (`migration-worker/src/fence.rs`). It is an atomic bool plus a
+worker (`migration-core/src/fence.rs`). It is an atomic bool plus a
 `CancellationToken`. When tripped:
 
 - The shard processor's row-level `fence.is_valid()` check stops
@@ -413,7 +413,7 @@ SIGSTOP fast.
 - `crates/migration-core/src/claim.rs` — the four atoms, fakes, unit tests
 - `crates/migration-worker/src/heartbeat.rs` — heartbeat task, R6/R7 guards
 - `crates/migration-worker/src/orchestrator.rs` — scan, acquire, complete, R4 fix
-- `crates/migration-worker/src/fence.rs` — fence primitive
+- `crates/migration-core/src/fence.rs` — fence primitive
 - `docs/work-items/CLAIM_PROTOCOL_V2_DELETE_THEN_CREATE.md` — v2 design rationale
 - `docs/work-items/M5_SELF_FENCE.md` — M5 verification harness assertions
 - `DESIGN.md` "Claims" and "Self-fencing" — architectural overview

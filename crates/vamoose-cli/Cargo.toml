@@ -5,6 +5,7 @@ edition     = { workspace = true }
 authors     = { workspace = true }
 license     = { workspace = true }
 description = "Unified vamoose CLI: composes migration-core, migration-mover, migration-worker, migration-aggr into a single binary"
+publish     = false
 
 [[bin]]
 name = "vamoose"
