@@ -49,8 +49,11 @@ from an old session); use `examples/worker.toml` instead. A stale
 
 ## Known issues (2026-07-01 review)
 
-Full write-ups live in the session review; headline items, in
-priority order:
+**Tracking:** every finding now has a row in
+[`docs/REVIEW_LEDGER.md`](REVIEW_LEDGER.md) (F01–F45) with status and
+a link to a test-first work-item doc where scheduled. The ledger is
+the authoritative status; the list below is the narrative summary.
+Headline items, in priority order:
 
 1. **Fresh claims are stealable (critical, protocol).** The
    progress-liveness cross-check's etag-mismatch/absent branches have
