@@ -44,8 +44,10 @@ no Postgres, no message broker. Adding a worker means starting a new
 - `crates/migration-mover` — the file copy engine, libnfs FFI
 - `crates/migration-worker` — the orchestrator (driven by
   `vamoose worker`)
-- `crates/migration-aggr` — sidecar for operator observability
-  (driven by `vamoose aggr`)
+- `crates/migration-aggr` — placeholder for the operator
+  observability sidecar (all subcommands are stubs today; live
+  observability comes from `vamoose status` / `vamoose coord` +
+  `vamoose tui`)
 - `crates/migration-coord` — HTTP/SSE control-plane daemon
   (`vamoose coord`); S3-backed event log, snapshot, single-writer
   lease
@@ -81,8 +83,11 @@ end-to-end cookbook. At a high level:
 
 1. Configure S3 access (AWS CLI profile, bucket, endpoint).
 2. `vamoose init` — lay out the bucket prefixes.
-3. `vamoose walker` — scan the source filesystem and upload canonical
-   parquet shards to S3.
+3. Scan the source filesystem and upload canonical parquet shards
+   to S3. (`vamoose walker` is still a stub: run `nfs-walker` and,
+   if its output is legacy-schema, `mig-walker-rewrite`, then upload
+   the canonical shards — `scripts/manual-verify.sh` shows the exact
+   steps.)
 4. Copy `examples/worker.toml` per migration host and edit the
    source / destination / S3 stanzas. **Do not** reuse a config whose
    source path overlaps its destination path.

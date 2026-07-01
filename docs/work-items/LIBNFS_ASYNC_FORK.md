@@ -1,7 +1,9 @@
 # Async libnfs FFI surface (prerequisite for multi-pass / bucketed mover)
 
-Status: not started. This is a hand-offable prompt for a focused
-implementation effort. It is the prerequisite for
+Status: closed 2026-05-18 — the surface shipped at
+`crates/migration-mover/src/libnfs/asyncio/` (see the closing notes
+at the bottom of this doc). Originally a hand-offable prompt for a
+focused implementation effort. It is the prerequisite for
 `docs/work-items/MULTI_PASS_MOVER.md`; that work assumes the surface
 described here is landed and verified.
 

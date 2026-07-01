@@ -10,7 +10,9 @@ Companion docs: `CLAIM_PROTOCOL.md` "Race catalog" rows R3 / R10,
 `CLAIM_PROTOCOL_V2_DELETE_THEN_CREATE.md` §3 (the underlying
 protocol that this change builds on, not modifies).
 
-Status: design only — no code in this work-item.
+Status: implemented and hardware-verified (closed 2026-05-20 — see
+§11). The reference logic in §5 ships in
+`migration-worker/src/orchestrator.rs::check_progress_liveness`.
 
 ## 1. Problem statement
 

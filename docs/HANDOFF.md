@@ -1,25 +1,27 @@
 # Vamoose project state — handoff for next session
 
-Last update: 2026-05-04, after PR2 hardening committed (`18f0833`).
+Last update: 2026-07-01, after the CI-green + docs-refresh pass on
+branch `ci-green`.
 
 ---
 
 ## TL;DR
 
-M2 and M3 are verified end-to-end against real VAST hardware
-(baseline `327fd66`, tag `m2-m3-verified`). PR2 hardening
-(`18f0833`) added the surfaces and guardrails that would have
-caught the FFI silent-zero bug without needing end-to-end
-verification.
+The system is delivered through the COORD_PLAN milestone: v2 claim
+protocol (delete-then-create) verified by the M5 self-fence run on
+real VAST hardware, `vamoose coord` (REST + SSE daemon), `vamoose
+tui` (operator dashboard), worker → coord integration, and
+supply-chain CI (fmt, clippy, cargo-deny, cargo-about).
 
-The system correctly migrates the test tree (10 files including
-100 MiB, 2 symlinks, 3-way hardlink, full directory tree) from one
-NFS export to another with full metadata preservation and atomic
-.partial rename. Source remains intact. SHA-256 verification of
-content passes.
+GitHub CI had been red since the workflow landed (fmt drift, a
+cargo-deny advisory/license pile-up, and a cargo-about config bug).
+Branch `ci-green` fixes all of it and adds the previously-missing
+clippy gate. 558 tests pass.
 
-PR2 is committed but **not yet hardware-verified**. That's the
-top remaining task.
+A four-track deep review (claim protocol, worker/mover, coord/TUI,
+docs/tests) was completed 2026-07-01. The protocol core is faithful
+to spec, but the review found real issues — see "Known issues" below
+before starting protocol or fleet work.
 
 ---
 
@@ -27,137 +29,152 @@ top remaining task.
 
 Location: `~/projects/vamoose/migration/`
 
-Recent commits:
-- `18f0833` — PR2: libnfs FFI hardening + verification narrative
-- `3deef13` — docs: handoff document for next session (this file)
-- `228ed21` — docs: add PR2 hardening work item
-- `327fd66` — Baseline: M2/M3 verified end-to-end against real VAST
-  (tag: `m2-m3-verified`)
+- `main` == `coord` (PR #7 merged 2026-05-30) — the COORD_PLAN
+  delivery.
+- `ci-green` — CI fixes + lint cleanup + this docs refresh.
+- Tags: `m2-m3-verified` (M2/M3 baseline), `m5-pass-v2-claim-protocol`
+  (M5 verification under v2).
 
-Branch: `master`. Tests: 100 passing, 1 ignored (the FFI smoke).
+Verification record: `docs/work-items/M5_NOTES.md` ("Pass record").
+Protocol spec: `docs/CLAIM_PROTOCOL.md` +
+`docs/work-items/CLAIM_PROTOCOL_V2_DELETE_THEN_CREATE.md`.
 
-Outside git (session state, parent dir):
-- `~/projects/vamoose/m2.parquet` — walker parquet output
-  (`scans/<scan_id>/part-*.parquet`; legacy-schema, pre-canonical)
-- `~/projects/vamoose/m2.canonical` — shim output (canonical schema)
-- `~/projects/vamoose/migration.tar.gz` — pre-git snapshot
-- `~/projects/vamoose/worker.toml` — **DANGEROUS:** still has
-  self-overlap dest URL from a previous session; do not use as-is.
-  Use `examples/worker.toml` from inside the repo instead.
-
-(Historical: an `m2.rocks` directory used to live here from the
-RocksDB-walker era. Walker is parquet-only now; if you still see one
-of those, it's a stale artifact and can be removed.)
+Outside git (session state, parent dir): `m2.parquet/`,
+`m2.canonical/`, `aggr-fixture/`, `migration.tar.gz` — lab artifacts.
+The parent-dir `worker.toml` is **dangerous** (self-overlap dest URL
+from an old session); use `examples/worker.toml` instead. A stale
+`m2.rocks/` directory from the RocksDB era can be deleted.
 
 ---
 
-## Three bugs found during M2/M3 verification, all fixed
+## Known issues (2026-07-01 review)
 
-Documented in detail in `M2_NOTES.md` "M2/M3 verification incidents".
-Summary:
+Full write-ups live in the session review; headline items, in
+priority order:
 
-1. **Walker schema mismatch.** Resolved by `mig-walker-rewrite` shim.
-2. **Dest path overlap data-loss.** Resolved by 5-fix bundle:
-   `join_root` helper, per-file self-target check, startup overlap
-   guard, NFSv3 baseline, symlink mode degradation.
-3. **libnfs FFI signature mismatch.** FFI fix landed in baseline.
-   PR2 added the regression test, EARLY_EOF surface, and
-   correctness rule.
+1. **Fresh claims are stealable (critical, protocol).** The
+   progress-liveness cross-check's etag-mismatch/absent branches have
+   no claim-age grace: between `try_acquire` and the owner's first
+   heartbeat progress PUT (≤ 30 s), any scanning peer sees
+   `held_etag != claim_etag` and fast-reclaims a live claim. The
+   owner then self-fences and exits. Near-deterministic theft cascade
+   at fleet startup; also fires at end-of-run when idle workers scan
+   aggressively. No data corruption (rename idempotency + fence
+   hold), but it breaks eventual progress at fleet scale. Fix shape:
+   require `now - claimed_utc > 2 × heartbeat_sec` on the
+   mismatch/absent branches of
+   `orchestrator.rs::check_progress_liveness`, and/or publish
+   progress synchronously at acquire. Needs a harness that runs two
+   *live* workers concurrently — every existing M5 harness serializes
+   them.
+2. **Coord: lease-lost shutdown still flushes (critical, coord).**
+   `Runtime::shutdown` flushes the event log and snapshot without
+   checking `lease_lost`, so a deposed coord can clobber its
+   successor's chunks. Gate all store writes on the lease.
+3. **Coord: events acked before durable.** Workers get seqs for
+   events that live only in RAM (flush is 1000-events/5-min); a coord
+   crash silently drops acked events (including pause/cancel) and
+   regresses `next_seq`, which freezes reconnecting TUIs.
+4. **Mover: EOF-clamp livelock + unbounded reorder buffer**
+   (`pipelined_copy.rs`) — a source truncated mid-copy can hot-spin
+   the task forever holding its permit; one slow read RPC can buffer
+   the rest of the file in RAM.
+5. **Mover: torn-copy result discarded** — `FileCopyResult.torn` is
+   computed and ignored by `copy_regular`; files modified during copy
+   commit silently with no downgrade record.
+6. **Mover: `chmod` before `chown` strips setuid/setgid** on NFSv3
+   destinations; apply owner before mode (rsync order).
+7. **Worker: failure/downgrade JSONL overwritten per shard** — the
+   per-host sink key is unconditionally PUT after each shard, so only
+   the last shard's records survive. That's the at-least-once
+   reconciliation trail — losing it converts recorded failures into
+   silent data loss.
+8. **Worker: every `process()` error marks the shard `Failed`
+   (terminal)** — including worker-local errors (scratch I/O, schema
+   version of a stale binary). One bad worker can terminal-fail
+   shards the rest of the fleet could do.
+9. **Worker: backpressure "degraded" is a one-way trap** — inputs
+   only update after a shard completes, but degraded blocks claiming
+   shards; once tripped the worker sleeps forever.
+10. **No I/O deadlines on the data plane** — libnfs has no timeout
+    configured (sync or async); a black-holed connection wedges a
+    shard forever while heartbeats keep it looking alive.
+11. **TUI: terminal restore is Drop-based** — under release
+    `panic = "abort"` a panic leaves the operator's terminal raw.
+    Install a panic hook.
+12. **Coord auth defaults fail open** — omitting both token flags is
+    dev mode (no auth) while the default bind is `0.0.0.0:8443`.
+    Refuse dev mode off-loopback.
 
-Each was undetectable by unit tests; each was caught only by
-end-to-end verification on real hardware. The "verify against real
-hardware" rule in `docs/CORRECTNESS_RULES.md` is load-bearing.
+Additional majors are catalogued per-crate in the review (SSE
+catch-up gap, audit-key overwrite, unbounded event log / archive
+never called, phase-machine holes, batch-scoped hardlink groups,
+symlink/hardlink EEXIST on at-least-once retry, sync-path missing
+NFS COMMIT, R4 completion/heartbeat TOCTOU).
 
 ---
 
-## What's left from PR2
+## Test-coverage gaps worth closing first
 
-PR2 code/docs are done. Two validation steps remain, both
-hardware-gated:
-
-1. **Run the FFI smoke test against real VAST.** 30 seconds.
-   Confirms the new `tests/libnfs_ffi_smoke.rs` actually exercises
-   real libnfs and the parameter order matches the linked binary.
-
-   ```bash
-   VAMOOSE_TEST_NFS_URL=nfs://main.selab-var204.selab.vastdata.com/bgolliher/vamoose-source \
-   VAMOOSE_TEST_NFS_PATH=/src-test/m2-verify/large.bin \
-   VAMOOSE_TEST_NFS_EXPECTED_SIZE=104857600 \
-       cargo test -p migration-mover --test libnfs_ffi_smoke -- \
-       --ignored --nocapture
-   ```
-
-2. **Re-run the full M2/M3 verification cookbook.** Confirms PR2
-   didn't regress anything. Expected output: "CONTENT MATCHES" with
-   no `EARLY_EOF` records in the downgrades sink (because the FFI
-   is correct).
-
-Cookbook is in the previous version of this doc and in
-`crates/migration-mover/MANUAL_VERIFY.md`.
+1. `migration-worker/src/heartbeat.rs` — 0 tests; it's the S3-side
+   trigger of the anti-dual-writer chain (everything around it is
+   tested).
+2. `migration-core/src/s3.rs` — 0 tests; the 200/404/412 →
+   outcome-enum mapping is what makes v2 at-most-once.
+3. An automated mini-M5: two orchestrators against the in-memory
+   ClaimStore with paused time (claim / die / reclaim / late-refresh
+   fence / late-complete refused).
+4. `vamoose-cli/src/config.rs` — 0 tests; every subcommand funnels
+   through it.
+5. `mig-walker-rewrite` schema-drift rejection (the M2 incident-1
+   class) — only the happy path is covered.
 
 ---
 
-## Open items not yet scheduled
+## Open items (carried + new)
 
-- **Walker canonical-schema PR.** When walker emits canonical
-  schema natively, `mig-walker-rewrite` becomes a no-op pass-through
-  and gets deleted. Owner: walker repo at `~/projects/nfs-walker/`.
-- **`run_prefix` for multi-run-per-bucket.** Real layout gap. The
-  current bucket layout is bucket-root only. To run multiple
-  migrations through one bucket, a `run_prefix` field in the
-  worker config would prefix all keys.
-- **xattr support in walker.** Mover already has dead code for
-  applying xattrs; walker doesn't capture them. Deferred until
-  walker support lands.
-- **M3.5 (real io_uring).** Currently M3 uses tokio JoinSet +
-  spawn_blocking; the original M3 plan called for io_uring. See
-  `M3_NOTES.md` for the rationale on deferral.
-- **M4 (NFSv4.2 server-side COPY).** Cancelled. NFSv3 is the
-  baseline; `Strategy::ServerSideCopy` variant retained but never
-  selected by `pick`.
-- **M5 — multi-host self-fence test.** Next milestone per
-  `DESIGN.md`. 3 workers, kill -9 mid-batch, verify reclaim +
-  self-fence + no dual-writer corruption.
-- **Aggregator (`mig-aggr`).** Partial implementation in
-  `crates/migration-aggr/`. Not yet exercised against real data.
-- **libnfs vendoring / `bindgen`.** Open questions for long-term
-  FFI determinism (post-PR2).
+- **Fix the fresh-claim grace window** (known issue 1) — top of the
+  protocol queue; small code change, needs the two-live-workers
+  harness.
+- **Coord durability pass** (known issues 2, 3, plus archive wiring).
+- **Walker canonical-schema PR** (walker repo `~/projects/nfs-walker/`)
+  — when walker emits canonical natively, `mig-walker-rewrite`
+  becomes a pass-through and gets deleted.
+- **`run_prefix` for multi-run-per-bucket** — layout still
+  bucket-root-only.
+- **Multi-pass mover Phases 3–8** — pass driver, `vamoose pass`;
+  Phases 1–2 (bucketed pool, pipelined copy) are shipped.
+- **migration-aggr** — still 100 % `todo!()` stubs behind a
+  documented CLI (running any subcommand aborts). Decide: implement
+  `clean-partials`/`verify` (both referenced by other docs), or gut
+  the binary to `bail!` like `vamoose aggr` does. Nothing cleans
+  orphaned `.partial` files today.
+- **xattr support** — mover has dead code awaiting walker capture.
+- **M3.5 (real io_uring)** — deferred; `uring.rs` still has a
+  `todo!()` landmine in `FixedBufferPool::acquire`.
+- **libnfs vendoring / bindgen** — long-term FFI determinism.
 
 ---
 
 ## Critical environment details
 
-See memory `reference_verification_env.md` for the durable
-operational details (cluster URL, AWS profile, libnfs binary path,
-NFS exports, worker invocation with `sudo HOME=/home/vastdata
-RUST_LOG=...`). Also covered in `crates/migration-mover/MANUAL_VERIFY.md`.
-
-The dangerous parent-dir `worker.toml` is captured in memory
-`project_dangerous_worker_toml.md` so future sessions don't
-accidentally pick it up.
+See memory `reference_verification_env.md` for cluster URL, AWS
+profile, libnfs binary path, NFS exports, and worker invocation
+(`sudo HOME=/home/vastdata RUST_LOG=...`). Also covered in
+`crates/migration-mover/MANUAL_VERIFY.md`.
 
 ---
 
 ## What the next agent should NOT do
 
-- Touch any FFI signatures. The current order in
+- Touch any FFI signatures. The order in
   `crates/migration-mover/src/libnfs/mod.rs` is correct, verified
-  against the linked library. Header comment in that file warns
-  about it.
+  against the linked library. Header comments warn about it.
 - Re-implement the overlap guards. They exist and are tested.
 - Change the schema contract. v1 is locked.
 - Run the worker against any manifest with `dst_url` matching
-  `src_url` (the overlap guard refuses, but don't tempt it).
+  `src_url`.
 - Use the `worker.toml` in `~/projects/vamoose/` (parent dir).
-
----
-
-## Open questions for Blake
-
-- Whether to vendor libnfs into the workspace for FFI determinism
-  (long-term, post-PR2).
-- Whether to set up `bindgen` against `/usr/local/include/nfsc/`
-  to auto-generate FFI bindings (post-PR2).
-- Whether `run_prefix` work belongs in the next milestone or is
-  parked.
-- Whether to start exercising the aggregator, or hold until M5+.
+- "Fix" `deny.toml`'s advisory ignores without reading their
+  justification comments — the rustls-webpki trio is only reachable
+  on the deliberate `verify_tls = false` bypass path.

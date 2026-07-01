@@ -1,6 +1,12 @@
 # M5 — Multi-host self-fence verification
 
-Status: harness landed; manual run on real VAST hardware pending.
+Status: passed on real VAST hardware under the v2 claim protocol
+(see M5_NOTES.md "Pass record", tag `m5-pass-v2-claim-protocol`).
+Note: this doc's protocol premise below (heartbeat via `PUT
+If-Match`) is the *v1* design that the M5 run disproved — VAST does
+not enforce PUT If-Match. The shipped protocol is
+`CLAIM_PROTOCOL_V2_DELETE_THEN_CREATE.md`; this doc stays as the
+harness/assertion reference.
 
 ## Goal
 
