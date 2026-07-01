@@ -103,9 +103,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-about
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-about
+        # Not taiki-e/install-action: cargo-about 0.9.1 has no prebuilt
+        # binary there, and its source build omits the `cli` feature
+        # that gates the binary — the install "succeeds" with nothing
+        # installed. Pin the version so the committed bundle stays
+        # byte-reproducible.
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
 
       - name: Generate THIRD_PARTY_LICENSES.md
         # `cargo about generate` walks the workspace dependency
