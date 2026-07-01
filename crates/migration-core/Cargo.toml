@@ -5,6 +5,7 @@ edition     = { workspace = true }
 authors     = { workspace = true }
 license     = { workspace = true }
 description = "Shared types, S3 protocol, and parquet schema for the migration system"
+publish     = false
 
 [dependencies]
 aws-sdk-s3 = { workspace = true }

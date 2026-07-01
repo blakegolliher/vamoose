@@ -497,7 +497,14 @@ mod tests {
             result: Err(fenced_err()),
         };
 
-        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput, &crate::coord_driver::EventEmitter::disabled());
+        record_outcome(
+            b"/data/file",
+            mo,
+            &mut outcome,
+            &sink,
+            &throughput,
+            &crate::coord_driver::EventEmitter::disabled(),
+        );
 
         assert_eq!(outcome.files_fenced, 1, "Fenced must bump files_fenced");
         assert_eq!(outcome.files_failed, 0, "Fenced must NOT bump files_failed");
@@ -523,7 +530,14 @@ mod tests {
             result: Err(MoveError::new(FailurePhase::Write, "ENOSPC")),
         };
 
-        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput, &crate::coord_driver::EventEmitter::disabled());
+        record_outcome(
+            b"/data/file",
+            mo,
+            &mut outcome,
+            &sink,
+            &throughput,
+            &crate::coord_driver::EventEmitter::disabled(),
+        );
 
         assert_eq!(outcome.files_failed, 1);
         assert_eq!(outcome.files_fenced, 0);
@@ -544,7 +558,14 @@ mod tests {
             result: Ok(()),
         };
 
-        record_outcome(b"/data/file", mo, &mut outcome, &sink, &throughput, &crate::coord_driver::EventEmitter::disabled());
+        record_outcome(
+            b"/data/file",
+            mo,
+            &mut outcome,
+            &sink,
+            &throughput,
+            &crate::coord_driver::EventEmitter::disabled(),
+        );
 
         assert_eq!(outcome.files_ok, 1);
         assert_eq!(outcome.files_failed, 0);

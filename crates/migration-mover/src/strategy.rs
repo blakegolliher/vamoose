@@ -60,10 +60,8 @@ pub fn pick(row: &RowView, ctx: &StrategyContext) -> Strategy {
         };
     }
 
-    if let Some(_) = row.inode {
-        if ctx.already_copied_inode {
-            return Strategy::HardlinkExisting;
-        }
+    if row.inode.is_some() && ctx.already_copied_inode {
+        return Strategy::HardlinkExisting;
     }
 
     if row.size == 0 {

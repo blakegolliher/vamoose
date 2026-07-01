@@ -27,7 +27,7 @@ pub async fn restore_root_mtime(
     let mut pair = pool.acquire().await?;
     // libnfs calls are blocking — move off the runtime so we don't
     // stall any other shutdown-time tasks.
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let (at_s, at_n, mt_s, mt_n) = ops::stat_times(pair.src(), &src_root).map_err(|e| {
             anyhow::anyhow!(
                 "stat source root {:?}: phase={:?} err={}",
@@ -47,5 +47,5 @@ pub async fn restore_root_mtime(
         Ok(())
     })
     .await??;
-    Ok(result)
+    Ok(())
 }

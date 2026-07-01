@@ -270,7 +270,7 @@ impl AsyncBucketedFileMover {
 
         if let Some((mt_s, mt_n)) = a.mtime {
             let (at_s, at_n) = a.atime.unwrap_or((mt_s, mt_n));
-            dst.utimes(dst_partial, at_s, at_n as i32, mt_s, mt_n as i32)
+            dst.utimes(dst_partial, at_s, at_n, mt_s, mt_n)
                 .await
                 .map_err(|e| nfs_err(FailurePhase::Setattr, format!("utimes: {e}")))?;
         }

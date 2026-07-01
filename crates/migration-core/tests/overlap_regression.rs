@@ -69,10 +69,7 @@ fn startup_guard_rejects_overlapping_manifest() {
                 detail: "irrelevant".into(),
             }
             .to_string();
-            assert!(
-                msg.contains("source and destination overlap"),
-                "msg: {msg}",
-            );
+            assert!(msg.contains("source and destination overlap"), "msg: {msg}",);
         }
         other => panic!("expected Error::SourceDestOverlap, got {other:?}"),
     }

@@ -5,8 +5,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{
-    Array, ArrayRef, BinaryBuilder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray,
-    UInt16Array, UInt32Array, UInt64Array, UInt64Builder, UInt8Builder,
+    Array, ArrayRef, BinaryBuilder, Int32Array, Int32Builder, Int64Array, Int64Builder,
+    StringArray, UInt16Array, UInt32Array, UInt64Array, UInt64Builder, UInt8Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
@@ -36,6 +36,7 @@ struct Cli {
     /// Walker parquet location. Accepts either:
     ///   - the walker output root (contains `scans/<scan_id>/`), or
     ///   - a `scans/<scan_id>/` directory containing part files directly.
+    ///
     /// Pre-RocksDB-removal walker layouts (flat directory of part files)
     /// are also accepted for backwards compat.
     #[arg(short = 'i', long)]
@@ -265,8 +266,7 @@ fn write_shard(
         .set_key_value_metadata(Some(kv))
         .build();
 
-    let file =
-        File::create(output).with_context(|| format!("creating {}", output.display()))?;
+    let file = File::create(output).with_context(|| format!("creating {}", output.display()))?;
     let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
     for batch in batches {
         writer.write(batch)?;
@@ -346,9 +346,7 @@ fn translate_batch(
         mode_b.append_value((walker_permissions.value(i) as u32) | s_ifmt);
 
         match (walker_mtime_sec, walker_mtime_nsec) {
-            (Some(sec_arr), Some(nsec_arr))
-                if !sec_arr.is_null(i) && !nsec_arr.is_null(i) =>
-            {
+            (Some(sec_arr), Some(nsec_arr)) if !sec_arr.is_null(i) && !nsec_arr.is_null(i) => {
                 // High-precision path — full nanosecond fidelity from libnfs.
                 mtime_sec_b.append_value(sec_arr.value(i));
                 mtime_nsec_b.append_value(nsec_arr.value(i));
@@ -367,9 +365,7 @@ fn translate_batch(
         }
 
         match (walker_atime_sec, walker_atime_nsec) {
-            (Some(sec_arr), Some(nsec_arr))
-                if !sec_arr.is_null(i) && !nsec_arr.is_null(i) =>
-            {
+            (Some(sec_arr), Some(nsec_arr)) if !sec_arr.is_null(i) && !nsec_arr.is_null(i) => {
                 // High-precision path.
                 atime_sec_b.append_value(sec_arr.value(i));
                 atime_nsec_b.append_value(nsec_arr.value(i));
@@ -649,7 +645,9 @@ fn opt_int32_optional_col<'a>(b: &'a RecordBatch, name: &str) -> Option<&'a Int3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{StringArray, UInt16Builder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder};
+    use arrow::array::{
+        StringArray, UInt16Builder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
+    };
     use migration_core::shard::ShardReader;
     use std::path::PathBuf;
 
@@ -705,7 +703,8 @@ mod tests {
         // `/ing/foo`.
         let err = strip_source_root(b"/src-testing/foo", b"/src-test").unwrap_err();
         assert!(
-            err.to_string().contains("does not start with --source-root"),
+            err.to_string()
+                .contains("does not start with --source-root"),
             "{err}"
         );
 
@@ -965,7 +964,7 @@ mod tests {
         // Row 0: directory at the export root.
         assert_eq!(rows[0].path, b"/", "dir at root strips to /");
         assert_eq!(rows[0].file_type, FileTypeTag::Dir);
-        assert_eq!(rows[0].mode & libc::S_IFMT as u32, libc::S_IFDIR as u32);
+        assert_eq!(rows[0].mode & libc::S_IFMT, libc::S_IFDIR);
         assert_eq!(rows[0].mode & 0o7777, 0o755);
         assert_eq!(rows[0].mtime_sec, Some(1_700_000_000));
         assert_eq!(rows[0].mtime_nsec, Some(1000)); // 1 us = 1000 ns
@@ -973,7 +972,7 @@ mod tests {
         // Row 1: regular file under root.
         assert_eq!(rows[1].path, b"/file.bin");
         assert_eq!(rows[1].file_type, FileTypeTag::Regular);
-        assert_eq!(rows[1].mode & libc::S_IFMT as u32, libc::S_IFREG as u32);
+        assert_eq!(rows[1].mode & libc::S_IFMT, libc::S_IFREG);
         assert_eq!(rows[1].mode & 0o7777, 0o644);
         assert_eq!(rows[1].size, 1234);
         assert_eq!(rows[1].atime_sec, None, "null mtime/atime preserved");
@@ -983,7 +982,7 @@ mod tests {
         // euclidean split.
         assert_eq!(rows[2].path, b"/link");
         assert_eq!(rows[2].file_type, FileTypeTag::Symlink);
-        assert_eq!(rows[2].mode & libc::S_IFMT as u32, libc::S_IFLNK as u32);
+        assert_eq!(rows[2].mode & libc::S_IFMT, libc::S_IFLNK);
         assert_eq!(rows[2].mode & 0o7777, 0o777);
         assert_eq!(rows[2].atime_sec, Some(-1));
         assert_eq!(rows[2].atime_nsec, Some(998_500_000));

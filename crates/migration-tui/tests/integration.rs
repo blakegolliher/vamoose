@@ -263,12 +263,9 @@ async fn appstate_after_replay_matches_coord_view() {
             .expect("timeout")
             .expect("not closed")
             .expect("ok");
-        match frame {
-            SseFrame::Event { envelope, .. } => {
-                assert!(app.apply_envelope(&envelope));
-                received += 1;
-            }
-            _ => {}
+        if let SseFrame::Event { envelope, .. } = frame {
+            assert!(app.apply_envelope(&envelope));
+            received += 1;
         }
     }
 

@@ -116,8 +116,9 @@ pub async fn pipelined_copy(
     // bodies are identical (rustc E0308), so coerce reads + writes to
     // `BoxFuture`. The Box pin is one heap alloc per in-flight RPC —
     // dwarfed by the per-RPC syscall path.
-    let mut reads_inflight: FuturesUnordered<BoxFuture<'_, Result<(u64, u64, Vec<u8>), NfsError>>> =
-        FuturesUnordered::new();
+    // A completed read resolves to (issue_offset, wanted_len, bytes).
+    type ReadFuture<'a> = BoxFuture<'a, Result<(u64, u64, Vec<u8>), NfsError>>;
+    let mut reads_inflight: FuturesUnordered<ReadFuture<'_>> = FuturesUnordered::new();
     let mut reorder_buf: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
 
     // Bounded write pipeline. `FuturesUnordered` of in-flight pwrites

@@ -210,16 +210,12 @@ pub struct EtaEstimate {
 /// rate, claim contention).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "reasons")]
+#[derive(Default)]
 pub enum Health {
+    #[default]
     OnTrack,
     AtRisk(Vec<String>),
     Blocked(Vec<String>),
-}
-
-impl Default for Health {
-    fn default() -> Self {
-        Self::OnTrack
-    }
 }
 
 /// Policy for resolving src/dst conflicts mid-migration. Stored on

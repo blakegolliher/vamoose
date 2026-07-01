@@ -5,24 +5,17 @@ edition     = { workspace = true }
 authors     = { workspace = true }
 license     = { workspace = true }
 description = "Read-only observability sidecar (mig-aggr)"
+publish     = false
 
 [[bin]]
 name = "mig-aggr"
 path = "src/main.rs"
 
+# Every subcommand is still a `todo!()` stub; deps stay trimmed to
+# what the stubs compile with. Re-add ratatui / prometheus / hyper /
+# migration-core alongside the real implementations.
 [dependencies]
-migration-core = { workspace = true }
-
 tokio    = { workspace = true }
-serde    = { workspace = true }
-serde_json = { workspace = true }
 anyhow   = { workspace = true }
-tracing  = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap     = { workspace = true }
-chrono   = { workspace = true }
-
-ratatui   = { workspace = true }
-crossterm = { workspace = true }
-prometheus = { workspace = true }
-hyper      = { workspace = true }

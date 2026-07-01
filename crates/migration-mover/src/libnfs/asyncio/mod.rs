@@ -107,8 +107,8 @@ pub struct MountOpts {
 impl Default for MountOpts {
     fn default() -> Self {
         Self {
-            rsize: 1 * 1024 * 1024,
-            wsize: 1 * 1024 * 1024,
+            rsize: 1024 * 1024,
+            wsize: 1024 * 1024,
             nconnect: 1,
             version: 3,
         }

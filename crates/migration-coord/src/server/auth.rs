@@ -239,8 +239,10 @@ mod tests {
 
     #[test]
     fn not_dev_mode_with_cluster_secret() {
-        let mut cfg = AuthConfig::default();
-        cfg.cluster_secret = Some("s".into());
+        let cfg = AuthConfig {
+            cluster_secret: Some("s".into()),
+            ..AuthConfig::default()
+        };
         assert!(!cfg.is_dev_mode());
     }
 

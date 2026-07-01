@@ -162,12 +162,8 @@ impl SseParser {
     fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
         self.leftover.extend_from_slice(chunk);
         let mut out = Vec::new();
-        loop {
-            // Find the next line terminator.
-            let pos = match self.leftover.iter().position(|&b| b == b'\n') {
-                Some(p) => p,
-                None => break,
-            };
+        // Consume complete lines (up to each terminator) as they arrive.
+        while let Some(pos) = self.leftover.iter().position(|&b| b == b'\n') {
             // Take the line (without the \n) and shift leftover.
             let line: Vec<u8> = self.leftover.drain(..=pos).take(pos).collect();
             let line = std::str::from_utf8(&line).unwrap_or("");
@@ -181,10 +177,11 @@ impl SseParser {
                 }
             } else if let Some(rest) = line.strip_prefix(':') {
                 // Comment.
-                let mut frame = SseFrame::default();
-                frame.event = Some(":comment".into());
-                frame.data = Some(rest.trim_start().to_string());
-                out.push(frame);
+                out.push(SseFrame {
+                    event: Some(":comment".into()),
+                    data: Some(rest.trim_start().to_string()),
+                    ..SseFrame::default()
+                });
             } else if let Some(rest) = line.strip_prefix("event:") {
                 self.pending.event = Some(rest.trim_start().to_string());
             } else if let Some(rest) = line.strip_prefix("id:") {

@@ -49,6 +49,9 @@ fn main() -> Result<()> {
         );
         total_rows += iter_rows;
     }
-    println!("\nopened {} shard(s), {total_rows} row(s) total", shards.len());
+    println!(
+        "\nopened {} shard(s), {total_rows} row(s) total",
+        shards.len()
+    );
     Ok(())
 }

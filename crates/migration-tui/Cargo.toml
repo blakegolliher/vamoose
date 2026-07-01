@@ -5,6 +5,7 @@ edition     = { workspace = true }
 authors     = { workspace = true }
 license     = { workspace = true }
 description = "Operator TUI for vamoose coord (live REST + SSE dashboard)"
+publish     = false
 
 [lib]
 name = "migration_tui"

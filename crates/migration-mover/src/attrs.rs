@@ -54,11 +54,11 @@ impl AttrPolicy {
 pub fn build(row: &RowView, policy: AttrPolicy) -> AttrSet {
     AttrSet {
         mode: policy.preserve_mode.then_some(row.mode),
-        uid: policy.preserve_owner.then(|| row.uid).flatten(),
-        gid: policy.preserve_owner.then(|| row.gid).flatten(),
+        uid: policy.preserve_owner.then_some(row.uid).flatten(),
+        gid: policy.preserve_owner.then_some(row.gid).flatten(),
         mtime: policy
             .preserve_times
-            .then(|| match (row.mtime_sec, row.mtime_nsec) {
+            .then_some(match (row.mtime_sec, row.mtime_nsec) {
                 (Some(s), Some(ns)) => Some((s, ns)),
                 (Some(s), None) => Some((s, 0)),
                 _ => None,
@@ -66,7 +66,7 @@ pub fn build(row: &RowView, policy: AttrPolicy) -> AttrSet {
             .flatten(),
         atime: policy
             .preserve_times
-            .then(|| match (row.atime_sec, row.atime_nsec) {
+            .then_some(match (row.atime_sec, row.atime_nsec) {
                 (Some(s), Some(ns)) => Some((s, ns)),
                 (Some(s), None) => Some((s, 0)),
                 _ => None,

@@ -5,6 +5,7 @@ edition     = { workspace = true }
 authors     = { workspace = true }
 license     = { workspace = true }
 description = "Migration worker binary (mig-worker)"
+publish     = false
 
 [lib]
 name = "migration_worker"

@@ -8,6 +8,7 @@
 //!   when either threshold is hit:
 //!     - `max_events_per_chunk` (default 1000)
 //!     - `max_chunk_age` since the chunk's first event (default 5 min)
+//!
 //!   The age threshold is evaluated on demand via
 //!   [`EventLogWriter::flush_aged`]; the coord runtime ticks this
 //!   alongside the snapshot tick.

@@ -11,8 +11,7 @@
 //!    resume-after-restart").
 //! 5. Loop:
 //!    a. Scan `shards/` for a claimable shard (free or stale-leased).
-//!    b. Try to acquire via `If-None-Match: *` or reclaim via
-//!       `If-Match: <stale-etag>`.
+//!    b. Acquire via `If-None-Match: *`, or v2-reclaim if stale.
 //!    c. Download the parquet index shard to local scratch.
 //!    d. Run the shard processor; update HeldClaim + ProgressState.
 //!    e. On clean completion: mark the claim `Completed`.
@@ -1201,7 +1200,7 @@ async fn reclaim_self_owned_claims(
             continue;
         }
         let new_epoch = record.epoch + 1;
-        match claim::reclaim(store, &shard, &e.etag, host_id, new_epoch).await {
+        match claim::reclaim(store, shard, &e.etag, host_id, new_epoch).await {
             Ok(ReclaimOutcome::Won { etag: new_etag, .. }) => {
                 tracing::info!(
                     shard = %shard,
