@@ -195,6 +195,48 @@ mod tests {
         assert_eq!(r.row_id, 99);
     }
 
+    /// `TornCopy` must round-trip through the sink's JSONL with its
+    /// pre/post `(size, mtime, ctime)` payload intact, tagged
+    /// `TORN_COPY` (default SCREAMING_SNAKE_CASE rename). Emitted by
+    /// `file_mover::copy_regular` when `pipelined_copy` observed the
+    /// source change between the pre/post stat brackets — the file
+    /// still committed (at-least-once; source intact), so the record
+    /// is the only operator-visible trace of the tear. See
+    /// docs/work-items/MOVER_TORN_COPY_SURFACE.md (F05).
+    #[test]
+    fn downgrade_sink_roundtrips_torn_record() {
+        let sink = DowngradeSink::new();
+        sink.set_current_shard("part-0007.parquet");
+        sink.record(
+            11,
+            b"/hot/file.bin",
+            DowngradeKind::TornCopy {
+                pre: (1024, 100, 100),
+                post: (2048, 200, 300),
+            },
+        );
+
+        let body = sink.drain_jsonl();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("\"TORN_COPY\""), "body: {s}");
+
+        let line = body.split(|&b| b == b'\n').next().unwrap();
+        let r: DowngradeRecord = serde_json::from_slice(line).unwrap();
+        assert_eq!(r.row_id, 11);
+        assert_eq!(r.shard, "part-0007.parquet");
+        assert_eq!(
+            r.downgrade,
+            DowngradeKind::TornCopy {
+                pre: (1024, 100, 100),
+                post: (2048, 200, 300),
+            },
+        );
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&r.path_b64)
+            .unwrap();
+        assert_eq!(decoded, b"/hot/file.bin");
+    }
+
     /// `SymlinkModeNfsV3` must serialize as the literal string
     /// `SYMLINK_MODE_NFSV3` — the operator-facing tag specified in
     /// SCHEMA_CONTRACT.md and BUGFIX_PLAN.md "Fix 5". The default

@@ -296,6 +296,21 @@ pub enum DowngradeKind {
     /// for the time attributes.
     #[serde(rename = "SYMLINK_TIME_NFSV3")]
     SymlinkTimeNfsV3,
+    /// The source's `(size, mtime, ctime)` changed between the
+    /// pre- and post-copy stat brackets (`pipelined_copy`'s torn-read
+    /// detection): the file was modified while being copied, so the
+    /// destination holds some interleaving of the pre- and
+    /// post-versions. The file is still committed — at-least-once
+    /// semantics, the source remains intact — and this record is the
+    /// operator-visible trace of the tear. `pre`/`post` are the
+    /// bracket triples `(size, mtime_sec, ctime_sec)`. Async-path
+    /// only for now; the sync mover has no stat bracket. A future
+    /// multi-pass driver (MULTI_PASS_MOVER.md) would re-copy torn
+    /// rows; until then this record is all the remediation there is.
+    TornCopy {
+        pre: (u64, i64, i64),
+        post: (u64, i64, i64),
+    },
 }
 
 #[cfg(test)]

@@ -61,6 +61,14 @@ pub struct MoveOutcome {
     pub row_id: u64,
     pub strategy: Strategy,
     pub bytes_moved: u64,
+    /// True iff the copy committed but the source changed under it
+    /// (`FileCopyResult::torn` → `file_mover::classify_copy`). The
+    /// row still counts as copied; a `DowngradeKind::TornCopy` record
+    /// was emitted, and the shard processor bumps `files_torn`.
+    /// Detection is async-path-only: the sync path
+    /// (`do_libnfs_copy`) has no pre/post stat bracket and always
+    /// reports `false`.
+    pub torn: bool,
     pub result: Result<(), MoveError>,
 }
 
@@ -223,6 +231,7 @@ impl Mover {
                     row_id,
                     strategy,
                     bytes_moved: 0,
+                    torn: false,
                     result: Err(MoveError::new(FailurePhase::Open, format!("pool: {e}"))),
                 };
             }
@@ -248,6 +257,8 @@ impl Mover {
             row_id,
             strategy,
             bytes_moved: if result.is_ok() { bytes } else { 0 },
+            // Sync paths have no torn detection (see do_libnfs_copy).
+            torn: false,
             result,
         }
     }
@@ -504,6 +515,14 @@ impl Mover {
     /// Default path: libnfs READ → libnfs WRITE through a 1 MiB
     /// streaming buffer, single-fiber within the call. Concurrency
     /// across files comes from the shard processor's JoinSet.
+    ///
+    /// Torn-copy detection is async-path-only for now: this sync path
+    /// has no pre/post source-stat bracket, so a file modified during
+    /// the copy commits here with no `DowngradeKind::TornCopy` record
+    /// and `MoveOutcome::torn` stays `false`. The bucketed async path
+    /// (`pipelined_copy` + `file_mover::classify_copy`) is the one
+    /// that detects and records tears; see
+    /// docs/work-items/MOVER_TORN_COPY_SURFACE.md (F05).
     fn do_libnfs_copy(&self, pair: &mut ContextPair, row: &RowView) -> Result<(), MoveError> {
         let src = self.src_path(row);
         let dst = self.dst_path(row);

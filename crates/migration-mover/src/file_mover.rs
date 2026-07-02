@@ -43,9 +43,75 @@ use crate::error::MoveError;
 use crate::libnfs::asyncio::{AsyncNfsContext, Flags};
 use crate::mover::check_self_target;
 use crate::paths::{join_root, partial_path};
-use crate::pipelined_copy::pipelined_copy;
+use crate::pipelined_copy::{pipelined_copy, FileCopyResult};
 use crate::strategy::{self, Strategy, StrategyContext};
 use crate::{MoveOutcome, Mover, MoverConfig};
+
+/// What to do with a completed [`pipelined_copy`] result. Every
+/// variant commits — a torn copy is NOT a failure (at-least-once
+/// semantics; the source remains intact), it just carries an
+/// operator-visible downgrade record alongside the commit. There is
+/// deliberately no failure variant here: re-copying a live file can
+/// tear again, so remediation belongs to the future multi-pass
+/// driver (`MULTI_PASS_MOVER.md`), not this path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyDisposition {
+    /// Clean copy: commit via rename, nothing to record.
+    Commit,
+    /// Torn copy: still commit via rename, and emit `downgrade` to
+    /// the downgrade sink for the row.
+    CommitAndRecord {
+        row_id: u64,
+        downgrade: DowngradeKind,
+    },
+}
+
+impl CopyDisposition {
+    /// Always true — the disposition never aborts the commit. Exists
+    /// to make the contract explicit at call sites and in tests.
+    pub fn commits(&self) -> bool {
+        match self {
+            CopyDisposition::Commit | CopyDisposition::CommitAndRecord { .. } => true,
+        }
+    }
+
+    /// The downgrade record to emit, if any.
+    pub fn downgrade(&self) -> Option<&DowngradeKind> {
+        match self {
+            CopyDisposition::Commit => None,
+            CopyDisposition::CommitAndRecord { downgrade, .. } => Some(downgrade),
+        }
+    }
+}
+
+/// Pure classifier for a completed [`pipelined_copy`] result — the
+/// seam where torn detection becomes an operator-visible outcome
+/// (F05, `docs/work-items/MOVER_TORN_COPY_SURFACE.md`). A `torn`
+/// result classifies to commit-and-record with a
+/// [`DowngradeKind::TornCopy`] carrying the pre/post
+/// `(size, mtime_sec, ctime_sec)` stat-bracket triples; a clean
+/// result is a plain commit. No I/O, no side effects — the caller
+/// ([`AsyncBucketedFileMover::copy_regular`]) emits the record,
+/// bumps counters, and warns.
+pub fn classify_copy(result: &FileCopyResult, row: &RowView) -> CopyDisposition {
+    if !result.torn {
+        return CopyDisposition::Commit;
+    }
+    let pre = (
+        result.pre_stat.size,
+        result.pre_stat.mtime as i64,
+        result.pre_stat.ctime as i64,
+    );
+    let post = (
+        result.post_stat.size,
+        result.post_stat.mtime as i64,
+        result.post_stat.ctime as i64,
+    );
+    CopyDisposition::CommitAndRecord {
+        row_id: row.row_id,
+        downgrade: DowngradeKind::TornCopy { pre, post },
+    }
+}
 
 /// Unified per-row mover surface. Two impls live in this module.
 #[async_trait]
@@ -133,7 +199,13 @@ impl AsyncBucketedFileMover {
     /// (with whole-file fsync inside) instead of the sync streaming
     /// loop, and (b) attrs/rename go through the bucketed async ctx
     /// instead of the sync pool.
-    async fn copy_regular(&self, row: &RowView) -> Result<u64, MoveError> {
+    ///
+    /// Returns `(bytes_copied, torn)`. `torn = true` means the source
+    /// changed under the copy ([`classify_copy`]): the file was still
+    /// committed, a [`DowngradeKind::TornCopy`] record went to the
+    /// downgrade sink, and the caller surfaces it on
+    /// [`MoveOutcome::torn`] so the shard summary can count it.
+    async fn copy_regular(&self, row: &RowView) -> Result<(u64, bool), MoveError> {
         let src = join_root(self.cfg.source_root.as_bytes(), &row.path);
         let dst = join_root(self.cfg.dest_root.as_bytes(), &row.path);
         let dst_partial = partial_path(&dst, &self.host_id, self.pid)?;
@@ -190,6 +262,25 @@ impl AsyncBucketedFileMover {
                 .record(row.row_id, &row.path, DowngradeKind::EarlyEof);
         }
 
+        // F05: torn-copy surface. A torn result still commits
+        // (at-least-once; source intact) but must leave an
+        // operator-visible trace — until the multi-pass driver
+        // exists, this record is the only remediation.
+        let disposition = classify_copy(&copy, row);
+        let torn = match &disposition {
+            CopyDisposition::Commit => false,
+            CopyDisposition::CommitAndRecord { row_id, downgrade } => {
+                tracing::warn!(
+                    path = %String::from_utf8_lossy(&row.path),
+                    row_id,
+                    "source modified during copy (torn); committing and \
+                     recording TORN_COPY downgrade",
+                );
+                self.downgrades.record(*row_id, &row.path, *downgrade);
+                true
+            }
+        };
+
         self.apply_async_attrs(dst_ctx, &dst_partial, row).await?;
 
         // R8: fence check immediately before the commit-point rename.
@@ -216,7 +307,7 @@ impl AsyncBucketedFileMover {
             "commit: rename .partial → final",
         );
 
-        Ok(copy.bytes_copied)
+        Ok((copy.bytes_copied, torn))
     }
 
     /// Apply mode / owner / mtime+atime through the async ctx in the
@@ -296,14 +387,15 @@ impl FileMover for AsyncBucketedFileMover {
         }
 
         let result = self.copy_regular(row).await;
-        let bytes_moved = match &result {
-            Ok(n) => *n,
-            Err(_) => 0,
+        let (bytes_moved, torn) = match &result {
+            Ok((n, torn)) => (*n, *torn),
+            Err(_) => (0, false),
         };
         MoveOutcome {
             row_id: row.row_id,
             strategy,
             bytes_moved,
+            torn,
             result: result.map(|_| ()),
         }
     }
@@ -362,6 +454,9 @@ fn nfs_err(phase: FailurePhase, msg: String) -> MoveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::libnfs::asyncio::NfsStat64;
+    use crate::pipelined_copy::FileCopyResult;
+    use migration_core::schema::FileTypeTag;
 
     #[test]
     fn trait_is_dyn_safe() {
@@ -369,5 +464,123 @@ mod tests {
         // signature mistake in an earlier draft. Mover is Send+Sync
         // and implements the trait via its inherent move_* methods.
         fn _accepts_dyn(_m: Arc<dyn FileMover>) {}
+    }
+
+    // ---- F05: torn-copy classification ---------------------------
+    //
+    // The FFI copy path is hardware-gated, so the torn-copy surface
+    // is tested at the seam: `classify_copy` is the pure function
+    // `copy_regular` consults after `pipelined_copy` returns. See
+    // docs/work-items/MOVER_TORN_COPY_SURFACE.md.
+
+    fn stat(size: u64, mtime: u64, ctime: u64) -> NfsStat64 {
+        NfsStat64 {
+            dev: 0,
+            ino: 1,
+            mode: 0o100644,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size,
+            blksize: 4096,
+            blocks: 0,
+            atime: 0,
+            mtime,
+            ctime,
+            atime_nsec: 0,
+            mtime_nsec: 0,
+            ctime_nsec: 0,
+            used: 0,
+        }
+    }
+
+    fn copy_result(torn: bool, pre: NfsStat64, post: NfsStat64) -> FileCopyResult {
+        FileCopyResult {
+            file_hash: [0; 16],
+            bytes_copied: post.size,
+            torn,
+            pre_stat: pre,
+            post_stat: post,
+        }
+    }
+
+    fn test_row(row_id: u64, path: &[u8], size: u64) -> RowView {
+        RowView {
+            row_id,
+            path: path.to_vec(),
+            size,
+            mtime_sec: None,
+            mtime_nsec: None,
+            atime_sec: None,
+            atime_nsec: None,
+            mode: 0o100644,
+            uid: None,
+            gid: None,
+            nlink: None,
+            inode: None,
+            fsid: None,
+            xattr_blob: None,
+            symlink_target: None,
+            file_type: FileTypeTag::Regular,
+        }
+    }
+
+    /// A `torn = true` copy result must classify to commit-and-record
+    /// with a `DowngradeKind::TornCopy` carrying the pre/post
+    /// `(size, mtime, ctime)` triples from the stat brackets.
+    #[test]
+    fn torn_result_produces_downgrade_record() {
+        let row = test_row(42, b"/data/hot.bin", 1024);
+        let result = copy_result(true, stat(1024, 100, 100), stat(2048, 200, 300));
+
+        let d = classify_copy(&result, &row);
+
+        match d {
+            CopyDisposition::CommitAndRecord { row_id, downgrade } => {
+                assert_eq!(row_id, 42);
+                assert_eq!(
+                    downgrade,
+                    DowngradeKind::TornCopy {
+                        pre: (1024, 100, 100),
+                        post: (2048, 200, 300),
+                    },
+                );
+            }
+            other => panic!("torn result must be CommitAndRecord, got {other:?}"),
+        }
+    }
+
+    /// `torn = false` → no record; plain commit.
+    #[test]
+    fn clean_result_produces_no_record() {
+        let row = test_row(7, b"/data/cold.bin", 512);
+        let result = copy_result(false, stat(512, 100, 100), stat(512, 100, 100));
+
+        let d = classify_copy(&result, &row);
+
+        assert_eq!(d, CopyDisposition::Commit);
+        assert!(
+            d.downgrade().is_none(),
+            "clean copy must not carry a record"
+        );
+    }
+
+    /// Torn must NOT become a failure: at-least-once semantics, the
+    /// source remains intact, and the row still counts as copied. The
+    /// classification marks commit-and-record — there is no failure
+    /// arm for torn at all.
+    #[test]
+    fn torn_file_still_commits() {
+        let row = test_row(9, b"/data/live.bin", 4096);
+        let result = copy_result(true, stat(4096, 1, 1), stat(4096, 2, 2));
+
+        let d = classify_copy(&result, &row);
+
+        assert!(
+            d.commits(),
+            "torn disposition must commit-and-record, never fail",
+        );
+        assert!(d.downgrade().is_some(), "torn commit must carry the record");
     }
 }
