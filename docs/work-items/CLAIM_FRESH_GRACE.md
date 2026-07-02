@@ -1,6 +1,7 @@
 # Fresh-claim grace window for the progress cross-check
 
-Status: open — not started.
+Status: in review — fix + tests on branch claim-fresh-grace; hardware
+fast-reclaim-drill pending before ledger `verified`.
 Ledger: F01, F30 in `docs/REVIEW_LEDGER.md`.
 Priority: critical — blocks the M6 multi-worker milestone.
 Scope: `migration-worker` (orchestrator, heartbeat), spec docs. New
@@ -135,12 +136,12 @@ unchanged. This is the intended trade.
 
 ## Definition of done
 
-- [ ] Tests 1–3, 6, 8a written first and observed red.
-- [ ] All acceptance tests green.
-- [ ] Both spec docs updated (the spec bug is part of the finding).
-- [ ] Full gate green: fmt, clippy `-D warnings`, `cargo test
+- [x] Tests 1–3, 6, 8a written first and observed red.
+- [x] All acceptance tests green.
+- [x] Both spec docs updated (the spec bug is part of the finding).
+- [x] Full gate green: fmt, clippy `-D warnings`, `cargo test
       --workspace`, deny.
 - [ ] `scripts/fast-reclaim-drill.sh` re-run on hardware before
       marking `verified` in the ledger (kill -9 → reclaim latency
       should grow by ≤ one grace window, no more).
-- [ ] Ledger F01/F30 rows updated; this doc's Status flipped.
+- [x] Ledger F01/F30 rows updated; this doc's Status flipped.
