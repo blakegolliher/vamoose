@@ -668,33 +668,40 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
             p.files_fenced = p.files_fenced.saturating_add(outcome.files_fenced);
         }
 
-        // Flush downgrade + failure JSONL produced this shard. PUTs
-        // are unconditional (one object per host, one PUT per
-        // non-empty shard); the aggregator stitches the JSONL back
-        // together. Shard names on each record were stamped at the
-        // start of this shard.
-        let drained = downgrades.drain_jsonl();
-        downgrades.set_current_shard("");
-        if !drained.is_empty() {
-            let key = layout::downgrades_key(&host_id);
-            if let Err(e) = s3.put(&key, drained).await {
-                tracing::warn!(
-                    error = ?e,
-                    shard = %shard_filename,
-                    "downgrade flush failed (records lost; copy itself succeeded)",
-                );
-            }
-        }
-        let drained_failures = failures.drain_jsonl();
-        failures.set_current_shard("");
-        if !drained_failures.is_empty() {
-            let key = layout::failures_key(&host_id);
-            if let Err(e) = s3.put(&key, drained_failures).await {
-                tracing::warn!(
-                    error = ?e,
-                    shard = %shard_filename,
-                    "failure flush failed (failure records lost)",
-                );
+        // Flush downgrade + failure JSONL produced this shard. Shard
+        // names on each record were stamped at the start of this
+        // shard. Flush errors are surfaced loudly but do not abort
+        // the run — the copies themselves already happened.
+        for e in flush_sinks(
+            &*s3,
+            &host_id,
+            &shard_filename,
+            record.epoch,
+            &downgrades,
+            &failures,
+        )
+        .await
+        {
+            match e {
+                FlushError::Collision { ref key } => {
+                    tracing::error!(
+                        key = %key,
+                        shard = %shard_filename,
+                        "sink flush collided with an existing object; refusing to \
+                         overwrite (records for this flush are lost)",
+                    );
+                }
+                FlushError::Store {
+                    ref key,
+                    ref source,
+                } => {
+                    tracing::warn!(
+                        error = ?source,
+                        key = %key,
+                        shard = %shard_filename,
+                        "sink flush failed (records lost; copies themselves succeeded)",
+                    );
+                }
             }
         }
 
@@ -842,6 +849,75 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
 // =============================================================================
 // Manifest + shard discovery helpers
 // =============================================================================
+
+/// Error surfaced by [`flush_sinks`] for one sink's PUT.
+#[derive(Debug)]
+pub(crate) enum FlushError {
+    /// The flush key already exists on S3. Never expected; refusing
+    /// to overwrite is what keeps the reconciliation trail intact.
+    Collision { key: String },
+    /// Transport / store error from the PUT itself.
+    Store {
+        key: String,
+        source: migration_core::errors::Error,
+    },
+}
+
+/// Drain the downgrade + failure sinks for one completed shard and
+/// PUT the JSONL to S3. Empty drains write nothing. Both sinks are
+/// flushed independently; every error is returned (an empty vec is
+/// full success).
+///
+/// Each flush gets its own key — `layout::failures_flush_key` /
+/// `layout::downgrades_flush_key`, unique per (host, shard, claim
+/// epoch) — so a flush never overwrites an earlier shard's records
+/// (F04). Because each key has exactly one legitimate writer, the
+/// write is a conditional create (`PUT If-None-Match: *`): an
+/// unexpected 412 means something already wrote our key and is
+/// surfaced as a loud [`FlushError::Collision`], never treated as
+/// success.
+pub(crate) async fn flush_sinks(
+    store: &dyn ClaimStore,
+    host_id: &str,
+    shard_filename: &str,
+    epoch: u64,
+    downgrades: &DowngradeSink,
+    failures: &FailureSink,
+) -> Vec<FlushError> {
+    let mut errors = Vec::new();
+
+    let drained = downgrades.drain_jsonl();
+    downgrades.set_current_shard("");
+    if !drained.is_empty() {
+        let key = layout::downgrades_flush_key(host_id, shard_filename, epoch);
+        if let Err(e) = flush_one(store, key, drained).await {
+            errors.push(e);
+        }
+    }
+
+    let drained_failures = failures.drain_jsonl();
+    failures.set_current_shard("");
+    if !drained_failures.is_empty() {
+        let key = layout::failures_flush_key(host_id, shard_filename, epoch);
+        if let Err(e) = flush_one(store, key, drained_failures).await {
+            errors.push(e);
+        }
+    }
+
+    errors
+}
+
+/// One sink PUT: conditional create, with the 412 case mapped to the
+/// distinguishable [`FlushError::Collision`].
+async fn flush_one(store: &dyn ClaimStore, key: String, body: Vec<u8>) -> Result<(), FlushError> {
+    match store.put_if_absent(&key, body).await {
+        Ok(_) => Ok(()),
+        Err(migration_core::errors::Error::PreconditionFailed) => {
+            Err(FlushError::Collision { key })
+        }
+        Err(e) => Err(FlushError::Store { key, source: e }),
+    }
+}
 
 async fn load_manifest(s3: &S3Client) -> anyhow::Result<Manifest> {
     let (body, _etag) = s3
@@ -1449,5 +1525,253 @@ mod tests {
             CLAIM_ETAG,
             now
         ));
+    }
+}
+
+#[cfg(test)]
+mod flush_sinks_tests {
+    //! F04 acceptance tests 2–5 (`docs/work-items/
+    //! WORKER_FAILURE_SINK_APPEND.md`): per-shard sink flushes must
+    //! never overwrite a previous flush's records.
+
+    use super::{flush_sinks, FlushError};
+    use async_trait::async_trait;
+    use migration_core::claim::{ClaimStore, DeleteOutcome, ListEntry};
+    use migration_core::errors::{Error, Result};
+    use migration_core::records::{FailurePhase, FailureRecord};
+    use migration_mover::{DowngradeSink, FailureSink};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// Which PUT primitive wrote a key — the mock records the
+    /// precondition so tests can assert the flush is conditional.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PutKind {
+        Conditional,
+        Unconditional,
+    }
+
+    /// In-memory ClaimStore for the flush path. `put_if_absent`
+    /// mimics S3 `PUT If-None-Match: *` (412 → PreconditionFailed if
+    /// the key exists); `put_unconditional` overwrites, like plain
+    /// PUT. Every write records which primitive was used.
+    #[derive(Default)]
+    struct FlushStore {
+        objects: Mutex<BTreeMap<String, Vec<u8>>>,
+        puts: Mutex<Vec<(String, PutKind)>>,
+    }
+
+    impl FlushStore {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn body(&self, key: &str) -> Option<Vec<u8>> {
+            self.objects.lock().unwrap().get(key).cloned()
+        }
+
+        fn puts(&self) -> Vec<(String, PutKind)> {
+            self.puts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ClaimStore for FlushStore {
+        async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<String> {
+            self.puts
+                .lock()
+                .unwrap()
+                .push((key.to_string(), PutKind::Conditional));
+            let mut g = self.objects.lock().unwrap();
+            if g.contains_key(key) {
+                return Err(Error::PreconditionFailed);
+            }
+            g.insert(key.to_string(), body);
+            Ok(format!("etag-{}", g.len()))
+        }
+
+        async fn put_unconditional(&self, key: &str, body: Vec<u8>) -> Result<String> {
+            self.puts
+                .lock()
+                .unwrap()
+                .push((key.to_string(), PutKind::Unconditional));
+            let mut g = self.objects.lock().unwrap();
+            g.insert(key.to_string(), body);
+            Ok(format!("etag-{}", g.len()))
+        }
+
+        async fn head_object(&self, key: &str) -> Result<Option<(String, Vec<u8>)>> {
+            let g = self.objects.lock().unwrap();
+            Ok(g.get(key).map(|b| ("etag".to_string(), b.clone())))
+        }
+
+        async fn delete_if_match(&self, _key: &str, _etag: &str) -> Result<DeleteOutcome> {
+            unimplemented!("flush path never deletes")
+        }
+
+        async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            let g = self.objects.lock().unwrap();
+            Ok(g.get(key).map(|b| (b.clone(), "etag".to_string())))
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<ListEntry>> {
+            let g = self.objects.lock().unwrap();
+            Ok(g.iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, b)| ListEntry {
+                    key: k.clone(),
+                    etag: "etag".to_string(),
+                    size: b.len() as u64,
+                })
+                .collect())
+        }
+    }
+
+    const HOST: &str = "A";
+
+    fn parse_jsonl(body: &[u8]) -> Vec<FailureRecord> {
+        body.split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).unwrap())
+            .collect()
+    }
+
+    /// F04 acceptance test 2 (red before fix): two consecutive shard
+    /// flushes on the same host must BOTH survive. Under the old flat
+    /// per-host key, the second flush overwrote the first — silently
+    /// losing the first shard's failure records.
+    #[tokio::test]
+    async fn flush_two_shards_preserves_both() {
+        let store = FlushStore::new();
+        let downgrades = DowngradeSink::new();
+        let failures = FailureSink::new();
+
+        // Shard 1 records one failure, then flushes.
+        failures.set_current_shard("part-0001.parquet");
+        failures.record(7, b"/one", FailurePhase::Open, "EACCES");
+        let errs = flush_sinks(&store, HOST, "part-0001.parquet", 1, &downgrades, &failures).await;
+        assert!(errs.is_empty(), "first flush errored: {errs:?}");
+
+        // Shard 2 records a different failure, then flushes.
+        failures.set_current_shard("part-0002.parquet");
+        failures.record(9, b"/two", FailurePhase::Write, "ENOSPC");
+        let errs = flush_sinks(&store, HOST, "part-0002.parquet", 1, &downgrades, &failures).await;
+        assert!(errs.is_empty(), "second flush errored: {errs:?}");
+
+        // Both flushes must exist under the failures prefix.
+        let listed = store.list("failures/").await.unwrap();
+        assert_eq!(
+            listed.len(),
+            2,
+            "expected one object per shard flush, got keys: {:?}",
+            listed.iter().map(|e| &e.key).collect::<Vec<_>>(),
+        );
+
+        // And their contents must round-trip: every record written is
+        // still readable, none overwritten.
+        let mut all: Vec<FailureRecord> = Vec::new();
+        for entry in &listed {
+            all.extend(parse_jsonl(&store.body(&entry.key).unwrap()));
+        }
+        all.sort_by_key(|r| r.row_id);
+        assert_eq!(all.len(), 2, "a flush was lost: {all:?}");
+        assert_eq!(all[0].row_id, 7);
+        assert_eq!(all[0].shard, "part-0001.parquet");
+        assert_eq!(all[0].error, "EACCES");
+        assert_eq!(all[1].row_id, 9);
+        assert_eq!(all[1].shard, "part-0002.parquet");
+        assert_eq!(all[1].error, "ENOSPC");
+    }
+
+    /// F04 acceptance test 3: the flush must use the conditional
+    /// create (`PUT If-None-Match: *`), refuse to clobber an existing
+    /// key, and surface a distinguishable Collision outcome instead
+    /// of silently overwriting.
+    #[tokio::test]
+    async fn flush_uses_put_if_absent() {
+        let store = FlushStore::new();
+        let downgrades = DowngradeSink::new();
+        let failures = FailureSink::new();
+
+        failures.set_current_shard("part-0001.parquet");
+        failures.record(1, b"/a", FailurePhase::Open, "EIO");
+        let errs = flush_sinks(&store, HOST, "part-0001.parquet", 1, &downgrades, &failures).await;
+        assert!(errs.is_empty(), "flush errored: {errs:?}");
+
+        // The mock recorded the precondition of every PUT: all must
+        // be conditional creates, never unconditional overwrites.
+        let puts = store.puts();
+        assert!(!puts.is_empty());
+        for (key, kind) in &puts {
+            assert_eq!(
+                *kind,
+                PutKind::Conditional,
+                "flush of {key} used an unconditional PUT",
+            );
+        }
+        let written_key = puts[0].0.clone();
+        let original_body = store.body(&written_key).unwrap();
+
+        // Re-flush the same (host, shard, epoch) with new records —
+        // the key collides. The flush must refuse to overwrite and
+        // surface a distinguishable outcome.
+        failures.set_current_shard("part-0001.parquet");
+        failures.record(2, b"/b", FailurePhase::Write, "ENOSPC");
+        let errs = flush_sinks(&store, HOST, "part-0001.parquet", 1, &downgrades, &failures).await;
+        assert_eq!(errs.len(), 1, "collision must surface an error: {errs:?}");
+        match &errs[0] {
+            FlushError::Collision { key } => assert_eq!(key, &written_key),
+            other => panic!("expected Collision, got {other:?}"),
+        }
+
+        // The existing object was not clobbered.
+        assert_eq!(store.body(&written_key).unwrap(), original_body);
+    }
+
+    /// F04 acceptance test 4: empty drains write nothing — the
+    /// current "skip empty" behavior is preserved.
+    #[tokio::test]
+    async fn empty_drain_writes_nothing() {
+        let store = FlushStore::new();
+        let downgrades = DowngradeSink::new();
+        let failures = FailureSink::new();
+
+        let errs = flush_sinks(&store, HOST, "part-0001.parquet", 1, &downgrades, &failures).await;
+        assert!(errs.is_empty(), "empty flush errored: {errs:?}");
+        assert!(store.puts().is_empty(), "empty drain must not PUT");
+        assert!(store.list("").await.unwrap().is_empty());
+    }
+
+    /// F04 acceptance test 5: consumers find records by listing the
+    /// per-host prefix (`failures/host-<id>` / `downgrades/host-<id>`)
+    /// — the new per-flush keys must still live under it.
+    #[tokio::test]
+    async fn flush_keys_listable_under_host_prefix() {
+        use migration_core::records::DowngradeKind;
+
+        let store = FlushStore::new();
+        let downgrades = DowngradeSink::new();
+        let failures = FailureSink::new();
+
+        downgrades.set_current_shard("part-0042.parquet");
+        downgrades.record(1, b"/d", DowngradeKind::NullMtime);
+        failures.set_current_shard("part-0042.parquet");
+        failures.record(2, b"/f", FailurePhase::Open, "EACCES");
+
+        let errs = flush_sinks(&store, HOST, "part-0042.parquet", 3, &downgrades, &failures).await;
+        assert!(errs.is_empty(), "flush errored: {errs:?}");
+
+        let f = store.list(&format!("failures/host-{HOST}")).await.unwrap();
+        assert_eq!(f.len(), 1, "failures not under per-host prefix");
+        let d = store
+            .list(&format!("downgrades/host-{HOST}"))
+            .await
+            .unwrap();
+        assert_eq!(d.len(), 1, "downgrades not under per-host prefix");
+
+        // Top-level prefixes (used by init/doctor and operators)
+        // still cover everything too.
+        assert_eq!(store.list("failures/").await.unwrap().len(), 1);
+        assert_eq!(store.list("downgrades/").await.unwrap().len(), 1);
     }
 }

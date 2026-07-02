@@ -4,7 +4,9 @@
 //! to JSONL for an S3 PUT.
 //!
 //! The processor records on Err from the mover; the orchestrator
-//! drains and PUTs to `failures/host-<id>.jsonl` after each shard.
+//! drains and PUTs to `failures/host-<id>/<shard-stem>-e<epoch>.jsonl`
+//! (one object per shard flush — see `layout::failures_flush_key`)
+//! after each shard.
 //! Intentionally not behind a trait — there's only one production
 //! impl, and tests inspect the buffered records directly.
 

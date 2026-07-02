@@ -49,7 +49,7 @@ docs+tests+CI. Full narrative context is in `docs/HANDOFF.md`
 
 | ID  | Area     | Finding | Work item | Status | Notes |
 |-----|----------|---------|-----------|--------|-------|
-| F04 | worker   | Per-host failures/downgrades JSONL overwritten on every shard flush — the at-least-once reconciliation trail silently loses records. | [WORKER_FAILURE_SINK_APPEND.md](work-items/WORKER_FAILURE_SINK_APPEND.md) | scheduled | |
+| F04 | worker   | Per-host failures/downgrades JSONL overwritten on every shard flush — the at-least-once reconciliation trail silently loses records. | [WORKER_FAILURE_SINK_APPEND.md](work-items/WORKER_FAILURE_SINK_APPEND.md) | in-progress | fix + tests on branch worker-failure-sink-append |
 | F05 | mover    | `FileCopyResult.torn` computed then discarded by `copy_regular`; modified-during-copy files commit silently, no downgrade record. | [MOVER_TORN_COPY_SURFACE.md](work-items/MOVER_TORN_COPY_SURFACE.md) | scheduled | |
 | F06 | mover    | EOF-clamp livelock in `pipelined_copy`: source shrinks mid-copy → stale reorder-buf entry never drained → busy-spin holding the inflight permit. | [MOVER_EOF_REORDER_BOUNDS.md](work-items/MOVER_EOF_REORDER_BOUNDS.md) | scheduled | Same doc as F07. |
 | F07 | mover    | `reorder_buf` unbounded: one slow read RPC can buffer the rest of a file in RAM. | [MOVER_EOF_REORDER_BOUNDS.md](work-items/MOVER_EOF_REORDER_BOUNDS.md) | scheduled | |

@@ -45,6 +45,9 @@ uuid     = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+# Used by the orchestrator flush_sinks tests to implement the mock
+# ClaimStore (the trait is declared with #[async_trait]).
+async-trait = { workspace = true }
 # Used by tests/coord_client_integration.rs to bring up an in-process
 # coord (router + axum_server bind) and drive it from the client.
 axum-server = { workspace = true }
