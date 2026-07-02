@@ -436,7 +436,14 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
                 last_target_filename: shard,
             }
         } else {
-            scan_shards(&*s3, &manifest, lease, &mut claim_body_cache).await?
+            scan_shards(
+                &*s3,
+                &manifest,
+                lease,
+                cfg.worker.heartbeat_sec,
+                &mut claim_body_cache,
+            )
+            .await?
         };
         let scan = scan_or_self;
         if scan.all_terminal {
@@ -904,8 +911,9 @@ fn key_basename(k: &str) -> &str {
     k.rsplit('/').next().unwrap_or(k)
 }
 
+/// Public for in-process integration tests — see `scan_shards`.
 #[derive(Debug)]
-enum ClaimTarget {
+pub enum ClaimTarget {
     Free {
         shard: String,
     },
@@ -925,13 +933,14 @@ enum ClaimTarget {
     },
 }
 
+/// Public for in-process integration tests — see `scan_shards`.
 #[derive(Debug, Default)]
-struct ScanResult {
-    next_target: Option<ClaimTarget>,
+pub struct ScanResult {
+    pub next_target: Option<ClaimTarget>,
     /// True iff every shard in the manifest is in a terminal state
     /// (Completed or Failed). Worker exits when this flips.
-    all_terminal: bool,
-    last_target_filename: String,
+    pub all_terminal: bool,
+    pub last_target_filename: String,
 }
 
 /// Cross-pass claim-body cache. Keyed by claim key (e.g.
@@ -942,7 +951,7 @@ struct ScanResult {
 /// state — all claims still owned and unchanged — this drops
 /// per-Active-claim GETs to zero; scan cost becomes pure LIST plus
 /// progress GETs (which the intra-pass cache also dedupes).
-pub(crate) type ClaimBodyCache = HashMap<String, (String, ClaimRecord)>;
+pub type ClaimBodyCache = HashMap<String, (String, ClaimRecord)>;
 
 /// Intra-pass progress cache. Built fresh inside each scan pass.
 /// Lets M Active claims owned by N hosts cost N progress GETs
@@ -959,10 +968,17 @@ enum ProgressFetch {
     Error,
 }
 
-async fn scan_shards(
+/// Public for in-process integration tests (e.g.
+/// `tests/two_live_workers.rs`), which drive a minimal worker loop
+/// against a mock `ClaimStore` without the hardware-bound `run()`
+/// path. `heartbeat_sec` is this scanner's configured heartbeat
+/// interval — used as the fresh-claim grace calibration when the
+/// owner has no progress object to read a writer-side value from.
+pub async fn scan_shards(
     store: &dyn ClaimStore,
     manifest: &Manifest,
     lease: Duration,
+    heartbeat_sec: u64,
     claim_body_cache: &mut ClaimBodyCache,
 ) -> anyhow::Result<ScanResult> {
     let entries = store.list(layout::SHARDS_PREFIX).await?;
@@ -1084,10 +1100,20 @@ async fn scan_shards(
                                 }
                             };
                             match fetch {
-                                ProgressFetch::Hit(body) => {
-                                    check_progress_liveness(Some(&body), &e.etag, now)
-                                }
-                                ProgressFetch::Miss => check_progress_liveness(None, &e.etag, now),
+                                ProgressFetch::Hit(body) => check_progress_liveness(
+                                    Some(&body),
+                                    &e.etag,
+                                    record.claimed_utc.0,
+                                    heartbeat_sec,
+                                    now,
+                                ),
+                                ProgressFetch::Miss => check_progress_liveness(
+                                    None,
+                                    &e.etag,
+                                    record.claimed_utc.0,
+                                    heartbeat_sec,
+                                    now,
+                                ),
                                 ProgressFetch::Error => false,
                             }
                         } else {
@@ -1127,26 +1153,63 @@ async fn scan_shards(
 /// reference implementation in `scan_shards` swallows GET errors and
 /// defers to lease, which is the conservative choice).
 ///
-/// Edges, per `PROGRESS_LIVENESS_CROSS_CHECK.md` §6:
+/// Edges, per `PROGRESS_LIVENESS_CROSS_CHECK.md` §6, plus the
+/// fresh-claim grace window from `CLAIM_FRESH_GRACE.md` (F01): the
+/// progress object is only rewritten on heartbeat ticks, so between
+/// an acquire and the owner's next tick it still describes the
+/// *previous* ownership window (`held_etag = None` at startup, or the
+/// previous shard's etag). The absent / `None` / mismatched branches
+/// therefore additionally require the claim itself to be older than
+/// `2 × heartbeat_sec` (`claim age = now - claimed_utc`, strict `>`,
+/// future timestamps → not eligible) before returning eligible —
+/// otherwise every fleet startup is a near-deterministic theft
+/// cascade. The matching-etag branch needs no grace: a matching
+/// `held_etag` proves the progress record was written inside this
+/// ownership window.
 ///
 /// | Progress file state                       | Returns |
 /// |-------------------------------------------|---------|
-/// | Absent (`body=None`)                      | `true`  (owner never started or crashed pre-tick) |
+/// | Absent (`body=None`); claim age ≤ 2 × scanner hb_sec | `false` (owner may not have ticked yet — grace) |
+/// | Absent (`body=None`); claim age > 2 × scanner hb_sec | `true`  (owner never started or crashed pre-tick) |
 /// | Parse failure                             | `false` (don't act on garbage; defer to lease) |
 /// | `heartbeat_sec == 0` (pre-cross-check)    | `false` (no calibrated freshness window) |
-/// | `held_etag` is `None`                     | `true`  (writer announced "not holding this") |
-/// | `held_etag` differs from current claim    | `true`  (claim has been replaced; old progress is stale → same-host_id restart safety) |
+/// | `held_etag` `None`/mismatch; claim age ≤ 2 × writer hb_sec | `false` (progress hasn't caught up to the acquire — grace) |
+/// | `held_etag` is `None`; claim age > grace  | `true`  (writer announced "not holding this") |
+/// | `held_etag` differs; claim age > grace    | `true`  (claim has been replaced; old progress is stale → same-host_id restart safety) |
 /// | etag matches; heartbeat age ≤ 2 × hb_sec  | `false` (alive) |
 /// | etag matches; heartbeat age > 2 × hb_sec  | `true`  (dead) |
+///
+/// The writer-side `p.heartbeat_sec` calibrates the grace when a
+/// progress object exists (same from-writer preference as the
+/// heartbeat-staleness threshold); with no progress object to read,
+/// the scanner's own configured `heartbeat_sec` is the fallback.
 fn check_progress_liveness(
     progress_body: Option<&[u8]>,
     claim_etag: &str,
+    claimed_utc: chrono::DateTime<chrono::Utc>,
+    scanner_heartbeat_sec: u64,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
+    // Fresh-claim grace: true iff the claim is strictly older than
+    // 2 × hb_sec. Conservative on every uncertain edge, matching the
+    // heartbeat-staleness math below: a future `claimed_utc` (clock
+    // skew) yields a negative age → not elapsed → not eligible; an
+    // uncalibrated hb_sec of 0 → not elapsed → defer to lease.
+    let grace_elapsed = |hb_sec: u64| -> bool {
+        if hb_sec == 0 {
+            return false;
+        }
+        let claim_age = now.signed_duration_since(claimed_utc);
+        claim_age.num_seconds() > (hb_sec.saturating_mul(2)) as i64
+    };
+
     let Some(body) = progress_body else {
-        // No progress object at all — owner never started, or it
-        // crashed before its first tick landed. Eligible.
-        return true;
+        // No progress object at all — owner never started, crashed
+        // before its first tick landed, or simply hasn't ticked yet.
+        // Only eligible once the claim has outlived the grace window;
+        // there is no writer-side heartbeat_sec to read, so calibrate
+        // on the scanner's own configured interval.
+        return grace_elapsed(scanner_heartbeat_sec);
     };
     let Ok(p) = serde_json::from_slice::<ProgressRecord>(body) else {
         // Garbage body — defer to lease.
@@ -1159,9 +1222,13 @@ fn check_progress_liveness(
     match p.held_etag.as_deref() {
         Some(e) if e == claim_etag => {}
         // None or mismatched etag — the progress object isn't bound
-        // to this claim's ownership window (worker self-fenced or
-        // same-host_id restart minted a new claim). Eligible.
-        _ => return true,
+        // to this claim's ownership window. Either the owner acquired
+        // it after its last tick (progress is one tick behind S3
+        // reality — NOT eligible until the grace window elapses), or
+        // the claim is a genuine orphan (worker self-fenced, or a
+        // same-host_id restart minted a new claim) — eligible once
+        // the claim has outlived the grace window.
+        _ => return grace_elapsed(p.heartbeat_sec),
     }
     let age = now.signed_duration_since(p.heartbeat_utc.0);
     let threshold_secs = (p.heartbeat_sec.saturating_mul(2)) as i64;
@@ -1306,12 +1373,23 @@ mod tests {
     //! `ProgressRecord`, serializes it to JSON, and asserts the
     //! returned boolean.
     use super::check_progress_liveness;
-    use chrono::{Duration as ChronoDuration, Utc};
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use migration_core::records::ProgressRecord;
     use migration_core::time::UtcTime;
 
     const CLAIM_ETAG: &str = "etag-claim-abc";
     const HB_SEC: u64 = 30;
+
+    /// A claim old enough that the fresh-claim grace window
+    /// (`2 × heartbeat_sec`) has strictly elapsed.
+    fn aged_claim(now: DateTime<Utc>) -> DateTime<Utc> {
+        now - ChronoDuration::seconds((HB_SEC * 2 + 1) as i64)
+    }
+
+    /// A claim acquired seconds ago — inside the grace window.
+    fn fresh_claim(now: DateTime<Utc>) -> DateTime<Utc> {
+        now - ChronoDuration::seconds(5)
+    }
 
     fn record_at(heartbeat: chrono::DateTime<Utc>, held_etag: Option<&str>) -> ProgressRecord {
         ProgressRecord {
@@ -1336,21 +1414,33 @@ mod tests {
         serde_json::to_vec(r).unwrap()
     }
 
-    /// Absent progress object → eligible. Owner crashed before its
-    /// first tick landed, or never started; peer reclaims fast.
+    /// Absent progress object on an aged claim → eligible. Owner
+    /// crashed before its first tick landed, or never started; peer
+    /// reclaims fast once the fresh-claim grace window has elapsed.
     #[test]
     fn absent_body_is_eligible() {
-        assert!(check_progress_liveness(None, CLAIM_ETAG, Utc::now()));
+        let now = Utc::now();
+        assert!(check_progress_liveness(
+            None,
+            CLAIM_ETAG,
+            aged_claim(now),
+            HB_SEC,
+            now
+        ));
     }
 
-    /// Parse failure → conservative; defer to lease.
+    /// Parse failure → conservative; defer to lease (even on an aged
+    /// claim — don't act on garbage).
     #[test]
     fn unparseable_body_defers_to_lease() {
         let garbage = b"not-json-at-all";
+        let now = Utc::now();
         assert!(!check_progress_liveness(
             Some(garbage),
             CLAIM_ETAG,
-            Utc::now()
+            aged_claim(now),
+            HB_SEC,
+            now
         ));
     }
 
@@ -1377,38 +1467,49 @@ mod tests {
             }}"#,
             Utc::now().to_rfc3339(),
         );
+        let now = Utc::now();
         assert!(!check_progress_liveness(
             Some(json.as_bytes()),
             CLAIM_ETAG,
-            Utc::now()
+            aged_claim(now),
+            HB_SEC,
+            now
         ));
     }
 
     /// `held_etag = None` means the writer announced "I am not
     /// holding any claim right now" (worker self-fenced, exiting, or
-    /// between shards) → peer is eligible to reclaim.
+    /// between shards) → peer is eligible to reclaim once the
+    /// fresh-claim grace window has elapsed.
     #[test]
     fn held_etag_none_is_eligible() {
-        let r = record_at(Utc::now(), None);
+        let now = Utc::now();
+        let r = record_at(now, None);
         assert!(check_progress_liveness(
             Some(&body_of(&r)),
             CLAIM_ETAG,
-            Utc::now()
+            aged_claim(now),
+            HB_SEC,
+            now
         ));
     }
 
     /// Same-host_id restart: the live claim has a new etag, but the
     /// pre-restart progress object still carries the old one. The
-    /// mismatch makes the shard fast-reclaim-eligible — and the
-    /// post-restart progress write will carry the new etag, so the
-    /// new ownership window won't ever match the dead claim.
+    /// mismatch makes the shard fast-reclaim-eligible (once the grace
+    /// window has elapsed) — and the post-restart progress write will
+    /// carry the new etag, so the new ownership window won't ever
+    /// match the dead claim.
     #[test]
     fn held_etag_mismatch_is_eligible() {
-        let r = record_at(Utc::now(), Some("etag-old-from-prior-acquire"));
+        let now = Utc::now();
+        let r = record_at(now, Some("etag-old-from-prior-acquire"));
         assert!(check_progress_liveness(
             Some(&body_of(&r)),
             CLAIM_ETAG,
-            Utc::now()
+            aged_claim(now),
+            HB_SEC,
+            now
         ));
     }
 
@@ -1421,18 +1522,30 @@ mod tests {
         assert!(!check_progress_liveness(
             Some(&body_of(&r)),
             CLAIM_ETAG,
+            fresh_claim(now),
+            HB_SEC,
             now
         ));
     }
 
     /// Owner stopped heartbeating: etag matches, but heartbeat_utc is
-    /// older than 2 × heartbeat_sec. Eligible for fast reclaim.
+    /// older than 2 × heartbeat_sec. Eligible for fast reclaim. The
+    /// fresh-claim grace does NOT gate this branch — a matching
+    /// held_etag proves the progress record was written inside this
+    /// ownership window, so heartbeat staleness is already calibrated
+    /// against the writer.
     #[test]
     fn stale_heartbeat_with_matching_etag_is_eligible() {
         let now = Utc::now();
         let age = ChronoDuration::seconds((HB_SEC * 2 + 1) as i64);
         let r = record_at(now - age, Some(CLAIM_ETAG));
-        assert!(check_progress_liveness(Some(&body_of(&r)), CLAIM_ETAG, now));
+        assert!(check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            aged_claim(now),
+            HB_SEC,
+            now
+        ));
     }
 
     /// Boundary case: heartbeat age exactly equal to the threshold is
@@ -1447,7 +1560,166 @@ mod tests {
         assert!(!check_progress_liveness(
             Some(&body_of(&r)),
             CLAIM_ETAG,
+            aged_claim(now),
+            HB_SEC,
             now
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Fresh-claim grace window — docs/work-items/CLAIM_FRESH_GRACE.md
+    // acceptance tests 1–7. The etag-mismatch and progress-absent
+    // branches must additionally require
+    // `now - claimed_utc > 2 × heartbeat_sec` before returning
+    // eligible; the matching-etag branches are unchanged.
+    // -------------------------------------------------------------------------
+
+    /// Acceptance test 1 (red before fix): a claim acquired 5s ago
+    /// whose owner's progress object still carries the previous
+    /// ownership window's etag (fresh heartbeat) must NOT be
+    /// reclaim-eligible — the owner simply hasn't ticked yet.
+    #[test]
+    fn fresh_claim_mismatched_progress_not_eligible() {
+        let now = Utc::now();
+        let r = record_at(now, Some("different-etag"));
+        assert!(!check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            fresh_claim(now),
+            HB_SEC,
+            now
+        ));
+    }
+
+    /// Acceptance test 2 (red before fix): a claim acquired 5s ago
+    /// with no progress object for the host must NOT be eligible —
+    /// at fleet startup every worker is in this state until its
+    /// first heartbeat tick lands.
+    #[test]
+    fn fresh_claim_absent_progress_not_eligible() {
+        let now = Utc::now();
+        assert!(!check_progress_liveness(
+            None,
+            CLAIM_ETAG,
+            fresh_claim(now),
+            HB_SEC,
+            now
+        ));
+    }
+
+    /// Acceptance test 3 (red before fix): claim age 5s, progress
+    /// present with `held_etag = None` (owner between shards / just
+    /// started). NOT eligible inside the grace window.
+    #[test]
+    fn fresh_claim_none_held_etag_not_eligible() {
+        let now = Utc::now();
+        let r = record_at(now, None);
+        assert!(!check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            fresh_claim(now),
+            HB_SEC,
+            now
+        ));
+    }
+
+    /// Acceptance test 4: once the claim is older than the grace
+    /// window, a mismatched held_etag makes it eligible again —
+    /// orphan reclaim must keep working.
+    #[test]
+    fn aged_claim_mismatched_progress_eligible() {
+        let now = Utc::now();
+        let r = record_at(now, Some("different-etag"));
+        assert!(check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            aged_claim(now),
+            HB_SEC,
+            now
+        ));
+    }
+
+    /// Acceptance test 5: aged claim, no progress object (owner
+    /// crashed before its first tick). Eligible — dead-worker
+    /// reclaim is the feature's reason to exist.
+    #[test]
+    fn aged_claim_absent_progress_eligible() {
+        let now = Utc::now();
+        assert!(check_progress_liveness(
+            None,
+            CLAIM_ETAG,
+            aged_claim(now),
+            HB_SEC,
+            now
+        ));
+    }
+
+    /// Acceptance test 6: claim age exactly `2 × heartbeat_sec` is
+    /// NOT eligible — strictly-greater comparison, matching the
+    /// heartbeat-staleness convention in the existing rows.
+    #[test]
+    fn boundary_exactly_grace_not_eligible() {
+        let now = Utc::now();
+        let claimed = now - ChronoDuration::seconds((HB_SEC * 2) as i64);
+        // Mismatched-etag branch at the boundary.
+        let r = record_at(now, Some("different-etag"));
+        assert!(!check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            claimed,
+            HB_SEC,
+            now
+        ));
+        // Absent-progress branch at the boundary.
+        assert!(!check_progress_liveness(
+            None, CLAIM_ETAG, claimed, HB_SEC, now
+        ));
+    }
+
+    /// Acceptance test 7: matching held_etag with a fresh heartbeat
+    /// is never eligible, no matter how old the claim is — the
+    /// happy-path regression guard.
+    #[test]
+    fn matching_etag_never_eligible_regardless_of_age() {
+        let now = Utc::now();
+        let r = record_at(now, Some(CLAIM_ETAG));
+        // Fresh claim.
+        assert!(!check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            fresh_claim(now),
+            HB_SEC,
+            now
+        ));
+        // Very old claim (hours past any lease/grace window).
+        let ancient = now - ChronoDuration::hours(6);
+        assert!(!check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            ancient,
+            HB_SEC,
+            now
+        ));
+    }
+
+    /// Conservative time handling: a `claimed_utc` in the future
+    /// (clock skew between the owner and this scanner) must read as
+    /// "grace not elapsed" → NOT eligible, same convention as the
+    /// existing heartbeat-staleness math.
+    #[test]
+    fn future_claimed_utc_not_eligible() {
+        let now = Utc::now();
+        let future = now + ChronoDuration::seconds(30);
+        let r = record_at(now, Some("different-etag"));
+        assert!(!check_progress_liveness(
+            Some(&body_of(&r)),
+            CLAIM_ETAG,
+            future,
+            HB_SEC,
+            now
+        ));
+        assert!(!check_progress_liveness(
+            None, CLAIM_ETAG, future, HB_SEC, now
         ));
     }
 }

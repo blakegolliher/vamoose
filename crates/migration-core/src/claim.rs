@@ -417,19 +417,60 @@ pub async fn fail(
     }
 }
 
-#[cfg(test)]
-mod tests {
+/// In-memory mock `ClaimStore` shared by this crate's protocol unit
+/// tests and (behind the `test-util` feature) by downstream crates'
+/// integration tests — e.g. `migration-worker/tests/two_live_workers.rs`.
+/// One canonical mock; do not fork divergent copies.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util {
     use super::*;
-    use crate::layout;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    /// One entry in the [`FakeStore`] operation log. Timestamped with
+    /// the real wall clock (`chrono::Utc::now()`) — the same clock
+    /// domain the claim records' `claimed_utc` fields live in — so
+    /// tests can compute e.g. "age of the claim that a reclaim
+    /// deleted" from the log alone.
+    #[derive(Debug, Clone)]
+    pub struct OpRecord {
+        pub at: chrono::DateTime<chrono::Utc>,
+        pub kind: OpKind,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum OpKind {
+        PutIfAbsent {
+            key: String,
+            body: Vec<u8>,
+            /// `true` when the PUT created the object (owner/terminal
+            /// state landed); `false` on 412/rigged failure.
+            ok: bool,
+        },
+        PutUnconditional {
+            key: String,
+            body: Vec<u8>,
+        },
+        DeleteIfMatch {
+            key: String,
+            etag: String,
+            outcome: DeleteOutcome,
+            /// Body of the object that was removed, when
+            /// `outcome == Deleted`. Lets tests parse the claim
+            /// record that a reclaim/complete displaced.
+            deleted_body: Option<Vec<u8>>,
+        },
+    }
+
     /// In-memory ClaimStore that mimics S3's v2 conditional semantics
     /// (`PUT If-None-Match: *`, `DELETE If-Match: <etag>`, HEAD).
-    /// Drives the protocol unit tests.
+    /// Drives the protocol unit tests. Every mutation is appended to
+    /// an op log (see [`OpRecord`]) so concurrency tests can assert on
+    /// exactly which transitions happened, not just on final state.
     pub struct FakeStore {
         inner: Mutex<HashMap<String, (Vec<u8>, String)>>,
         etag_counter: Mutex<u64>,
+        ops: Mutex<Vec<OpRecord>>,
         /// Test rig for the terminal-state retry path. When non-zero,
         /// the next N `put_if_absent` calls return the configured
         /// error WITHOUT mutating state; the counter decrements on
@@ -441,7 +482,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum RiggedFailureKind {
+    pub enum RiggedFailureKind {
         Transient,
         PreconditionFailed,
     }
@@ -451,6 +492,7 @@ mod tests {
             Self {
                 inner: Mutex::new(HashMap::new()),
                 etag_counter: Mutex::new(0),
+                ops: Mutex::new(Vec::new()),
                 put_failures_remaining: Mutex::new(0),
                 put_failure_kind: Mutex::new(RiggedFailureKind::Transient),
             }
@@ -461,17 +503,35 @@ mod tests {
             format!("etag-{}", *c)
         }
 
+        fn log(&self, kind: OpKind) {
+            self.ops.lock().unwrap().push(OpRecord {
+                at: chrono::Utc::now(),
+                kind,
+            });
+        }
+
+        /// Snapshot of the op log so far, in call order.
+        pub fn op_log(&self) -> Vec<OpRecord> {
+            self.ops.lock().unwrap().clone()
+        }
+
         /// Configure the next `n` `put_if_absent` calls to return
         /// the given failure mode without mutating state. Used by
         /// terminal-state retry tests.
-        fn rig_next_puts_to_fail(&self, n: u32, kind: RiggedFailureKind) {
+        pub fn rig_next_puts_to_fail(&self, n: u32, kind: RiggedFailureKind) {
             *self.put_failures_remaining.lock().unwrap() = n;
             *self.put_failure_kind.lock().unwrap() = kind;
         }
 
         /// How many rigged failures remain to consume.
-        fn rigged_remaining(&self) -> u32 {
+        pub fn rigged_remaining(&self) -> u32 {
             *self.put_failures_remaining.lock().unwrap()
+        }
+    }
+
+    impl Default for FakeStore {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -484,6 +544,11 @@ mod tests {
                 if *rem > 0 {
                     *rem -= 1;
                     let kind = *self.put_failure_kind.lock().unwrap();
+                    self.log(OpKind::PutIfAbsent {
+                        key: key.to_string(),
+                        body,
+                        ok: false,
+                    });
                     return Err(match kind {
                         RiggedFailureKind::Transient => {
                             Error::Other(anyhow::anyhow!("rigged transient PUT failure"))
@@ -494,10 +559,36 @@ mod tests {
             }
             let mut g = self.inner.lock().unwrap();
             if g.contains_key(key) {
+                self.log(OpKind::PutIfAbsent {
+                    key: key.to_string(),
+                    body,
+                    ok: false,
+                });
                 return Err(Error::PreconditionFailed);
             }
             let etag = self.next_etag();
-            g.insert(key.to_string(), (body, etag.clone()));
+            g.insert(key.to_string(), (body.clone(), etag.clone()));
+            drop(g);
+            self.log(OpKind::PutIfAbsent {
+                key: key.to_string(),
+                body,
+                ok: true,
+            });
+            Ok(etag)
+        }
+        async fn put_unconditional(&self, key: &str, body: Vec<u8>) -> Result<String> {
+            // Unlike the trait's default no-op, actually store the
+            // object — worker integration tests need progress files
+            // to be readable back through `get`.
+            let etag = self.next_etag();
+            self.inner
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (body.clone(), etag.clone()));
+            self.log(OpKind::PutUnconditional {
+                key: key.to_string(),
+                body,
+            });
             Ok(etag)
         }
         async fn head_object(&self, key: &str) -> Result<Option<(String, Vec<u8>)>> {
@@ -506,14 +597,22 @@ mod tests {
         }
         async fn delete_if_match(&self, key: &str, etag: &str) -> Result<DeleteOutcome> {
             let mut g = self.inner.lock().unwrap();
-            match g.get(key) {
+            let (outcome, deleted_body) = match g.get(key) {
                 Some((_, current)) if current == etag => {
-                    g.remove(key);
-                    Ok(DeleteOutcome::Deleted)
+                    let removed = g.remove(key).map(|(b, _)| b);
+                    (DeleteOutcome::Deleted, removed)
                 }
-                Some(_) => Ok(DeleteOutcome::EtagMismatch),
-                None => Ok(DeleteOutcome::NotFound),
-            }
+                Some(_) => (DeleteOutcome::EtagMismatch, None),
+                None => (DeleteOutcome::NotFound, None),
+            };
+            drop(g);
+            self.log(OpKind::DeleteIfMatch {
+                key: key.to_string(),
+                etag: etag.to_string(),
+                outcome,
+                deleted_body,
+            });
+            Ok(outcome)
         }
         async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
             let g = self.inner.lock().unwrap();
@@ -533,6 +632,13 @@ mod tests {
             Ok(out)
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::{FakeStore, RiggedFailureKind};
+    use super::*;
+    use crate::layout;
 
     const SHARD: &str = "part-0042.parquet";
 

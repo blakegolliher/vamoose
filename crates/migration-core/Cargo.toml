@@ -35,3 +35,9 @@ futures    = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+# Exposes `claim::test_util` (the in-memory mock ClaimStore used by
+# this crate's own protocol tests) to downstream crates' tests, so
+# integration harnesses don't fork a divergent copy of the mock.
+test-util = []

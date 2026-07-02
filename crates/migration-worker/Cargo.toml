@@ -50,3 +50,9 @@ reqwest = { workspace = true }
 axum-server = { workspace = true }
 http = { workspace = true }
 axum = { workspace = true }
+# Re-exported mock ClaimStore (claim::test_util::FakeStore) for
+# tests/two_live_workers.rs — one canonical in-memory mock, no
+# forked copies (see docs/work-items/CLAIM_FRESH_GRACE.md).
+migration-core = { workspace = true, features = ["test-util"] }
+# `start_paused` mock time for the two-live-workers harness.
+tokio = { workspace = true, features = ["test-util"] }

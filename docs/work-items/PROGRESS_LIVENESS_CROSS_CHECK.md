@@ -109,8 +109,20 @@ step) into `write_progress`, and pass the configured
 
 Don't add new locking — the existing snapshot is sufficient. The
 held etag in the progress object is allowed to be one tick stale
-relative to S3 reality; the cross-check accounts for that by using
-a `2 × heartbeat_sec` threshold rather than `1 ×`.
+relative to S3 reality.
+
+> **Correction (F01, `docs/work-items/CLAIM_FRESH_GRACE.md`).** An
+> earlier revision of this section claimed the one-tick staleness
+> "is accounted for by the `2 × heartbeat_sec` threshold". That was
+> wrong: the `heartbeat_utc` threshold only guards the matching-etag
+> branch of the predicate. A one-tick-stale `held_etag` — progress
+> absent at startup, `held_etag = None`, or the *previous* shard's
+> etag — lands in the absent/mismatch branches, which returned
+> "eligible" immediately and made every live, seconds-old claim
+> stealable until its owner's next tick (a near-deterministic theft
+> cascade at fleet startup). Those branches are instead guarded by
+> the **fresh-claim grace window**: they return eligible only once
+> `now - claim.claimed_utc > 2 × heartbeat_sec`. See §5.
 
 ## 5. Scan-shards algorithm change
 
@@ -143,50 +155,98 @@ ClaimState::Active => {
 }
 ```
 
-where:
+where (as shipped, the predicate is pure & synchronous — the caller
+does the progress GET and error handling; `claimed_utc` comes from
+the claim body already parsed in `scan_shards`):
 
 ```rust
 /// Returns `true` iff the per-host progress file confirms the
 /// owning worker is no longer heartbeating against this specific
 /// claim. Conservative on every uncertain edge — missing field,
-/// fetch error, parse error — defaults to `false` so the lease
-/// check remains the sole gate.
-async fn check_progress_liveness(
-    s3: &S3Client,
-    owner_host: &str,
+/// fetch error, parse error, future timestamp — defaults to
+/// `false` so the lease check remains the sole gate.
+fn check_progress_liveness(
+    progress_body: Option<&[u8]>,
     claim_etag: &str,
+    claimed_utc: DateTime<Utc>,
+    scanner_heartbeat_sec: u64,
     now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
-    let key = layout::progress_key(owner_host);
-    let Some((body, _)) = s3.get(&key).await? else {
-        // No progress object at all — owner never started, or it
-        // crashed before the first tick. Fast-reclaim eligible.
-        return Ok(true);
+) -> bool {
+    // Fresh-claim grace (F01, CLAIM_FRESH_GRACE.md): the progress
+    // object is only rewritten on heartbeat ticks, so between an
+    // acquire and the owner's next tick it still describes the
+    // PREVIOUS ownership window. The absent and None/mismatched-
+    // held_etag branches therefore only fire once the claim itself
+    // is strictly older than 2 × heartbeat_sec. Same conservative
+    // time handling as the heartbeat math: a future claimed_utc
+    // (clock skew) → negative age → not eligible.
+    let grace_elapsed = |hb_sec: u64| -> bool {
+        if hb_sec == 0 {
+            return false;
+        }
+        let claim_age = now.signed_duration_since(claimed_utc);
+        claim_age.num_seconds() > (hb_sec.saturating_mul(2)) as i64
     };
-    let Ok(p) = serde_json::from_slice::<ProgressRecord>(&body) else {
+
+    let Some(body) = progress_body else {
+        // No progress object at all — owner never started, crashed
+        // before the first tick, or just hasn't ticked yet. Only
+        // eligible once the grace window has elapsed; no writer-side
+        // heartbeat_sec exists, so calibrate on the scanner's own.
+        return grace_elapsed(scanner_heartbeat_sec);
+    };
+    let Ok(p) = serde_json::from_slice::<ProgressRecord>(body) else {
         // Parse failure — be conservative, defer to lease.
-        return Ok(false);
+        return false;
     };
     // Old-schema progress object: heartbeat_sec=0 (default). Defer
     // to lease; we have no calibrated freshness window.
     if p.heartbeat_sec == 0 {
-        return Ok(false);
+        return false;
     }
     // Same-host_id restart safety: the owning etag in the progress
     // record must match the claim's current etag. A mismatch means
     // the progress file belongs to an earlier acquire (different
-    // ownership window) — treat as stale.
+    // ownership window) — stale, but only reclaim-eligible once the
+    // claim has outlived the grace window (the owner may simply not
+    // have ticked since acquiring).
     match p.held_etag.as_deref() {
         Some(e) if e == claim_etag => {}
-        Some(_) | None => return Ok(true),
+        Some(_) | None => return grace_elapsed(p.heartbeat_sec),
     }
     // Both match: check freshness. 2× heartbeat_sec gives the
-    // writer one missed tick of grace.
+    // writer one missed tick of grace. No claim-age guard here — a
+    // matching held_etag proves the progress record was written
+    // inside this ownership window.
     let age = now.signed_duration_since(p.heartbeat_utc.0);
     let threshold_secs = (p.heartbeat_sec.saturating_mul(2)) as i64;
-    Ok(age.num_seconds() > threshold_secs)
+    age.num_seconds() > threshold_secs
 }
 ```
+
+Decision table (claim age = `now - claim.claimed_utc`; grace =
+`2 × heartbeat_sec`, writer-supplied when a progress object exists,
+scanner-local otherwise; all comparisons strict `>`, future
+timestamps never satisfy them):
+
+| Progress file state | Claim age | Eligible? |
+|---|---|---|
+| Absent | ≤ grace (scanner hb) | **no** — owner may not have ticked yet |
+| Absent | > grace (scanner hb) | yes — owner never started / crashed pre-tick |
+| Parse failure | any | no — defer to lease |
+| `heartbeat_sec == 0` (old schema) | any | no — no calibrated window |
+| `held_etag` `None` or mismatched | ≤ grace (writer hb) | **no** — progress one tick behind the acquire |
+| `held_etag` `None` or mismatched | > grace (writer hb) | yes — orphan / same-host_id restart |
+| `held_etag` matches, heartbeat age ≤ 2 × hb | any | no — alive |
+| `held_etag` matches, heartbeat age > 2 × hb | any | yes — dead |
+
+**Trade-off (intended).** Crash recovery via the progress cross-check
+takes up to `2 × heartbeat_sec` longer for a worker that dies
+immediately after acquiring: its claim must outlive the grace window
+before the absent/mismatch branches may fire. The lease-based path is
+unchanged. This is the intended trade — a bounded slowdown on one
+crash pattern in exchange for live claims never being stealable in
+the acquire-to-first-tick window.
 
 Cost: one extra GET per `Active` claim per scan pass. At 100 workers
 and 10k shards in steady state most claims are `Completed`, so this
