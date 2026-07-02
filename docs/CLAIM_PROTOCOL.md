@@ -181,13 +181,26 @@ The orchestrator loop in `migration-worker/src/orchestrator.rs`:
 1. **Scan**: list `shards/`, classify each as `Free` / `Stale(etag)` /
    `Active(live)` / `Terminal`. An `Active` claim is considered
    `Stale` when *either* `now - claimed_utc > lease_timeout`
-   (the lease path) *or* the owner's `progress/host-<id>.json` is
-   absent, has a mismatched `held_etag`, or has `heartbeat_utc`
-   older than `2 × heartbeat_sec` (the progress-cross-check path —
-   see `docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md`). The
-   cross-check shortens typical recovery from `lease_timeout` to
-   `2 × heartbeat_sec` without changing the v2 protocol's
-   correctness story; both signals are OR'd and either can fire.
+   (the lease path) *or* the progress-cross-check path fires — see
+   `docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md` §5. The
+   cross-check fires when the owner's `progress/host-<id>.json`
+   carries a matching `held_etag` whose `heartbeat_utc` is older
+   than `2 × heartbeat_sec`, **or** when the progress object is
+   absent / carries a `None` or mismatched `held_etag` *and* the
+   claim itself is older than `2 × heartbeat_sec` (the fresh-claim
+   grace window — `docs/work-items/CLAIM_FRESH_GRACE.md`). The
+   grace window exists because the progress object is only rewritten
+   on heartbeat ticks: between an acquire and the owner's next tick
+   it still describes the previous ownership window, so without the
+   guard every live, seconds-old claim is stealable — a theft
+   cascade at fleet startup. Both signals are OR'd and either can
+   fire; the cross-check shortens typical recovery from
+   `lease_timeout` to `2 × heartbeat_sec` without changing the v2
+   protocol's correctness story. Trade-off (intended): crash
+   recovery via the cross-check takes up to `2 × heartbeat_sec`
+   longer for a worker that dies immediately after acquiring,
+   because its claim must outlive the grace window first; the
+   lease-based path is unchanged.
 2. **Acquire**: `try_acquire` on a Free shard, or `reclaim` on a Stale
    shard. On `Contended`/`LostRace`, pick another.
 3. **Set held-claim cell**: `*current = Some(HeldClaim{shard, etag, epoch})`.
