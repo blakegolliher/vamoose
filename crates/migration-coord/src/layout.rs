@@ -88,9 +88,10 @@ pub fn job_failed_files_key(job_id: &str) -> String {
 }
 
 /// Audit-chunk key. `date` should be `YYYY-MM-DD` UTC. Sequence is the
-/// audit-line sequence within that day; coord increments it
-/// monotonically and persists nothing across restarts (a fresh restart
-/// continues from `0` for the day — we de-dup on `command_id`).
+/// audit-line sequence within that day. The counter is persisted via
+/// snapshots only, so a crash can rewind it; the audit writer handles
+/// that by allocating keys with `put_if_absent` and advancing past any
+/// collision — existing rows are never overwritten (ledger F22).
 pub fn audit_chunk_key(date: &str, seq: u64) -> String {
     format!("{AUDIT_PREFIX}{date}/{seq:020}{EVENT_CHUNK_EXT}")
 }

@@ -124,6 +124,13 @@ impl RuntimeConfig {
 // Runtime
 // =============================================================================
 
+/// Upper bound on `put_if_absent` probes when allocating an audit
+/// key (see [`CoordRuntime::record_audit`]). Collisions only happen
+/// when a restart rewound the per-day counter, so the free slot is
+/// at most one crash window's worth of audit rows ahead — operator
+/// commands number in the tens per day, so this bound is generous.
+const MAX_AUDIT_SEQ_PROBES: u64 = 10_000;
+
 struct RuntimeInner {
     state: Snapshot,
     next_seq: u64,
@@ -438,10 +445,20 @@ impl CoordRuntime {
     /// the JSON line to `audit/<YYYY-MM-DD>/<seq:020>.jsonl`, and
     /// returns the assigned `command_id` (UUID v4).
     ///
-    /// On UTC date rollover the counter resets — the snapshot
-    /// persists `(audit_seq_today, audit_seq_date)` so a coord
-    /// restart on the same day continues the day's numbering
-    /// rather than racing previously-written keys.
+    /// On UTC date rollover the counter resets. The snapshot
+    /// persists `(audit_seq_today, audit_seq_date)`, but that only
+    /// covers numbering up to the last snapshot — a crash inside
+    /// the window rewinds the in-memory counter (to zero on a day
+    /// with no snapshot). Durability therefore does NOT depend on
+    /// the counter: rows are written with `put_if_absent`, and a
+    /// collision (a prior generation already used the number) just
+    /// advances the seq and retries. Existing rows are never
+    /// overwritten (ledger F22).
+    ///
+    /// The inner lock is held across the conditional PUTs so
+    /// concurrent audits cannot double-allocate a seq — same
+    /// pattern as `ingest`, which holds the lock through its chunk
+    /// flush.
     pub async fn record_audit(
         &self,
         token_label: impl Into<String>,
@@ -454,36 +471,44 @@ impl CoordRuntime {
         let date = now.format("%Y-%m-%d").to_string();
         let command_id = uuid::Uuid::new_v4().to_string();
 
-        let (key, body) = {
-            let mut guard = self.inner.lock().await;
-            if guard.lease_lost {
-                return Err(Error::LeaseLost);
-            }
-            // Rollover: reset on a new UTC day.
-            if guard.state.audit_seq_date != date {
-                guard.state.audit_seq_date = date.clone();
-                guard.state.audit_seq_today = 0;
-            }
-            guard.state.audit_seq_today += 1;
-            let seq = guard.state.audit_seq_today;
-            let key = crate::layout::audit_chunk_key(&date, seq);
+        let mut guard = self.inner.lock().await;
+        if guard.lease_lost {
+            return Err(Error::LeaseLost);
+        }
+        // Rollover: reset on a new UTC day.
+        if guard.state.audit_seq_date != date {
+            guard.state.audit_seq_date = date.clone();
+            guard.state.audit_seq_today = 0;
+        }
 
-            let entry = crate::schema::AuditEntry {
-                at: now,
-                command_id: command_id.clone(),
-                token_label: token_label.into(),
-                action: action.into(),
-                target: target.into(),
-                args,
-                result,
-            };
-            let mut body = serde_json::to_vec(&entry)?;
-            body.push(b'\n');
-            (key, body)
+        let entry = crate::schema::AuditEntry {
+            at: now,
+            command_id: command_id.clone(),
+            token_label: token_label.into(),
+            action: action.into(),
+            target: target.into(),
+            args,
+            result,
         };
+        let mut body = serde_json::to_vec(&entry)?;
+        body.push(b'\n');
 
-        self.store.put(&key, body).await?;
-        Ok(command_id)
+        // Self-healing key allocation: a collision means a prior
+        // coord generation used the number during the crash window;
+        // the next free slot is at most that window's row count
+        // ahead. Bounded so a pathological store cannot spin forever.
+        for _ in 0..MAX_AUDIT_SEQ_PROBES {
+            guard.state.audit_seq_today += 1;
+            let key = crate::layout::audit_chunk_key(&date, guard.state.audit_seq_today);
+            match self.store.put_if_absent(&key, body.clone()).await? {
+                crate::store::PutOutcome::Created(_) => return Ok(command_id),
+                crate::store::PutOutcome::AlreadyExists => continue,
+            }
+        }
+        Err(Error::Other(anyhow::anyhow!(
+            "audit key allocation exhausted {MAX_AUDIT_SEQ_PROBES} probes \
+             for {date} — audit/ prefix is unexpectedly dense",
+        )))
     }
 
     /// Update a worker's heartbeat-only fields (counters,

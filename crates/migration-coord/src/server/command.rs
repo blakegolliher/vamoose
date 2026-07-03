@@ -2,15 +2,18 @@
 //! retry-failed}. Each:
 //!
 //! 1. Validates the job exists. 404 if not.
-//! 2. Records an audit line at `audit/<YYYY-MM-DD>/<seq>.jsonl`.
-//! 3. Ingests the corresponding event so the SSE stream broadcasts
+//! 2. Ingests the corresponding event so the SSE stream broadcasts
 //!    the state change and the reducer updates `phase` /
 //!    `phase_history`.
-//! 4. Force-flushes the event log (flush-before-ack, ledger F03).
+//! 3. Force-flushes the event log (flush-before-ack, ledger F03).
 //!    A 200 means the command survives a coord crash — a pause
 //!    that only ever lived in the writer buffer would silently
 //!    un-pause on failover. The flush is fenced on the lease, so a
 //!    deposed coord fails the request instead of acking.
+//! 4. Records an audit line at `audit/<YYYY-MM-DD>/<seq>.jsonl`.
+//!    Audit comes AFTER the durable event (ledger F22): the
+//!    `Accepted` row asserts a command that took effect, so a
+//!    failed ingest/flush must never leave one behind.
 //! 5. Returns `{ command_id }`.
 //!
 //! Workers don't observe these commands directly in Phase 2. The
@@ -75,11 +78,6 @@ async fn record_and_ingest(
 ) -> Result<CommandAccepted, ApiError> {
     let target = format!("jobs/{job_id}");
     let args = serde_json::json!({ "reason": reason });
-    let command_id = state
-        .runtime
-        .record_audit(label.as_str(), action, &target, args, AuditResult::Accepted)
-        .await
-        .map_err(ApiError::storage)?;
     state
         .runtime
         .ingest(kind)
@@ -88,6 +86,15 @@ async fn record_and_ingest(
     // Ack == durable (ledger F03): the event must hit the store
     // before the operator sees 200.
     state.runtime.flush_log().await.map_err(ApiError::storage)?;
+    // Audit AFTER the durable effect (ledger F22): the `Accepted`
+    // row describes an applied command. If ingest or flush fails
+    // above, no audit row is written at all — the trail never
+    // asserts a command that didn't take effect.
+    let command_id = state
+        .runtime
+        .record_audit(label.as_str(), action, &target, args, AuditResult::Accepted)
+        .await
+        .map_err(ApiError::storage)?;
     Ok(CommandAccepted { command_id })
 }
 

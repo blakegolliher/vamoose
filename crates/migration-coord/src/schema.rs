@@ -721,10 +721,12 @@ impl EventKind {
 /// Serialized form of the full coord state at a point in time. Loaded
 /// at startup, then events with `seq > last_seq` are replayed on top.
 ///
-/// `audit_seq_today` is the per-day audit sequence counter — the
-/// snapshot persists it so a coord restart on the same UTC day picks
-/// up where it left off rather than colliding with already-written
-/// audit keys.
+/// `audit_seq_today` is the per-day audit sequence counter. The
+/// snapshot persists it so a restart on the same UTC day usually
+/// resumes the numbering, but that is an optimization only — a crash
+/// inside the snapshot window rewinds the counter, and the audit
+/// writer recovers by allocating keys with `put_if_absent` and
+/// skipping past collisions (ledger F22).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     #[serde(default = "default_schema_version")]
