@@ -6,7 +6,10 @@
 //!   [`get_errors`], [`healthz`]. Each is a single round trip; the
 //!   types come from `migration_coord::server::read` so coord and
 //!   client share the wire shape and cargo catches a drift at
-//!   compile time.
+//!   compile time. Together these back the bootstrap/Resync-recovery
+//!   contract of COORD_PLAN §3.4 (`healthz.last_seq` is the resume
+//!   cursor; `/jobs` is the snapshot source) — see
+//!   `crate::app::fetch_bootstrap_snapshot`.
 //!
 //! - SSE consumer: [`Client::stream`] opens `GET /stream` with
 //!   `Last-Event-ID` and yields an `async_stream::try_stream` of
@@ -49,6 +52,13 @@ pub enum ClientError {
 
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// The REST bootstrap walk never saw a quiescent coord (the
+    /// cursor kept moving between the pre- and post-walk reads), so
+    /// no sound resume cursor exists for the fetched pieces.
+    /// Retryable — the driver backs off and bootstraps again.
+    #[error("bootstrap walk torn by concurrent writes after {attempts} attempts")]
+    BootstrapTorn { attempts: usize },
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;
@@ -302,9 +312,19 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
 /// terminated by a blank line. `Keepalive` is the coord's periodic
 /// `: ping` comment — the TUI uses it to refresh a "last seen"
 /// timer for the connection status banner.
+///
+/// `UnknownEvent` is the forward-compatibility escape hatch (F38): a
+/// frame whose `data:` is a valid JSON object carrying a string
+/// `kind` this build has no [`EventKind`] variant for — i.e. a
+/// *newer* coord talking to an older TUI. Surfacing it as an `Err`
+/// instead would tear the stream down, and because the resume cursor
+/// never advances past the frame the reconnect would replay it
+/// forever. The caller applies `seq` to its cursor and counts the
+/// skip; the payload is unrecoverable by definition.
 #[derive(Debug, Clone)]
 pub enum SseFrame {
     Event { seq: u64, envelope: EventEnvelope },
+    UnknownEvent { seq: u64, kind: String },
     Resync,
     Keepalive,
 }
@@ -313,7 +333,11 @@ pub enum SseFrame {
 /// Result<SseFrame>>`. Hand-rolled minimal parser — handles only the
 /// subset of SSE the coord emits, documented in
 /// `migration_coord::server::stream`.
-fn parse_sse_stream<S>(byte_stream: S) -> impl Stream<Item = Result<SseFrame>> + Send
+///
+/// Public so the integration suite can drive the exact parser path
+/// with synthetic future-coord frames the live coord cannot emit
+/// (its `EventKind` schema is closed).
+pub fn parse_sse_stream<S>(byte_stream: S) -> impl Stream<Item = Result<SseFrame>> + Send
 where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static,
 {
@@ -383,7 +407,27 @@ impl PartialFrame {
                 };
                 match serde_json::from_str::<EventEnvelope>(data_str) {
                     Ok(envelope) => Some(Ok(SseFrame::Event { seq, envelope })),
-                    Err(e) => Some(Err(ClientError::Serde(e))),
+                    // F38: distinguish future-version skew from
+                    // corruption via a lightweight pre-parse. A JSON
+                    // object with a string `kind` tag is a versioned
+                    // event from a coord newer than this build —
+                    // skippable, with the seq preserved so the
+                    // cursor can advance past it. Anything else
+                    // (non-JSON, non-object, missing tag) stays an
+                    // error exactly as before.
+                    Err(e) => match serde_json::from_str::<serde_json::Value>(data_str) {
+                        Ok(serde_json::Value::Object(map))
+                            if map.get("kind").is_some_and(|v| v.is_string()) =>
+                        {
+                            let kind = map
+                                .get("kind")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            Some(Ok(SseFrame::UnknownEvent { seq, kind }))
+                        }
+                        _ => Some(Err(ClientError::Serde(e))),
+                    },
                 }
             }
             _ => Some(Err(ClientError::MalformedFrame(format!(
@@ -482,6 +526,60 @@ mod tests {
         match stream.next().await.expect("frame").expect("ok") {
             SseFrame::Event { seq, .. } => assert_eq!(seq, 7),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parser_skips_unknown_kind_and_reports_seq() {
+        // F38: a frame whose JSON parses but whose `kind` is a
+        // variant this build doesn't know (a *newer* coord) must be
+        // surfaced as a skippable item carrying its seq — NOT as an
+        // Err, which would tear the stream down and put the client
+        // in a permanent reconnect loop (the resume cursor never
+        // passes the unknown frame).
+        let unknown = "event:FutureThing\nid:5\ndata:{\"kind\":\"FutureThing\"}\n\n";
+        let data = "{\"seq\":6,\"at\":\"2026-05-29T14:32:00Z\",\"schema_version\":1,\
+                    \"kind\":\"JobCreated\",\"job_id\":\"bobby\",\"name\":\"bobby-mig\",\
+                    \"source\":\"nfs://src\",\"dest\":\"nfs://dst\",\"owner\":\"test\",\
+                    \"config_hash\":\"ab\"}";
+        let raw = format!("{unknown}event:JobCreated\nid:6\ndata:{data}\n\n");
+        let stream = parse_sse_stream(bytes_stream(vec![raw.into_bytes()]));
+        tokio::pin!(stream);
+        match stream.next().await.expect("frame").expect("must not Err") {
+            SseFrame::UnknownEvent { seq, kind } => {
+                assert_eq!(seq, 5);
+                assert_eq!(kind, "FutureThing");
+            }
+            other => panic!("expected UnknownEvent, got {other:?}"),
+        }
+        // The stream keeps going: the following valid frame arrives.
+        match stream.next().await.expect("frame").expect("ok") {
+            SseFrame::Event { seq, .. } => assert_eq!(seq, 6),
+            other => panic!("expected Event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_data_still_errors() {
+        // Corruption ≠ future-version skew. Pin the distinction:
+        // data that is not JSON at all must still surface as
+        // ClientError::Serde exactly as before F38 ...
+        let raw = "event:JobCreated\nid:7\ndata:this is not json\n\n".to_string();
+        let stream = parse_sse_stream(bytes_stream(vec![raw.into_bytes()]));
+        tokio::pin!(stream);
+        match stream.next().await.expect("frame").expect_err("must err") {
+            ClientError::Serde(_) => {}
+            other => panic!("expected Serde, got {other:?}"),
+        }
+        // ... and JSON that parses but has no string `kind` field is
+        // also corruption (every versioned event carries the tag),
+        // not skew — it must error, not be skipped.
+        let raw = "event:JobCreated\nid:8\ndata:{\"seq\":8}\n\n".to_string();
+        let stream = parse_sse_stream(bytes_stream(vec![raw.into_bytes()]));
+        tokio::pin!(stream);
+        match stream.next().await.expect("frame").expect_err("must err") {
+            ClientError::Serde(_) => {}
+            other => panic!("expected Serde, got {other:?}"),
         }
     }
 

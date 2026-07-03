@@ -39,6 +39,13 @@ pub struct Args {
     /// for the lifetime of the TUI.
     #[arg(long, default_value_t = 10)]
     pub request_timeout_sec: u64,
+
+    /// Write logs to this file (rotating). The TUI never logs to
+    /// stderr — tracing-fmt output would corrupt the alternate
+    /// screen (F39, COORD_PLAN §3.7) — so without this flag log
+    /// events are discarded.
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
 }
 
 pub async fn run(args: Args, _config_path: Option<PathBuf>) -> anyhow::Result<()> {

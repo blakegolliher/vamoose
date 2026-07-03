@@ -13,6 +13,17 @@
 //!   the SSE driver task with reconnect-and-backoff, drives a
 //!   render tick at ≤ 20 fps, and feeds keyboard + SSE events into
 //!   the reducer.
+//!
+//! State acquisition contract (COORD_PLAN §3.4, §3.7 P4): the
+//! driver bootstraps over REST — `GET /healthz` for the resume
+//! cursor, `GET /jobs` (+ per-job detail) for the data — before the
+//! first `GET /stream`, and again whenever the coord emits `Resync`
+//! (its per-subscriber bus overflowed and events were dropped that
+//! will never be re-streamed). A seq-0 replay is NOT equivalent:
+//! archived terminal jobs' event chunks are deleted from `events/`
+//! (F23), so they only exist in the REST view. The reducer never
+//! does I/O — [`handle_input`] returns [`AppAction::Resync`] and the
+//! driver owns drop-stream → bootstrap → re-stream ([`sse_driver`]).
 
 use crate::client::{Client, ClientError, SseFrame};
 use crate::render;
@@ -46,6 +57,11 @@ pub enum Input {
     /// applied via [`AppState::apply_envelope`]; `Keepalive` just
     /// refreshes the connection's `last_traffic` timestamp.
     SseFrame(SseFrame),
+    /// Fresh REST snapshot from the driver's bootstrap path (initial
+    /// connect and Resync recovery — F26). Applied via
+    /// [`AppState::replace_snapshot`] so every state mutation stays
+    /// on the reducer.
+    Snapshot(Box<migration_coord::schema::Snapshot>),
     /// Crossterm key event from the input task.
     Key(KeyEvent),
     /// Periodic render tick — used to advance elapsed-time labels
@@ -65,6 +81,13 @@ pub enum AppAction {
     Continue,
     Quit,
     Execute(crate::palette::PaletteCommand),
+    /// The coord requested a Resync (SSE bus overflow — dropped
+    /// events will never be re-streamed). The reducer has flipped
+    /// the banner; the caller that owns the stream must drop it,
+    /// re-bootstrap over REST, and resume ([`sse_driver`] does this
+    /// itself when it forwards the frame — the main loop treats
+    /// this like `Continue`).
+    Resync,
 }
 
 /// Apply one [`Input`] to `state`. The render layer treats `now`
@@ -91,8 +114,14 @@ pub fn handle_input(state: &mut AppState, input: Input, now: DateTime<Utc>) -> A
             state.mark_disconnected(err);
             AppAction::Continue
         }
-        Input::SseFrame(frame) => {
-            handle_sse_frame(state, frame, now);
+        Input::SseFrame(frame) => handle_sse_frame(state, frame, now),
+        Input::Snapshot(snapshot) => {
+            // Bootstrap / Resync recovery (F26): hard-replace the
+            // derived state with the REST view; the resume cursor
+            // only ever moves forward (replace_snapshot keeps
+            // max(last_seen_seq, snapshot.last_seq)).
+            state.replace_snapshot(*snapshot);
+            auto_select_first_job(state);
             AppAction::Continue
         }
         Input::Key(key) => handle_key(state, key),
@@ -100,36 +129,56 @@ pub fn handle_input(state: &mut AppState, input: Input, now: DateTime<Utc>) -> A
     }
 }
 
-fn handle_sse_frame(state: &mut AppState, frame: SseFrame, now: DateTime<Utc>) {
+/// Auto-select the first visible job once we have any — saves the
+/// operator one keypress on first boot. Idempotent; no-op while a
+/// selection exists.
+fn auto_select_first_job(state: &mut AppState) {
+    if state.ui.selected_job.is_none() {
+        if let Some(j) = state
+            .snapshot
+            .jobs
+            .values()
+            .min_by_key(|j| j.id.as_str().to_string())
+        {
+            state.ui.selected_job = Some(j.id.clone());
+        }
+    }
+}
+
+fn handle_sse_frame(state: &mut AppState, frame: SseFrame, now: DateTime<Utc>) -> AppAction {
     match frame {
         SseFrame::Event { envelope, .. } => {
             state.apply_envelope(&envelope);
             state.mark_traffic(now);
-            if state.ui.selected_job.is_none() {
-                // Auto-select the first visible job once we have
-                // any — saves the operator one keypress on first
-                // boot. Idempotent for subsequent frames.
-                if let Some(j) = state
-                    .snapshot
-                    .jobs
-                    .values()
-                    .min_by_key(|j| j.id.as_str().to_string())
-                {
-                    state.ui.selected_job = Some(j.id.clone());
-                }
+            auto_select_first_job(state);
+        }
+        SseFrame::UnknownEvent { seq, kind } => {
+            // F38: a coord newer than this build streamed a kind we
+            // have no variant for. Skip it but advance the resume
+            // cursor (dropping the frame without the advance would
+            // replay it on every reconnect, forever) and count it
+            // for the banner. The payload is unrecoverable — the
+            // envelope can't deserialize past the unknown tag.
+            if state.note_unknown_event(seq) {
+                tracing::debug!(seq, kind = %kind, "skipped unknown event kind from newer coord");
             }
+            state.mark_traffic(now);
         }
         SseFrame::Resync => {
             // Server told us our SSE subscriber overflowed and
-            // dropped events. Re-bootstrap by treating it as a
-            // soft reconnect — the driver will resume from the
-            // current last_seen_seq on its next attempt.
+            // dropped events — they will never be re-streamed
+            // (COORD_PLAN §3.4). Flip the banner and demand a
+            // driver-side recovery: drop the stream, re-fetch the
+            // REST snapshot, resume from the new cursor. The
+            // reducer does no I/O itself.
             state.mark_reconnecting(now, "server requested Resync — re-bootstrapping");
+            return AppAction::Resync;
         }
         SseFrame::Keepalive => {
             state.mark_traffic(now);
         }
     }
+    AppAction::Continue
 }
 
 fn handle_key(state: &mut AppState, key: KeyEvent) -> AppAction {
@@ -776,12 +825,13 @@ pub async fn run(client: Client, opts: RunOpts) -> anyhow::Result<()> {
                         state.tick_command_status(now);
                         terminal.draw(|f| render::render(f, &state, now))?;
                     }
-                    AppAction::Continue => {
-                        {
-                    let now = Utc::now();
-                    state.tick_command_status(now);
-                    terminal.draw(|f| render::render(f, &state, now))?;
-                }
+                    // Resync recovery is owned by the SSE driver —
+                    // it saw the same frame before forwarding it.
+                    // The loop just redraws the flipped banner.
+                    AppAction::Continue | AppAction::Resync => {
+                        let now = Utc::now();
+                        state.tick_command_status(now);
+                        terminal.draw(|f| render::render(f, &state, now))?;
                     }
                 }
             }
@@ -861,11 +911,87 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// SSE driver task: connect → forward frames → on drop, mark
-/// reconnecting + sleep with exponential backoff → reconnect.
-/// Reads the current `last_seen_seq` from `state` on every connect
-/// so a backlog from before the disconnect is resumed correctly.
-async fn sse_driver(
+/// Non-retryable client error: a 4xx-class HTTP response (bad
+/// token, unknown route). 5xx and transport errors stay retryable.
+fn is_fatal(e: &ClientError) -> bool {
+    matches!(e, ClientError::Http { status, .. } if !status.is_server_error() && !status.is_success())
+}
+
+/// Fetch the coord's authoritative view over REST (F26 bootstrap,
+/// COORD_PLAN §3.4 / §3.7 P4): `GET /healthz` for the resume
+/// cursor, then every `GET /jobs` page plus each job's `/workers`
+/// and `/errors`, shaped by [`crate::state::snapshot_from_rest`].
+/// Required on first connect and after every `Resync` — a seq-0 SSE
+/// replay cannot substitute since archived terminal jobs' event
+/// chunks are deleted from `events/` (F23).
+///
+/// Consistency: the cursor is re-read after the walk; if events
+/// landed mid-fetch the walk retries (bounded), and a walk that never
+/// sees a quiescent coord is a **retryable error** — the driver's
+/// normal backoff loop tries again. There is no safe cursor for a
+/// torn walk: the pieces were read at different seqs, so a pre-walk
+/// cursor replays events whose effects are already baked into
+/// later-read pieces (permanently double-counting aggregates like
+/// error buckets — envelope-seq dedup cannot see into the snapshot),
+/// and a post-walk cursor permanently skips increments missing from
+/// earlier-read pieces. Only a clean pass (same cursor before and
+/// after) is sound.
+pub async fn fetch_bootstrap_snapshot(
+    client: &Client,
+    now: DateTime<Utc>,
+) -> crate::client::Result<migration_coord::schema::Snapshot> {
+    const CONSISTENT_ATTEMPTS: usize = 3;
+    let mut cursor_seq = client.healthz().await?.last_seq;
+    for attempt in 1..=CONSISTENT_ATTEMPTS {
+        let mut jobs = Vec::new();
+        let mut workers = Vec::new();
+        let mut buckets = Vec::new();
+        let mut page_cursor: Option<String> = None;
+        loop {
+            let page = client.get_jobs(page_cursor.as_deref(), None).await?;
+            for job in &page.jobs {
+                workers.extend(client.get_workers(job.id.as_str()).await?.workers);
+                let b = client.get_errors(job.id.as_str()).await?.buckets;
+                if !b.is_empty() {
+                    buckets.push((job.id.clone(), b));
+                }
+            }
+            jobs.extend(page.jobs);
+            match page.next_cursor {
+                Some(c) => page_cursor = Some(c),
+                None => break,
+            }
+        }
+        let after = client.healthz().await?.last_seq;
+        if after == cursor_seq {
+            return Ok(crate::state::snapshot_from_rest(
+                jobs, workers, buckets, cursor_seq, now,
+            ));
+        }
+        tracing::debug!(
+            before = cursor_seq,
+            after,
+            attempt,
+            "bootstrap walk torn by concurrent writes; retrying"
+        );
+        cursor_seq = after;
+    }
+    Err(crate::client::ClientError::BootstrapTorn {
+        attempts: CONSISTENT_ATTEMPTS,
+    })
+}
+
+/// SSE driver task: REST-bootstrap → open the stream from the
+/// bootstrap cursor → forward frames → on drop, mark reconnecting +
+/// sleep with exponential backoff → reconnect from the highest seq
+/// seen. On a server-sent `Resync` the stream is dropped and the
+/// bootstrap runs again — the dropped events are only recoverable
+/// through the REST view (COORD_PLAN §3.4).
+///
+/// Public so the integration suite can run the real
+/// bootstrap/stream/recovery machinery against an in-process coord
+/// without standing up a terminal.
+pub async fn sse_driver(
     client: Client,
     state: Arc<Mutex<AppState>>,
     tx: mpsc::Sender<Input>,
@@ -874,8 +1000,39 @@ async fn sse_driver(
 ) {
     use futures::StreamExt;
     let mut backoff = opts.reconnect_initial;
+    // True on the first connect and again after every Resync.
+    let mut needs_bootstrap = true;
+    // Cursor from the latest bootstrap. The reducer owns
+    // last_seen_seq, but the Input::Snapshot we just sent may not
+    // have been folded in yet when the stream opens — take the max.
+    let mut bootstrap_seq: u64 = 0;
     loop {
-        let resume_from = state.lock().await.last_seq();
+        if needs_bootstrap {
+            match fetch_bootstrap_snapshot(&client, Utc::now()).await {
+                Ok(snapshot) => {
+                    bootstrap_seq = bootstrap_seq.max(snapshot.last_seq);
+                    if tx.send(Input::Snapshot(Box::new(snapshot))).await.is_err() {
+                        return;
+                    }
+                    needs_bootstrap = false;
+                }
+                Err(e) if is_fatal(&e) => {
+                    let _ = tx.send(Input::SseFatal(e.to_string())).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Input::SseDisconnected(e.to_string())).await;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff.saturating_mul(2)).min(opts.reconnect_max);
+                    continue;
+                }
+            }
+        }
+        let resume_from = state.lock().await.last_seq().max(bootstrap_seq);
         let cursor = Some(resume_from);
         let stream_result = client.stream(cursor, None).await;
         match stream_result {
@@ -893,8 +1050,19 @@ async fn sse_driver(
                         next = stream.next() => {
                             match next {
                                 Some(Ok(frame)) => {
+                                    let resync = matches!(frame, SseFrame::Resync);
                                     if tx.send(Input::SseFrame(frame)).await.is_err() {
                                         return;
+                                    }
+                                    if resync {
+                                        // The coord dropped events we
+                                        // will never see on this or any
+                                        // stream. Drop it and recover
+                                        // through REST (the reducer only
+                                        // flips the banner — recovery is
+                                        // owned here).
+                                        needs_bootstrap = true;
+                                        break;
                                     }
                                 }
                                 Some(Err(e)) => {
@@ -915,9 +1083,14 @@ async fn sse_driver(
                         }
                     }
                 }
+                if needs_bootstrap {
+                    // Resync recovery: the coord is healthy, it just
+                    // dropped our tail — re-bootstrap immediately,
+                    // no backoff.
+                    continue;
+                }
             }
-            Err(e) if matches!(e, ClientError::Http { status, .. } if !status.is_server_error() && !status.is_success()) =>
-            {
+            Err(e) if is_fatal(&e) => {
                 // 4xx-class error — non-retryable. Surface it and
                 // stop the driver so the operator sees the banner
                 // turn red.
@@ -1295,14 +1468,112 @@ mod tests {
     }
 
     #[test]
-    fn sse_frame_resync_marks_reconnecting() {
+    fn driver_advances_cursor_past_unknown() {
+        // F38: an unknown-kind frame (newer coord) must advance the
+        // resume cursor past its seq — otherwise the reconnect
+        // replays it forever — and bump the operator-visible
+        // counter. It must NOT touch the connection state.
         let mut s = AppState::empty(at(0));
         s.mark_connected(at(0));
-        handle_input(&mut s, Input::SseFrame(SseFrame::Resync), at(5));
+        s.apply_envelope(&job_created(1, "alpha"));
+        assert_eq!(s.last_seq(), 1);
+
+        let action = handle_input(
+            &mut s,
+            Input::SseFrame(SseFrame::UnknownEvent {
+                seq: 5,
+                kind: "FutureThing".into(),
+            }),
+            at(3),
+        );
+        assert_eq!(action, AppAction::Continue, "no disconnect, no quit");
+        assert_eq!(s.last_seq(), 5, "cursor advances past the unknown frame");
+        assert_eq!(s.unknown_events, 1, "operator-visible counter bumps");
+        assert!(
+            matches!(
+                s.connection,
+                crate::state::ConnectionStatus::Connected { .. }
+            ),
+            "connection stays up"
+        );
+
+        // A replayed duplicate (reconnect overlap) is deduped by the
+        // same drop rule apply_envelope uses.
+        handle_input(
+            &mut s,
+            Input::SseFrame(SseFrame::UnknownEvent {
+                seq: 5,
+                kind: "FutureThing".into(),
+            }),
+            at(4),
+        );
+        assert_eq!(s.unknown_events, 1, "duplicate seq must not double-count");
+        assert_eq!(s.last_seq(), 5);
+
+        // Later valid events still apply on top.
+        handle_input(
+            &mut s,
+            Input::SseFrame(SseFrame::Event {
+                seq: 6,
+                envelope: job_created(6, "bravo"),
+            }),
+            at(5),
+        );
+        assert!(s.job(&jid("bravo")).is_some());
+        assert_eq!(s.last_seq(), 6);
+    }
+
+    #[test]
+    fn sse_frame_resync_requests_driver_recovery() {
+        // F26 — replaces `sse_frame_resync_marks_reconnecting`, which
+        // pinned the old flip-banner-only behavior. The reducer does
+        // no I/O: it marks the banner and returns AppAction::Resync;
+        // the driver owns the actual recovery (drop stream → REST
+        // re-bootstrap → resume from the new cursor). Without it the
+        // events the coord dropped at the overflow are lost forever
+        // and the counters desync permanently.
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        let action = handle_input(&mut s, Input::SseFrame(SseFrame::Resync), at(5));
+        assert_eq!(
+            action,
+            AppAction::Resync,
+            "reducer must demand a driver-side re-bootstrap"
+        );
         assert!(matches!(
             s.connection,
             crate::state::ConnectionStatus::Reconnecting { .. }
         ));
+    }
+
+    #[test]
+    fn snapshot_input_replaces_state_and_advances_cursor() {
+        // F26 — the bootstrap/Resync recovery path applies the REST
+        // snapshot through the reducer (Input::Snapshot →
+        // replace_snapshot), keeping all state mutation single-path.
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+
+        // Donor state builds a valid Snapshot the "REST fetch" would
+        // have produced, further along than what we've seen.
+        let mut donor = AppState::empty(at(0));
+        donor.apply_envelope(&job_created(9, "bravo"));
+        let snap = donor.snapshot.clone();
+        assert_eq!(snap.last_seq, 9);
+
+        let action = handle_input(&mut s, Input::Snapshot(Box::new(snap)), at(5));
+        assert_eq!(action, AppAction::Continue);
+        assert!(s.job(&jid("bravo")).is_some(), "snapshot data applied");
+        assert!(
+            s.job(&jid("alpha")).is_none(),
+            "replace is a hard replace — stale derived state dropped"
+        );
+        assert_eq!(s.last_seq(), 9, "resume cursor advances to the snapshot's");
+        assert_eq!(
+            s.ui.selected_job,
+            Some(jid("bravo")),
+            "first job auto-selected after bootstrap, same as first SSE event"
+        );
     }
 
     // ----- selection movement -----

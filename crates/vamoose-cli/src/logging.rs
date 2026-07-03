@@ -1,13 +1,24 @@
-//! Vamoose worker logging.
+//! Vamoose logging.
 //!
-//! Two layers always run:
+//! Output routing is selected per subcommand via [`LogMode`] (F39,
+//! COORD_PLAN §3.7):
+//!
+//! In [`LogMode::Standard`] (every subcommand except the TUI), two
+//! layers always run:
 //!   * stderr (`tracing_subscriber::fmt`) — preserves the dev/harness
 //!     workflow where operators read logs as the worker prints them.
 //!   * rotating file — active file is plain text so `tail -F` and
 //!     `grep` work; archives are gzipped by `file_rotate` on rotation.
 //!
-//! When `[logging].s3_upload = true`, a background tokio task polls
-//! the log directory for `.gz` archives and uploads them to
+//! In [`LogMode::TuiQuiet`] (`vamoose tui`), tracing-fmt output is
+//! suppressed entirely — a single stderr line would corrupt the
+//! ratatui alternate screen — and events route to a rotating file
+//! only when the operator passed `--log-file`. The S3 uploader is
+//! never spawned in this mode, regardless of `[logging].s3_upload`.
+//!
+//! When `[logging].s3_upload = true` (Standard mode only), a
+//! background tokio task polls the log directory for `.gz` archives
+//! and uploads them to
 //! `s3://{bucket}/{s3_prefix}/{hostname}-{pid}/{startup_ts}/...`. The
 //! task owns its own cancellation token (decoupled from the
 //! orchestrator fence) so non-worker subcommands can use the same
@@ -31,19 +42,32 @@ use tokio_util::sync::CancellationToken;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Logging, S3};
 
 type SharedRotator = Arc<Mutex<FileRotate<AppendCount>>>;
 
+/// Output routing per subcommand (F39, COORD_PLAN §3.7). An enum
+/// rather than a bool so the TUI variant can carry its `--log-file`.
+#[derive(Debug, Clone)]
+pub enum LogMode {
+    /// stderr + rotating file + config-gated S3 uploader — every
+    /// subcommand except the TUI.
+    Standard,
+    /// `vamoose tui`: no stderr layer, ever (a single fmt line
+    /// corrupts the ratatui alternate screen), and never the S3
+    /// uploader. Events route to a rotating file appender only when
+    /// `--log-file` was passed; otherwise they are discarded.
+    TuiQuiet { log_file: Option<PathBuf> },
+}
+
 /// Handle returned by [`init`]; hold it for the lifetime of the
 /// process and call [`LoggingHandle::shutdown`] before exit so the
 /// last batched events flush and the final archive uploads.
 pub struct LoggingHandle {
     guard: Option<WorkerGuard>,
-    writer: SharedRotator,
+    writer: Option<SharedRotator>,
     uploader: Option<UploaderTask>,
 }
 
@@ -52,63 +76,165 @@ struct UploaderTask {
     handle: JoinHandle<()>,
 }
 
-/// Initialize tracing. Installs the global subscriber, opens the
-/// rotating log file, and (optionally) spawns the S3 uploader task.
+/// Initialize tracing. Installs the global subscriber for `mode`,
+/// opens the mode's rotating log file (if any), and — Standard mode
+/// only — spawns the config-gated S3 uploader task.
 ///
-/// `s3_cfg` and `bucket` are only consulted when `logging.s3_upload`
-/// is true; otherwise they're ignored.
+/// `s3_cfg` and `bucket` are only consulted when the uploader
+/// actually spawns; otherwise they're ignored.
 pub fn init(
     filter: EnvFilter,
     logging: &Logging,
     s3_cfg: &S3,
     bucket: &str,
+    mode: &LogMode,
 ) -> Result<LoggingHandle> {
-    // Parent dir must exist (or we must be able to create it). Hard
-    // fail with a clear message — silent fallback to stderr-only would
-    // hide a misconfigured operator setup.
-    if let Some(parent) = logging.path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating log directory {}", parent.display()))?;
+    let (dispatch, handle) = build(filter, logging, s3_cfg, bucket, mode, std::io::stderr)?;
+    tracing::dispatcher::set_global_default(dispatch)
+        .map_err(|e| anyhow::anyhow!("install tracing subscriber: {e}"))?;
+    Ok(handle)
+}
+
+/// Minimal-subscriber fallback for when the config failed to load.
+///
+/// Standard keeps today's behavior: a plain stderr fmt subscriber so
+/// the eventual config error surfaces. TuiQuiet must not touch
+/// stderr even here — it installs the quiet subscriber with default
+/// rotation caps, honoring `--log-file` when given; with no file the
+/// subscriber simply discards events.
+pub fn init_fallback(filter: EnvFilter, mode: &LogMode) -> Option<LoggingHandle> {
+    match mode {
+        LogMode::Standard => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .try_init()
+                .ok();
+            None
+        }
+        LogMode::TuiQuiet { .. } => {
+            // The S3 stub is never consulted: TuiQuiet cannot spawn
+            // the uploader. Failure to open --log-file degrades to
+            // no subscriber at all — for the TUI, silence beats a
+            // corrupted alternate screen.
+            let s3 = S3 {
+                endpoint: String::new(),
+                region: "us-east-1".into(),
+                profile: None,
+                access_key: None,
+                secret_key: None,
+                no_verify_ssl: None,
+            };
+            let (dispatch, handle) =
+                build(filter, &Logging::default(), &s3, "", mode, std::io::stderr).ok()?;
+            tracing::dispatcher::set_global_default(dispatch).ok()?;
+            Some(handle)
         }
     }
+}
 
-    let max_bytes = parse_size(&logging.max_bytes)
-        .with_context(|| format!("invalid [logging].max_bytes: {:?}", logging.max_bytes))?;
-
-    let rotator = FileRotate::new(
-        &logging.path,
-        AppendCount::new(logging.max_archives),
-        ContentLimit::Bytes(max_bytes as usize),
-        // Compress every archive (0 plaintext archives kept).
-        Compression::OnRotate(0),
-        // Default file permissions.
-        None,
-    );
-    let writer: SharedRotator = Arc::new(Mutex::new(rotator));
-
-    // `non_blocking` runs writes on a dedicated thread so log emission
-    // can't stall the worker on disk I/O. Lossy by default — if the
-    // channel fills (slow disk, full disk), events are dropped rather
-    // than blocking the publisher.
-    let (nb, guard) = tracing_appender::non_blocking(SharedWriter(writer.clone()));
-
-    install_subscriber(filter, nb)?;
-
-    let uploader = if logging.s3_upload {
-        Some(spawn_uploader(logging, s3_cfg, bucket)?)
-    } else {
-        None
+/// Assemble the subscriber + handle for `mode` without installing
+/// anything globally. `stderr_writer` is the injectable stderr seam:
+/// production passes `std::io::stderr`, tests pass a capture buffer.
+/// In [`LogMode::TuiQuiet`] no stderr layer is constructed at all —
+/// quiet by construction, not by filtering.
+fn build<W>(
+    filter: EnvFilter,
+    logging: &Logging,
+    s3_cfg: &S3,
+    bucket: &str,
+    mode: &LogMode,
+    stderr_writer: W,
+) -> Result<(tracing::Dispatch, LoggingHandle)>
+where
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
+    // Which file (if any) this mode writes.
+    let file_path: Option<&Path> = match mode {
+        LogMode::Standard => Some(logging.path.as_path()),
+        LogMode::TuiQuiet { log_file } => log_file.as_deref(),
     };
 
-    Ok(LoggingHandle {
-        guard: Some(guard),
-        writer,
-        uploader,
-    })
+    let mut writer: Option<SharedRotator> = None;
+    let mut guard: Option<WorkerGuard> = None;
+    let mut file_nb: Option<NonBlocking> = None;
+    if let Some(path) = file_path {
+        // Parent dir must exist (or we must be able to create it).
+        // Hard fail with a clear message — silent fallback to
+        // stderr-only would hide a misconfigured operator setup.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating log directory {}", parent.display()))?;
+            }
+        }
+
+        let max_bytes = parse_size(&logging.max_bytes)
+            .with_context(|| format!("invalid [logging].max_bytes: {:?}", logging.max_bytes))?;
+
+        let rotator = FileRotate::new(
+            path,
+            AppendCount::new(logging.max_archives),
+            ContentLimit::Bytes(max_bytes as usize),
+            // Compress every archive (0 plaintext archives kept).
+            Compression::OnRotate(0),
+            // Default file permissions.
+            None,
+        );
+        let shared: SharedRotator = Arc::new(Mutex::new(rotator));
+
+        // `non_blocking` runs writes on a dedicated thread so log
+        // emission can't stall the worker on disk I/O. Lossy by
+        // default — if the channel fills (slow disk, full disk),
+        // events are dropped rather than blocking the publisher.
+        let (nb, g) = tracing_appender::non_blocking(SharedWriter(shared.clone()));
+        writer = Some(shared);
+        guard = Some(g);
+        file_nb = Some(nb);
+    }
+
+    let stderr_layer = match mode {
+        LogMode::Standard => Some(tracing_subscriber::fmt::layer().with_writer(stderr_writer)),
+        LogMode::TuiQuiet { .. } => None,
+    };
+    let file_layer = file_nb.map(|nb| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(NbMaker(nb))
+    });
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(file_layer);
+    let dispatch = tracing::Dispatch::new(subscriber);
+
+    // The uploader is gated on the MODE first, config second: the
+    // TUI must never spawn it no matter what the config says (F39) —
+    // the machinery itself stays intact for Standard mode.
+    let uploader = match mode {
+        LogMode::Standard if logging.s3_upload => Some(spawn_uploader(logging, s3_cfg, bucket)?),
+        _ => None,
+    };
+
+    Ok((
+        dispatch,
+        LoggingHandle {
+            guard,
+            writer,
+            uploader,
+        },
+    ))
 }
 
 impl LoggingHandle {
+    /// Whether the S3 uploader task was spawned. Test seam for the
+    /// F39 mode gate (nothing on the production path consults it —
+    /// hence the allow — but it's the honest probe for "did init
+    /// start an uploader" should a subcommand ever need it).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn uploader_running(&self) -> bool {
+        self.uploader.is_some()
+    }
+
     /// Flush pending events, finalize the active log, and drain the
     /// uploader task. The whole sequence is bounded by `deadline`.
     pub async fn shutdown(mut self, deadline: Duration) {
@@ -118,8 +244,10 @@ impl LoggingHandle {
 
         // 2. Flush the file so any buffered bytes hit disk before the
         //    uploader's final pass.
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.flush();
+        if let Some(w) = &self.writer {
+            if let Ok(mut w) = w.lock() {
+                let _ = w.flush();
+            }
         }
 
         // 3. Drain uploader. It runs one final pass when cancelled
@@ -137,8 +265,10 @@ impl Drop for LoggingHandle {
         // Best-effort flush for the abnormal-exit path. We can't await
         // the uploader here; that's what shutdown() is for.
         self.guard.take();
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = w.flush();
+        if let Some(w) = &self.writer {
+            if let Ok(mut w) = w.lock() {
+                let _ = w.flush();
+            }
         }
         if let Some(task) = self.uploader.take() {
             task.cancel.cancel();
@@ -176,21 +306,6 @@ impl<'a> MakeWriter<'a> for NbMaker {
     fn make_writer(&'a self) -> Self::Writer {
         self.0.clone()
     }
-}
-
-fn install_subscriber(filter: EnvFilter, file_writer: NonBlocking) -> Result<()> {
-    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(NbMaker(file_writer));
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(stderr_layer)
-        .with(file_layer)
-        .try_init()
-        .map_err(|e| anyhow::anyhow!("install tracing subscriber: {e}"))?;
-    Ok(())
 }
 
 // ---------- uploader ---------------------------------------------------
@@ -402,7 +517,178 @@ fn parse_size(s: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_size;
+    use super::*;
+    use crate::config::{Logging, S3};
+    use std::sync::{Arc, Mutex};
+
+    /// Injectable stderr seam: captures everything the subscriber's
+    /// stderr layer writes so the F39 tests can assert on it.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn contents(&self) -> Vec<u8> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn s3_stub() -> S3 {
+        S3 {
+            endpoint: "http://127.0.0.1:1".into(),
+            region: "us-east-1".into(),
+            profile: None,
+            access_key: None,
+            secret_key: None,
+            no_verify_ssl: None,
+        }
+    }
+
+    fn logging_at(dir: &Path, s3_upload: bool) -> Logging {
+        Logging {
+            path: dir.join("vamoose.log"),
+            max_bytes: "1 MiB".into(),
+            max_archives: 2,
+            s3_upload,
+            s3_prefix: "logs".into(),
+            poll_secs: 3600,
+        }
+    }
+
+    /// F39 acceptance 9: in TuiQuiet mode the subscriber has no
+    /// stderr layer at all — one log line from any dependency would
+    /// corrupt the ratatui alternate screen (COORD_PLAN §3.7). The
+    /// mode makes stderr impossible by construction; this smoke test
+    /// pins it through the injected-writer seam.
+    #[test]
+    fn tui_subscriber_has_no_stderr_layer() {
+        let stderr = CaptureWriter::default();
+        let (dispatch, _handle) = build(
+            EnvFilter::new("info"),
+            &Logging::default(),
+            &s3_stub(),
+            "bucket",
+            &LogMode::TuiQuiet { log_file: None },
+            stderr.clone(),
+        )
+        .expect("build");
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::error!("this line would corrupt the alternate screen");
+        });
+        assert!(
+            stderr.contents().is_empty(),
+            "TuiQuiet must never write to stderr; got: {:?}",
+            String::from_utf8_lossy(&stderr.contents())
+        );
+    }
+
+    /// F39 acceptance 10: `--log-file` routes TUI events into the
+    /// rotating-appender machinery — and still nothing on stderr.
+    #[test]
+    fn tui_log_file_flag_routes_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("tui.log");
+        let stderr = CaptureWriter::default();
+        let (dispatch, handle) = build(
+            EnvFilter::new("info"),
+            &logging_at(dir.path(), false),
+            &s3_stub(),
+            "bucket",
+            &LogMode::TuiQuiet {
+                log_file: Some(log_path.clone()),
+            },
+            stderr.clone(),
+        )
+        .expect("build");
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::info!("f39-file-routed");
+        });
+        // Dropping the handle drains the non-blocking channel and
+        // flushes the rotator.
+        drop(handle);
+        let body = std::fs::read_to_string(&log_path).expect("log file exists");
+        assert!(
+            body.contains("f39-file-routed"),
+            "event lands in file: {body:?}"
+        );
+        assert!(stderr.contents().is_empty(), "still nothing on stderr");
+    }
+
+    /// F39 acceptance 11: `[logging].s3_upload = true` must NOT
+    /// start the uploader in TUI mode — the uploader is config-
+    /// driven, and before F39 `vamoose tui` silently spawned it.
+    #[tokio::test]
+    async fn tui_never_starts_s3_uploader() {
+        let dir = tempfile::tempdir().unwrap();
+        let stderr = CaptureWriter::default();
+        let (_dispatch, handle) = build(
+            EnvFilter::new("info"),
+            &logging_at(dir.path(), true),
+            &s3_stub(),
+            "bucket",
+            &LogMode::TuiQuiet {
+                log_file: Some(dir.path().join("tui.log")),
+            },
+            stderr,
+        )
+        .expect("build");
+        assert!(
+            !handle.uploader_running(),
+            "vamoose tui must never spawn the S3 log uploader"
+        );
+    }
+
+    /// F39 acceptance 12 (regression): Standard mode keeps stderr +
+    /// file + the configured uploader exactly as today.
+    #[tokio::test]
+    async fn worker_logging_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let logging = logging_at(dir.path(), true);
+        let stderr = CaptureWriter::default();
+        let (dispatch, handle) = build(
+            EnvFilter::new("info"),
+            &logging,
+            &s3_stub(),
+            "bucket",
+            &LogMode::Standard,
+            stderr.clone(),
+        )
+        .expect("build");
+        assert!(
+            handle.uploader_running(),
+            "Standard mode keeps the config-driven uploader"
+        );
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::info!("f39-standard-both");
+        });
+        drop(handle);
+        let err = String::from_utf8_lossy(&stderr.contents()).to_string();
+        assert!(
+            err.contains("f39-standard-both"),
+            "stderr layer intact: {err:?}"
+        );
+        let body = std::fs::read_to_string(&logging.path).expect("log file");
+        assert!(
+            body.contains("f39-standard-both"),
+            "file layer intact: {body:?}"
+        );
+    }
 
     /// F31: table test over the size strings `[logging].max_bytes`
     /// accepts (and the ones it must refuse).

@@ -140,6 +140,18 @@ fn render_top_banner(frame: &mut Frame, area: Rect, state: &AppState, now: DateT
         )),
     ];
 
+    // Unknown-events counter (F38) — nonzero means a newer coord
+    // streamed kinds this build predates and the view may be
+    // missing information the operator would want. Warn-colored,
+    // omitted entirely at zero to keep the banner quiet.
+    if state.unknown_events > 0 {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            format!("{} unknown ev", state.unknown_events),
+            Style::default().fg(theme.warn),
+        ));
+    }
+
     // Filter span — show the live edit buffer with a cursor glyph
     // while in filter mode, or the committed filter otherwise.
     // Palette mode doesn't touch the filter (it uses the bottom
@@ -1746,6 +1758,27 @@ mod tests {
         assert!(banner.contains("connected"));
         // 5 seconds elapsed → "5s".
         assert!(banner.contains("5s"));
+    }
+
+    #[test]
+    fn top_banner_surfaces_unknown_event_counter() {
+        // F38: skipped unknown-kind frames must be operator-visible.
+        // Zero → no clutter; nonzero → a counter in the banner.
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(95));
+        let buf = render_to_buffer(&s, at(100), 140, 8);
+        assert!(
+            !buffer_row(&buf, 0).contains("unknown"),
+            "no unknown-events span when the counter is zero"
+        );
+        s.note_unknown_event(5);
+        s.note_unknown_event(9);
+        let buf = render_to_buffer(&s, at(100), 140, 8);
+        let banner = buffer_row(&buf, 0);
+        assert!(
+            banner.contains("2 unknown"),
+            "expected '2 unknown' in banner:\n{banner}"
+        );
     }
 
     #[test]
