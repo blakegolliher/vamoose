@@ -613,8 +613,12 @@ async fn bootstrap_fetches_jobs_then_streams_from_last_seq() {
     }
 
     // The live tail still flows after bootstrap (cursor not too high
-    // either): one more event must arrive over SSE.
-    rt.ingest(progress("bravo", w, 2, 50)).await.unwrap();
+    // either): one more event must arrive over SSE. A fresh worker id:
+    // the F24 stream caps coalesce ProgressDelta to 1 Hz per
+    // (job, worker), so a same-key delta inside the cap window is
+    // (correctly) dropped from the bus and would never arrive live.
+    let w_live = WorkerId::new();
+    rt.ingest(progress("bravo", w_live, 2, 50)).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         assert!(
