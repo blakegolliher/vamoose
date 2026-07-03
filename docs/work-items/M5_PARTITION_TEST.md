@@ -72,9 +72,10 @@ A–G are identical to M5_SELF_FENCE.md. Repeated here for completeness;
   `"412"`, `"heartbeat refresh"`, `"HEAD shows different etag"`, or
   `"heartbeat HEAD failing for"` (R6 path — the path this test
   actually exercises).
-- **E.** `failures/host-A.jsonl` and `failures/host-B.jsonl` absent or
-  empty. R8 sends Fenced rows to a separate counter, not to the
-  failures sink.
+- **E.** The `failures/host-A/` and `failures/host-B/` prefixes absent
+  or empty (per-flush objects
+  `failures/host-<id>/<shard-stem>-e<epoch>.jsonl` since F04). R8
+  sends Fenced rows to a separate counter, not to the failures sink.
 - **F.** No concurrent in-flight renames across A.out + B.out within
   1.0s. Sequential duplicates allowed (same population mix as M5).
 - **G.** No B-stamped `.partial` files survive on dest. A-stamped

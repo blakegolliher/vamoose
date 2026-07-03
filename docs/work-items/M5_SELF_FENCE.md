@@ -67,9 +67,11 @@ failure causes the script to exit non-zero.
   reason mentions either `"412"` or `"heartbeat refresh"` — i.e. A
   fenced because the heartbeat refresh saw 412 after B reclaimed,
   not for any other reason.
-- **E. Failures sinks.** `failures/host-A.jsonl` and
-  `failures/host-B.jsonl` are either absent in S3 or empty. The
-  source tree is static; any per-file failure is a real failure.
+- **E. Failures sinks.** The `failures/host-A/` and
+  `failures/host-B/` prefixes are either absent in S3 or empty
+  (per-flush objects `failures/host-<id>/<shard-stem>-e<epoch>.jsonl`
+  since F04). The source tree is static; any per-file failure is a
+  real failure.
 - **F. Single commit per dest path.** A single `commit: rename
   .partial → final` debug log line exists per final dest path
   across **A.err and B.err combined**. No path commits twice.

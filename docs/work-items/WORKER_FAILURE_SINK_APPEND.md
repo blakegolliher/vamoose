@@ -1,6 +1,6 @@
 # Stop overwriting the per-host failure/downgrade sinks
 
-Status: open — not started.
+Status: in review — fix + tests on branch worker-failure-sink-append.
 Ledger: F04 in `docs/REVIEW_LEDGER.md`.
 Priority: high — silent loss of the at-least-once reconciliation trail.
 Scope: `migration-core/src/layout.rs`, `migration-worker/src/orchestrator.rs`.
@@ -76,8 +76,10 @@ them converts recorded failures into silently unaccounted data loss.
 
 ## Definition of done
 
-- [ ] Test 2 written first and observed red.
-- [ ] All acceptance tests green; full gate green (fmt, clippy,
+- [x] Test 2 written first and observed red (overwrite reproduced:
+      second flush replaced `failures/host-A.jsonl`, list saw 1 object
+      instead of 2).
+- [x] All acceptance tests green; full gate green (fmt, clippy,
       workspace tests, deny).
-- [ ] Doc comments + operator docs updated to the new key scheme.
-- [ ] Ledger F04 updated; this doc's Status flipped.
+- [x] Doc comments + operator docs updated to the new key scheme.
+- [x] Ledger F04 updated; this doc's Status flipped.

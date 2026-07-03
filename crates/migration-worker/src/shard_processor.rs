@@ -473,10 +473,10 @@ mod tests {
     // ---- R8: record_outcome Fenced special-case ------------------
     //
     // The classification rules are the load-bearing piece of R8 from
-    // the operator's POV. M5 assertion E ("failures/host-*.jsonl is
-    // empty or absent") becomes trivially false if a Fenced row is
-    // mis-routed into the failures sink, so these tests pin the
-    // routing for each of the three buckets.
+    // the operator's POV. M5 assertion E ("the failures/host-<id>/
+    // prefix is empty or absent") becomes trivially false if a Fenced
+    // row is mis-routed into the failures sink, so these tests pin
+    // the routing for each of the three buckets.
 
     use migration_mover::strategy::Strategy;
     use migration_mover::MoveError;

@@ -177,6 +177,20 @@ aws_s3() {
 aws_s3api() {
     aws ${AWS_S3_FLAGS} --endpoint-url "${VAMOOSE_ENDPOINT}" s3api "$@"
 }
+# Concatenate every object under an S3 prefix. The failure sink writes
+# one immutable object per shard flush
+# (failures/host-<id>/<shard-stem>-e<epoch>.jsonl since F04), so
+# "is the sink empty?" means listing the per-host prefix and cat'ing
+# whatever is there. Prints nothing when the prefix is absent/empty.
+s3_cat_prefix() {
+    local prefix="$1" key
+    aws_s3api list-objects-v2 --bucket "${VAMOOSE_BUCKET}" \
+        --prefix "${prefix}" --query 'Contents[].Key' --output text 2>/dev/null |
+        tr '\t' '\n' | grep -ve '^None$' -e '^$' |
+        while read -r key; do
+            aws_s3 cp "s3://${VAMOOSE_BUCKET}/${key}" - 2>/dev/null || true
+        done
+}
 
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" | tee -a "${ASSERT_LOG}" >&2; exit 1; }
@@ -830,16 +844,17 @@ else
     fi
 fi
 
-# E. Failures sinks empty/absent.
-fail_a=$(aws_s3 cp "s3://${VAMOOSE_BUCKET}/failures/host-${A_HOST}.jsonl" - 2>/dev/null || true)
-fail_b=$(aws_s3 cp "s3://${VAMOOSE_BUCKET}/failures/host-${B_HOST}.jsonl" - 2>/dev/null || true)
+# E. Failures sinks empty/absent (one object per shard flush under
+# the per-host prefix since F04).
+fail_a=$(s3_cat_prefix "failures/host-${A_HOST}/" || true)
+fail_b=$(s3_cat_prefix "failures/host-${B_HOST}/" || true)
 if [[ -z "${fail_a}" && -z "${fail_b}" ]]; then
-    assert_pass "E: failures/host-A.jsonl + failures/host-B.jsonl absent or empty"
+    assert_pass "E: failures/host-A/ + failures/host-B/ absent or empty"
 else
     {
-        echo "--- failures/host-A.jsonl ---"
+        echo "--- failures/host-A/ ---"
         echo "${fail_a}"
-        echo "--- failures/host-B.jsonl ---"
+        echo "--- failures/host-B/ ---"
         echo "${fail_b}"
     } > "${RUN_DIR}/failures.txt"
     assert_fail "E: per-file failures present; see ${RUN_DIR}/failures.txt"

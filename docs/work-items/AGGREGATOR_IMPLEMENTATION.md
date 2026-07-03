@@ -19,8 +19,12 @@ s3://<bucket>/manifest.json                                 (1 file)
 s3://<bucket>/index/part-r*.parquet                         (N shards)
 s3://<bucket>/shards/part-r*.parquet.claim                  (N claims, ETag-locked)
 s3://<bucket>/progress/host-<id>.json                       (1 per host, latest)
-s3://<bucket>/downgrades/host-<id>.jsonl                    (1 per host, append-only)
-s3://<bucket>/failures/host-<id>.jsonl                      (1 per host, append-only)
+s3://<bucket>/downgrades/host-<id>/<stem>-e<epoch>.jsonl    (1 per shard flush)
+s3://<bucket>/failures/host-<id>/<stem>-e<epoch>.jsonl      (1 per shard flush)
+
+(Downgrade/failure sinks changed from one overwritten per-host object
+to one immutable object per shard flush — F04. Consumers list the
+`downgrades/` / `failures/` prefixes and concatenate the JSONL.)
 
 Sample downgrade line:
 

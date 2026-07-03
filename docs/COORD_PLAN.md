@@ -69,7 +69,8 @@ index/<shard>.parquet
 shards/<shard>.parquet.claim
 progress/host-<id>.json
 batches/host-<id>.jsonl
-failures/host-<id>.jsonl
+failures/host-<id>/<shard-stem>-e<epoch>.jsonl
+downgrades/host-<id>/<shard-stem>-e<epoch>.jsonl
 ```
 
 Single migration = single bucket.
@@ -100,7 +101,7 @@ archivelogs/<job_id>/
 Worker continues to write at the bucket root exactly as today:
 `manifest.json`, `index/<shard>.parquet`, `shards/<shard>.parquet.claim`,
 `progress/host-<id>.json`, `batches/host-<id>.jsonl`,
-`failures/host-<id>.jsonl`.
+`failures/host-<id>/<shard-stem>-e<epoch>.jsonl`.
 
 The prefixes are disjoint — no key from `migration-core::layout` can
 collide with any key under `coord/`, `state/`, `events/`, `jobs/`,
