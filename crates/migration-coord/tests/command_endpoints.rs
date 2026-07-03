@@ -53,7 +53,7 @@ fn job_created(j: &str) -> EventKind {
     }
 }
 
-async fn fresh_app() -> (axum::Router, CoordRuntime, Arc<MemStore>) {
+async fn fresh_app_with_clock() -> (axum::Router, CoordRuntime, Arc<MemStore>, Arc<FixedClock>) {
     let mem = Arc::new(MemStore::new());
     let store: Arc<dyn CoordStore> = mem.clone();
     let clock = FixedClock::new(
@@ -61,10 +61,15 @@ async fn fresh_app() -> (axum::Router, CoordRuntime, Arc<MemStore>) {
             .unwrap()
             .with_timezone(&chrono::Utc),
     );
-    let rt = CoordRuntime::start(store, clock, me("A"), rt_cfg())
+    let rt = CoordRuntime::start(store, clock.clone(), me("A"), rt_cfg())
         .await
         .unwrap();
     let router = build_router(AppState::new(rt.clone()));
+    (router, rt, mem, clock)
+}
+
+async fn fresh_app() -> (axum::Router, CoordRuntime, Arc<MemStore>) {
+    let (router, rt, mem, _clock) = fresh_app_with_clock().await;
     (router, rt, mem)
 }
 
@@ -299,4 +304,61 @@ async fn audit_rolls_over_on_new_utc_day() {
     // Each day's counter starts at 1.
     assert!(day1[0].key.contains("00000000000000000001"));
     assert!(day2[0].key.contains("00000000000000000001"));
+}
+
+// =============================================================================
+// Ack durability (ledger F03) — a 200 on a command means the state
+// change survives a coord crash. An operator who saw "paused: ok"
+// must not find the job silently running again after a failover.
+// =============================================================================
+
+#[tokio::test]
+async fn command_ack_implies_durable() {
+    let (app, rt, mem, clock) = fresh_app_with_clock().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+
+    let (status, body) = post_json(app, "/jobs/bobby/pause", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["command_id"].is_string());
+
+    // Crash (no shutdown, no flush) + takeover: advance past the
+    // lease ttl + grace and replay from the same store.
+    clock.advance(chrono::Duration::seconds(60));
+    let store: Arc<dyn CoordStore> = mem.clone();
+    let rt2 = CoordRuntime::start(store, clock.clone(), me("B"), rt_cfg())
+        .await
+        .unwrap();
+    let job = rt2
+        .job_view(&jid("bobby"))
+        .await
+        .expect("job must survive the crash — pause was acked with 200");
+    assert_eq!(
+        job.phase,
+        Phase::Paused,
+        "acked pause must still hold after crash-restart",
+    );
+}
+
+/// Lease-fence composition (ledger F02 x F03): a fenced coord must
+/// fail commands outright — no audit row, no event, no 200.
+#[tokio::test]
+async fn fenced_coord_never_acks_commands() {
+    let (app, rt, mem, _clock) = fresh_app_with_clock().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    rt.flush_log().await.unwrap();
+
+    rt.mark_lease_lost().await;
+    let writes_before = mem.write_count();
+
+    let (status, _body) = post_json(app, "/jobs/bobby/pause", None).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a fenced coord must not ack an operator command",
+    );
+    assert_eq!(
+        mem.write_count(),
+        writes_before,
+        "a fenced coord must not write audit rows or event chunks",
+    );
 }

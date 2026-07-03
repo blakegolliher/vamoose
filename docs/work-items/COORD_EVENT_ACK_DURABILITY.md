@@ -1,6 +1,6 @@
 # Make event acks mean durable; close the SSE catch-up gap
 
-Status: open — not started.
+Status: in review — fix + tests on branch coord-event-ack-durability.
 Ledger: F03, F18 in `docs/REVIEW_LEDGER.md`.
 Priority: critical (F03) + major (F18) — same root cause.
 Scope: `migration-coord` (`runtime.rs`, `events.rs`,
@@ -79,6 +79,20 @@ leaves mechanism latitude:
   responses until the writer's next flush tick (harder, changes
   latency). Pick (a) unless it measurably can't meet the 10k
   events/s target; record the choice here.
+
+  **Mechanism chosen: (a) flush-before-ack.** Every event-emitting
+  request path (`/workers/{id}/events`, `/workers/register`,
+  `/workers/{id}/fence`, and the command handlers' shared
+  `record_and_ingest`) calls `CoordRuntime::flush_log()` after the
+  ingests and before responding. Amortization measured (test 6): a
+  1000-event batch costs 1 chunk PUT (threshold flush at 1000 +
+  no-op final flush; asserted ≤ 2 writes), and the `#[ignore]`d
+  bench sustains ~171k events/s end-to-end through the router on a
+  MemStore (release build) — well past the 10k events/s target;
+  against S3 the cost is one PUT per request, amortized across the
+  batch. `flush_log` is lease-fenced (F02), so a deposed coord
+  fails the request instead of acking —
+  `fenced_coord_never_acks{,_commands}` pin the composition.
 - **Catch-up:** serve the unflushed tail during catch-up — subscribe
   to the broadcast first, then read chunks, then drain the writer's
   in-memory tail (it needs a snapshot/read accessor), dedup by seq
@@ -99,7 +113,9 @@ leaves mechanism latitude:
 
 ## Definition of done
 
-- [ ] Tests 1–5 written first; 1–4 observed red.
-- [ ] All acceptance tests green; full gate green.
-- [ ] `stream.rs` docs match reality; mechanism choice recorded here.
-- [ ] Ledger F03/F18 updated; this doc's Status flipped.
+- [x] Tests 1–5 written first; 1–4 observed red (1–3 failed on
+      missing durability/seq regression, 4–5 timed out waiting for
+      the unflushed tail).
+- [x] All acceptance tests green; full gate green.
+- [x] `stream.rs` docs match reality; mechanism choice recorded here.
+- [ ] Ledger F03/F18 updated (coordinator); this doc's Status flipped.

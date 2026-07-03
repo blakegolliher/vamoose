@@ -3,9 +3,14 @@
 //! Produces a `Stream<Item = StreamFrame>` that the axum handler
 //! formats as `text/event-stream`. The stream interleaves:
 //!
-//! 1. **Catch-up** — if the client provided `Last-Event-ID`, read
-//!    matching envelopes from the on-disk log (`events/...`) and
-//!    yield them in seq order before switching to live.
+//! 1. **Catch-up** — if the client provided `Last-Event-ID`, merge
+//!    matching envelopes from the writer's unflushed in-memory tail
+//!    and the on-disk log (`events/...`) and yield them in seq
+//!    order before switching to live. Reading the flushed chunks
+//!    alone is not enough: events buffered in the
+//!    [`crate::events::EventLogWriter`] have already been acked and
+//!    broadcast, so a client resuming before the next flush would
+//!    silently skip them.
 //! 2. **Live tail** — receive from the runtime's broadcast bus.
 //!    Each envelope is yielded as [`StreamFrame::Event`].
 //! 3. **Resync on lag** — if the subscriber falls past the bus
@@ -20,11 +25,22 @@
 //! ## Catch-up + live race
 //!
 //! The handler subscribes to the bus **before** kicking off the
-//! catch-up read. Events that arrive during the catch-up are
-//! buffered in the receiver. Once catch-up emits everything with
-//! seq ≤ snapshot_seq, the live-tail loop filters by seq strictly
-//! greater than the highest emitted so far. Duplicates are dropped;
-//! gaps are impossible by construction.
+//! catch-up read, so events that arrive during catch-up are
+//! buffered in the receiver. Catch-up then snapshots the writer's
+//! unflushed tail *before* listing flushed chunks: at
+//! tail-snapshot time every already-ingested event is either still
+//! in the buffer (captured by the tail) or already flushed
+//! (captured by the later chunk read), and everything ingested
+//! after the subscribe arrives on the receiver. Reading in the
+//! opposite order would race a concurrent flush — an event could
+//! leave the buffer after the chunk read and before the tail read,
+//! and appear in neither. The merged catch-up set is emitted in
+//! seq order, and the live-tail loop filters by seq strictly
+//! greater than the highest emitted so far, so overlap between the
+//! tail, the chunks, and the receiver dedups to exactly-once
+//! within one connection. Gaps can still reach the client via the
+//! bounded bus (`Lagged` → `Resync`, below); the catch-up seam
+//! itself does not introduce them.
 //!
 //! ## Filtering
 //!
@@ -98,10 +114,11 @@ impl Default for StreamConfig {
 /// would have no receiver during the brief window between handler
 /// construction and the first stream poll, and any ingest landing
 /// in that window would be lost on the live tail. The stream body
-/// only captures the receiver and a cloned store — the
-/// `CoordRuntime` is *not* held by the body, so a `drop(runtime)`
-/// outside the stream actually closes the channel and the loop
-/// observes `RecvError::Closed`.
+/// only captures the receiver, a cloned store, and an
+/// [`crate::runtime::EventTailReader`] — the `CoordRuntime` (and with it the
+/// broadcast sender) is *not* held by the body, so a
+/// `drop(runtime)` outside the stream actually closes the channel
+/// and the loop observes `RecvError::Closed`.
 pub fn sse_stream(
     rt: CoordRuntime,
     last_event_id: Option<u64>,
@@ -110,8 +127,11 @@ pub fn sse_stream(
 ) -> impl Stream<Item = Result<StreamFrame>> + 'static {
     let mut rx = rt.subscribe();
     let store = rt.store().clone();
-    // Drop the runtime handle now — only `rx` and `store` cross
-    // into the stream body. See doc comment for why.
+    let tail = rt.tail_reader();
+    // Drop the runtime handle now — only `rx`, `store`, and `tail`
+    // cross into the stream body. The tail reader deliberately does
+    // not hold the broadcast sender, so the drop semantics above
+    // still hold. See doc comment for why.
     drop(rt);
 
     async_stream::try_stream! {
@@ -122,9 +142,23 @@ pub fn sse_stream(
         //   Some(N>0)  -> catch up everything with seq > N.
         let mut highest: u64 = last_event_id.unwrap_or(0);
 
-        // Step 1: catch-up.
+        // Step 1: catch-up = unflushed writer tail + flushed chunks.
+        //
+        // Order matters: snapshot the tail BEFORE listing chunks. At
+        // tail-snapshot time an already-ingested event is either
+        // still buffered (captured here) or already flushed (visible
+        // to the chunk read below); anything ingested after the
+        // subscribe above is buffered in `rx`. The opposite order
+        // would race a concurrent flush and miss events that move
+        // from buffer to chunk between the two reads. A flush in the
+        // window between the two reads can land the same envelope in
+        // both — the ascending emit with the `seq > highest` guard
+        // dedups it.
         if let Some(since) = last_event_id {
-            let catch_up = read_all_events_since(store.as_ref(), since).await?;
+            let tail_events = tail.unflushed_since(since).await;
+            let mut catch_up = read_all_events_since(store.as_ref(), since).await?;
+            catch_up.extend(tail_events);
+            catch_up.sort_by_key(|e| e.seq);
             for env in catch_up {
                 if env.seq > highest && filter.matches(&env) {
                     highest = env.seq;
@@ -424,6 +458,106 @@ mod tests {
         }
         assert_eq!(seqs, vec![1, 2, s3, s4]);
         assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    // =========================================================
+    // Catch-up gap (ledger F18) — catch-up must serve the
+    // writer's unflushed in-memory tail, not just flushed
+    // chunks. Note these tests deliberately do NOT call
+    // rt.flush_log(); the flushed-log variants above
+    // (catch_up_emits_log_events_before_live etc.) stay as-is
+    // so flushed + unflushed catch-up are both pinned.
+    // =========================================================
+
+    async fn next_event_seq(stream: &mut (impl Stream<Item = Result<StreamFrame>> + Unpin)) -> u64 {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("stream must yield within 2s — catch-up is dropping events")
+            .expect("stream ended unexpectedly")
+            .unwrap();
+        match frame {
+            StreamFrame::Event(env) => env.seq,
+            other => panic!("expected an Event frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_catchup_includes_unflushed_tail() {
+        let (rt, _clock, _store) = fresh_runtime().await;
+        // Ingest WITHOUT flushing — all three events live only in
+        // the writer's open chunk (max_events_per_chunk = 10).
+        let s1 = rt.ingest(job_created("bobby")).await.unwrap();
+        let s2 = rt.ingest(progress_delta("bobby", 10)).await.unwrap();
+        let s3 = rt.ingest(progress_delta("bobby", 5)).await.unwrap();
+
+        // Client connects with Last-Event-ID = 0 while everything
+        // sits unflushed. It must still receive 1..=3, in order,
+        // with no gap and no duplicate.
+        let stream = sse_stream(
+            rt.clone(),
+            Some(0),
+            JobFilter::All,
+            StreamConfig {
+                keepalive_interval: std::time::Duration::from_secs(60),
+            },
+        );
+        tokio::pin!(stream);
+
+        let got = [
+            next_event_seq(&mut stream).await,
+            next_event_seq(&mut stream).await,
+            next_event_seq(&mut stream).await,
+        ];
+        assert_eq!(got, [s1, s2, s3]);
+
+        // No duplicates: the very next frame is the next live event,
+        // not a replay of the tail.
+        let s4 = rt.ingest(progress_delta("bobby", 1)).await.unwrap();
+        assert_eq!(next_event_seq(&mut stream).await, s4);
+    }
+
+    #[tokio::test]
+    async fn sse_reconnect_mid_buffer_no_gap_no_dup() {
+        let (rt, _clock, _store) = fresh_runtime().await;
+        // 10 events → exactly one threshold flush
+        // (max_events_per_chunk = 10 in cfg_for_tests)…
+        rt.ingest(job_created("bobby")).await.unwrap();
+        for _ in 0..9 {
+            rt.ingest(progress_delta("bobby", 1)).await.unwrap();
+        }
+        // …then 5 more that stay in the writer buffer.
+        for _ in 0..5 {
+            rt.ingest(progress_delta("bobby", 1)).await.unwrap();
+        }
+        assert_eq!(
+            rt.buffered_event_count().await,
+            5,
+            "test setup: tail unflushed"
+        );
+
+        // Reconnect mid-buffer: Last-Event-ID = 12 straddles the
+        // flushed chunk (1..=10) and the unflushed tail (11..=15).
+        let stream = sse_stream(
+            rt.clone(),
+            Some(12),
+            JobFilter::All,
+            StreamConfig {
+                keepalive_interval: std::time::Duration::from_secs(60),
+            },
+        );
+        tokio::pin!(stream);
+
+        let got = [
+            next_event_seq(&mut stream).await,
+            next_event_seq(&mut stream).await,
+            next_event_seq(&mut stream).await,
+        ];
+        assert_eq!(got, [13, 14, 15]);
+
+        // Exactly 13..=15 — nothing further is pending.
+        let extra =
+            tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await;
+        assert!(extra.is_err(), "no frame may follow seq 15, got {extra:?}",);
     }
 
     #[tokio::test]

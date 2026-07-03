@@ -54,7 +54,7 @@ fn job_created(j: &str) -> EventKind {
     }
 }
 
-async fn fresh_app() -> (axum::Router, CoordRuntime, Arc<MemStore>) {
+async fn fresh_app_with_clock() -> (axum::Router, CoordRuntime, Arc<MemStore>, Arc<FixedClock>) {
     let mem = Arc::new(MemStore::new());
     let store: Arc<dyn CoordStore> = mem.clone();
     let clock = FixedClock::new(
@@ -62,11 +62,38 @@ async fn fresh_app() -> (axum::Router, CoordRuntime, Arc<MemStore>) {
             .unwrap()
             .with_timezone(&chrono::Utc),
     );
-    let rt = CoordRuntime::start(store, clock, me("A"), rt_cfg())
+    let rt = CoordRuntime::start(store, clock.clone(), me("A"), rt_cfg())
         .await
         .unwrap();
     let router = build_router(AppState::new(rt.clone()));
+    (router, rt, mem, clock)
+}
+
+async fn fresh_app() -> (axum::Router, CoordRuntime, Arc<MemStore>) {
+    let (router, rt, mem, _clock) = fresh_app_with_clock().await;
     (router, rt, mem)
+}
+
+/// Simulate a coord crash (no graceful shutdown, no flush) followed
+/// by a takeover: advance the clock past the lease ttl + grace and
+/// start a fresh runtime against the same store.
+async fn crash_restart(mem: &Arc<MemStore>, clock: &Arc<FixedClock>) -> CoordRuntime {
+    clock.advance(chrono::Duration::seconds(60));
+    let store: Arc<dyn CoordStore> = mem.clone();
+    CoordRuntime::start(store, clock.clone(), me("B"), rt_cfg())
+        .await
+        .unwrap()
+}
+
+fn delta_event(wid: &WorkerId, files: u64) -> Value {
+    serde_json::json!({
+        "kind": "ProgressDelta",
+        "job_id": "bobby",
+        "worker_id": wid,
+        "files_delta": files,
+        "bytes_delta": 0,
+        "errors_delta": 0,
+    })
 }
 
 async fn post_json(router: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -494,4 +521,198 @@ async fn fence_marks_worker_and_emits_event() {
     let w = &snap.workers[&wid];
     assert_eq!(w.state, WorkerState::Fenced);
     assert_eq!(w.fence_reason.as_deref(), Some("self-fence R7"));
+}
+
+// =============================================================================
+// Ack durability (ledger F03) — a 200 with seqs means the events
+// survive a coord crash. The worker drops acked events from its
+// bounded resend buffer, so an ack for a RAM-only event is data loss.
+// =============================================================================
+
+#[tokio::test]
+async fn worker_events_ack_implies_durable() {
+    let (app, rt, mem, clock) = fresh_app_with_clock().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = WorkerId::new();
+
+    let body = serde_json::json!({
+        "events": [delta_event(&wid, 5), delta_event(&wid, 3)],
+    });
+    let (status, resp) = post_json(app, &format!("/workers/{wid}/events"), body).await;
+    assert_eq!(status, StatusCode::OK);
+    let seqs: Vec<u64> = resp["seqs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs.len(), 2);
+
+    // The acked events must be readable from store chunks, not just
+    // the in-memory writer buffer.
+    let durable = migration_coord::events::read_all_events_since(mem.as_ref(), 0)
+        .await
+        .unwrap();
+    let durable_seqs: Vec<u64> = durable.iter().map(|e| e.seq).collect();
+    for s in &seqs {
+        assert!(
+            durable_seqs.contains(s),
+            "acked seq {s} is not in any flushed chunk (durable seqs: {durable_seqs:?})",
+        );
+    }
+
+    // Crash-restart: replay from the same store must contain every
+    // acked seq (state reflects the deltas, last_seq covers them).
+    let rt2 = crash_restart(&mem, &clock).await;
+    let last = rt2.last_seq().await;
+    for s in &seqs {
+        assert!(
+            *s <= last,
+            "acked seq {s} lost across crash-restart (replayed last_seq = {last})",
+        );
+    }
+    let job = rt2
+        .job_view(&jid("bobby"))
+        .await
+        .expect("job must survive the crash — its events were acked");
+    assert_eq!(job.progress.files_done, 8);
+}
+
+#[tokio::test]
+async fn seq_never_regresses_across_restart() {
+    let (app, rt, mem, clock) = fresh_app_with_clock().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = WorkerId::new();
+
+    let body = serde_json::json!({
+        "events": [delta_event(&wid, 1), delta_event(&wid, 2), delta_event(&wid, 3)],
+    });
+    let (status, resp) = post_json(app, &format!("/workers/{wid}/events"), body).await;
+    assert_eq!(status, StatusCode::OK);
+    let max_acked = resp["seqs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_u64().unwrap())
+        .max()
+        .unwrap();
+
+    // Crash + takeover. The first seq the new coord assigns must be
+    // strictly greater than every acked seq — otherwise the TUI's
+    // `seq <= last_seen_seq` drop rule silently discards new events.
+    let rt2 = crash_restart(&mem, &clock).await;
+    let first_new = rt2.ingest(job_created("mary")).await.unwrap();
+    assert!(
+        first_new > max_acked,
+        "seq regressed across restart: new coord assigned {first_new}, \
+         but {max_acked} was already acked",
+    );
+}
+
+/// Lease-fence composition (ledger F02 x F03): once the lease is
+/// observed lost, the events endpoint must fail the request — no
+/// seqs handed out, no store writes. A deposed coord that acks is a
+/// deposed coord that loses data.
+#[tokio::test]
+async fn fenced_coord_never_acks() {
+    let (app, rt, mem, _clock) = fresh_app_with_clock().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    rt.flush_log().await.unwrap();
+    let wid = WorkerId::new();
+
+    rt.mark_lease_lost().await;
+    let writes_before = mem.write_count();
+
+    let body = serde_json::json!({ "events": [delta_event(&wid, 5)] });
+    let (status, _resp) = post_json(app, &format!("/workers/{wid}/events"), body).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a fenced coord must not ack worker events",
+    );
+    assert_eq!(
+        mem.write_count(),
+        writes_before,
+        "a fenced coord must not write to the store on the events path",
+    );
+    // Nothing new became durable either.
+    let durable = migration_coord::events::read_all_events_since(mem.as_ref(), 1)
+        .await
+        .unwrap();
+    assert!(
+        durable.is_empty(),
+        "no event past the pre-fence flush may be durable: {durable:?}",
+    );
+}
+
+// =============================================================================
+// Throughput sanity (F03 test 6) — whatever durability mechanism
+// lands must amortize: a batch of 1000 events acks in ~one flush
+// write, not 1000 individual PUTs.
+// =============================================================================
+
+#[tokio::test]
+async fn events_batch_1000_amortizes_flush_writes() {
+    let (app, rt, mem, _clock) = fresh_app_with_clock().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    // Clear the setup event so the write count below isolates the
+    // batch itself.
+    rt.flush_log().await.unwrap();
+    let wid = WorkerId::new();
+
+    let events: Vec<Value> = (0..1000).map(|_| delta_event(&wid, 1)).collect();
+    let writes_before = mem.write_count();
+    let (status, resp) = post_json(
+        app,
+        &format!("/workers/{wid}/events"),
+        serde_json::json!({ "events": events }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["seqs"].as_array().unwrap().len(), 1000);
+
+    let batch_writes = mem.write_count() - writes_before;
+    assert!(
+        batch_writes <= 2,
+        "a 1000-event batch must amortize to at most 2 chunk writes, saw {batch_writes}",
+    );
+
+    // And every acked event is durable.
+    let durable = migration_coord::events::read_all_events_since(mem.as_ref(), 1)
+        .await
+        .unwrap();
+    assert_eq!(durable.len(), 1000);
+}
+
+/// Manual throughput bench — run with `cargo test -- --ignored`.
+/// MemStore-backed, so this measures the coord-side per-event cost
+/// (lock + reduce + serialize + amortized flush), not S3 latency.
+#[tokio::test]
+#[ignore = "throughput bench; run manually"]
+async fn bench_events_batch_throughput() {
+    let (app, rt, _mem, _clock) = fresh_app_with_clock().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = WorkerId::new();
+
+    const BATCHES: usize = 10;
+    const PER_BATCH: usize = 1000;
+    let start = std::time::Instant::now();
+    for _ in 0..BATCHES {
+        let events: Vec<Value> = (0..PER_BATCH).map(|_| delta_event(&wid, 1)).collect();
+        let (status, _) = post_json(
+            app.clone(),
+            &format!("/workers/{wid}/events"),
+            serde_json::json!({ "events": events }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let elapsed = start.elapsed();
+    let total = (BATCHES * PER_BATCH) as f64;
+    let rate = total / elapsed.as_secs_f64();
+    eprintln!("events_batch throughput: {rate:.0} events/s ({total} events in {elapsed:?})");
+    assert!(
+        rate > 10_000.0,
+        "flush-before-ack must sustain the 10k events/s target; measured {rate:.0}/s",
+    );
 }
