@@ -25,14 +25,17 @@
 //!
 //! 1. data WRITE
 //! 2. close write fh
-//! 3. chmod (mode)
-//! 4. chown (uid/gid) — skipped or downgraded if `require_chown`
-//!    not set and EPERM is observed
+//! 3. chown (uid/gid) — skipped or downgraded if `require_chown`
+//!    not set and EPERM is observed; runs *before* chmod because
+//!    NFSv3 SETATTR of uid/gid clears S_ISUID/S_ISGID on regular
+//!    files (kill-priv semantics) — see `attr_plan` (F08)
+//! 4. chmod (mode)
 //! 5. utimes (atime/mtime) — last, because some servers update mtime
 //!    as a side effect of mode/owner changes
 //! 6. rename `.partial` → final — **commit point**
 
-use crate::attrs::{self, AttrPolicy};
+use crate::attr_plan::{self, AttrExec, ChownOutcome};
+use crate::attrs::AttrPolicy;
 use crate::batch::InflightProfile;
 use crate::downgrade::DowngradeSink;
 use crate::error::MoveError;
@@ -587,18 +590,21 @@ impl Mover {
     // Helpers.
     // =========================================================================
 
-    /// Apply mode + uid/gid + atime/mtime on the still-`.partial`
-    /// destination. Strict order per R4. Honors `cfg.policy` and
-    /// `cfg.require_chown`. Records downgrades for null source attrs
-    /// the user asked to preserve, per SCHEMA_CONTRACT.md "Null
-    /// attribute semantics".
+    /// Apply uid/gid + mode + atime/mtime on the still-`.partial`
+    /// destination, in the order planned by
+    /// [`attr_plan::plan_attr_ops`]: chown → chmod → utimes (F08 —
+    /// owner before mode so NFSv3 kill-priv semantics can't strip
+    /// S_ISUID/S_ISGID the chmod just applied; utimes strictly last).
+    /// Honors `cfg.policy` and `cfg.require_chown` (chown EPERM in
+    /// degraded mode records `NullOwner` and continues to chmod).
+    /// Records downgrades for null source attrs the user asked to
+    /// preserve, per SCHEMA_CONTRACT.md "Null attribute semantics".
     fn apply_attrs(
         &self,
         ctx: &mut NfsContext,
         dst_partial: &[u8],
         row: &RowView,
     ) -> Result<(), MoveError> {
-        let attrs = attrs::build(row, self.cfg.policy);
         let policy = self.cfg.policy;
 
         if policy.preserve_owner && (row.uid.is_none() || row.gid.is_none()) {
@@ -614,28 +620,59 @@ impl Mover {
                 .record(row.row_id, &row.path, DowngradeKind::NullAtime);
         }
 
-        if let Some(mode) = attrs.mode {
-            ops::chmod(ctx, dst_partial, mode)?;
-        }
+        let plan = attr_plan::plan_attr_ops(row, policy);
+        let mut exec = SyncAttrExec {
+            ctx,
+            dst_partial,
+            row,
+            downgrades: &self.downgrades,
+            require_chown: self.cfg.require_chown,
+        };
+        attr_plan::execute_plan(&plan, &mut exec)
+    }
+}
 
-        if let (Some(uid), Some(gid)) = (attrs.uid, attrs.gid) {
-            match ops::chown(ctx, dst_partial, uid, gid) {
-                Ok(()) => {}
-                Err(e) if e.error == "EPERM" && !self.cfg.require_chown => {
-                    tracing::debug!(uid, gid, "chown EPERM in degraded mode; skipping");
-                    self.downgrades
-                        .record(row.row_id, &row.path, DowngradeKind::NullOwner);
-                }
-                Err(e) => return Err(e),
+/// [`AttrExec`] over the sync libnfs context — each op maps to the
+/// pre-existing `ops::` call. The chown-EPERM degraded-mode policy
+/// lives here unchanged (record `NullOwner`, report `SkippedDegraded`
+/// so the plan continues); only its position in the sequence moved.
+struct SyncAttrExec<'a> {
+    ctx: &'a mut NfsContext,
+    dst_partial: &'a [u8],
+    row: &'a RowView,
+    downgrades: &'a DowngradeSink,
+    require_chown: bool,
+}
+
+impl AttrExec for SyncAttrExec<'_> {
+    type Err = MoveError;
+
+    fn chown(&mut self, uid: u32, gid: u32) -> Result<ChownOutcome, MoveError> {
+        match ops::chown(self.ctx, self.dst_partial, uid, gid) {
+            Ok(()) => Ok(ChownOutcome::Applied),
+            Err(e) if e.error == "EPERM" && !self.require_chown => {
+                tracing::debug!(uid, gid, "chown EPERM in degraded mode; skipping");
+                self.downgrades
+                    .record(self.row.row_id, &self.row.path, DowngradeKind::NullOwner);
+                Ok(ChownOutcome::SkippedDegraded)
             }
+            Err(e) => Err(e),
         }
+    }
 
-        if let Some((mt_s, mt_n)) = attrs.mtime {
-            let (at_s, at_n) = attrs.atime.unwrap_or((mt_s, mt_n));
-            ops::utimes(ctx, dst_partial, at_s, at_n, mt_s, mt_n)?;
-        }
+    fn chmod(&mut self, mode: u32) -> Result<(), MoveError> {
+        ops::chmod(self.ctx, self.dst_partial, mode)
+    }
 
-        Ok(())
+    fn utimes(&mut self, atime: (i64, i32), mtime: (i64, i32)) -> Result<(), MoveError> {
+        ops::utimes(
+            self.ctx,
+            self.dst_partial,
+            atime.0,
+            atime.1,
+            mtime.0,
+            mtime.1,
+        )
     }
 }
 

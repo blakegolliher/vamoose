@@ -25,6 +25,7 @@ test-tree/
 ├── large/                          # ~5 files of ~100 MiB each
 ├── deep/a/b/c/d/e/buried.bin       # tests mkdir-on-demand path
 ├── modes/                          # files with 0644, 0755, 0600, 0640, ...
+│                                   # plus a 4755 root-owned file (see [5])
 ├── owners/                         # mix of uid/gid (run as root for this)
 ├── links/
 │   ├── target.bin                  # nlink-2 source
@@ -111,7 +112,11 @@ The script covers:
 
 - **[4]** sha256 of every regular file matches.
 - **[5]** mode + uid + gid + mtime match (atime intentionally not
-  checked — preserve_atime is best-effort).
+  checked — preserve_atime is best-effort). Include a `4755`
+  root-owned file in the test tree (`modes/`); post-migration
+  `stat -c '%a %u:%g' <dst>` must show `4755` — setuid must survive
+  the chown-before-chmod attr order (F08; NFSv3 kill-priv strips
+  S_ISUID/S_ISGID if ownership changes after chmod).
 - **[6]** symlink targets match byte-for-byte.
 - **[7]** hardlink groupings match — inode numbers will differ between
   filesystems, but the partitioning of paths into groups must be
