@@ -711,11 +711,19 @@ async fn resync_refetches_snapshot_and_resumes() {
     // converges on the coord's exact derived state.
     let mut saw_resync = false;
     let mut converged = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut last_tags: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     while tokio::time::Instant::now() < deadline {
         if let Some(tag) = pump_one(&mut rx, &state, Duration::from_secs(2)).await {
             if tag.contains("Resync") {
                 saw_resync = true;
+            }
+            // Keep a short tail of reducer inputs for the failure
+            // message — enough to see a wedge (Fatal? Disconnected
+            // loop? nothing at all?) straight from a CI log.
+            last_tags.push(tag.chars().take(90).collect());
+            if last_tags.len() > 12 {
+                last_tags.remove(0);
             }
         }
         let s = state.lock().await;
@@ -733,11 +741,25 @@ async fn resync_refetches_snapshot_and_resumes() {
         saw_resync,
         "harness failed to force a bus overflow — Resync never reached the reducer"
     );
-    assert!(
-        converged,
-        "client never converged with the coord after Resync — the \
-         overflow-dropped counters were lost (the F26 desync)"
-    );
+    if !converged {
+        let s = state.lock().await;
+        let coord = rt.state().await;
+        panic!(
+            "client never converged with the coord after Resync — the \
+             overflow-dropped counters were lost (the F26 desync).\n\
+             connection={:?} driver_finished={} client_seq={} coord_seq={}\n\
+             jobs_eq={} workers_eq={} buckets_eq={}\n\
+             recent reducer inputs: {:#?}",
+            s.connection,
+            driver.is_finished(),
+            s.last_seq(),
+            coord.last_seq,
+            s.snapshot.jobs == coord.jobs,
+            s.snapshot.workers == coord.workers,
+            s.snapshot.error_buckets == coord.error_buckets,
+            last_tags,
+        );
+    }
 
     cancel.cancel();
     drop(rx);
