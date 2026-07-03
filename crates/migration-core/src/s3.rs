@@ -155,6 +155,85 @@ impl rustls::client::ServerCertVerifier for NoCertVerifier {
     }
 }
 
+// =============================================================================
+// Pure wire-semantics helpers
+// =============================================================================
+//
+// The 200/404/412(+code-string) → outcome mapping and the etag
+// (un)quoting are what make v2 at-most-once. They are extracted as
+// pure functions so the semantics get table tests while the SDK
+// plumbing stays thin wiring.
+
+/// Strip the RFC-7232 quoting S3 puts around etags on the wire.
+///
+/// All etags stored and compared inside vamoose are unquoted; every
+/// read path (PUT response, GET, LIST, HEAD-via-GET, download)
+/// funnels through here so a quoted `"abc"` from the wire compares
+/// equal to a stored `abc` — the apples-to-apples invariant.
+/// Idempotent on already-unquoted input.
+fn unquote_etag(raw: &str) -> String {
+    raw.trim_matches('"').to_string()
+}
+
+/// Re-quote a stored (unquoted) etag for an outbound `If-Match`
+/// header. The SDK's `if_match` builder passes the value verbatim and
+/// the server compares against the quoted wire form, so the header
+/// must carry the quotes. Idempotent on already-quoted input.
+fn quote_etag(etag: &str) -> String {
+    format!("\"{}\"", etag.trim_matches('"'))
+}
+
+/// Classification of a conditional-PUT (`If-None-Match: *`) service
+/// error. Anything that is not an unambiguous precondition failure is
+/// `Other` — ambiguous errors must surface as transient errors, never
+/// as success or as a 412.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutErrorClass {
+    /// The object already exists — the caller lost the create race.
+    PreconditionFailed,
+    /// Anything else (5xx, throttle, transport oddity): transient.
+    Other,
+}
+
+/// Pure mapping of a PUT service-error's `(HTTP status, error code)`
+/// pair. The HTTP 412 status is the canonical signal; the
+/// `PreconditionFailed` code string is the fallback for transports
+/// (VAST-style bodies) that surface the code without the status.
+fn classify_put_response(status: u16, code: &str) -> PutErrorClass {
+    if status == 412 || code == "PreconditionFailed" {
+        PutErrorClass::PreconditionFailed
+    } else {
+        PutErrorClass::Other
+    }
+}
+
+/// Classification of a conditional-DELETE (`If-Match: <etag>`)
+/// service error. 412 and 404 are protocol control-flow signals
+/// (mapped to [`DeleteOutcome`] by the caller); everything else is
+/// `Other` and must surface as a transient error, never as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteErrorClass {
+    /// 412 — object exists but its etag is not what we provided.
+    EtagMismatch,
+    /// 404 — object does not exist.
+    NotFound,
+    /// Anything else: transient, surface as `Err`.
+    Other,
+}
+
+/// Pure mapping of a DELETE service-error's `(HTTP status, error
+/// code)` pair. Same canonical-status-with-code-string-fallback shape
+/// as [`classify_put_response`].
+fn classify_delete_response(status: u16, code: &str) -> DeleteErrorClass {
+    if status == 412 || code == "PreconditionFailed" {
+        DeleteErrorClass::EtagMismatch
+    } else if status == 404 || code == "NoSuchKey" {
+        DeleteErrorClass::NotFound
+    } else {
+        DeleteErrorClass::Other
+    }
+}
+
 #[async_trait]
 impl ClaimStore for S3Client {
     async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<String> {
@@ -168,11 +247,9 @@ impl ClaimStore for S3Client {
             .send()
             .await
             .map_err(map_put_err)?;
-        Ok(resp
-            .e_tag()
-            .ok_or_else(|| Error::Other(anyhow::anyhow!("PUT returned no etag")))?
-            .trim_matches('"')
-            .to_string())
+        Ok(unquote_etag(resp.e_tag().ok_or_else(|| {
+            Error::Other(anyhow::anyhow!("PUT returned no etag"))
+        })?))
     }
 
     async fn put_unconditional(&self, key: &str, body: Vec<u8>) -> Result<String> {
@@ -192,15 +269,11 @@ impl ClaimStore for S3Client {
             .await
         {
             Ok(resp) => {
-                let etag = resp
-                    .e_tag()
-                    .ok_or_else(|| {
-                        Error::Other(anyhow::anyhow!(
-                            "head_object: GET returned no etag for {key}"
-                        ))
-                    })?
-                    .trim_matches('"')
-                    .to_string();
+                let etag = unquote_etag(resp.e_tag().ok_or_else(|| {
+                    Error::Other(anyhow::anyhow!(
+                        "head_object: GET returned no etag for {key}"
+                    ))
+                })?);
                 let body = resp
                     .body
                     .collect()
@@ -219,7 +292,7 @@ impl ClaimStore for S3Client {
         // S3 etags are quoted on the wire. The SDK's `if_match` builder
         // takes the value verbatim; pass it pre-quoted to match
         // exactly what the server sees in HEAD/GET responses.
-        let etag_quoted = format!("\"{}\"", etag.trim_matches('"'));
+        let etag_quoted = quote_etag(etag);
         let resp = self
             .inner
             .delete_object()
@@ -233,14 +306,12 @@ impl ClaimStore for S3Client {
             Err(SdkError::ServiceError(svc)) => {
                 let status = svc.raw().status().as_u16();
                 let code = svc.err().meta().code().unwrap_or_default().to_string();
-                if status == 412 || code == "PreconditionFailed" {
-                    Ok(DeleteOutcome::EtagMismatch)
-                } else if status == 404 || code == "NoSuchKey" {
-                    Ok(DeleteOutcome::NotFound)
-                } else {
-                    Err(Error::Other(anyhow::anyhow!(
+                match classify_delete_response(status, &code) {
+                    DeleteErrorClass::EtagMismatch => Ok(DeleteOutcome::EtagMismatch),
+                    DeleteErrorClass::NotFound => Ok(DeleteOutcome::NotFound),
+                    DeleteErrorClass::Other => Err(Error::Other(anyhow::anyhow!(
                         "S3 DELETE {key}: status={status} code={code}"
-                    )))
+                    ))),
                 }
             }
             Err(e) => Err(Error::Other(anyhow::anyhow!("S3 DELETE {key}: {e:?}"))),
@@ -257,10 +328,7 @@ impl ClaimStore for S3Client {
             .await
         {
             Ok(resp) => {
-                let etag = resp
-                    .e_tag()
-                    .map(|s| s.trim_matches('"').to_string())
-                    .unwrap_or_default();
+                let etag = resp.e_tag().map(unquote_etag).unwrap_or_default();
                 let bytes = resp
                     .body
                     .collect()
@@ -293,7 +361,7 @@ impl ClaimStore for S3Client {
                 .map_err(|e| Error::Other(anyhow::anyhow!("S3 LIST {prefix}: {e}")))?;
             for o in resp.contents() {
                 let key = o.key().unwrap_or_default().to_string();
-                let etag = o.e_tag().unwrap_or_default().trim_matches('"').to_string();
+                let etag = unquote_etag(o.e_tag().unwrap_or_default());
                 let size = o.size().unwrap_or(0) as u64;
                 out.push(ListEntry { key, etag, size });
             }
@@ -315,14 +383,12 @@ impl ClaimStore for S3Client {
 /// HttpResponse so we can access the raw status; do not generalize.
 fn map_put_err(err: SdkError<aws_sdk_s3::operation::put_object::PutObjectError>) -> Error {
     if let SdkError::ServiceError(svc) = &err {
-        // PreconditionFailed has HTTP status 412 — the canonical signal.
-        if svc.raw().status().as_u16() == 412 {
-            return Error::PreconditionFailed;
-        }
-        // Fall back to the modeled error code in case the transport
-        // layer surfaced it differently.
+        // The HTTP 412 status is the canonical signal; the modeled
+        // error code is the fallback in case the transport layer
+        // surfaced it differently. See `classify_put_response`.
+        let status = svc.raw().status().as_u16();
         let code = svc.err().meta().code().unwrap_or_default();
-        if code == "PreconditionFailed" {
+        if classify_put_response(status, code) == PutErrorClass::PreconditionFailed {
             return Error::PreconditionFailed;
         }
     }
@@ -417,10 +483,7 @@ impl S3Client {
             .send()
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("S3 PUT {key}: {e:?}")))?;
-        Ok(resp
-            .e_tag()
-            .map(|s| s.trim_matches('"').to_string())
-            .unwrap_or_default())
+        Ok(resp.e_tag().map(unquote_etag).unwrap_or_default())
     }
 
     /// Download an object to a local path. Used for shard parquet
@@ -436,10 +499,7 @@ impl S3Client {
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("S3 GET {key}: {e:?}")))?;
 
-        let etag = resp
-            .e_tag()
-            .map(|s| s.trim_matches('"').to_string())
-            .unwrap_or_default();
+        let etag = resp.e_tag().map(unquote_etag).unwrap_or_default();
 
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -455,5 +515,152 @@ impl S3Client {
         }
         out.flush().await?;
         Ok(etag)
+    }
+}
+
+// =============================================================================
+// Tests — F29. Table tests over the pure wire-semantics helpers; the
+// SDK plumbing above stays thin, untested wiring by design (see
+// docs/work-items/PROTOCOL_TEST_PACK.md). No live endpoints.
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // Conditional PUT (If-None-Match: *) — the acquire/complete atom.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn put_if_absent_412_maps_to_precondition_failed() {
+        // Canonical: HTTP 412 with or without the modeled code.
+        assert_eq!(
+            classify_put_response(412, ""),
+            PutErrorClass::PreconditionFailed
+        );
+        assert_eq!(
+            classify_put_response(412, "PreconditionFailed"),
+            PutErrorClass::PreconditionFailed
+        );
+        // VAST-style: the body carries the `PreconditionFailed` code
+        // string while the transport surfaces a different status.
+        assert_eq!(
+            classify_put_response(400, "PreconditionFailed"),
+            PutErrorClass::PreconditionFailed
+        );
+        // Unrelated 4xx must NOT be treated as a lost create race.
+        assert_eq!(
+            classify_put_response(403, "AccessDenied"),
+            PutErrorClass::Other
+        );
+        assert_eq!(classify_put_response(409, "Conflict"), PutErrorClass::Other);
+    }
+
+    // -------------------------------------------------------------------------
+    // Conditional DELETE (If-Match: <etag>) — the old-state half of
+    // every reclaim/complete.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn delete_if_match_412_maps_to_lost_race_outcome() {
+        // 412 → EtagMismatch, which reclaim/complete map to
+        // LostRace / Lost. Canonical status and code-string fallback.
+        assert_eq!(
+            classify_delete_response(412, ""),
+            DeleteErrorClass::EtagMismatch
+        );
+        assert_eq!(
+            classify_delete_response(412, "PreconditionFailed"),
+            DeleteErrorClass::EtagMismatch
+        );
+        assert_eq!(
+            classify_delete_response(400, "PreconditionFailed"),
+            DeleteErrorClass::EtagMismatch
+        );
+        // Precedence: a PreconditionFailed code wins over a 404
+        // status — same order as the original inline mapping.
+        assert_eq!(
+            classify_delete_response(404, "PreconditionFailed"),
+            DeleteErrorClass::EtagMismatch
+        );
+    }
+
+    #[test]
+    fn delete_if_match_404_maps_to_not_found() {
+        assert_eq!(
+            classify_delete_response(404, ""),
+            DeleteErrorClass::NotFound
+        );
+        assert_eq!(
+            classify_delete_response(404, "NoSuchKey"),
+            DeleteErrorClass::NotFound
+        );
+        // Code-string fallback without the canonical status.
+        assert_eq!(
+            classify_delete_response(400, "NoSuchKey"),
+            DeleteErrorClass::NotFound
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Etag quoting — the apples-to-apples invariant. Every read path
+    // (PUT response, GET, LIST, HEAD-via-GET, download) funnels
+    // through `unquote_etag`; the outbound If-Match header goes
+    // through `quote_etag`.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn etag_unquoted_on_put_get_list() {
+        // A quoted etag from the wire compares equal to the stored
+        // unquoted form, whichever read path produced it.
+        let wire = "\"3858f62230ac3c915f300c664312c63f\"";
+        let stored = "3858f62230ac3c915f300c664312c63f";
+        assert_eq!(unquote_etag(wire), stored);
+        // Idempotent — an already-unquoted etag passes through.
+        assert_eq!(unquote_etag(stored), stored);
+        // Both forms normalize to the same comparison key.
+        assert_eq!(unquote_etag(wire), unquote_etag(stored));
+        // Multipart-style etags (with the part-count suffix) survive.
+        assert_eq!(unquote_etag("\"abc-2\""), "abc-2");
+    }
+
+    #[test]
+    fn if_match_header_requotes_stored_etag() {
+        // Stored (unquoted) etag goes out quoted.
+        assert_eq!(quote_etag("abc123"), "\"abc123\"");
+        // Idempotent — never double-quote a wire-form etag.
+        assert_eq!(quote_etag("\"abc123\""), "\"abc123\"");
+        // Round trip: unquote then requote recovers the wire form.
+        assert_eq!(quote_etag(&unquote_etag("\"abc123\"")), "\"abc123\"");
+    }
+
+    // -------------------------------------------------------------------------
+    // Taxonomy pin: ambiguous errors are transient, never success and
+    // never a protocol control-flow signal.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn unexpected_5xx_maps_to_transient_not_success() {
+        for status in [500u16, 502, 503] {
+            assert_eq!(
+                classify_put_response(status, "InternalError"),
+                PutErrorClass::Other,
+                "PUT {status} must classify as transient"
+            );
+            assert_eq!(
+                classify_delete_response(status, "InternalError"),
+                DeleteErrorClass::Other,
+                "DELETE {status} must classify as transient"
+            );
+        }
+        // Empty code strings don't accidentally match anything.
+        assert_eq!(classify_put_response(500, ""), PutErrorClass::Other);
+        assert_eq!(classify_delete_response(503, ""), DeleteErrorClass::Other);
+        // SlowDown throttling is transient, not a lost race.
+        assert_eq!(
+            classify_delete_response(503, "SlowDown"),
+            DeleteErrorClass::Other
+        );
     }
 }

@@ -104,6 +104,7 @@ fn spawn_worker(
             throughput: ThroughputCounter::new(),
             throughput_window_secs: 60,
             coord_fence: None,
+            clock: Arc::new(migration_worker::heartbeat::SystemDriftClock),
         };
         let hb_handle = tokio::spawn(hb.run());
 
