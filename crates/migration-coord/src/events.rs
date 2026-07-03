@@ -181,6 +181,13 @@ impl EventLogWriter {
         Ok(())
     }
 
+    /// Number of events currently buffered across all open chunks.
+    /// The runtime exposes this so the CLI can report exactly how
+    /// many events a lease-lost shutdown dropped.
+    pub fn buffered_events(&self) -> usize {
+        self.chunks.values().map(|c| c.buf.len()).sum()
+    }
+
     /// Test-only — number of open chunks (used to assert flush
     /// behavior).
     #[cfg(test)]

@@ -153,6 +153,10 @@ struct MemInner {
     /// Stable etag counter. Each successful write increments it and
     /// stamps the entry; reads return the stamped etag.
     next_etag: u64,
+    /// Number of write calls (`put` + `put_if_absent`) observed,
+    /// regardless of outcome. Test-only knob — lets tests assert
+    /// "no writes happened" after a lease-lost fence.
+    write_calls: u64,
     objects: BTreeMap<String, MemObject>,
 }
 
@@ -199,6 +203,14 @@ impl MemStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Test-only knob — number of write calls (`put` +
+    /// `put_if_absent`) seen so far, regardless of outcome. Lets a
+    /// test snapshot the count, poke the code under test, and assert
+    /// zero new writes (the lease-lost fence contract).
+    pub fn write_count(&self) -> u64 {
+        self.inner.lock().unwrap().write_calls
+    }
 }
 
 #[async_trait]
@@ -218,6 +230,7 @@ impl CoordStore for MemStore {
 
     async fn put(&self, key: &str, body: Vec<u8>) -> Result<String> {
         let mut inner = self.inner.lock().unwrap();
+        inner.write_calls += 1;
         let etag = Self::next_etag(&mut inner);
         inner.objects.insert(
             key.to_string(),
@@ -231,6 +244,7 @@ impl CoordStore for MemStore {
 
     async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<PutOutcome> {
         let mut inner = self.inner.lock().unwrap();
+        inner.write_calls += 1;
         if inner.objects.contains_key(key) {
             return Ok(PutOutcome::AlreadyExists);
         }
