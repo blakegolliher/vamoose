@@ -63,6 +63,13 @@ const STREAM_BUF_SIZE: usize = 1 << 20; // 1 MiB
 pub struct MoveOutcome {
     pub row_id: u64,
     pub strategy: Strategy,
+    /// Bytes actually written for this row (F41) — the streaming
+    /// copy's byte count for regular files (less than `row.size` on
+    /// an EarlyEof short copy), and 0 for failures and for rows that
+    /// move no file data (skip / symlink / hardlink / dir-attrs /
+    /// empty). Never `row.size` taken on faith: this value feeds the
+    /// throughput sample that gates backpressure, progress records,
+    /// and coord aggregation.
     pub bytes_moved: u64,
     /// True iff the copy committed but the source changed under it
     /// (`FileCopyResult::torn` → `file_mover::classify_copy`). The
@@ -211,7 +218,8 @@ impl Mover {
         let target = link_target.to_vec();
         let path = row.path.clone();
         self.run_with_pair(row, Strategy::HardlinkExisting, move |me, pair| {
-            me.do_hardlink(pair, &target, &path)
+            // F41: a hardlink writes no file data — report 0 bytes.
+            me.do_hardlink(pair, &target, &path).map(|()| 0)
         })
         .await
     }
@@ -219,13 +227,13 @@ impl Mover {
     /// Common framing: pick-strategy → acquire-pair → spawn_blocking →
     /// build MoveOutcome. The closure receives the cloned mover and a
     /// mutable borrow of the pair so it can drive any of the
-    /// strategy-specific sync paths.
+    /// strategy-specific sync paths; on success it returns the bytes
+    /// it actually wrote (F41), which becomes `MoveOutcome::bytes_moved`.
     async fn run_with_pair<F>(&self, row: &RowView, strategy: Strategy, work: F) -> MoveOutcome
     where
-        F: FnOnce(&Mover, &mut ContextPair) -> Result<(), MoveError> + Send + 'static,
+        F: FnOnce(&Mover, &mut ContextPair) -> Result<u64, MoveError> + Send + 'static,
     {
         let row_id = row.row_id;
-        let bytes = row.size;
 
         let pair = match self.pool.acquire().await {
             Ok(p) => p,
@@ -259,10 +267,12 @@ impl Mover {
         MoveOutcome {
             row_id,
             strategy,
-            bytes_moved: if result.is_ok() { bytes } else { 0 },
+            // F41: the bytes the body actually wrote — never row.size
+            // taken on faith. 0 on failure (pre-existing contract).
+            bytes_moved: *result.as_ref().unwrap_or(&0),
             // Sync paths have no torn detection (see do_libnfs_copy).
             torn: false,
-            result,
+            result: result.map(|_| ()),
         }
     }
 
@@ -270,21 +280,25 @@ impl Mover {
     // Sync strategy dispatch (called from inside spawn_blocking).
     // =========================================================================
 
+    /// Dispatch one strategy body and report the bytes it actually
+    /// wrote (F41). Only the streaming copy moves file data; symlink,
+    /// hardlink, dir-attrs, empty, and skip rows write no file bytes
+    /// and report 0 — `row.size` is never reported on faith.
     fn execute(
         &self,
         pair: &mut ContextPair,
         row: &RowView,
         strategy: Strategy,
-    ) -> Result<(), MoveError> {
+    ) -> Result<u64, MoveError> {
         match strategy {
-            Strategy::ServerSideCopy => self.do_server_side_copy(pair, row),
+            Strategy::ServerSideCopy => self.do_server_side_copy(pair, row).map(|()| 0),
             Strategy::LibnfsIoUring => self.do_libnfs_copy(pair, row),
-            Strategy::KernelCopyFileRange => self.do_kernel_cfr(pair, row),
-            Strategy::Symlink => self.do_symlink(pair, row),
+            Strategy::KernelCopyFileRange => self.do_kernel_cfr(pair, row).map(|()| 0),
+            Strategy::Symlink => self.do_symlink(pair, row).map(|()| 0),
             Strategy::HardlinkExisting => Err(MoveError::new(FailurePhase::Hardlink, "EINVAL")),
-            Strategy::Empty => self.do_empty(pair, row),
-            Strategy::DirAttrs => self.do_dir_attrs(pair, row),
-            Strategy::Skip => Ok(()),
+            Strategy::Empty => self.do_empty(pair, row).map(|()| 0),
+            Strategy::DirAttrs => self.do_dir_attrs(pair, row).map(|()| 0),
+            Strategy::Skip => Ok(0),
         }
     }
 
@@ -518,6 +532,9 @@ impl Mover {
     /// Default path: libnfs READ → libnfs WRITE through a 1 MiB
     /// streaming buffer, single-fiber within the call. Concurrency
     /// across files comes from the shard processor's JoinSet.
+    /// Returns the bytes actually written (F41) — on an EarlyEof
+    /// short copy this is less than `row.size` and the row still
+    /// commits `Ok` with a `DowngradeKind::EarlyEof` record.
     ///
     /// Torn-copy detection is async-path-only for now: this sync path
     /// has no pre/post source-stat bracket, so a file modified during
@@ -526,7 +543,7 @@ impl Mover {
     /// (`pipelined_copy` + `file_mover::classify_copy`) is the one
     /// that detects and records tears; see
     /// docs/work-items/MOVER_TORN_COPY_SURFACE.md (F05).
-    fn do_libnfs_copy(&self, pair: &mut ContextPair, row: &RowView) -> Result<(), MoveError> {
+    fn do_libnfs_copy(&self, pair: &mut ContextPair, row: &RowView) -> Result<u64, MoveError> {
         let src = self.src_path(row);
         let dst = self.dst_path(row);
         let dst_partial = partial_path(&dst, &self.host_id, self.pid)?;
@@ -583,7 +600,7 @@ impl Mover {
             "commit: rename .partial → final",
         );
         ops::rename(pair.dst(), &dst_partial, &dst)?;
-        Ok(())
+        Ok(written)
     }
 
     // =========================================================================
@@ -973,6 +990,10 @@ mod tests {
     }
 
     fn build_mover_with_fence(fence: Fence) -> Mover {
+        build_mover(Arc::new(StubPool) as Arc<dyn LibnfsContextPool>, fence)
+    }
+
+    fn build_mover(pool: Arc<dyn LibnfsContextPool>, fence: Fence) -> Mover {
         let cfg = MoverConfig {
             source_url: "nfs://srcA/exp".to_string(),
             dest_url: "nfs://srcB/exp".to_string(),
@@ -994,11 +1015,150 @@ mod tests {
         };
         Mover::new(
             cfg,
-            Arc::new(StubPool) as Arc<dyn LibnfsContextPool>,
+            pool,
             "test-host",
             crate::downgrade::DowngradeSink::new(),
             fence,
         )
+    }
+
+    // ---- F41: honest byte counts ----------------------------------
+    //
+    // `MoveOutcome::bytes_moved` must report the bytes actually
+    // written, never `row.size` taken on faith. Two sync-path `Ok`
+    // outcomes used to inflate it: `Strategy::Skip` (copies nothing)
+    // and an EarlyEof short copy (commits `written < row.size`).
+    // See docs/work-items/WORKER_RESILIENCE.md item 2.
+
+    use migration_core::schema::FileTypeTag;
+    use migration_core::shard::RowView;
+
+    /// Pool that hands out unmounted pairs — valid for strategy arms
+    /// and stubbed bodies that never touch the contexts.
+    struct DummyPairPool;
+    #[async_trait]
+    impl LibnfsContextPool for DummyPairPool {
+        async fn acquire(&self) -> anyhow::Result<ContextPair> {
+            Ok(ContextPair::unmounted_for_tests())
+        }
+    }
+
+    fn test_row(size: u64, file_type: FileTypeTag) -> RowView {
+        RowView {
+            row_id: 7,
+            path: b"/data/file".to_vec(),
+            size,
+            mtime_sec: None,
+            mtime_nsec: None,
+            atime_sec: None,
+            atime_nsec: None,
+            mode: 0o644,
+            uid: None,
+            gid: None,
+            nlink: None,
+            inode: None,
+            fsid: None,
+            xattr_blob: None,
+            symlink_target: None,
+            file_type,
+        }
+    }
+
+    /// F41 acceptance test 5 (red before fix): a Skip row (fifo /
+    /// socket / dev) copies nothing and must report 0 bytes while
+    /// still counting as a success. Before the fix it reported
+    /// `row.size` — inflating throughput, backpressure inputs, and
+    /// coord aggregation.
+    #[tokio::test]
+    async fn skip_reports_zero_bytes() {
+        let mover = build_mover(
+            Arc::new(DummyPairPool) as Arc<dyn LibnfsContextPool>,
+            Fence::new(),
+        );
+        let row = test_row(4096, FileTypeTag::Fifo);
+        let outcome = mover.move_one(&row).await;
+        assert_eq!(outcome.strategy, Strategy::Skip);
+        assert!(
+            outcome.result.is_ok(),
+            "Skip must stay a success: {:?}",
+            outcome.result,
+        );
+        assert_eq!(
+            outcome.bytes_moved, 0,
+            "Skip copies nothing and must report 0 bytes, not row.size",
+        );
+    }
+
+    /// F41 acceptance test 6 (red before fix — a type-level red: the
+    /// sync copy bodies returned `()`, so a stubbed body could not
+    /// even express a written count). `do_libnfs_copy` is FFI-coupled,
+    /// so this drives `run_with_pair`'s outcome assembly with a
+    /// stubbed body that commits fewer bytes than `row.size` — the
+    /// EarlyEof shape (`stream_copy` hit EOF early; the row still
+    /// commits `Ok`, with the downgrade recorded by the real body).
+    /// The outcome must report the actual written count.
+    #[tokio::test]
+    async fn early_eof_reports_written_bytes() {
+        let mover = build_mover(
+            Arc::new(DummyPairPool) as Arc<dyn LibnfsContextPool>,
+            Fence::new(),
+        );
+        let row = test_row(4096, FileTypeTag::Regular);
+        let outcome = mover
+            .run_with_pair(&row, Strategy::LibnfsIoUring, |_, _| Ok(500))
+            .await;
+        assert!(outcome.result.is_ok(), "EarlyEof stays a committed success");
+        assert_eq!(
+            outcome.bytes_moved, 500,
+            "outcome must report the bytes actually written, not row.size",
+        );
+    }
+
+    /// Regression guard (hardware-free analog of file_mover_smoke's
+    /// `bytes_moved == size` assertion): a full clean copy still
+    /// reports the full size.
+    #[tokio::test]
+    async fn full_copy_reports_full_size() {
+        let mover = build_mover(
+            Arc::new(DummyPairPool) as Arc<dyn LibnfsContextPool>,
+            Fence::new(),
+        );
+        let row = test_row(4096, FileTypeTag::Regular);
+        let outcome = mover
+            .run_with_pair(&row, Strategy::LibnfsIoUring, |_, _| Ok(4096))
+            .await;
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.bytes_moved, 4096);
+    }
+
+    /// Failed rows keep reporting 0 bytes (pre-F41 behavior pin).
+    #[tokio::test]
+    async fn failed_copy_reports_zero_bytes() {
+        let mover = build_mover(
+            Arc::new(DummyPairPool) as Arc<dyn LibnfsContextPool>,
+            Fence::new(),
+        );
+        let row = test_row(4096, FileTypeTag::Regular);
+        let outcome = mover
+            .run_with_pair(&row, Strategy::LibnfsIoUring, |_, _| {
+                Err(MoveError::new(FailurePhase::Write, "EIO"))
+            })
+            .await;
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.bytes_moved, 0);
+    }
+
+    /// Pins the F41 plumbing by type: the sync copy body returns the
+    /// actual written count (`u64`), not `()`. Never called — the
+    /// body is FFI-coupled; the count itself comes from `stream_copy`,
+    /// whose short-read behavior is pinned by the tests above.
+    #[allow(dead_code)]
+    fn _pin_do_libnfs_copy_returns_written(
+        m: &Mover,
+        p: &mut ContextPair,
+        r: &RowView,
+    ) -> Result<u64, MoveError> {
+        m.do_libnfs_copy(p, r)
     }
 
     #[test]
