@@ -141,8 +141,13 @@ pub async fn pipelined_copy(
     // rate even on a fleet of workers.
     let mut hasher = Xxh3::new();
 
-    // No buffered-bytes bound yet — the F07 fix wires the real cap.
-    let max_buffered_bytes = u64::MAX;
+    // Reorder-buffer bound (F07): if the read at the deliver cursor
+    // stalls, completed reads pile up in the reorder buffer; without
+    // a cap the pump would buffer the whole remaining file in RAM.
+    // Derived from the bucket config (no new user knob): twice the
+    // pipeline's natural window of `read_depth` chunks of `rsize`
+    // (the largest chunk a read or gap-fill can carry).
+    let max_buffered_bytes = (read_depth as u64).saturating_mul(rsize).saturating_mul(2);
 
     loop {
         // 1) Pump fresh reads while the state machine allows it
@@ -167,9 +172,20 @@ pub async fn pipelined_copy(
             if state.drained() {
                 break;
             }
-            // Not drained and nothing in flight: the pump above will
-            // make progress next iteration (loop-step-zero boundary).
-            continue;
+            // Nothing in flight, not drained, and the pump above
+            // declined to issue: no event can ever make progress.
+            // Structurally unreachable — whenever the reorder buffer
+            // is non-empty the chunk at the deliver cursor is in
+            // flight (issuance is in offset order and the EOF clamp
+            // purges unreachable entries) — so this is a state-machine
+            // accounting bug. Fail the file copy rather than spin on
+            // a core forever holding the inflight-limiter permit
+            // (the F06 livelock shape).
+            return Err(MoveError::new(
+                FailurePhase::Read,
+                "pipelined_copy wedged: no reads in flight but reorder \
+                 state not drained (reorder/EOF accounting bug)",
+            ));
         }
 
         // 3) Wait for at least one more read to complete and route it
