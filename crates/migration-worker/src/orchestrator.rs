@@ -18,6 +18,16 @@
 //!    f. On fence trip: leave the claim where it is and exit.
 //! 6. Exit cleanly when every shard is Completed/Failed or the worker
 //!    is fenced.
+//!
+//! # Shutdown diagnostics
+//!
+//! The step-by-step shutdown trace (section 7) is emitted at `debug`
+//! level under the `shutdown` tracing target — enable it with
+//! `RUST_LOG=shutdown=debug` when diagnosing a wedged or slow
+//! shutdown. The raw `libc::write` lines in the hard-exit watchdog
+//! thread (and in `main.rs` after [`run`] returns) are deliberate,
+//! not candidates for tracing: they run when the tokio runtime and
+//! the tracing stack may already be gone or wedged.
 
 use crate::backpressure::Backpressure;
 use crate::caps;
@@ -796,55 +806,55 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     } else {
         WatchdogRunOutcome::Fenced
     };
-    eprintln!("[shutdown] section 7 entered");
+    tracing::debug!(target: "shutdown", "section 7 entered");
     {
-        eprintln!("[shutdown] acquiring progress write lock");
+        tracing::debug!(target: "shutdown", "acquiring progress write lock");
         let mut p = progress.write().await;
-        eprintln!("[shutdown] got progress write lock");
+        tracing::debug!(target: "shutdown", "got progress write lock");
         p.status = "exiting".into();
     }
-    eprintln!("[shutdown] released progress write lock");
+    tracing::debug!(target: "shutdown", "released progress write lock");
     // Cancel the coord driver so it stops heartbeating and the
     // task joins. Bounded await — if the HTTP layer is wedged the
     // worker should still get to clean exit; the driver leaks at
     // process termination, which is benign (no shared resources).
     if let Some(handle) = coord_handle {
         coord_cancel.cancel();
-        eprintln!("[shutdown] awaiting coord_driver with 5s timeout");
+        tracing::debug!(target: "shutdown", "awaiting coord_driver with 5s timeout");
         match tokio::time::timeout(std::time::Duration::from_secs(5), handle.task).await {
             Ok(Ok(Ok(()))) => tracing::info!("coord_driver: clean exit"),
             Ok(Ok(Err(e))) => tracing::warn!(error = %e, "coord_driver returned error"),
             Ok(Err(e)) => tracing::warn!(join_error = %e, "coord_driver join failed"),
             Err(_) => tracing::warn!("coord_driver did not exit within 5s; dropping handle"),
         }
-        eprintln!("[shutdown] coord_driver done");
+        tracing::debug!(target: "shutdown", "coord_driver done");
     }
     // Drop the held claim so the heartbeat stops refreshing.
     {
-        eprintln!("[shutdown] acquiring current lock");
+        tracing::debug!(target: "shutdown", "acquiring current lock");
         let mut g = current.lock().await;
-        eprintln!("[shutdown] got current lock");
+        tracing::debug!(target: "shutdown", "got current lock");
         *g = None;
     }
-    eprintln!("[shutdown] released current lock");
+    tracing::debug!(target: "shutdown", "released current lock");
     // Best-effort: trip fence to wake the heartbeat loop out of its tick.
     fence.trip("worker shutting down");
-    eprintln!("[shutdown] fence tripped");
+    tracing::debug!(target: "shutdown", "fence tripped");
     // Bound the heartbeat-join. If the heartbeat task is wedged (e.g.
     // a stale S3 connection-pool entry blocking write_progress),
     // hb_handle.await would hang the worker process forever. Abort on
     // timeout; the runtime drop reaps the task on its own schedule.
     let mut hb_handle = hb_handle;
-    eprintln!("[shutdown] awaiting hb_handle with 5s timeout");
+    tracing::debug!(target: "shutdown", "awaiting hb_handle with 5s timeout");
     if tokio::time::timeout(std::time::Duration::from_secs(5), &mut hb_handle)
         .await
         .is_err()
     {
-        eprintln!("[shutdown] hb_handle timeout - aborting");
+        tracing::debug!(target: "shutdown", "hb_handle timeout - aborting");
         tracing::warn!("heartbeat task did not exit within 5s of shutdown; aborting it",);
         hb_handle.abort();
     }
-    eprintln!("[shutdown] hb_handle done");
+    tracing::debug!(target: "shutdown", "hb_handle done");
 
     // Hard-exit deadline. libnfs's nfs_destroy_context (called from
     // NfsContext::Drop) can block indefinitely on RPC traffic after
@@ -856,7 +866,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     // task) because the tokio runtime itself is what we're trying to
     // get past; tokio task scheduling can't help during runtime
     // shutdown when a Drop is blocking the executor.
-    eprintln!("[shutdown] spawning hard-exit watchdog");
+    tracing::debug!(target: "shutdown", "spawning hard-exit watchdog");
     // F17: the exit code and the stderr line are computed HERE, while
     // allocation is still safe, and moved into the thread — the thread
     // itself must stay allocation-free past the sleep.
@@ -881,7 +891,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
             libc::_exit(watchdog_code);
         }
     });
-    eprintln!("[shutdown] watchdog spawned, returning Ok(())");
+    tracing::debug!(target: "shutdown", "watchdog spawned, returning Ok(())");
 
     Ok(())
 }
