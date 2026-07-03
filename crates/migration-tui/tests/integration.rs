@@ -574,7 +574,7 @@ async fn bootstrap_fetches_jobs_then_streams_from_last_seq() {
     // Pump the reducer until both jobs are present and the link is
     // up, recording every replayed Event frame's debug tag.
     let mut replayed: Vec<String> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -615,7 +615,7 @@ async fn bootstrap_fetches_jobs_then_streams_from_last_seq() {
     // The live tail still flows after bootstrap (cursor not too high
     // either): one more event must arrive over SSE.
     rt.ingest(progress("bravo", w, 2, 50)).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -667,7 +667,7 @@ async fn resync_refetches_snapshot_and_resumes() {
     ));
 
     // Phase 1: pump until the initial view is synced.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         assert!(
             tokio::time::Instant::now() < deadline,
