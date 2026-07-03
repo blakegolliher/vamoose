@@ -498,6 +498,11 @@ pub struct AppState {
     /// snapshot's `last_seq` (the reducer also updates that field
     /// in-place). The resume cursor on reconnect is this value.
     pub last_seen_seq: u64,
+    /// Count of SSE frames skipped because their `kind` is unknown
+    /// to this build (F38 — a newer coord streaming to an older
+    /// TUI). Surfaced in the banner so the operator knows the view
+    /// may be missing event kinds this binary predates.
+    pub unknown_events: u64,
     /// Per-job rolling throughput history derived from
     /// `ProgressDelta` events. Pruned to 5 min on every push.
     pub progress_windows: HashMap<JobId, ProgressDeltaHistory>,
@@ -561,6 +566,7 @@ impl AppState {
             },
             ui: UiState::default(),
             last_seen_seq: 0,
+            unknown_events: 0,
             progress_windows: HashMap::new(),
             recent_errors: HashMap::new(),
             recent_verify_mismatches: HashMap::new(),
@@ -697,6 +703,23 @@ impl AppState {
             }
             _ => {}
         }
+        true
+    }
+
+    /// Record one skipped unknown-kind frame (F38). Advances
+    /// `last_seen_seq` through the same drop rule
+    /// [`AppState::apply_envelope`] uses — `seq <= last_seen_seq` is
+    /// a duplicate/stale replay and is discarded — so a reconnect
+    /// overlap never double-counts, and the reconnect resume cursor
+    /// moves past the frame instead of replaying it forever.
+    ///
+    /// Returns `true` when the frame advanced state.
+    pub fn note_unknown_event(&mut self, seq: u64) -> bool {
+        if seq <= self.last_seen_seq {
+            return false;
+        }
+        self.last_seen_seq = seq;
+        self.unknown_events += 1;
         true
     }
 
@@ -914,6 +937,27 @@ mod tests {
         assert_eq!(j.progress.files_done, 5);
         assert_eq!(j.progress.bytes_done, 1024);
         assert_eq!(s.last_seen_seq, 2);
+    }
+
+    #[test]
+    fn note_unknown_event_advances_cursor_and_dedups() {
+        // F38: unknown-kind frames advance the resume cursor through
+        // the same drop rule apply_envelope uses, so duplicates from
+        // a reconnect overlap never double-count.
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "bobby"));
+        assert!(s.note_unknown_event(5));
+        assert_eq!(s.last_seen_seq, 5);
+        assert_eq!(s.unknown_events, 1);
+        // Duplicate / stale seqs are dropped.
+        assert!(!s.note_unknown_event(5));
+        assert!(!s.note_unknown_event(2));
+        assert_eq!(s.unknown_events, 1);
+        assert_eq!(s.last_seen_seq, 5);
+        // A later unknown counts again.
+        assert!(s.note_unknown_event(9));
+        assert_eq!(s.unknown_events, 2);
+        assert_eq!(s.last_seen_seq, 9);
     }
 
     #[test]

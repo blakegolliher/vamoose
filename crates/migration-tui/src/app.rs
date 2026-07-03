@@ -119,6 +119,18 @@ fn handle_sse_frame(state: &mut AppState, frame: SseFrame, now: DateTime<Utc>) {
                 }
             }
         }
+        SseFrame::UnknownEvent { seq, kind } => {
+            // F38: a coord newer than this build streamed a kind we
+            // have no variant for. Skip it but advance the resume
+            // cursor (dropping the frame without the advance would
+            // replay it on every reconnect, forever) and count it
+            // for the banner. The payload is unrecoverable — the
+            // envelope can't deserialize past the unknown tag.
+            if state.note_unknown_event(seq) {
+                tracing::debug!(seq, kind = %kind, "skipped unknown event kind from newer coord");
+            }
+            state.mark_traffic(now);
+        }
         SseFrame::Resync => {
             // Server told us our SSE subscriber overflowed and
             // dropped events. Re-bootstrap by treating it as a
@@ -1292,6 +1304,62 @@ mod tests {
         } else {
             panic!("expected Connected");
         }
+    }
+
+    #[test]
+    fn driver_advances_cursor_past_unknown() {
+        // F38: an unknown-kind frame (newer coord) must advance the
+        // resume cursor past its seq — otherwise the reconnect
+        // replays it forever — and bump the operator-visible
+        // counter. It must NOT touch the connection state.
+        let mut s = AppState::empty(at(0));
+        s.mark_connected(at(0));
+        s.apply_envelope(&job_created(1, "alpha"));
+        assert_eq!(s.last_seq(), 1);
+
+        let action = handle_input(
+            &mut s,
+            Input::SseFrame(SseFrame::UnknownEvent {
+                seq: 5,
+                kind: "FutureThing".into(),
+            }),
+            at(3),
+        );
+        assert_eq!(action, AppAction::Continue, "no disconnect, no quit");
+        assert_eq!(s.last_seq(), 5, "cursor advances past the unknown frame");
+        assert_eq!(s.unknown_events, 1, "operator-visible counter bumps");
+        assert!(
+            matches!(
+                s.connection,
+                crate::state::ConnectionStatus::Connected { .. }
+            ),
+            "connection stays up"
+        );
+
+        // A replayed duplicate (reconnect overlap) is deduped by the
+        // same drop rule apply_envelope uses.
+        handle_input(
+            &mut s,
+            Input::SseFrame(SseFrame::UnknownEvent {
+                seq: 5,
+                kind: "FutureThing".into(),
+            }),
+            at(4),
+        );
+        assert_eq!(s.unknown_events, 1, "duplicate seq must not double-count");
+        assert_eq!(s.last_seq(), 5);
+
+        // Later valid events still apply on top.
+        handle_input(
+            &mut s,
+            Input::SseFrame(SseFrame::Event {
+                seq: 6,
+                envelope: job_created(6, "bravo"),
+            }),
+            at(5),
+        );
+        assert!(s.job(&jid("bravo")).is_some());
+        assert_eq!(s.last_seq(), 6);
     }
 
     #[test]

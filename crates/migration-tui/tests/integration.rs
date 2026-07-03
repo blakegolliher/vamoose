@@ -175,7 +175,7 @@ async fn sse_catches_up_then_streams_live() {
                 assert!(app.apply_envelope(&envelope));
                 received += 1;
             }
-            SseFrame::Keepalive | SseFrame::Resync => {}
+            SseFrame::Keepalive | SseFrame::Resync | SseFrame::UnknownEvent { .. } => {}
         }
     }
     assert_eq!(app.last_seq(), 2);
@@ -482,6 +482,93 @@ async fn unknown_job_command_returns_404() {
         panic!("expected Http error");
     };
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    shutdown.cancel();
+}
+
+// =============================================================================
+// F38 — unknown EventKind tolerance
+// =============================================================================
+
+/// Render one envelope the way the coord's SSE layer does:
+/// `event:` = the kind tag, `id:` = seq, `data:` = the envelope JSON.
+fn sse_frame_for(env: &migration_coord::schema::EventEnvelope) -> String {
+    format!(
+        "event:{}\nid:{}\ndata:{}\n\n",
+        env.kind.name(),
+        env.seq,
+        serde_json::to_string(env).expect("envelope serializes")
+    )
+}
+
+#[tokio::test]
+async fn unknown_kind_frame_interleaved_keeps_client_in_sync() {
+    // F38 end-to-end: real coord events plus a synthetic frame from a
+    // "future coord" (an EventKind this build has no variant for),
+    // driven through the same parser + reducer path the live TUI
+    // uses. The live coord can't emit an unknown kind — its schema is
+    // closed — so the raw SSE body is assembled from the coord's own
+    // envelopes with the future frame appended, per the work item.
+    use migration_tui::app::{handle_input, Input};
+
+    let (rt, addr, shutdown) = spawn_coord().await;
+    rt.ingest(job_created("alpha")).await.unwrap();
+    rt.ingest(EventKind::ProgressDelta {
+        job_id: jid("alpha"),
+        worker_id: WorkerId::new(),
+        files_delta: 5,
+        bytes_delta: 1024,
+        errors_delta: 0,
+    })
+    .await
+    .unwrap();
+    rt.flush_log().await.unwrap();
+
+    let client = client_for(addr);
+    let evs = client.get_events("alpha", 0).await.expect("events").events;
+    assert_eq!(evs.len(), 2, "harness expects the two ingested events");
+
+    let mut body = String::new();
+    for env in &evs {
+        body.push_str(&sse_frame_for(env));
+    }
+    // The future coord's next event — seq 3, a kind we don't know.
+    body.push_str("event:ShardRebalanced\nid:3\ndata:{\"kind\":\"ShardRebalanced\",\"seq\":3}\n\n");
+    // A keepalive after it proves the stream keeps flowing.
+    body.push_str(": ping\n\n");
+
+    let byte_stream = futures::stream::iter(vec![std::result::Result::<
+        bytes::Bytes,
+        reqwest::Error,
+    >::Ok(bytes::Bytes::from(body))]);
+    let stream = migration_tui::client::parse_sse_stream(byte_stream);
+    tokio::pin!(stream);
+
+    let now = Utc.timestamp_opt(50, 0).unwrap();
+    let mut app = AppState::empty(now);
+    app.mark_connected(now);
+    let mut frames = 0usize;
+    while let Some(frame) = stream.next().await {
+        let frame = frame.expect(
+            "no frame may surface as Err — an Err disconnects the driver \
+             and replays the same frame forever (the F38 reconnect storm)",
+        );
+        handle_input(&mut app, Input::SseFrame(frame), now);
+        frames += 1;
+    }
+    assert_eq!(frames, 4, "2 events + unknown + keepalive all yielded");
+
+    // Client ends in sync with the coord ...
+    let coord_snap = rt.state().await;
+    assert_eq!(app.snapshot.jobs.len(), coord_snap.jobs.len());
+    let alpha = app.job(&jid("alpha")).expect("alpha present");
+    let coord_alpha = coord_snap.jobs.get(&jid("alpha")).unwrap();
+    assert_eq!(alpha.progress, coord_alpha.progress);
+    // ... with the cursor past the unknown frame, the counter bumped,
+    // and the connection never torn down.
+    assert_eq!(app.last_seq(), 3, "resume cursor is past the unknown frame");
+    assert_eq!(app.unknown_events, 1);
+    assert!(matches!(app.connection, ConnectionStatus::Connected { .. }));
+
     shutdown.cancel();
 }
 
