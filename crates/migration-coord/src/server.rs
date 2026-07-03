@@ -168,6 +168,13 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, code, message)
     }
 
+    /// 409 — the request is well-formed and the target exists, but
+    /// the target's current state does not allow it (e.g. pausing a
+    /// cancelled job, ledger F25).
+    pub fn conflict(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
+    }
+
     pub fn unauthorized(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, code, message)
     }

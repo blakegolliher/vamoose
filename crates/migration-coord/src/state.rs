@@ -123,50 +123,63 @@ impl Snapshot {
 
             EventKind::JobPhaseChanged {
                 job_id,
-                from,
+                from: _,
                 to,
                 reason,
-            } => transition_phase(self, job_id, *from, *to, reason, env.at),
+                // The event's `from` is advisory; transition_phase
+                // derives the real one from state and the legality
+                // guard (F25) rejects anything the current phase
+                // does not allow.
+            } => transition_phase(self, job_id, *to, reason, env.at),
 
             EventKind::JobPaused { job_id, reason } => {
-                if let Some(from) = self.jobs.get(job_id).map(|j| j.phase) {
-                    transition_phase(self, job_id, from, Phase::Paused, reason, env.at);
-                }
+                transition_phase(self, job_id, Phase::Paused, reason, env.at);
             }
 
             EventKind::JobResumed { job_id, reason } => {
-                // Resume returns to the last non-paused phase, or
-                // Scanning if there's no history (a paused-at-
-                // creation job).
-                let resume_to = self.jobs.get(job_id).map(|j| {
-                    j.phase_history
-                        .iter()
-                        .rev()
-                        .find(|t| t.from != Phase::Paused)
-                        .map(|t| t.from)
-                        .unwrap_or(Phase::Scanning)
-                });
-                if let Some(resume_to) = resume_to {
-                    transition_phase(self, job_id, Phase::Paused, resume_to, reason, env.at);
+                // Resume is only legal from Paused (F25) — checked
+                // here explicitly because for a non-paused job the
+                // derived target below could otherwise look like a
+                // legal forward transition (e.g. Planned -> Scanning
+                // on empty history).
+                let current = self.jobs.get(job_id).map(|j| j.phase);
+                if current == Some(Phase::Paused) {
+                    // Resume returns to the last non-paused phase, or
+                    // Scanning if there's no history (a paused-at-
+                    // creation job).
+                    let resume_to = self
+                        .jobs
+                        .get(job_id)
+                        .map(|j| {
+                            j.phase_history
+                                .iter()
+                                .rev()
+                                .find(|t| t.from != Phase::Paused)
+                                .map(|t| t.from)
+                                .unwrap_or(Phase::Scanning)
+                        })
+                        .expect("job exists: current phase was read above");
+                    transition_phase(self, job_id, resume_to, reason, env.at);
+                } else if let Some(current) = current {
+                    tracing::warn!(
+                        job = %job_id,
+                        phase = ?current,
+                        reason,
+                        "ignoring JobResumed for a job that is not paused",
+                    );
                 }
             }
 
             EventKind::JobCancelled { job_id, reason } => {
-                if let Some(from) = self.jobs.get(job_id).map(|j| j.phase) {
-                    transition_phase(self, job_id, from, Phase::Cancelled, reason, env.at);
-                }
+                transition_phase(self, job_id, Phase::Cancelled, reason, env.at);
             }
 
             EventKind::JobCompleted { job_id } => {
-                if let Some(from) = self.jobs.get(job_id).map(|j| j.phase) {
-                    transition_phase(self, job_id, from, Phase::Completed, "ok", env.at);
-                }
+                transition_phase(self, job_id, Phase::Completed, "ok", env.at);
             }
 
             EventKind::JobFailed { job_id, reason } => {
-                if let Some(from) = self.jobs.get(job_id).map(|j| j.phase) {
-                    transition_phase(self, job_id, from, Phase::Failed, reason, env.at);
-                }
+                transition_phase(self, job_id, Phase::Failed, reason, env.at);
             }
 
             EventKind::WorkerJoined {
@@ -296,25 +309,21 @@ impl Snapshot {
             }
 
             EventKind::VerifyStarted { job_id } => {
-                if let Some(from) = self.jobs.get(job_id).map(|j| j.phase) {
-                    transition_phase(self, job_id, from, Phase::Verifying, "verify start", env.at);
-                }
+                transition_phase(self, job_id, Phase::Verifying, "verify start", env.at);
             }
 
             EventKind::VerifyCompleted { job_id, mismatches } => {
-                if let Some(from) = self.jobs.get(job_id).map(|j| j.phase) {
-                    let to = if *mismatches == 0 {
-                        Phase::Cutover
-                    } else {
-                        Phase::Failed
-                    };
-                    let reason = if *mismatches == 0 {
-                        "verify ok".to_string()
-                    } else {
-                        format!("verify: {mismatches} mismatches")
-                    };
-                    transition_phase(self, job_id, from, to, &reason, env.at);
-                }
+                let to = if *mismatches == 0 {
+                    Phase::Cutover
+                } else {
+                    Phase::Failed
+                };
+                let reason = if *mismatches == 0 {
+                    "verify ok".to_string()
+                } else {
+                    format!("verify: {mismatches} mismatches")
+                };
+                transition_phase(self, job_id, to, &reason, env.at);
             }
 
             EventKind::VerifyFileMismatch { .. } => {
@@ -344,15 +353,31 @@ fn sentinel_config(source: &str, dest: &str) -> JobConfig {
 fn transition_phase(
     state: &mut Snapshot,
     job_id: &JobId,
-    from: Phase,
     to: Phase,
     reason: &str,
     at: DateTime<Utc>,
 ) {
     if let Some(j) = state.jobs.get_mut(job_id) {
+        // `from` is always the job's actual phase — events that carry
+        // their own `from` (JobPhaseChanged) may disagree with state,
+        // and the history should record what really happened.
+        let from = j.phase;
         // Drop no-op transitions (Paused→Paused etc.) — the operator
         // sees no value in them and they would clutter phase_history.
-        if j.phase == to {
+        if from == to {
+            return;
+        }
+        // Legality guard (ledger F25). Replay compatibility: the log
+        // may carry historical illegal events (pre-guard writers) —
+        // warn and skip, never panic, never apply.
+        if !crate::schema::phase_transition_allowed(from, to) {
+            tracing::warn!(
+                job = %job_id,
+                ?from,
+                ?to,
+                reason,
+                "ignoring illegal phase transition event",
+            );
             return;
         }
         j.phase = to;
@@ -797,6 +822,128 @@ mod tests {
             },
         ));
         assert_eq!(s.jobs[&jid("mary")].phase, Phase::Failed);
+    }
+
+    // =========================================================================
+    // Phase legality in the reducer (ledger F25) — defense in depth
+    // for replay: historical or buggy-writer events carrying illegal
+    // transitions must be warn+no-op, never applied, never a panic.
+    // =========================================================================
+
+    #[test]
+    fn reducer_ignores_illegal_transition_events() {
+        let mut s = Snapshot::empty(at(0));
+
+        // JobPaused against a Cancelled job: Cancelled -> Paused must
+        // not happen.
+        s.apply(&job_created(1, 0, "bobby"));
+        s.apply(&env(
+            2,
+            5,
+            EventKind::JobCancelled {
+                job_id: jid("bobby"),
+                reason: "op".into(),
+            },
+        ));
+        assert_eq!(s.jobs[&jid("bobby")].phase, Phase::Cancelled);
+        let history_before = s.jobs[&jid("bobby")].phase_history.clone();
+        s.apply(&env(
+            3,
+            10,
+            EventKind::JobPaused {
+                job_id: jid("bobby"),
+                reason: "stray".into(),
+            },
+        ));
+        assert_eq!(
+            s.jobs[&jid("bobby")].phase,
+            Phase::Cancelled,
+            "JobPaused on a cancelled job must be a no-op",
+        );
+        assert_eq!(s.jobs[&jid("bobby")].phase_history, history_before);
+        // Bookkeeping still advances — the event was consumed, not applied.
+        assert_eq!(s.last_seq, 3);
+
+        // JobResumed against a non-Paused job: the rewind bug. A
+        // Copying job must not be driven back to Planned (or to
+        // Scanning on empty history).
+        s.apply(&job_created(4, 0, "mary"));
+        s.apply(&env(
+            5,
+            15,
+            EventKind::JobPhaseChanged {
+                job_id: jid("mary"),
+                from: Phase::Planned,
+                to: Phase::Copying,
+                reason: "go".into(),
+            },
+        ));
+        let history_before = s.jobs[&jid("mary")].phase_history.clone();
+        s.apply(&env(
+            6,
+            20,
+            EventKind::JobResumed {
+                job_id: jid("mary"),
+                reason: "stray".into(),
+            },
+        ));
+        assert_eq!(
+            s.jobs[&jid("mary")].phase,
+            Phase::Copying,
+            "JobResumed on a non-paused job must be a no-op",
+        );
+        assert_eq!(s.jobs[&jid("mary")].phase_history, history_before);
+
+        // Terminal states are absorbing: no event moves a job out of
+        // Completed/Failed/Cancelled — not even another terminal event.
+        s.apply(&job_created(7, 0, "sue"));
+        s.apply(&env(8, 25, EventKind::JobCompleted { job_id: jid("sue") }));
+        for (seq, kind) in [
+            (
+                9,
+                EventKind::JobPhaseChanged {
+                    job_id: jid("sue"),
+                    from: Phase::Completed,
+                    to: Phase::Scanning,
+                    reason: "stray".into(),
+                },
+            ),
+            (
+                10,
+                EventKind::JobResumed {
+                    job_id: jid("sue"),
+                    reason: "stray".into(),
+                },
+            ),
+            (
+                11,
+                EventKind::JobPaused {
+                    job_id: jid("sue"),
+                    reason: "stray".into(),
+                },
+            ),
+            (
+                12,
+                EventKind::JobFailed {
+                    job_id: jid("sue"),
+                    reason: "stray".into(),
+                },
+            ),
+            (
+                13,
+                EventKind::JobCancelled {
+                    job_id: jid("sue"),
+                    reason: "stray".into(),
+                },
+            ),
+        ] {
+            s.apply(&env(seq, 30, kind));
+            assert_eq!(
+                s.jobs[&jid("sue")].phase,
+                Phase::Completed,
+                "terminal phases are absorbing (event seq {seq})",
+            );
+        }
     }
 
     // =========================================================================

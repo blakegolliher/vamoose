@@ -526,3 +526,81 @@ async fn fenced_coord_never_acks_commands() {
         "a fenced coord must not write audit rows or event chunks",
     );
 }
+
+// =============================================================================
+// Phase legality (ledger F25) — commands that make no sense for the
+// job's current phase are rejected with 409 before any side effect:
+// no event, no audit row, no phase change.
+// =============================================================================
+
+#[tokio::test]
+async fn pause_on_terminal_job_is_rejected() {
+    let (app, rt, mem) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let (s, _) = post_json(app.clone(), "/jobs/bobby/cancel", None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let last_seq_before = rt.last_seq().await;
+    let audits_before = mem.list("audit/").await.unwrap().len();
+
+    let (status, body) = post_json(app, "/jobs/bobby/pause", None).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "pausing a cancelled job must 409, got body {body}",
+    );
+    assert_eq!(body["code"], "invalid_phase");
+    let msg = body["message"].as_str().unwrap();
+    assert!(
+        msg.contains("Cancelled") && msg.contains("pause"),
+        "message must name the current phase and the command: {msg}",
+    );
+
+    // No side effects leaked.
+    assert_eq!(rt.last_seq().await, last_seq_before, "no event ingested");
+    assert_eq!(
+        mem.list("audit/").await.unwrap().len(),
+        audits_before,
+        "no audit row for a rejected command",
+    );
+    assert_eq!(
+        rt.job_view(&jid("bobby")).await.unwrap().phase,
+        Phase::Cancelled,
+        "phase unchanged",
+    );
+}
+
+#[tokio::test]
+async fn resume_on_non_paused_job_is_rejected() {
+    let (app, rt, mem) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    rt.ingest(EventKind::JobPhaseChanged {
+        job_id: jid("bobby"),
+        from: Phase::Planned,
+        to: Phase::Copying,
+        reason: "start".into(),
+    })
+    .await
+    .unwrap();
+    let history_before = rt.job_view(&jid("bobby")).await.unwrap().phase_history;
+    let audits_before = mem.list("audit/").await.unwrap().len();
+
+    // The rewind bug: resume on a never-paused Copying job used to
+    // drive Copying -> Planned.
+    let (status, body) = post_json(app, "/jobs/bobby/resume", None).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "resuming a non-paused job must 409, got body {body}",
+    );
+    assert_eq!(body["code"], "invalid_phase");
+
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(job.phase, Phase::Copying, "phase must not rewind");
+    assert_eq!(job.phase_history, history_before, "history unchanged");
+    assert_eq!(
+        mem.list("audit/").await.unwrap().len(),
+        audits_before,
+        "no audit row for a rejected command",
+    );
+}
