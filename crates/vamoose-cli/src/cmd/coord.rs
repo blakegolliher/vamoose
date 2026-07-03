@@ -65,6 +65,13 @@ pub struct Args {
     /// `X-Cluster-Secret`.
     #[arg(long)]
     pub cluster_secret_env: Option<String>,
+
+    /// DANGEROUS: permit dev mode (no auth at all) on a non-loopback
+    /// bind. Default is to refuse startup — an unauthenticated coord
+    /// on `0.0.0.0` accepts job control from anyone who can reach the
+    /// port. Intended only for isolated lab networks.
+    #[arg(long)]
+    pub allow_unauthenticated_nonloopback: bool,
 }
 
 pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -73,13 +80,27 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
     let s3 = build_s3(&cfg).await?;
     let store: Arc<dyn CoordStore> = Arc::new(S3Store::new(s3));
 
-    // 2. Auth.
+    // 2. Auth. F21: dev mode (no tokens, no cluster secret) must not
+    //    silently bind a non-loopback address — refuse startup unless
+    //    the operator opted in explicitly.
     let auth = build_auth(&args)?;
+    check_dev_mode_bind(
+        auth.is_dev_mode(),
+        &args.listen,
+        args.allow_unauthenticated_nonloopback,
+    )?;
     if auth.is_dev_mode() {
         tracing::warn!(
             "coord running in DEV MODE — no admin tokens, no cluster secret. \
              Audit log will record token_label='dev-mode'. Do not use in production."
         );
+        if !args.listen.ip().is_loopback() {
+            tracing::warn!(
+                listen = %args.listen,
+                "DEV MODE on a NON-LOOPBACK bind (--allow-unauthenticated-nonloopback): \
+                 anyone who can reach this port has full unauthenticated job control",
+            );
+        }
     }
 
     // 3. Identity for the lease.
@@ -194,6 +215,30 @@ async fn build_s3(cfg: &Config) -> anyhow::Result<S3Client> {
     Ok(client)
 }
 
+/// F21 gate: refuse to start an unauthenticated (dev-mode) coord on a
+/// non-loopback bind unless the operator passed the explicit escape
+/// hatch. Pure over its three inputs so the policy is unit-testable
+/// without binding sockets. Default DENY: with no tokens and no
+/// cluster secret, the default `--listen 0.0.0.0:8443` would otherwise
+/// expose full unauthenticated job control to the network.
+fn check_dev_mode_bind(
+    dev_mode: bool,
+    listen: &SocketAddr,
+    allow_unauthenticated_nonloopback: bool,
+) -> anyhow::Result<()> {
+    if !dev_mode || listen.ip().is_loopback() || allow_unauthenticated_nonloopback {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to bind {listen} without authentication: no admin tokens and no \
+         cluster secret are configured (dev mode), and {ip} is not a loopback \
+         address. Configure auth via --admin-tokens and/or --cluster-secret-env, \
+         bind a loopback address (e.g. --listen 127.0.0.1:8443), or — for \
+         isolated lab networks only — pass --allow-unauthenticated-nonloopback.",
+        ip = listen.ip(),
+    )
+}
+
 fn build_auth(args: &Args) -> anyhow::Result<AuthConfig> {
     let mut auth = AuthConfig::default();
 
@@ -274,5 +319,62 @@ mod tests {
         rt.ingest(job_created()).await.unwrap();
         let res = finish_shutdown(&rt, 3).await;
         assert!(res.is_ok(), "clean shutdown must exit zero, got {res:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // F21: dev mode (no auth) must not bind non-loopback by default
+    // ------------------------------------------------------------------
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Dev mode + a non-loopback bind is an open unauthenticated
+    /// control plane. Startup must refuse, and the error must name
+    /// the ways out: configure auth (`--admin-tokens` /
+    /// `--cluster-secret-env`) or opt in explicitly
+    /// (`--allow-unauthenticated-nonloopback`).
+    #[test]
+    fn dev_mode_nonloopback_refused() {
+        for bind in ["0.0.0.0:8443", "[::]:8443", "10.1.2.3:8443"] {
+            let err = check_dev_mode_bind(true, &addr(bind), false)
+                .expect_err(&format!("dev mode on {bind} must be refused"));
+            let msg = format!("{err:#}");
+            for flag in [
+                "--admin-tokens",
+                "--cluster-secret-env",
+                "--allow-unauthenticated-nonloopback",
+            ] {
+                assert!(msg.contains(flag), "error must name {flag}, got: {msg}");
+            }
+        }
+    }
+
+    /// Loopback binds stay fine in dev mode — that is what dev mode
+    /// is for (the caller logs the existing DEV MODE warning).
+    #[test]
+    fn dev_mode_loopback_ok() {
+        for bind in ["127.0.0.1:8443", "[::1]:8443"] {
+            check_dev_mode_bind(true, &addr(bind), false)
+                .unwrap_or_else(|e| panic!("loopback {bind} must be allowed in dev mode: {e:#}"));
+        }
+    }
+
+    /// With auth configured, any bind address is acceptable.
+    #[test]
+    fn authed_any_bind_ok() {
+        for bind in ["0.0.0.0:8443", "[::]:8443", "10.1.2.3:8443", "127.0.0.1:1"] {
+            check_dev_mode_bind(false, &addr(bind), false)
+                .unwrap_or_else(|e| panic!("authed bind {bind} must be allowed: {e:#}"));
+        }
+    }
+
+    /// The explicit escape hatch overrides the refusal (lab flows);
+    /// it changes nothing when auth is configured or the bind is
+    /// loopback.
+    #[test]
+    fn escape_hatch_allows_dev_mode_nonloopback() {
+        check_dev_mode_bind(true, &addr("0.0.0.0:8443"), true)
+            .expect("--allow-unauthenticated-nonloopback must permit the bind");
     }
 }
