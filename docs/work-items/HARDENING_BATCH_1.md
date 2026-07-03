@@ -1,6 +1,26 @@
 # Hardening batch 1 — small, independent operator-facing fixes
 
-Status: open — not started.
+Status: in review — items A–G on branch `hardening-batch-1`, one
+commit per item, full gate green. Per-item outcomes:
+
+- A (F17): fixed — watchdog exits 2 on any wedge (decision: 2 for
+  wedged-after-fenced too; run outcome goes in the stderr line).
+- B (F27): fixed — `install_panic_hook()` + shared
+  `restore_terminal()`; `VAMOOSE_TUI_PANIC_AFTER_MS` manual hook.
+- C (F21): fixed — default DENY dev mode on non-loopback binds;
+  escape hatch `--allow-unauthenticated-nonloopback`.
+- D (F37): fixed — `_cluster`, `.`/`..`, control chars, >128 bytes
+  rejected; worker side is operator-set config validated at startup,
+  no clamping needed.
+- E (F35): fixed — decision: typed `Err(UringError::Unimplemented)`
+  rather than deletion (pool is the published M3.5 API surface).
+- F (F33): fixed — 15 lines → `tracing::debug!(target: "shutdown")`;
+  `libc::write` exit-path lines left alone; `RUST_LOG=shutdown=debug`
+  documented in the orchestrator module doc.
+- G (F31): done — clap `debug_assert`, config fixtures, dual-format
+  seam pinned, `parse_size` table. F45 decision: NOT a one-liner
+  (ripples through `cmd::doctor`); current behavior pinned by test,
+  F45 stays open.
 Ledger: F17, F21, F27, F31, F33, F35, F37 in `docs/REVIEW_LEDGER.md`.
 Priority: medium — each small; batched for one session.
 Scope: worker, coord, tui, cli, mover — disjoint small diffs.
@@ -98,10 +118,11 @@ leave F45 open); (3) `logging::parse_size` table test ("50 MiB",
 
 ## Definition of done
 
-- [ ] Every item's tests written before its fix; reds observed where
+- [x] Every item's tests written before its fix; reds observed where
       marked.
-- [ ] Full gate green after the batch (fmt, clippy, workspace tests,
+- [x] Full gate green after the batch (fmt, clippy, workspace tests,
       deny).
 - [ ] Ledger rows F17/F21/F27/F31/F33/F35/F37 updated individually
       (an item can land `wontfix` with a reason — say so in the row).
-- [ ] This doc's Status flipped.
+      (Coordinator: ledger is updated separately, not on this branch.)
+- [x] This doc's Status flipped.
