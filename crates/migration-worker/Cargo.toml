@@ -59,3 +59,10 @@ axum = { workspace = true }
 migration-core = { workspace = true, features = ["test-util"] }
 # `start_paused` mock time for the two-live-workers harness.
 tokio = { workspace = true, features = ["test-util"] }
+# Used by tests/worker_error_classification.rs (F13) to construct
+# the migration-core Error variants the classifier table covers.
+# All three are already compiled as migration-core dependencies, so
+# they add no new build cost.
+parquet = { workspace = true }
+arrow = { workspace = true }
+aws-sdk-s3 = { workspace = true }

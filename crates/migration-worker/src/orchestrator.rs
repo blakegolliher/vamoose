@@ -29,8 +29,10 @@ use crate::shard_processor::{ProcessOutcome, ShardProcessor};
 use crate::throughput::ThroughputCounter;
 
 use migration_core::claim::{
-    self, AcquireOutcome, ClaimStore, CompleteOutcome, FailOutcome, ListEntry, ReclaimOutcome,
+    self, AcquireOutcome, ClaimStore, CompleteOutcome, DeleteOutcome, FailOutcome, ListEntry,
+    ReclaimOutcome,
 };
+use migration_core::errors::Error as CoreError;
 use migration_core::fence::Fence;
 use migration_core::layout;
 use migration_core::overlap;
@@ -46,7 +48,7 @@ use migration_mover::{
     LibnfsContextPool, Mover, MoverConfig, MultiPool,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -359,6 +361,12 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     );
     // Cross-pass claim-body cache. See `ClaimBodyCache` doc.
     let mut claim_body_cache: ClaimBodyCache = HashMap::new();
+    // F13: per-run skip set. Shards this worker released after a
+    // worker-local `process()` error — this process never re-claims
+    // them (a healthy peer takes them instead), but they still count
+    // toward `all_terminal` via their true claim state. See
+    // `handle_process_error` and `classify_shard_error`.
+    let mut skip_shards: HashSet<String> = HashSet::new();
 
     loop {
         if !fence.is_valid() {
@@ -442,6 +450,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
                 lease,
                 cfg.worker.heartbeat_sec,
                 &mut claim_body_cache,
+                &skip_shards,
             )
             .await?
         };
@@ -601,65 +610,36 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         let outcome = match processor.process(&scratch).await {
             Ok(o) => o,
             Err(e) => {
-                // Shard-fatal: the parquet won't decode, or a row
-                // schema is malformed. A peer reclaiming after lease
-                // expiry would just hit the same error → infinite
-                // fleet-wide reclaim loop. Mark the claim `Failed`
-                // (terminal, scanners skip it) and continue to the
-                // next shard. Operator inspects the error log + the
-                // Failed claim record and re-uploads / re-indexes.
-                tracing::error!(
-                    error = ?e,
-                    shard = %shard_filename,
-                    "shard-fatal error; marking claim Failed and moving on",
-                );
                 // Best-effort scratch cleanup before we give up on
                 // this shard.
                 if let Err(rm) = tokio::fs::remove_file(&scratch).await {
                     tracing::warn!(
                         error = ?rm,
                         scratch = %scratch.display(),
-                        "scratch cleanup failed (post-shard-fatal)",
+                        "scratch cleanup failed (post-shard-error)",
                     );
                 }
-                // Same R4 reasoning as the complete() path: clear the
-                // held-claim cell BEFORE calling fail() so the
-                // heartbeat doesn't fence us on the transient absent
-                // window between DELETE and PUT.
-                let (fail_etag, fail_epoch) = {
-                    let mut g = current.lock().await;
-                    let (e, ep) = match g.as_ref() {
-                        Some(c) if c.shard == shard_filename => (c.etag.clone(), c.epoch),
-                        _ => (etag.clone(), record.epoch),
-                    };
-                    *g = None;
-                    (e, ep)
-                };
-                match claim::fail(&*s3, &shard_filename, &fail_etag, &host_id, fail_epoch).await {
-                    Ok(FailOutcome::Failed { .. }) => {
-                        tracing::warn!(
-                            shard = %shard_filename,
-                            "claim marked Failed (terminal); requires operator follow-up",
-                        );
-                    }
-                    Ok(FailOutcome::Lost) => {
-                        // Another worker took over while we were
-                        // processing — they'll hit the same error and
-                        // mark Failed themselves. Drop the claim
-                        // cleanly here.
-                        tracing::warn!(
-                            shard = %shard_filename,
-                            "claim lost while marking Failed; new owner will retry-then-fail",
-                        );
-                    }
-                    Err(write_err) => {
-                        tracing::warn!(
-                            error = ?write_err,
-                            shard = %shard_filename,
-                            "claim Failed write errored; shard will remain Active until lease expiry",
-                        );
-                    }
-                }
+                // F13: classify before deciding the claim's fate.
+                // Shard-fatal (corrupt parquet, undecodable rows) →
+                // terminal `Failed`, as before. Worker-local (stale
+                // binary, scratch I/O, S3 hiccup) → release the claim
+                // for a healthy peer, skip the shard locally, and
+                // back off before re-scanning. See
+                // `handle_process_error` / `classify_shard_error`.
+                handle_process_error(
+                    ProcessErrorContext {
+                        store: &*s3,
+                        host_id: &host_id,
+                        shard_filename: &shard_filename,
+                        current: &current,
+                        fallback_etag: &etag,
+                        fallback_epoch: record.epoch,
+                        heartbeat_sec: cfg.worker.heartbeat_sec,
+                    },
+                    &e,
+                    &mut skip_shards,
+                )
+                .await;
                 continue;
             }
         };
@@ -1050,12 +1030,20 @@ enum ProgressFetch {
 /// path. `heartbeat_sec` is this scanner's configured heartbeat
 /// interval — used as the fresh-claim grace calibration when the
 /// owner has no progress object to read a writer-side value from.
+///
+/// `skip_shards` (F13) is this worker's per-run release-and-skip set:
+/// shards it released after a worker-local `process()` error. A
+/// skipped shard is never offered as `next_target` (this worker must
+/// not thrash re-claiming it), but its true claim state still counts
+/// toward `all_terminal` — so the worker exits normally once healthy
+/// peers drive every shard terminal.
 pub async fn scan_shards(
     store: &dyn ClaimStore,
     manifest: &Manifest,
     lease: Duration,
     heartbeat_sec: u64,
     claim_body_cache: &mut ClaimBodyCache,
+    skip_shards: &HashSet<String>,
 ) -> anyhow::Result<ScanResult> {
     let entries = store.list(layout::SHARDS_PREFIX).await?;
     let by_key: HashMap<String, &ListEntry> = entries.iter().map(|e| (e.key.clone(), e)).collect();
@@ -1080,13 +1068,16 @@ pub async fn scan_shards(
     for shard in &manifest.shards {
         let shard_filename = key_basename(&shard.key).to_string();
         let claim_key = layout::claim_key(&shard_filename);
+        // F13: a skipped shard is never a claim target for this
+        // worker, but its claim state still feeds `all_terminal`.
+        let skipped = skip_shards.contains(&shard_filename);
 
         let entry = by_key.get(claim_key.as_str()).copied();
 
         match entry {
             None => {
                 all_terminal = false;
-                if next.is_none() {
+                if next.is_none() && !skipped {
                     next = Some(ClaimTarget::Free {
                         shard: shard_filename.clone(),
                     });
@@ -1103,7 +1094,7 @@ pub async fn scan_shards(
                     _ => {
                         let Some((body, _)) = store.get(&claim_key).await? else {
                             all_terminal = false;
-                            if next.is_none() {
+                            if next.is_none() && !skipped {
                                 next = Some(ClaimTarget::Free {
                                     shard: shard_filename.clone(),
                                 });
@@ -1152,7 +1143,7 @@ pub async fn scan_shards(
                         // dedupe by host within a single pass so M
                         // active shards owned by N hosts cost at most
                         // N progress GETs.
-                        let stale_by_progress = if next.is_none() && !stale_by_lease {
+                        let stale_by_progress = if next.is_none() && !skipped && !stale_by_lease {
                             let fetch = match progress_cache.get(&record.host).cloned() {
                                 Some(cached) => cached,
                                 None => {
@@ -1195,7 +1186,7 @@ pub async fn scan_shards(
                         } else {
                             false
                         };
-                        if (stale_by_lease || stale_by_progress) && next.is_none() {
+                        if (stale_by_lease || stale_by_progress) && next.is_none() && !skipped {
                             next = Some(ClaimTarget::Stale {
                                 shard: shard_filename.clone(),
                                 stale_etag: e.etag.clone(),
@@ -1434,6 +1425,244 @@ async fn backoff_after_lost_race(heartbeat_sec: u64) {
     };
     let total_ms = base_ms + jitter_ms;
     tokio::time::sleep(Duration::from_millis(total_ms)).await;
+}
+
+// =============================================================================
+// F13: shard-error classification (worker-local vs shard-fatal)
+// =============================================================================
+
+/// Classification of an error returned by `ShardProcessor::process`.
+///
+/// The `fail()` contract (`docs/CLAIM_PROTOCOL.md`) reserves the
+/// terminal `Failed` state for errors "that would re-occur for any
+/// worker reclaiming the shard." Everything else is a property of
+/// *this* worker and must not poison the shard fleet-wide. See
+/// `docs/work-items/WORKER_ERROR_CLASSIFICATION.md` (ledger F13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardErrorClass {
+    /// A property of the shard bytes: any worker reclaiming the shard
+    /// hits the same error. The claim is marked terminal `Failed` so
+    /// the fleet stops cycling it and an operator intervenes.
+    Fatal,
+    /// A property of THIS worker (binary version, local scratch,
+    /// network path to S3, claim-plane state). A healthy peer can
+    /// process the shard; the worker releases the claim and skips the
+    /// shard locally instead of terminal-failing it.
+    WorkerLocal,
+}
+
+/// Pure classifier over the migration-core error taxonomy. Public for
+/// in-process integration tests (F13 acceptance test 1).
+///
+/// Row-level per-file failures never reach this function — they are
+/// recorded in the failures sink by `record_outcome` and `process()`
+/// still returns `Ok`. This classifier only sees whole-shard errors.
+pub fn classify_shard_error(e: &CoreError) -> ShardErrorClass {
+    match e {
+        // Shard-fatal: the shard's bytes/schema are bad. Reclaim by a
+        // peer would deterministically re-fail.
+        CoreError::ShardCorrupt { .. }
+        | CoreError::CorruptRow { .. }
+        | CoreError::MissingColumn(_)
+        | CoreError::Parquet(_)
+        | CoreError::Arrow(_) => ShardErrorClass::Fatal,
+
+        // `Other` carries untyped errors — today that's the shard
+        // reader's "unexpected arrow type" (a shard-schema property).
+        // It is also the conservative default for anything a future
+        // refactor forgets to type: an unknown misclassified as Fatal
+        // degrades to the old loud, operator-visible failure mode
+        // rather than an unbounded fleet-wide claim/release loop.
+        CoreError::Other(_) => ShardErrorClass::Fatal,
+
+        // Worker-local: nothing about the shard itself is wrong.
+        //  - SchemaVersionMismatch: this binary is stale for the
+        //    shard's format_version; a current peer reads it fine.
+        //  - Io: local scratch (EIO/ENOMEM reading the downloaded
+        //    parquet) — host-specific.
+        //  - S3: transport to the bucket — host/network-specific.
+        //    (Retry policy for these on scan/acquire is F42, not
+        //    built here.)
+        //  - Json: control-plane bodies (claim/progress/manifest),
+        //    never shard bytes.
+        //  - PreconditionFailed / ClaimInvalidated: claim-plane
+        //    signals about our ownership, not about the shard.
+        //  - ManifestChanged / SourceDestOverlap: run-level guards;
+        //    the worker stops, the shard is untouched.
+        CoreError::SchemaVersionMismatch { .. }
+        | CoreError::Io(_)
+        | CoreError::S3(_)
+        | CoreError::Json(_)
+        | CoreError::PreconditionFailed
+        | CoreError::ClaimInvalidated(_)
+        | CoreError::ManifestChanged { .. }
+        | CoreError::SourceDestOverlap { .. } => ShardErrorClass::WorkerLocal,
+    }
+}
+
+/// Inputs `handle_process_error` borrows from the orchestrator loop.
+/// Grouped in a struct so the handler stays callable from in-process
+/// integration tests (F13 acceptance tests 2, 3, 5) without a live
+/// `run()`.
+pub struct ProcessErrorContext<'a> {
+    pub store: &'a dyn ClaimStore,
+    pub host_id: &'a str,
+    pub shard_filename: &'a str,
+    /// The shared held-claim cell. Cleared BEFORE any claim write
+    /// (same R4 reasoning as `complete()`) so the heartbeat doesn't
+    /// fence the worker on the transient absent/replaced window.
+    pub current: &'a Mutex<Option<HeldClaim>>,
+    /// Ownership proof used if the cell no longer carries this shard.
+    pub fallback_etag: &'a str,
+    pub fallback_epoch: u64,
+    /// Calibrates the release-path backoff (same base as the
+    /// contention backoff: `heartbeat_sec / 4` + jitter).
+    pub heartbeat_sec: u64,
+}
+
+/// Handle a `processor.process()` error for the shard we currently
+/// hold. Public for in-process integration tests; the orchestrator
+/// loop calls this from its process-error arm and then `continue`s.
+///
+/// - [`ShardErrorClass::Fatal`] → unchanged pre-F13 behavior: write a
+///   terminal `Failed` claim via `claim::fail` so scanners skip the
+///   shard and an operator intervenes.
+/// - [`ShardErrorClass::WorkerLocal`] → release the claim with the
+///   worker's own held etag via the existing delete-if-match atom
+///   (spec-clean: the owner deletes its own claim; the shard returns
+///   to Free and a healthy peer picks it up), record the shard in the
+///   per-run skip set so THIS worker never re-claims it, and sleep
+///   the contention backoff so a fleet-wide transient (e.g. an S3
+///   blip) doesn't become a claim/release storm. The error is NOT
+///   retried in place — release-and-skip keeps the failure domain
+///   small (see the work item's "Out of scope").
+///
+/// Returns the classification so callers/tests can assert on it.
+pub async fn handle_process_error(
+    ctx: ProcessErrorContext<'_>,
+    error: &anyhow::Error,
+    skip_shards: &mut HashSet<String>,
+) -> ShardErrorClass {
+    let class = error
+        .downcast_ref::<CoreError>()
+        .map(classify_shard_error)
+        // Errors that aren't typed migration-core errors are
+        // unmatchable — same conservative default as
+        // `CoreError::Other` (see `classify_shard_error`).
+        .unwrap_or(ShardErrorClass::Fatal);
+
+    // Same R4 reasoning as the complete() path: snapshot the held
+    // etag/epoch AND clear the held-claim cell in a single lock-held
+    // block, BEFORE the claim write below. Both arms transiently
+    // remove (release) or replace (fail) the claim object on S3; a
+    // heartbeat HEAD during that window would otherwise spuriously
+    // fence the worker.
+    let (held_etag, held_epoch) = {
+        let mut g = ctx.current.lock().await;
+        let (e, ep) = match g.as_ref() {
+            Some(c) if c.shard == ctx.shard_filename => (c.etag.clone(), c.epoch),
+            _ => (ctx.fallback_etag.to_string(), ctx.fallback_epoch),
+        };
+        *g = None;
+        (e, ep)
+    };
+
+    match class {
+        ShardErrorClass::WorkerLocal => {
+            tracing::error!(
+                error = ?error,
+                shard = %ctx.shard_filename,
+                classification = "worker-local",
+                "worker-local shard error; releasing claim for a healthy peer \
+                 and skipping this shard locally (NOT marking Failed)",
+            );
+            // Release via the existing delete-if-match atom. We own
+            // `held_etag`, so this is spec-clean deletion by the
+            // owner — no new terminal state, no PUT If-Match.
+            let claim_key = layout::claim_key(ctx.shard_filename);
+            match ctx.store.delete_if_match(&claim_key, &held_etag).await {
+                Ok(DeleteOutcome::Deleted) => {
+                    tracing::warn!(
+                        shard = %ctx.shard_filename,
+                        "claim released; shard is Free for healthy peers",
+                    );
+                }
+                Ok(DeleteOutcome::EtagMismatch | DeleteOutcome::NotFound) => {
+                    // Someone already reclaimed or replaced the claim
+                    // — nothing of ours left to release.
+                    tracing::warn!(
+                        shard = %ctx.shard_filename,
+                        "claim already replaced while releasing; nothing to do",
+                    );
+                }
+                Err(release_err) => {
+                    // Leave the claim Active; a peer reclaims it via
+                    // the lease / progress-cross-check path (bounded
+                    // recovery). Never fall back to fail() here.
+                    tracing::warn!(
+                        error = ?release_err,
+                        shard = %ctx.shard_filename,
+                        "claim release errored; shard stays Active until a \
+                         peer reclaims via lease/cross-check",
+                    );
+                }
+            }
+            // Per-run skip set: this worker never re-claims the shard,
+            // so a persistent local fault (stale binary, sick scratch
+            // disk) can't thrash claim/release cycles on it.
+            skip_shards.insert(ctx.shard_filename.to_string());
+            // Reuse the contention backoff before the caller re-scans
+            // so a fleet-wide transient spreads out across workers.
+            backoff_after_lost_race(ctx.heartbeat_sec).await;
+        }
+        ShardErrorClass::Fatal => {
+            // Unchanged pre-F13 behavior: the parquet won't decode, or
+            // a row schema is malformed. A peer reclaiming after lease
+            // expiry would just hit the same error → infinite
+            // fleet-wide reclaim loop. Mark the claim `Failed`
+            // (terminal, scanners skip it); the operator inspects the
+            // error log + Failed record and re-uploads / re-indexes.
+            tracing::error!(
+                error = ?error,
+                shard = %ctx.shard_filename,
+                classification = "shard-fatal",
+                "shard-fatal error; marking claim Failed and moving on",
+            );
+            match claim::fail(
+                ctx.store,
+                ctx.shard_filename,
+                &held_etag,
+                ctx.host_id,
+                held_epoch,
+            )
+            .await
+            {
+                Ok(FailOutcome::Failed { .. }) => {
+                    tracing::warn!(
+                        shard = %ctx.shard_filename,
+                        "claim marked Failed (terminal); requires operator follow-up",
+                    );
+                }
+                Ok(FailOutcome::Lost) => {
+                    // Another worker took over while we were
+                    // processing — they'll hit the same error and
+                    // mark Failed themselves. Drop the claim cleanly.
+                    tracing::warn!(
+                        shard = %ctx.shard_filename,
+                        "claim lost while marking Failed; new owner will retry-then-fail",
+                    );
+                }
+                Err(write_err) => {
+                    tracing::warn!(
+                        error = ?write_err,
+                        shard = %ctx.shard_filename,
+                        "claim Failed write errored; shard will remain Active until lease expiry",
+                    );
+                }
+            }
+        }
+    }
+    class
 }
 
 // Touch the imported types so cargo doesn't warn about unused names

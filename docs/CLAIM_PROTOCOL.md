@@ -125,6 +125,25 @@ worker B reclaims → also bails → repeat. `Failed` is terminal for
 the scanner, so the loop terminates and an operator can see the
 record and intervene.
 
+**Worker-local errors never go through `fail` (F13).** The
+orchestrator classifies every `process()` error
+(`classify_shard_error` in `orchestrator.rs`): only errors that are
+a property of the shard's bytes — corrupt parquet, undecodable rows,
+contract-violating schema — are shard-fatal and mark the claim
+`Failed`. Errors that are a property of the *worker* — a stale
+binary's `SchemaVersionMismatch`, local scratch I/O failures, S3
+download errors — instead **release** the claim with the worker's
+own held etag via the existing `DELETE If-Match` atom (spec-clean:
+the owner deleting its own claim; no new terminal state, no
+`PUT If-Match`) and record the shard in a per-run in-memory skip
+set. The shard returns to Free and a healthy peer picks it up; the
+skip set keeps the sick worker from thrashing claim/release cycles
+on the same shard, and the release path reuses the contention
+backoff so a fleet-wide transient (e.g. an S3 blip) doesn't become
+a claim/release storm. Without this split, one stale or sick worker
+would terminal-`Fail` shards the rest of the fleet could process —
+rows silently never copied unless an operator noticed.
+
 #### Terminal-state PUT retry
 
 Both `complete` and `fail` retry the new-state `PUT If-None-Match: *`

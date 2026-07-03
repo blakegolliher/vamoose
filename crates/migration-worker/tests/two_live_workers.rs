@@ -19,7 +19,7 @@
 //!   after acquiring must still be reclaimed once the grace window
 //!   elapses, long before the lease window.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -112,9 +112,18 @@ fn spawn_worker(
             if !fence.is_valid() {
                 break fence.reason();
             }
-            let scan = scan_shards(&*store, &manifest, lease, heartbeat_sec, &mut cache)
-                .await
-                .expect("scan_shards");
+            // Empty skip set: the mini worker exercises no F13
+            // release-and-skip path.
+            let scan = scan_shards(
+                &*store,
+                &manifest,
+                lease,
+                heartbeat_sec,
+                &mut cache,
+                &HashSet::new(),
+            )
+            .await
+            .expect("scan_shards");
             if scan.all_terminal {
                 break None;
             }
