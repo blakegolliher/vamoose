@@ -285,6 +285,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         throughput: throughput.clone(),
         throughput_window_secs: 60,
         coord_fence: coord_fence_tx,
+        clock: Arc::new(crate::heartbeat::SystemDriftClock),
     };
     let hb_handle = tokio::spawn(async move { hb.run().await });
 
