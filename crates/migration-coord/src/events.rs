@@ -188,6 +188,23 @@ impl EventLogWriter {
         self.chunks.values().map(|c| c.buf.len()).sum()
     }
 
+    /// Snapshot every buffered (not-yet-flushed) envelope with
+    /// `seq > since`, across all routes, ascending by seq. The SSE
+    /// catch-up path reads this so a client resuming while events
+    /// sit in the writer buffer does not miss the tail between the
+    /// last flushed chunk and the live broadcast.
+    pub fn unflushed_since(&self, since: u64) -> Vec<EventEnvelope> {
+        let mut out: Vec<EventEnvelope> = self
+            .chunks
+            .values()
+            .flat_map(|c| c.buf.iter())
+            .filter(|e| e.seq > since)
+            .cloned()
+            .collect();
+        out.sort_by_key(|e| e.seq);
+        out
+    }
+
     /// Test-only — number of open chunks (used to assert flush
     /// behavior).
     #[cfg(test)]
@@ -419,6 +436,27 @@ mod tests {
         w.flush_aged(&s, base() + Duration::days(1)).await.unwrap();
         w.flush_all(&s).await.unwrap();
         assert!(s.list("events/").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unflushed_since_returns_buffered_tail_across_routes() {
+        let s = MemStore::new();
+        let mut w = EventLogWriter::new(small_cfg());
+        // Interleave two routes so the tail spans chunks; keep each
+        // below the flush threshold (3).
+        w.append(&s, env_for_job(1, base(), "bobby")).await.unwrap();
+        w.append(&s, env_cluster(2, base())).await.unwrap();
+        w.append(&s, env_for_job(3, base(), "bobby")).await.unwrap();
+
+        let all = w.unflushed_since(0);
+        assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 3]);
+
+        let tail = w.unflushed_since(2);
+        assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), [3]);
+
+        // Flushed events leave the tail.
+        w.flush_all(&s).await.unwrap();
+        assert!(w.unflushed_since(0).is_empty());
     }
 
     #[tokio::test]

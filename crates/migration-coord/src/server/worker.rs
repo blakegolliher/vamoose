@@ -30,6 +30,18 @@
 //! - **POST /workers/{id}/fence** — self-fence. Body: `{reason}`.
 //!   Coord emits `WorkerFenced`, which the reducer routes to the
 //!   worker's state.
+//!
+//! ## Ack durability
+//!
+//! Every event-emitting endpoint force-flushes the event log before
+//! responding (flush-before-ack, ledger F03). A 200 with seqs means
+//! the events survive a coord crash — the worker drops acked events
+//! from its bounded resend buffer, so acking a RAM-only event would
+//! be silent data loss. Batches amortize: appends past
+//! `max_events_per_chunk` flush at the threshold, and the final
+//! flush writes at most one chunk per route. The flush is fenced on
+//! the lease ([`crate::runtime::CoordRuntime::flush_log`]); a
+//! deposed coord fails the request instead of acking.
 
 use super::{ApiError, AppState};
 use crate::schema::{ControlMode, EventKind, JobId, WorkerCounters, WorkerId, WorkerState};
@@ -111,6 +123,9 @@ pub async fn register(
         })
         .await
         .map_err(ApiError::storage)?;
+    // Ack == durable: the returned worker_id is only valid if the
+    // WorkerJoined (and any WorkerLeft) events survive a crash.
+    state.runtime.flush_log().await.map_err(ApiError::storage)?;
     Ok(Json(RegisterResponse {
         worker_id,
         superseded,
@@ -254,6 +269,11 @@ pub async fn events_batch(
         };
         seqs.push(seq);
     }
+    // Ack == durable (ledger F03): the worker treats returned seqs
+    // as delivered and drops them from its resend buffer, so the
+    // buffered chunks must hit the store before we respond. Fenced
+    // on the lease — a deposed coord fails here instead of acking.
+    state.runtime.flush_log().await.map_err(ApiError::storage)?;
     Ok(Json(EventsBatchResponse { seqs }))
 }
 
@@ -285,5 +305,8 @@ pub async fn fence(
         })
         .await
         .map_err(ApiError::storage)?;
+    // Ack == durable: the fence event carries safety semantics — it
+    // must not evaporate in a coord crash after the worker saw 200.
+    state.runtime.flush_log().await.map_err(ApiError::storage)?;
     Ok(Json(FenceResponse { seq }))
 }

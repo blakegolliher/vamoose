@@ -6,7 +6,12 @@
 //! 3. Ingests the corresponding event so the SSE stream broadcasts
 //!    the state change and the reducer updates `phase` /
 //!    `phase_history`.
-//! 4. Returns `{ command_id }`.
+//! 4. Force-flushes the event log (flush-before-ack, ledger F03).
+//!    A 200 means the command survives a coord crash — a pause
+//!    that only ever lived in the writer buffer would silently
+//!    un-pause on failover. The flush is fenced on the lease, so a
+//!    deposed coord fails the request instead of acking.
+//! 5. Returns `{ command_id }`.
 //!
 //! Workers don't observe these commands directly in Phase 2. The
 //! pause/resume/cancel/drain semantics are realized by the worker
@@ -80,6 +85,9 @@ async fn record_and_ingest(
         .ingest(kind)
         .await
         .map_err(ApiError::storage)?;
+    // Ack == durable (ledger F03): the event must hit the store
+    // before the operator sees 200.
+    state.runtime.flush_log().await.map_err(ApiError::storage)?;
     Ok(CommandAccepted { command_id })
 }
 

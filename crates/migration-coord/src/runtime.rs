@@ -512,6 +512,18 @@ impl CoordRuntime {
         self.bus.subscribe()
     }
 
+    /// Read-only accessor for the event-log writer's unflushed
+    /// in-memory tail. The SSE catch-up path holds this instead of
+    /// a full `CoordRuntime` clone: it shares the inner state but
+    /// NOT the broadcast sender, so a long-lived stream body does
+    /// not keep the event bus alive (dropping every runtime handle
+    /// still closes the channel and ends the stream).
+    pub fn tail_reader(&self) -> EventTailReader {
+        EventTailReader {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     /// Subscriber count. Useful for `/healthz` and tests.
     pub fn subscriber_count(&self) -> usize {
         self.bus.receiver_count()
@@ -628,6 +640,27 @@ impl CoordRuntime {
         let handle = self.lease_handle().await;
         lease::release(self.store.as_ref(), &handle).await?;
         Ok(())
+    }
+}
+
+/// See [`CoordRuntime::tail_reader`]. Clones share the runtime's
+/// inner state; none of them hold the broadcast sender.
+#[derive(Clone)]
+pub struct EventTailReader {
+    inner: Arc<Mutex<RuntimeInner>>,
+}
+
+impl EventTailReader {
+    /// Snapshot every buffered (not-yet-flushed) envelope with
+    /// `seq > since`, ascending by seq.
+    pub async fn unflushed_since(&self, since: u64) -> Vec<EventEnvelope> {
+        self.inner.lock().await.writer.unflushed_since(since)
+    }
+}
+
+impl std::fmt::Debug for EventTailReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventTailReader").finish_non_exhaustive()
     }
 }
 
