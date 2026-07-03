@@ -14,8 +14,13 @@
 //! if the contract's table format changes, this test fails loudly and
 //! should be updated alongside it — that is drift detection working,
 //! not a bug in the test.
+//!
+//! Lives in `src/` (compiled into the lib test binary) rather than
+//! `tests/` deliberately: each `tests/*.rs` file links its own
+//! full-workspace debug binary, and CI runners have been tipped into
+//! linker SIGBUS (disk exhaustion) by exactly one binary too many.
 
-use migration_core::schema;
+use crate::schema;
 
 /// A column row scraped from a contract markdown table:
 /// (name, arrow type as written, nullable).
