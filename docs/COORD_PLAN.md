@@ -228,7 +228,10 @@ Acceptance:
   drop the process, restart — state reconstitutes byte-identical (modulo
   `last_seen` timestamps from re-replay).
 - Snapshot fires at both thresholds.
-- `JobCompleted` rolls the event log to `archivelogs/`.
+- `JobCompleted` rolls the event log to `archivelogs/`. *(Delivered by
+  ledger F23 — see `work-items/COORD_ARCHIVE_WIRING.md`: archive runs
+  on the snapshot tick after the terminal phase is durable in the
+  snapshot, covering `JobCompleted`, `JobFailed`, and `JobCancelled`.)*
 - Lease acquire/refresh/takeover all succeed against var204 specifically.
 - Two concurrent coord starts — exactly one wins; loser backs off.
 

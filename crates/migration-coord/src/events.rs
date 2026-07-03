@@ -205,6 +205,16 @@ impl EventLogWriter {
         out
     }
 
+    /// True if the writer currently buffers unflushed events for
+    /// `job_id`'s route. The archive tick uses this to defer a
+    /// terminal job whose tail is not yet on disk — archiving it now
+    /// would leave the eventual flush stranded under `events/`.
+    pub fn has_buffered_for_job(&self, job_id: &JobId) -> bool {
+        self.chunks
+            .get(&ChunkRoute::Job(job_id.clone()))
+            .is_some_and(|c| !c.buf.is_empty())
+    }
+
     /// Test-only — number of open chunks (used to assert flush
     /// behavior).
     #[cfg(test)]
@@ -241,11 +251,44 @@ pub async fn list_chunks(store: &dyn CoordStore, route_prefix: &str) -> Result<V
     Ok(entries.into_iter().map(|e| e.key).collect())
 }
 
+/// Parse the zero-padded start seq embedded in a chunk key
+/// (`.../<start_seq:020>.jsonl`). Returns `None` for keys that do not
+/// match the layout — callers treat those conservatively (read them).
+pub(crate) fn chunk_start_seq(key: &str) -> Option<u64> {
+    let basename = key.rsplit('/').next()?;
+    let stem = basename.strip_suffix(crate::layout::EVENT_CHUNK_EXT)?;
+    stem.parse().ok()
+}
+
+/// Given ascending chunk keys for **one** route, drop the leading
+/// chunks that cannot contain any event with `seq > since`: a chunk is
+/// skippable when the *next* chunk's start seq is `<= since` (every
+/// event in it is then strictly below `since`). The boundary chunk —
+/// the one `since` falls inside — is always read: one chunk of slack
+/// instead of clever boundary math. A key whose seq cannot be parsed
+/// stops the skipping so malformed keys are still read (and rejected
+/// loudly by `read_chunk`'s schema checks) rather than silently
+/// dropped.
+pub(crate) fn skip_chunks_below(keys: &[String], since: u64) -> &[String] {
+    let mut start = 0;
+    while start + 1 < keys.len() {
+        match chunk_start_seq(&keys[start + 1]) {
+            Some(next_start) if next_start <= since => start += 1,
+            _ => break,
+        }
+    }
+    &keys[start..]
+}
+
 /// Read every envelope across **every** route under `events/`
 /// with `seq > since`, sorted ascending by seq. Used by the SSE
 /// resume path: when a client connects with `Last-Event-ID = N`,
 /// the handler emits these in order before switching to the live
 /// broadcast.
+///
+/// Seq-aware: chunk keys embed their zero-padded start seq, so per
+/// route we skip the leading chunks that cannot contain `seq > since`
+/// (see [`skip_chunks_below`]) instead of GETting the entire history.
 ///
 /// Memory: O(events-since-checkpoint). The SSE catch-up window is
 /// expected to be small (a reconnect after a brief blip); a client
@@ -256,14 +299,29 @@ pub async fn read_all_events_since(
     since: u64,
 ) -> Result<Vec<EventEnvelope>> {
     let entries = store.list(crate::layout::EVENTS_PREFIX).await?;
-    let mut envelopes = Vec::new();
+    // Group chunk keys by route (`events/_cluster/`, `events/<job>/`)
+    // so the skip logic sees each route's ascending seq sequence. The
+    // LIST is lexically ordered, so within a route keys are already
+    // ascending by start seq.
+    let mut by_route: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for entry in entries {
         if !entry.key.ends_with(crate::layout::EVENT_CHUNK_EXT) {
             continue;
         }
-        for env in read_chunk(store, &entry.key).await? {
-            if env.seq > since {
-                envelopes.push(env);
+        let Some(slash) = entry.key.rfind('/') else {
+            continue;
+        };
+        let route = entry.key[..=slash].to_string();
+        by_route.entry(route).or_default().push(entry.key);
+    }
+
+    let mut envelopes = Vec::new();
+    for keys in by_route.values() {
+        for key in skip_chunks_below(keys, since) {
+            for env in read_chunk(store, key).await? {
+                if env.seq > since {
+                    envelopes.push(env);
+                }
             }
         }
     }
@@ -490,6 +548,90 @@ mod tests {
         assert_eq!(chunks[0], "events/bobby/00000000000000000001.jsonl");
         assert_eq!(chunks[1], "events/bobby/00000000000000001001.jsonl");
         assert_eq!(chunks[2], "events/bobby/00000000000000002001.jsonl");
+    }
+
+    #[test]
+    fn chunk_start_seq_parses_layout_keys() {
+        assert_eq!(
+            chunk_start_seq("events/bobby/00000000000000000017.jsonl"),
+            Some(17),
+        );
+        assert_eq!(
+            chunk_start_seq("events/_cluster/18446744073709551615.jsonl"),
+            Some(u64::MAX),
+        );
+        assert_eq!(chunk_start_seq("events/bobby/not-a-seq.jsonl"), None);
+        assert_eq!(chunk_start_seq("events/bobby/17.txt"), None);
+    }
+
+    #[test]
+    fn skip_chunks_below_keeps_one_chunk_of_slack() {
+        let keys: Vec<String> = [1u64, 1000, 2000]
+            .iter()
+            .map(|s| job_events_chunk_key("bobby", *s))
+            .collect();
+        // since inside the middle chunk's range: drop only the first.
+        assert_eq!(skip_chunks_below(&keys, 1500), &keys[1..]);
+        // since exactly at a chunk start: that chunk may still hold
+        // events > since — keep it, drop everything before.
+        assert_eq!(skip_chunks_below(&keys, 2000), &keys[2..]);
+        // since below everything: keep all. since = 0 (full read).
+        assert_eq!(skip_chunks_below(&keys, 500), &keys[..]);
+        assert_eq!(skip_chunks_below(&keys, 0), &keys[..]);
+        // since past the end: only the final chunk is read (slack).
+        assert_eq!(skip_chunks_below(&keys, 99_999), &keys[2..]);
+        // Empty route.
+        assert_eq!(skip_chunks_below(&[], 10), &[] as &[String]);
+    }
+
+    #[test]
+    fn skip_chunks_below_stops_at_unparseable_key() {
+        let keys = vec![
+            job_events_chunk_key("bobby", 1),
+            "events/bobby/garbage.jsonl".to_string(),
+            job_events_chunk_key("bobby", 2000),
+        ];
+        // The unparseable successor halts skipping — chunk 0 is kept
+        // so nothing is silently dropped.
+        assert_eq!(skip_chunks_below(&keys, 1500), &keys[..]);
+    }
+
+    #[tokio::test]
+    async fn read_all_events_since_skips_per_route_independently() {
+        let s = MemStore::new();
+        // bobby: chunks starting at 1 and 100; cluster: one chunk at
+        // 50. Serialize one envelope per chunk directly.
+        async fn put_env(s: &MemStore, key: &str, env: &EventEnvelope) {
+            let mut body = Vec::new();
+            serde_json::to_writer(&mut body, env).unwrap();
+            body.push(b'\n');
+            s.put(key, body).await.unwrap();
+        }
+        put_env(
+            &s,
+            &job_events_chunk_key("bobby", 1),
+            &env_for_job(1, base(), "bobby"),
+        )
+        .await;
+        put_env(
+            &s,
+            &job_events_chunk_key("bobby", 100),
+            &env_for_job(100, base(), "bobby"),
+        )
+        .await;
+        put_env(&s, &cluster_events_chunk_key(50), &env_cluster(50, base())).await;
+
+        // since = 40: bobby's 1-chunk stays (its successor starts at
+        // 100 > 40 — slack), the cluster chunk is its route's only
+        // chunk. Everything with seq > 40 comes back merged ascending.
+        let events = read_all_events_since(&s, 40).await.unwrap();
+        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![50, 100]);
+
+        // since = 100: bobby's 1-chunk is now skippable (next start
+        // 100 <= 100); no event anywhere exceeds 100.
+        let events = read_all_events_since(&s, 100).await.unwrap();
+        assert!(events.is_empty());
     }
 
     #[tokio::test]

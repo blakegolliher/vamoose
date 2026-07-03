@@ -129,6 +129,12 @@ pub async fn lease_loop(
 /// last-snapshot seq locally so a snapshot trigger reflects the
 /// runtime's actual cadence rather than a refreshed-at-startup
 /// guess.
+///
+/// Also drives archive-on-completion: every check tick drains
+/// [`CoordRuntime::archive_terminal_jobs`] — jobs whose terminal
+/// phase a successful snapshot write made durable. Running it here
+/// (never inline in ingest or command handlers) keeps ingest latency
+/// flat and gives failed archives a natural per-tick retry.
 pub async fn snapshot_loop(
     rt: CoordRuntime,
     cfg: TickerConfig,
@@ -177,6 +183,16 @@ pub async fn snapshot_loop(
                             tracing::warn!(error = %e, "snapshot write failed; retry next tick");
                         }
                     }
+                }
+
+                // Archive-on-completion. Eligibility only grows on a
+                // successful snapshot write (above), but the drain
+                // runs every check tick so a previously failed
+                // archive retries without waiting for the next
+                // snapshot threshold. Best-effort: per-job failures
+                // are logged inside and retried next tick.
+                if let Err(e) = rt.archive_terminal_jobs().await {
+                    tracing::warn!(error = %e, "archive tick failed; retry next tick");
                 }
             }
         }
