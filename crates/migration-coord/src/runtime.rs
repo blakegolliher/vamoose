@@ -556,28 +556,51 @@ impl CoordRuntime {
         self.inner.lock().await.lease.clone()
     }
 
+    /// Number of events currently buffered in open (unflushed)
+    /// event-log chunks. The CLI reports this when a lease-lost
+    /// shutdown drops the buffer instead of flushing it.
+    pub async fn buffered_event_count(&self) -> usize {
+        self.inner.lock().await.writer.buffered_events()
+    }
+
     /// Force-flush every open event-log chunk. Called from the
     /// snapshot tick (so the snapshot reflects a clean log
     /// boundary) and from graceful shutdown.
+    ///
+    /// Fenced on the lease: once the lease is observed lost this
+    /// returns [`Error::LeaseLost`] without touching the store — a
+    /// deposed coord's buffered chunks could otherwise clobber the
+    /// successor's (chunk keys carry no lease epoch).
     pub async fn flush_log(&self) -> Result<()> {
         let mut guard = self.inner.lock().await;
+        if guard.lease_lost {
+            return Err(Error::LeaseLost);
+        }
         guard.writer.flush_all(self.store.as_ref()).await
     }
 
     /// Flush only chunks aged past `max_chunk_age`. Driven by the
-    /// snapshot tick at a lower cadence than `flush_log`.
+    /// snapshot tick at a lower cadence than `flush_log`. Fenced on
+    /// the lease like [`CoordRuntime::flush_log`].
     pub async fn flush_aged(&self) -> Result<()> {
         let mut guard = self.inner.lock().await;
+        if guard.lease_lost {
+            return Err(Error::LeaseLost);
+        }
         let now = self.clock.now();
         guard.writer.flush_aged(self.store.as_ref(), now).await
     }
 
     /// Persist the current state to `state/snapshot.json`. Called
-    /// from the snapshot tick.
+    /// from the snapshot tick. Fenced on the lease: a deposed coord
+    /// must not overwrite the successor's snapshot with a plain PUT.
     pub async fn write_snapshot(&self, history_keep: usize) -> Result<()> {
         let now = self.clock.now();
         let snap = {
             let mut guard = self.inner.lock().await;
+            if guard.lease_lost {
+                return Err(Error::LeaseLost);
+            }
             // Stamp written_at and schema_version; the rest is
             // already populated by the reducer.
             guard.state.written_at = now;
@@ -590,7 +613,16 @@ impl CoordRuntime {
     /// Graceful shutdown: flush the log, write a final snapshot,
     /// release the lease. Returns the [`crate::lease::release`]
     /// outcome implicitly (release is idempotent — see lease docs).
+    ///
+    /// Short-circuits with [`Error::LeaseLost`] before any store
+    /// write (or the lease release) once the lease is observed
+    /// lost: a successor coord has already taken over and replayed;
+    /// flushing our buffer or snapshotting our state would corrupt
+    /// its log. The caller decides how loudly to surface the drop.
     pub async fn shutdown(&self, history_keep: usize) -> Result<()> {
+        if self.lease_lost().await {
+            return Err(Error::LeaseLost);
+        }
         self.flush_log().await?;
         self.write_snapshot(history_keep).await?;
         let handle = self.lease_handle().await;
@@ -891,6 +923,140 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snap.written_at, at(123));
+    }
+
+    // =========================================================
+    // Lease-lost write fence (ledger F02) — every store-writing
+    // method must refuse to touch the store once the lease is
+    // observed lost, so a deposed coord cannot clobber the
+    // successor's chunks or snapshot.
+    // =========================================================
+
+    #[tokio::test]
+    async fn flush_log_after_lease_lost_writes_nothing() {
+        let (rt, _clock, store) = fresh_runtime().await;
+        // Buffer a few events (max_events_per_chunk = 100, so no
+        // threshold flush happens).
+        rt.ingest(job_created("bobby")).await.unwrap();
+        rt.ingest(job_created("mary")).await.unwrap();
+        rt.ingest(job_created("sue")).await.unwrap();
+
+        let writes_before = store.write_count();
+        rt.mark_lease_lost().await;
+
+        let err = rt.flush_log().await.unwrap_err();
+        assert!(
+            matches!(err, Error::LeaseLost),
+            "expected LeaseLost, got {err:?}",
+        );
+        assert_eq!(
+            store.write_count(),
+            writes_before,
+            "flush_log after lease loss must not write to the store",
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_aged_after_lease_lost_writes_nothing() {
+        let (rt, clock, store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        // Age the open chunk well past max_chunk_age (60s) so
+        // flush_aged WOULD flush it if the fence were absent.
+        clock.advance(Duration::seconds(120));
+
+        let writes_before = store.write_count();
+        rt.mark_lease_lost().await;
+
+        let err = rt.flush_aged().await.unwrap_err();
+        assert!(
+            matches!(err, Error::LeaseLost),
+            "expected LeaseLost, got {err:?}",
+        );
+        assert_eq!(
+            store.write_count(),
+            writes_before,
+            "flush_aged after lease loss must not write to the store",
+        );
+    }
+
+    #[tokio::test]
+    async fn write_snapshot_after_lease_lost_writes_nothing() {
+        let (rt, _clock, store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+
+        let writes_before = store.write_count();
+        rt.mark_lease_lost().await;
+
+        let err = rt.write_snapshot(3).await.unwrap_err();
+        assert!(
+            matches!(err, Error::LeaseLost),
+            "expected LeaseLost, got {err:?}",
+        );
+        assert_eq!(
+            store.write_count(),
+            writes_before,
+            "write_snapshot after lease loss must not write to the store",
+        );
+        // And nothing landed at the snapshot key.
+        let snap = crate::snapshot::load(store.as_ref()).await.unwrap();
+        assert!(snap.is_none(), "no snapshot may exist after fenced write");
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_lease_lost_skips_flush_and_snapshot() {
+        let (rt, _clock, store) = fresh_runtime().await;
+        // Buffered events that a naive shutdown would flush.
+        rt.ingest(job_created("bobby")).await.unwrap();
+        rt.ingest(job_created("mary")).await.unwrap();
+
+        let writes_before = store.write_count();
+        rt.mark_lease_lost().await;
+
+        // Must not panic; must be distinguishable from clean
+        // shutdown so the CLI can log "buffered events NOT flushed".
+        let err = rt.shutdown(3).await.unwrap_err();
+        assert!(
+            matches!(err, Error::LeaseLost),
+            "expected LeaseLost, got {err:?}",
+        );
+        assert_eq!(
+            store.write_count(),
+            writes_before,
+            "shutdown after lease loss must not write to the store",
+        );
+        // No event chunks flushed, no snapshot written.
+        assert!(store.list("events/").await.unwrap().is_empty());
+        let snap = crate::snapshot::load(store.as_ref()).await.unwrap();
+        assert!(snap.is_none());
+        // The successor's lease must not be touched either — release
+        // is skipped entirely (the lease object we wrote at start is
+        // still whatever the store holds).
+        assert!(
+            store.get(crate::layout::LEASE_KEY).await.unwrap().is_some(),
+            "fenced shutdown must not attempt lease release",
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_lease_held_still_flushes() {
+        let (rt, _clock, store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+
+        let writes_before = store.write_count();
+        rt.shutdown(3).await.unwrap();
+
+        assert!(
+            store.write_count() > writes_before,
+            "clean shutdown must flush the log and write a snapshot",
+        );
+        // Buffered chunk flushed.
+        let chunks = store.list("events/bobby/").await.unwrap();
+        assert_eq!(chunks.len(), 1);
+        // Snapshot written.
+        let snap = crate::snapshot::load(store.as_ref()).await.unwrap();
+        assert!(snap.is_some());
+        // Lease released.
+        assert!(store.get(crate::layout::LEASE_KEY).await.unwrap().is_none());
     }
 
     /// Sanity check: dropping the runtime does not panic even if

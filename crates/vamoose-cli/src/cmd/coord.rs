@@ -130,11 +130,11 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
     }
 
     // 7. Graceful shutdown of the runtime — flush log, snapshot,
-    //    release the lease.
+    //    release the lease. If the lease was lost, the runtime
+    //    refuses every write and this returns Err so the process
+    //    exits nonzero (deposed, not clean).
     tracing::info!("coord: serving stopped, shutting runtime down");
-    if let Err(e) = runtime.shutdown(ticker_cfg.history_keep).await {
-        tracing::error!(error = %e, "coord: runtime shutdown failed");
-    }
+    let shutdown_result = finish_shutdown(&runtime, ticker_cfg.history_keep).await;
 
     // 8. Wait for the ticks task to observe the cancel and finish.
     match ticks_handle.await {
@@ -143,8 +143,42 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
         Err(e) => tracing::error!(error = %e, "coord: ticks join failed"),
     }
 
-    tracing::info!("coord: clean exit");
-    Ok(())
+    if shutdown_result.is_ok() {
+        tracing::info!("coord: clean exit");
+    }
+    shutdown_result
+}
+
+/// Final runtime teardown after the HTTP listener stops.
+///
+/// Returns `Err` when the coord is exiting because the lease was
+/// lost — the caller propagates it so the process exit code
+/// distinguishes "deposed by a successor" from a clean shutdown.
+/// Any other shutdown failure is logged and swallowed (best-effort
+/// teardown, same as before).
+async fn finish_shutdown(runtime: &CoordRuntime, history_keep: usize) -> anyhow::Result<()> {
+    match runtime.shutdown(history_keep).await {
+        Ok(()) => Ok(()),
+        Err(migration_coord::Error::LeaseLost) => {
+            let buffered = runtime.buffered_event_count().await;
+            tracing::error!(
+                buffered_events = buffered,
+                "coord: lease lost — {buffered} buffered event(s) NOT flushed and no final \
+                 snapshot written. This is the safe outcome: a successor coord owns the log \
+                 and replayed from the last durable state; our buffered events were never \
+                 acknowledged as durable, and flushing them now would clobber the \
+                 successor's chunks.",
+            );
+            Err(anyhow::anyhow!(
+                "lease lost — exited without flushing {buffered} buffered event(s); \
+                 successor coord owns the event log"
+            ))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "coord: runtime shutdown failed");
+            Ok(())
+        }
+    }
 }
 
 async fn build_s3(cfg: &Config) -> anyhow::Result<S3Client> {
@@ -179,4 +213,66 @@ fn build_auth(args: &Args) -> anyhow::Result<AuthConfig> {
     }
 
     Ok(auth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use migration_coord::runtime::test_clock::FixedClock;
+    use migration_coord::schema::{ConfigHash, EventKind, JobId};
+    use migration_coord::store::MemStore;
+
+    async fn fresh_runtime() -> (CoordRuntime, Arc<MemStore>) {
+        let mem = Arc::new(MemStore::new());
+        let store: Arc<dyn CoordStore> = mem.clone();
+        let clock = FixedClock::new(Utc.with_ymd_and_hms(2026, 7, 3, 12, 0, 0).unwrap());
+        let me = Identity::fresh("test-host".to_string(), 42);
+        let rt = CoordRuntime::start(store, clock, me, RuntimeConfig::default_for_prod())
+            .await
+            .unwrap();
+        (rt, mem)
+    }
+
+    fn job_created() -> EventKind {
+        EventKind::JobCreated {
+            job_id: JobId::new("bobby").unwrap(),
+            name: "bobby-migration".into(),
+            source: "nfs://src".into(),
+            dest: "nfs://dst".into(),
+            owner: "test".into(),
+            config_hash: ConfigHash("ab".into()),
+        }
+    }
+
+    /// F02 acceptance test 6: exiting because the lease was lost
+    /// must be distinguishable from a clean shutdown — the seam
+    /// `run()` maps to the process exit code returns `Err`.
+    #[tokio::test]
+    async fn cmd_coord_lease_lost_exit_is_nonzero() {
+        let (rt, store) = fresh_runtime().await;
+        rt.ingest(job_created()).await.unwrap();
+        rt.mark_lease_lost().await;
+
+        let writes_before = store.write_count();
+        let res = finish_shutdown(&rt, 3).await;
+        assert!(
+            res.is_err(),
+            "lease-lost shutdown must map to a nonzero exit, got {res:?}",
+        );
+        assert_eq!(
+            store.write_count(),
+            writes_before,
+            "lease-lost shutdown must not write to the store",
+        );
+    }
+
+    /// Regression guard: a clean shutdown still exits zero.
+    #[tokio::test]
+    async fn cmd_coord_clean_shutdown_exit_is_ok() {
+        let (rt, _store) = fresh_runtime().await;
+        rt.ingest(job_created()).await.unwrap();
+        let res = finish_shutdown(&rt, 3).await;
+        assert!(res.is_ok(), "clean shutdown must exit zero, got {res:?}");
+    }
 }
