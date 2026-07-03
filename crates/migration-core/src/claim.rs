@@ -479,6 +479,15 @@ pub mod test_util {
         /// transient (retryable) and PreconditionFailed (not).
         put_failures_remaining: Mutex<u32>,
         put_failure_kind: Mutex<RiggedFailureKind>,
+        /// F42 test rigs: same shape as the PUT rig, for `list` and
+        /// `get`. Call counters let retry tests assert op counts
+        /// (attempts made) without extending the op log.
+        list_failures_remaining: Mutex<u32>,
+        list_failure_kind: Mutex<RiggedFailureKind>,
+        list_calls: Mutex<u64>,
+        get_failures_remaining: Mutex<u32>,
+        get_failure_kind: Mutex<RiggedFailureKind>,
+        get_calls: Mutex<u64>,
     }
 
     #[derive(Clone, Copy)]
@@ -495,6 +504,12 @@ pub mod test_util {
                 ops: Mutex::new(Vec::new()),
                 put_failures_remaining: Mutex::new(0),
                 put_failure_kind: Mutex::new(RiggedFailureKind::Transient),
+                list_failures_remaining: Mutex::new(0),
+                list_failure_kind: Mutex::new(RiggedFailureKind::Transient),
+                list_calls: Mutex::new(0),
+                get_failures_remaining: Mutex::new(0),
+                get_failure_kind: Mutex::new(RiggedFailureKind::Transient),
+                get_calls: Mutex::new(0),
             }
         }
         fn next_etag(&self) -> String {
@@ -526,6 +541,52 @@ pub mod test_util {
         /// How many rigged failures remain to consume.
         pub fn rigged_remaining(&self) -> u32 {
             *self.put_failures_remaining.lock().unwrap()
+        }
+
+        /// F42: configure the next `n` `list` calls to fail with the
+        /// given kind without touching state. Same rigging style as
+        /// [`Self::rig_next_puts_to_fail`].
+        pub fn rig_next_lists_to_fail(&self, n: u32, kind: RiggedFailureKind) {
+            *self.list_failures_remaining.lock().unwrap() = n;
+            *self.list_failure_kind.lock().unwrap() = kind;
+        }
+
+        /// F42: configure the next `n` `get` calls to fail with the
+        /// given kind without touching state.
+        pub fn rig_next_gets_to_fail(&self, n: u32, kind: RiggedFailureKind) {
+            *self.get_failures_remaining.lock().unwrap() = n;
+            *self.get_failure_kind.lock().unwrap() = kind;
+        }
+
+        /// Total `list` calls made (rigged failures included) — lets
+        /// retry tests assert attempt counts.
+        pub fn list_calls(&self) -> u64 {
+            *self.list_calls.lock().unwrap()
+        }
+
+        /// Total `get` calls made (rigged failures included).
+        pub fn get_calls(&self) -> u64 {
+            *self.get_calls.lock().unwrap()
+        }
+
+        /// Consume one rigged failure from `(remaining, kind)` if any
+        /// is armed. Returns the error the caller should surface.
+        fn consume_rigged(
+            remaining: &Mutex<u32>,
+            kind: &Mutex<RiggedFailureKind>,
+            op: &str,
+        ) -> Option<Error> {
+            let mut rem = remaining.lock().unwrap();
+            if *rem == 0 {
+                return None;
+            }
+            *rem -= 1;
+            Some(match *kind.lock().unwrap() {
+                RiggedFailureKind::Transient => {
+                    Error::Other(anyhow::anyhow!("rigged transient {op} failure"))
+                }
+                RiggedFailureKind::PreconditionFailed => Error::PreconditionFailed,
+            })
         }
     }
 
@@ -615,10 +676,24 @@ pub mod test_util {
             Ok(outcome)
         }
         async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            *self.get_calls.lock().unwrap() += 1;
+            if let Some(err) =
+                Self::consume_rigged(&self.get_failures_remaining, &self.get_failure_kind, "GET")
+            {
+                return Err(err);
+            }
             let g = self.inner.lock().unwrap();
             Ok(g.get(key).cloned())
         }
         async fn list(&self, prefix: &str) -> Result<Vec<ListEntry>> {
+            *self.list_calls.lock().unwrap() += 1;
+            if let Some(err) = Self::consume_rigged(
+                &self.list_failures_remaining,
+                &self.list_failure_kind,
+                "LIST",
+            ) {
+                return Err(err);
+            }
             let g = self.inner.lock().unwrap();
             let out = g
                 .iter()

@@ -489,6 +489,12 @@ impl S3Client {
     /// Download an object to a local path. Used for shard parquet
     /// downloads to tmpfs. Streams the body — does not buffer the whole
     /// object in memory. Returns the object's etag.
+    ///
+    /// Error typing (F42): SDK/service failures on the GET surface as
+    /// [`Error::S3`] and mid-stream body failures as [`Error::Io`] —
+    /// both classify WorkerLocal in the worker's F13 taxonomy. Never
+    /// `Error::Other`, which classifies Fatal and would terminal-fail
+    /// a shard on a transient transport blip.
     pub async fn download_to(&self, key: &str, dest: &std::path::Path) -> Result<String> {
         let mut resp = self
             .inner
@@ -497,7 +503,7 @@ impl S3Client {
             .key(key)
             .send()
             .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("S3 GET {key}: {e:?}")))?;
+            .map_err(|e| Error::S3(e.into()))?;
 
         let etag = resp.e_tag().map(unquote_etag).unwrap_or_default();
 
@@ -505,12 +511,12 @@ impl S3Client {
             tokio::fs::create_dir_all(parent).await?;
         }
         let mut out = tokio::fs::File::create(dest).await?;
-        while let Some(chunk) = resp
-            .body
-            .try_next()
-            .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("S3 GET {key} body: {e}")))?
-        {
+        while let Some(chunk) = resp.body.try_next().await.map_err(|e| {
+            // ByteStream errors have no aws_sdk_s3::Error conversion;
+            // a mid-stream failure is read-side I/O (host/network) —
+            // Io also classifies WorkerLocal.
+            Error::Io(std::io::Error::other(format!("S3 GET {key} body: {e}")))
+        })? {
             out.write_all(&chunk).await?;
         }
         out.flush().await?;
@@ -633,6 +639,43 @@ mod tests {
         assert_eq!(quote_etag("\"abc123\""), "\"abc123\"");
         // Round trip: unquote then requote recovers the wire form.
         assert_eq!(quote_etag(&unquote_etag("\"abc123\"")), "\"abc123\"");
+    }
+
+    // -------------------------------------------------------------------------
+    // F42: download_to error typing.
+    // -------------------------------------------------------------------------
+
+    /// F42 (red before fix): `download_to` must surface SDK/transport
+    /// failures as `Error::S3`, not `Error::Other`. The worker's F13
+    /// classifier maps `S3 → WorkerLocal` (release-and-skip) and
+    /// `Other → Fatal` — with the old typing, a transient download
+    /// blip terminal-failed the shard. Uses a closed local port so
+    /// the GET fails at the transport layer with no network
+    /// dependency; retries are disabled so the failure is immediate.
+    #[tokio::test]
+    async fn download_sdk_error_is_s3_typed() {
+        use aws_sdk_s3::config::{Credentials, Region};
+
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url("http://127.0.0.1:1") // closed port → connection refused
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .force_path_style(true)
+            .build();
+        let client = S3Client::new(Client::from_conf(conf), "test-bucket");
+
+        let dest = std::env::temp_dir().join("vamoose-f42-download-typing-test.parquet");
+        let err = client
+            .download_to("index/part-0001.parquet", &dest)
+            .await
+            .expect_err("GET against a closed port must fail");
+        assert!(
+            matches!(err, Error::S3(_)),
+            "download_to must type SDK errors as Error::S3, got: {err:?}",
+        );
+        let _ = tokio::fs::remove_file(&dest).await;
     }
 
     // -------------------------------------------------------------------------
