@@ -21,7 +21,7 @@
 //!
 //! 1. `pipelined_copy(...)` — durabilizes bytes via whole-file fsync.
 //! 2. close src + dst fhs (post-fsync cleanup; bytes are durable).
-//! 3. `apply_async_attrs(...)` — chmod / chown / utimes on `.partial`.
+//! 3. `apply_async_attrs(...)` — chown / chmod / utimes on `.partial`.
 //! 4. `fence.check_pre_rename()` — R8 gate.
 //! 5. `dst.rename(.partial, final)` — atomic commit point.
 //!
@@ -36,7 +36,7 @@ use migration_core::fence::Fence;
 use migration_core::records::{DowngradeKind, FailurePhase};
 use migration_core::shard::RowView;
 
-use crate::attrs;
+use crate::attr_plan::{self, AttrOp};
 use crate::bucketed_pool::BucketedAsyncPool;
 use crate::downgrade::DowngradeSink;
 use crate::error::MoveError;
@@ -310,19 +310,21 @@ impl AsyncBucketedFileMover {
         Ok((copy.bytes_copied, torn))
     }
 
-    /// Apply mode / owner / mtime+atime through the async ctx in the
-    /// same order as `Mover::apply_attrs` (chmod → chown → utimes).
-    /// Honors the same downgrade rules: null source attrs the user
-    /// asked to preserve get a `DowngradeKind` record; chown EPERM
-    /// is degraded to a `NullOwner` downgrade when `require_chown` is
-    /// false.
+    /// Apply owner / mode / mtime+atime through the async ctx in the
+    /// order planned by [`attr_plan::plan_attr_ops`], the same plan
+    /// the sync `Mover::apply_attrs` executes: chown → chmod → utimes
+    /// (F08 — owner before mode so NFSv3 kill-priv semantics can't
+    /// strip S_ISUID/S_ISGID the chmod just applied; utimes strictly
+    /// last). Honors the same downgrade rules: null source attrs the
+    /// user asked to preserve get a `DowngradeKind` record; chown
+    /// EPERM is degraded to a `NullOwner` downgrade when
+    /// `require_chown` is false, and the plan continues to chmod.
     async fn apply_async_attrs(
         &self,
         dst: &AsyncNfsContext,
         dst_partial: &[u8],
         row: &RowView,
     ) -> Result<(), MoveError> {
-        let a = attrs::build(row, self.cfg.policy);
         let policy = self.cfg.policy;
 
         if policy.preserve_owner && (row.uid.is_none() || row.gid.is_none()) {
@@ -338,32 +340,38 @@ impl AsyncBucketedFileMover {
                 .record(row.row_id, &row.path, DowngradeKind::NullAtime);
         }
 
-        if let Some(mode) = a.mode {
-            dst.chmod(dst_partial, mode)
-                .await
-                .map_err(|e| nfs_err(FailurePhase::Setattr, format!("chmod: {e}")))?;
-        }
-
-        if let (Some(uid), Some(gid)) = (a.uid, a.gid) {
-            match dst.chown(dst_partial, uid, gid).await {
-                Ok(()) => {}
-                Err(e)
-                    if matches!(e.errno(), Some(eno) if eno == libc::EPERM)
-                        && !self.cfg.require_chown =>
-                {
-                    tracing::debug!(uid, gid, "chown EPERM in degraded mode; skipping");
-                    self.downgrades
-                        .record(row.row_id, &row.path, DowngradeKind::NullOwner);
+        // Async twin of the sync `execute_plan` loop (closures can't
+        // await, so the plan is iterated inline). Each op maps to the
+        // pre-existing call; the chown-EPERM degraded-mode policy is
+        // unchanged — only its position in the sequence moved.
+        for op in attr_plan::plan_attr_ops(row, policy) {
+            match op {
+                AttrOp::Chown { uid, gid } => match dst.chown(dst_partial, uid, gid).await {
+                    Ok(()) => {}
+                    Err(e)
+                        if matches!(e.errno(), Some(eno) if eno == libc::EPERM)
+                            && !self.cfg.require_chown =>
+                    {
+                        tracing::debug!(uid, gid, "chown EPERM in degraded mode; skipping");
+                        self.downgrades
+                            .record(row.row_id, &row.path, DowngradeKind::NullOwner);
+                    }
+                    Err(e) => return Err(nfs_err(FailurePhase::Setattr, format!("chown: {e}"))),
+                },
+                AttrOp::Chmod { mode } => {
+                    dst.chmod(dst_partial, mode)
+                        .await
+                        .map_err(|e| nfs_err(FailurePhase::Setattr, format!("chmod: {e}")))?;
                 }
-                Err(e) => return Err(nfs_err(FailurePhase::Setattr, format!("chown: {e}"))),
+                AttrOp::Utimes {
+                    atime: (at_s, at_n),
+                    mtime: (mt_s, mt_n),
+                } => {
+                    dst.utimes(dst_partial, at_s, at_n, mt_s, mt_n)
+                        .await
+                        .map_err(|e| nfs_err(FailurePhase::Setattr, format!("utimes: {e}")))?;
+                }
             }
-        }
-
-        if let Some((mt_s, mt_n)) = a.mtime {
-            let (at_s, at_n) = a.atime.unwrap_or((mt_s, mt_n));
-            dst.utimes(dst_partial, at_s, at_n, mt_s, mt_n)
-                .await
-                .map_err(|e| nfs_err(FailurePhase::Setattr, format!("utimes: {e}")))?;
         }
         Ok(())
     }

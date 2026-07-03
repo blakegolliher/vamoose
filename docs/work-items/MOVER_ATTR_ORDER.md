@@ -1,6 +1,6 @@
 # Apply chown before chmod (preserve setuid/setgid)
 
-Status: open — not started.
+Status: in review — fix + tests on branch `mover-attr-order`; hardware 4755 stat check (MANUAL_VERIFY.md [5]) pending before `verified`.
 Ledger: F08 in `docs/REVIEW_LEDGER.md`.
 Priority: high — silent permission corruption on exactly the files
 where mode matters most.

@@ -4,13 +4,16 @@
 //! once per file to avoid extra round-trips. Order matters:
 //!
 //! 1. `WRITE` last data block (in mover proper, not here).
-//! 2. Per-attribute sequence: `chmod` → `chown` → `utimes`. Each is a
-//!    distinct libnfs call. **There is no NFSv4 batched-SETATTR fast
-//!    path in this build.** The system targets NFSv3 as the protocol
-//!    baseline (BUGFIX_PLAN.md "Fix 4"), and the per-attribute
-//!    sequence is the only path. If NFSv4 batching is revived later
-//!    it would short-circuit this sequence; until then there is one
-//!    code path and `mover.rs::Mover::apply_attrs` is the implementer.
+//! 2. Per-attribute sequence: `chown` → `chmod` → `utimes` (order
+//!    planned by `attr_plan::plan_attr_ops` — owner before mode so
+//!    NFSv3 kill-priv semantics can't strip S_ISUID/S_ISGID; F08).
+//!    Each is a distinct libnfs call. **There is no NFSv4
+//!    batched-SETATTR fast path in this build.** The system targets
+//!    NFSv3 as the protocol baseline (BUGFIX_PLAN.md "Fix 4"), and
+//!    the per-attribute sequence is the only path. If NFSv4 batching
+//!    is revived later it would short-circuit this sequence; until
+//!    then there is one code path and `mover.rs::Mover::apply_attrs`
+//!    is the implementer.
 //! 3. `SETXATTR` per name/value pair if `xattr_blob` is non-null.
 //!    **Currently dead code** — walker doesn't emit xattrs yet. The
 //!    apply path is wired up so it lights up automatically.

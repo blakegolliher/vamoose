@@ -17,6 +17,7 @@
 //!
 //! See DESIGN.md "Mover" and the M2 working spec.
 
+pub mod attr_plan;
 pub mod attrs;
 pub mod batch;
 pub mod bucketed_pool;
