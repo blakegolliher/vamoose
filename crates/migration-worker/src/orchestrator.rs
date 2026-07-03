@@ -117,7 +117,23 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
         }
     }
 
-    let manifest = load_manifest(&s3).await?;
+    // F42: transient-store retry budget for the scan / manifest /
+    // acquire call sites below — R6's shape, see
+    // `transient_retry_budget`.
+    let retry_budget =
+        transient_retry_budget(cfg.worker.lease_timeout_sec, cfg.worker.heartbeat_sec);
+
+    let manifest = {
+        let mut st = &*s3;
+        retry_transient(
+            "manifest GET",
+            retry_budget,
+            cfg.worker.heartbeat_sec,
+            &mut st,
+            |s3c| Box::pin(load_manifest(s3c)),
+        )
+        .await?
+    };
     if manifest.format_version != RUN_FORMAT_VERSION {
         anyhow::bail!(
             "manifest format_version {} does not match worker {}",
@@ -487,14 +503,14 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
                 last_target_filename: shard,
             }
         } else {
-            scan_shards(
-                &*s3,
-                &manifest,
-                lease,
-                cfg.worker.heartbeat_sec,
-                &mut claim_body_cache,
-                &skip_shards,
-            )
+            // F42: a transient LIST/GET blip inside a scan pass must
+            // not take the worker down — retry under the budget. All
+            // borrows go through the state tuple (see retry_transient).
+            let heartbeat_sec = cfg.worker.heartbeat_sec;
+            let mut st = (&*s3, &manifest, &mut claim_body_cache, &skip_shards);
+            retry_transient("shard scan", retry_budget, heartbeat_sec, &mut st, |st| {
+                Box::pin(scan_shards(st.0, st.1, lease, heartbeat_sec, st.2, st.3))
+            })
             .await?
         };
         let scan = scan_or_self;
@@ -543,7 +559,21 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
 
         let (etag, record) = match target {
             ClaimTarget::Free { shard } => {
-                match claim::try_acquire(&*s3, &shard, &host_id).await? {
+                // F42: transient store errors on the acquire back off
+                // and retry (bounded by the budget) rather than exit.
+                // The shard is NOT skip-set — nothing is wrong with
+                // it. The atom itself is untouched; only the call
+                // site is wrapped.
+                let mut st = (&*s3, shard.as_str(), host_id.as_str());
+                match retry_transient(
+                    "claim acquire",
+                    retry_budget,
+                    cfg.worker.heartbeat_sec,
+                    &mut st,
+                    |st| Box::pin(claim::try_acquire(st.0, st.1, st.2)),
+                )
+                .await?
+                {
                     AcquireOutcome::Acquired { etag, record } => (etag, record),
                     AcquireOutcome::Contended { existing, .. } => {
                         // Thundering-herd dampener: when many workers race
@@ -567,7 +597,17 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
                 prior_epoch,
             } => {
                 let new_epoch = prior_epoch + 1;
-                match claim::reclaim(&*s3, &shard, &stale_etag, &host_id, new_epoch).await? {
+                // F42: same treatment as the acquire site.
+                let mut st = (&*s3, shard.as_str(), stale_etag.as_str(), host_id.as_str());
+                match retry_transient(
+                    "claim reclaim",
+                    retry_budget,
+                    cfg.worker.heartbeat_sec,
+                    &mut st,
+                    |st| Box::pin(claim::reclaim(st.0, st.1, st.2, st.3, new_epoch)),
+                )
+                .await?
+                {
                     ReclaimOutcome::Won { etag, record } => (etag, record),
                     ReclaimOutcome::LostRace => {
                         backoff_after_lost_race(cfg.worker.heartbeat_sec).await;
@@ -625,12 +665,48 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
             p.status = "active".into();
         }
 
-        // Download the parquet shard to scratch.
+        // Download the parquet shard to scratch and verify its etag
+        // against the manifest (F40). F42: neither failure may take
+        // the worker down with the claim still held — route through
+        // handle_process_error, which classifies per F13: a typed
+        // Error::S3/Io transport failure is WorkerLocal (release +
+        // skip + backoff; a healthy peer takes the shard), the F40
+        // empty-etag errors are untyped and default to Fatal, and a
+        // ManifestChanged mismatch is WorkerLocal (release-and-skip —
+        // correct for a manifest swap mid-run).
         let scratch = cfg.shard.local_scratch.join(&shard_filename);
-        let download_etag = s3
-            .download_to(&layout::index_key(&shard_filename), &scratch)
-            .await?;
-        verify_shard_etag(&manifest, &shard_filename, &download_etag)?;
+        if let Err(e) = fetch_shard_index(
+            s3.download_to(&layout::index_key(&shard_filename), &scratch),
+            &manifest,
+            &shard_filename,
+        )
+        .await
+        {
+            // Best-effort cleanup of a partial download. A missing
+            // file (GET failed before creating it) is not noteworthy.
+            if let Err(rm) = tokio::fs::remove_file(&scratch).await {
+                tracing::debug!(
+                    error = ?rm,
+                    scratch = %scratch.display(),
+                    "scratch cleanup failed (post-download-error)",
+                );
+            }
+            handle_process_error(
+                ProcessErrorContext {
+                    store: &*s3,
+                    host_id: &host_id,
+                    shard_filename: &shard_filename,
+                    current: &current,
+                    fallback_etag: &etag,
+                    fallback_epoch: record.epoch,
+                    heartbeat_sec: cfg.worker.heartbeat_sec,
+                },
+                &e,
+                &mut skip_shards,
+            )
+            .await;
+            continue;
+        }
 
         // Stamp the current shard onto both sinks so records carry
         // the right shard name (the mover doesn't otherwise know).
@@ -1539,6 +1615,113 @@ async fn backoff_after_lost_race(heartbeat_sec: u64) {
 }
 
 // =============================================================================
+// F42: transient-store retry (scan / manifest / acquire paths)
+// =============================================================================
+
+/// F42: consecutive-failure budget for transient store errors on the
+/// scan / manifest / acquire paths. Same shape as the heartbeat's R6
+/// budget (`heartbeat.rs`): one lease window's worth of
+/// heartbeat-spaced attempts, floored at 1 so absurd configs stay
+/// sane. Past this many CONSECUTIVE failures the worker gives up and
+/// surfaces the error — a worker must not spin forever on a dead
+/// bucket, and by then a peer has been unable to see our heartbeats
+/// for a full lease window anyway.
+pub fn transient_retry_budget(lease_timeout_sec: u64, heartbeat_sec: u64) -> u64 {
+    (lease_timeout_sec / heartbeat_sec.max(1)).max(1)
+}
+
+/// One attempt's future, as returned by a [`retry_transient`] closure.
+/// Boxed so the closure can lend its `&mut S` state to the future
+/// (needed for `scan_shards`' `&mut ClaimBodyCache`).
+pub type AttemptFuture<'a, T, E> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'a>>;
+
+/// F42: drive `attempt` until it succeeds or `budget` consecutive
+/// failures accumulate, sleeping the jittered contention backoff
+/// (`backoff_after_lost_race`: `heartbeat_sec/4` base + jitter,
+/// paused-time friendly) between attempts. Every error is treated as
+/// transient here — the wrapped ops (LIST / GET / conditional PUT via
+/// the claim atoms) either succeed, return a typed outcome (e.g.
+/// `Contended`), or fail on the store/transport path; the budget
+/// bounds the worst case. Success returns immediately, so the budget
+/// only ever counts CONSECUTIVE failures (mirror of the R6 counter
+/// reset on a successful HEAD).
+///
+/// This wraps CALL SITES only — never the claim atoms themselves.
+///
+/// Usage note: every reference the attempt future needs must be
+/// threaded through `state` (a tuple works) — the closure itself may
+/// only capture `Copy` values. A closure that captures references
+/// from its environment cannot satisfy the higher-ranked bound (the
+/// returned future would have to outlive an arbitrary `'a`), and
+/// rustc surfaces that as "borrowed for `'static`" at the call site.
+pub async fn retry_transient<S, T, E, F>(
+    op: &str,
+    budget: u64,
+    heartbeat_sec: u64,
+    state: &mut S,
+    mut attempt: F,
+) -> Result<T, E>
+where
+    S: ?Sized,
+    E: std::fmt::Debug,
+    F: for<'a> FnMut(&'a mut S) -> AttemptFuture<'a, T, E>,
+{
+    let budget = budget.max(1);
+    let mut consec: u64 = 0;
+    loop {
+        match attempt(state).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                consec += 1;
+                if consec >= budget {
+                    tracing::error!(
+                        op,
+                        consecutive_failures = consec,
+                        budget,
+                        error = ?e,
+                        "transient-error budget exhausted; surfacing the error",
+                    );
+                    return Err(e);
+                }
+                tracing::warn!(
+                    op,
+                    consecutive_failures = consec,
+                    budget,
+                    error = ?e,
+                    "transient store error; backing off before retry",
+                );
+                backoff_after_lost_race(heartbeat_sec).await;
+            }
+        }
+    }
+}
+
+/// F42 download seam: await the shard-index download and run the F40
+/// etag verification on its result. The downloader is passed as a
+/// future (production: `S3Client::download_to`, an `S3Client`-only
+/// method unreachable via `FakeStore`; tests: a canned result) so the
+/// composed error path is testable without S3 — the S3-backed wiring
+/// in `run()` stays untested, like the F29 classifiers.
+///
+/// Download errors are NOT retried in place: the caller routes them
+/// to [`handle_process_error`], which classifies per F13 — a typed
+/// `Error::S3` transport failure is WorkerLocal (release + skip +
+/// backoff; a healthy peer takes the shard), while the F40 empty-etag
+/// errors are untyped and default to Fatal.
+pub async fn fetch_shard_index<F>(
+    download: F,
+    manifest: &Manifest,
+    shard_filename: &str,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = Result<String, CoreError>>,
+{
+    let actual_etag = download.await?;
+    verify_shard_etag(manifest, shard_filename, &actual_etag)
+}
+
+// =============================================================================
 // F13: shard-error classification (worker-local vs shard-fatal)
 // =============================================================================
 
@@ -1592,8 +1775,9 @@ pub fn classify_shard_error(e: &CoreError) -> ShardErrorClass {
         //  - Io: local scratch (EIO/ENOMEM reading the downloaded
         //    parquet) — host-specific.
         //  - S3: transport to the bucket — host/network-specific.
-        //    (Retry policy for these on scan/acquire is F42, not
-        //    built here.)
+        //    (F42: scan/manifest/acquire sites retry these via
+        //    `retry_transient`; download failures land here through
+        //    `fetch_shard_index` → `handle_process_error`.)
         //  - Json: control-plane bodies (claim/progress/manifest),
         //    never shard bytes.
         //  - PreconditionFailed / ClaimInvalidated: claim-plane
