@@ -178,6 +178,70 @@ impl Phase {
     pub fn is_terminal(self) -> bool {
         matches!(self, Phase::Completed | Phase::Failed | Phase::Cancelled)
     }
+
+    /// Position in the linear pipeline for active phases; `None` for
+    /// `Paused` and the terminal trio. Used by
+    /// [`phase_transition_allowed`] to enforce forward-only
+    /// progression among active phases.
+    fn pipeline_rank(self) -> Option<u8> {
+        match self {
+            Phase::Planned => Some(0),
+            Phase::Scanning => Some(1),
+            Phase::Copying => Some(2),
+            Phase::Verifying => Some(3),
+            Phase::Cutover => Some(4),
+            Phase::Paused | Phase::Completed | Phase::Failed | Phase::Cancelled => None,
+        }
+    }
+
+    /// An active phase is one where work can proceed — neither
+    /// `Paused` nor terminal.
+    pub fn is_active(self) -> bool {
+        self.pipeline_rank().is_some()
+    }
+
+    /// `pause`/`drain` are only meaningful for a job that is
+    /// currently doing (or about to do) work.
+    pub fn can_pause(self) -> bool {
+        self.is_active()
+    }
+
+    /// `resume` is only meaningful for a paused job — resuming
+    /// anything else would rewind the pipeline (ledger F25).
+    pub fn can_resume(self) -> bool {
+        self == Phase::Paused
+    }
+}
+
+/// Whether a phase transition is legal (ledger F25). Encodes the
+/// rule stated on [`Phase`]: linear (forward-only, skips allowed)
+/// progression through the active phases, `Paused` re-entry from and
+/// back to any active phase, and the terminal trio reachable from
+/// any non-terminal phase but absorbing once entered.
+///
+/// A same-phase "transition" is not a transition — callers drop it
+/// as a no-op before consulting this.
+pub fn phase_transition_allowed(from: Phase, to: Phase) -> bool {
+    if from == to || from.is_terminal() {
+        // Terminal states are absorbing; self-loops are no-ops.
+        return false;
+    }
+    if to.is_terminal() {
+        // Cancel/complete/fail is legal from any non-terminal phase.
+        return true;
+    }
+    if to == Phase::Paused {
+        return from.is_active();
+    }
+    if from == Phase::Paused {
+        return to.is_active();
+    }
+    // Both active: forward-only. Skipping phases is allowed (a job
+    // can go Planned -> Copying); moving backwards is not.
+    match (from.pipeline_rank(), to.pipeline_rank()) {
+        (Some(f), Some(t)) => f < t,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,6 +570,38 @@ pub struct ErrorBucket {
 /// Cap on sample paths per error bucket. Enforced by the reducer.
 pub const ERROR_SAMPLE_CAP: usize = 10;
 
+/// Cap on distinct error-class buckets per job (ledger F24).
+/// `ErrorClass::Other(String)` is free-form, so without a cap one
+/// worker emitting distinct strings grows live state, every
+/// snapshot, and replay cost without bound. Once a job has this
+/// many buckets, further new classes fold into a single catch-all
+/// bucket (class `Other(ERROR_OVERFLOW_CLASS)`) — so the bucket
+/// vector holds at most `ERROR_BUCKET_CAP + 1` entries. Identities
+/// past the cap are dropped; counts stay exact.
+pub const ERROR_BUCKET_CAP: usize = 64;
+
+/// Class label of the catch-all bucket new error classes fold into
+/// once a job is at [`ERROR_BUCKET_CAP`].
+pub const ERROR_OVERFLOW_CLASS: &str = "(overflow)";
+
+/// Cap on `Job.phase_history` entries (ledger F24). Oldest entries
+/// are dropped first; resume-target derivation only looks at the
+/// most recent entries, so trimming the front is safe. 256 is weeks
+/// of pause/resume cycles at human cadence.
+pub const PHASE_HISTORY_CAP: usize = 256;
+
+/// Wire cap (COORD_PLAN §3.3, ledger F24): minimum interval between
+/// `ProgressDelta` broadcasts on the SSE bus per (job, worker) — the
+/// 1 Hz coalescing rule. State and the event log still see every
+/// delta; only the bus is capped.
+pub const PROGRESS_STREAM_MIN_INTERVAL_MS: i64 = 1000;
+
+/// Wire cap (COORD_PLAN §3.3, ledger F24): maximum `ErrorEmitted`
+/// broadcasts per error class per second on the SSE bus. Excess
+/// events still reach state (folding into `ErrorBucket.count`) and
+/// the event log; only the bus is capped.
+pub const ERROR_STREAM_MAX_PER_SEC: u32 = 10;
+
 // =============================================================================
 // Event log
 // =============================================================================
@@ -721,10 +817,12 @@ impl EventKind {
 /// Serialized form of the full coord state at a point in time. Loaded
 /// at startup, then events with `seq > last_seq` are replayed on top.
 ///
-/// `audit_seq_today` is the per-day audit sequence counter — the
-/// snapshot persists it so a coord restart on the same UTC day picks
-/// up where it left off rather than colliding with already-written
-/// audit keys.
+/// `audit_seq_today` is the per-day audit sequence counter. The
+/// snapshot persists it so a restart on the same UTC day usually
+/// resumes the numbering, but that is an optimization only — a crash
+/// inside the snapshot window rewinds the counter, and the audit
+/// writer recovers by allocating keys with `put_if_absent` and
+/// skipping past collisions (ledger F22).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     #[serde(default = "default_schema_version")]
@@ -902,6 +1000,56 @@ mod tests {
             "my_job",
         ] {
             assert!(JobId::new(id).is_ok(), "{id:?} must stay valid");
+        }
+    }
+
+    /// Full legality matrix for [`phase_transition_allowed`] (ledger
+    /// F25): Paused re-entry from active phases only, forward-only
+    /// progression through the pipeline, terminal trio reachable from
+    /// any non-terminal phase and absorbing once entered.
+    #[test]
+    fn legal_matrix_table() {
+        use Phase::*;
+        const ALL: [Phase; 9] = [
+            Planned, Scanning, Copying, Verifying, Cutover, Paused, Completed, Failed, Cancelled,
+        ];
+        let active = [Planned, Scanning, Copying, Verifying, Cutover];
+        let terminal = [Completed, Failed, Cancelled];
+
+        for from in ALL {
+            for to in ALL {
+                let got = phase_transition_allowed(from, to);
+                let want = if from == to || terminal.contains(&from) {
+                    // Self-loops are no-ops; terminal is absorbing.
+                    false
+                } else if terminal.contains(&to) {
+                    // Any non-terminal job can be cancelled/completed/
+                    // failed.
+                    true
+                } else if to == Paused {
+                    // Pause re-entry from active phases only.
+                    active.contains(&from)
+                } else if from == Paused {
+                    // Resume lands on any active phase (the prior one).
+                    active.contains(&to)
+                } else {
+                    // Active -> active: forward-only, skips allowed.
+                    let rank = |p: Phase| active.iter().position(|&a| a == p).unwrap();
+                    rank(from) < rank(to)
+                };
+                assert_eq!(
+                    got, want,
+                    "phase_transition_allowed({from:?}, {to:?}) should be {want}",
+                );
+            }
+        }
+
+        // Predicate helpers agree with the matrix.
+        for p in ALL {
+            assert_eq!(p.can_pause(), active.contains(&p), "can_pause({p:?})");
+            assert_eq!(p.can_resume(), p == Paused, "can_resume({p:?})");
+            assert_eq!(p.is_terminal(), terminal.contains(&p));
+            assert_eq!(p.is_active(), active.contains(&p));
         }
     }
 

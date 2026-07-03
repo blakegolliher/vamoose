@@ -1,16 +1,21 @@
 //! Command handlers — POST /jobs/{id}/{pause,resume,cancel,drain,
 //! retry-failed}. Each:
 //!
-//! 1. Validates the job exists. 404 if not.
-//! 2. Records an audit line at `audit/<YYYY-MM-DD>/<seq>.jsonl`.
-//! 3. Ingests the corresponding event so the SSE stream broadcasts
+//! 1. Validates the job exists (404 if not) and that the command is
+//!    legal for the job's current phase (409 `invalid_phase` if not,
+//!    ledger F25) — rejection happens before any side effect.
+//! 2. Ingests the corresponding event so the SSE stream broadcasts
 //!    the state change and the reducer updates `phase` /
 //!    `phase_history`.
-//! 4. Force-flushes the event log (flush-before-ack, ledger F03).
+//! 3. Force-flushes the event log (flush-before-ack, ledger F03).
 //!    A 200 means the command survives a coord crash — a pause
 //!    that only ever lived in the writer buffer would silently
 //!    un-pause on failover. The flush is fenced on the lease, so a
 //!    deposed coord fails the request instead of acking.
+//! 4. Records an audit line at `audit/<YYYY-MM-DD>/<seq>.jsonl`.
+//!    Audit comes AFTER the durable event (ledger F22): the
+//!    `Accepted` row asserts a command that took effect, so a
+//!    failed ingest/flush must never leave one behind.
 //! 5. Returns `{ command_id }`.
 //!
 //! Workers don't observe these commands directly in Phase 2. The
@@ -51,14 +56,30 @@ pub struct ReasonBody {
     pub reason: Option<String>,
 }
 
-async fn require_job(state: &AppState, id: &JobId) -> Result<(), ApiError> {
-    if state.runtime.job_view(id).await.is_none() {
-        return Err(ApiError::not_found(
-            "job_not_found",
-            format!("no such job: {id}"),
-        ));
+async fn require_job(state: &AppState, id: &JobId) -> Result<crate::schema::Job, ApiError> {
+    state
+        .runtime
+        .job_view(id)
+        .await
+        .ok_or_else(|| ApiError::not_found("job_not_found", format!("no such job: {id}")))
+}
+
+/// Phase-legality gate (ledger F25). Rejects a command that makes no
+/// sense for the job's current phase with 409 — BEFORE any audit or
+/// ingest, so a rejected command leaves no side effects.
+fn require_phase(
+    allowed: bool,
+    command: &str,
+    phase: crate::schema::Phase,
+) -> Result<(), ApiError> {
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "invalid_phase",
+            format!("cannot {command} a job in phase {phase:?}"),
+        ))
     }
-    Ok(())
 }
 
 fn parse_id(raw: String) -> Result<JobId, ApiError> {
@@ -75,11 +96,6 @@ async fn record_and_ingest(
 ) -> Result<CommandAccepted, ApiError> {
     let target = format!("jobs/{job_id}");
     let args = serde_json::json!({ "reason": reason });
-    let command_id = state
-        .runtime
-        .record_audit(label.as_str(), action, &target, args, AuditResult::Accepted)
-        .await
-        .map_err(ApiError::storage)?;
     state
         .runtime
         .ingest(kind)
@@ -88,6 +104,15 @@ async fn record_and_ingest(
     // Ack == durable (ledger F03): the event must hit the store
     // before the operator sees 200.
     state.runtime.flush_log().await.map_err(ApiError::storage)?;
+    // Audit AFTER the durable effect (ledger F22): the `Accepted`
+    // row describes an applied command. If ingest or flush fails
+    // above, no audit row is written at all — the trail never
+    // asserts a command that didn't take effect.
+    let command_id = state
+        .runtime
+        .record_audit(label.as_str(), action, &target, args, AuditResult::Accepted)
+        .await
+        .map_err(ApiError::storage)?;
     Ok(CommandAccepted { command_id })
 }
 
@@ -107,7 +132,8 @@ pub async fn pause(
     body: Option<Json<ReasonBody>>,
 ) -> Result<Json<CommandAccepted>, ApiError> {
     let id = parse_id(id)?;
-    require_job(&state, &id).await?;
+    let job = require_job(&state, &id).await?;
+    require_phase(job.phase.can_pause(), "pause", job.phase)?;
     let reason = reason_or_default(body.map(|Json(b)| b), "operator");
     let kind = EventKind::JobPaused {
         job_id: id.clone(),
@@ -128,7 +154,8 @@ pub async fn resume(
     body: Option<Json<ReasonBody>>,
 ) -> Result<Json<CommandAccepted>, ApiError> {
     let id = parse_id(id)?;
-    require_job(&state, &id).await?;
+    let job = require_job(&state, &id).await?;
+    require_phase(job.phase.can_resume(), "resume", job.phase)?;
     let reason = reason_or_default(body.map(|Json(b)| b), "operator");
     let kind = EventKind::JobResumed {
         job_id: id.clone(),
@@ -149,7 +176,10 @@ pub async fn cancel(
     body: Option<Json<ReasonBody>>,
 ) -> Result<Json<CommandAccepted>, ApiError> {
     let id = parse_id(id)?;
-    require_job(&state, &id).await?;
+    let job = require_job(&state, &id).await?;
+    // Cancel is legal from any non-terminal phase (including Paused);
+    // cancelling an already-terminal job is a conflict.
+    require_phase(!job.phase.is_terminal(), "cancel", job.phase)?;
     let reason = reason_or_default(body.map(|Json(b)| b), "operator");
     let kind = EventKind::JobCancelled {
         job_id: id.clone(),
@@ -176,7 +206,9 @@ pub async fn drain(
     _body: Option<Json<ReasonBody>>,
 ) -> Result<Json<CommandAccepted>, ApiError> {
     let id = parse_id(id)?;
-    require_job(&state, &id).await?;
+    let job = require_job(&state, &id).await?;
+    // Drain rides on JobPaused, so it shares pause's legality.
+    require_phase(job.phase.can_pause(), "drain", job.phase)?;
     let reason = "drain".to_string();
     let kind = EventKind::JobPaused {
         job_id: id.clone(),

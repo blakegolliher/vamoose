@@ -364,8 +364,21 @@ workers never compare clocks across nodes.
 - Per-file events (`ErrorEmitted`) stream, but coord caps to N/sec
   globally per error class to prevent flooding. Excess is folded into
   `ErrorBucket.count`.
+  *Delivered (ledger F24):* `ERROR_STREAM_MAX_PER_SEC` per class per
+  second, decided inline at ingest (`runtime.rs` `StreamCaps`).
+  Excess still reaches state — and therefore `ErrorBucket.count` —
+  as always; only the bus is capped. The per-job bucket *table* is
+  additionally capped at `ERROR_BUCKET_CAP` distinct classes plus
+  one catch-all overflow bucket.
 - `WorkerHeartbeat` never streams (updates state but not the event log).
+  *Delivered by construction:* no heartbeat event kind exists; pinned
+  by the `worker_heartbeat_never_streams` test.
 - `ProgressDelta` streams at 1Hz max per (job, worker) — coord coalesces.
+  *Delivered (ledger F24) as a bus-only cap*
+  (`PROGRESS_STREAM_MIN_INTERVAL_MS`): state folds every delta and
+  the event log carries every delta; coalescing the log itself would
+  change replay semantics, so a log-side cap is recorded as a
+  follow-up in the F24 ledger row.
 
 ### 3.4 SSE backpressure
 
