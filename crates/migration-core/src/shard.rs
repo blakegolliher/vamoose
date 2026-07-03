@@ -492,15 +492,51 @@ mod tests {
 
         fn write(self, rows: &[TestRow]) -> std::path::PathBuf {
             let batch = build_batch(self.schema.clone(), rows);
+            self.write_batch(batch)
+        }
+
+        /// Raw-batch write path for schema-drift tests: the parquet
+        /// file takes the batch's own schema, which need not be
+        /// canonical. KV footer handling is identical to `write`.
+        fn write_batch(self, batch: RecordBatch) -> std::path::PathBuf {
             let props = WriterProperties::builder()
                 .set_key_value_metadata(Some(self.kv))
                 .build();
             let file = std::fs::File::create(&self.path).unwrap();
-            let mut writer = ArrowWriter::try_new(file, self.schema, Some(props)).unwrap();
+            let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
             writer.write(&batch).unwrap();
             writer.close().unwrap();
             self.path
         }
+    }
+
+    /// Canonical single-row batch with column `name` dropped — the
+    /// "producer forgot a column" drift shape.
+    fn batch_without_column(name: &str) -> RecordBatch {
+        let batch = build_batch(schema::canonical_schema(), &[TestRow::ok(0)]);
+        let (idx, _) = batch.schema().column_with_name(name).unwrap();
+        let keep: Vec<usize> = (0..batch.num_columns()).filter(|&i| i != idx).collect();
+        batch.project(&keep).unwrap()
+    }
+
+    /// Canonical single-row batch with column `name` re-typed to Utf8
+    /// (same name, wrong arrow type) — the M2 incident-1 drift shape.
+    fn batch_with_utf8_column(name: &str) -> RecordBatch {
+        let batch = build_batch(schema::canonical_schema(), &[TestRow::ok(0)]);
+        let (idx, _) = batch.schema().column_with_name(name).unwrap();
+        let mut fields: Vec<arrow::datatypes::Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields[idx] = arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, false);
+        let mut columns = batch.columns().to_vec();
+        columns[idx] = Arc::new(arrow::array::StringArray::from(vec![
+            "drifted";
+            batch.num_rows()
+        ]));
+        RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns).unwrap()
     }
 
     #[derive(Clone)]
@@ -636,6 +672,92 @@ mod tests {
             .write(&[TestRow::ok(0)]);
         let reader = ShardReader::open(&path).expect("missing KV is WARN, not error");
         assert_eq!(reader.rows(), 1);
+    }
+
+    #[test]
+    fn open_rejects_missing_required_column() {
+        // The M2 incident-1 class, rejecting direction: a producer
+        // whose schema lacks a required column must fail at OPEN, not
+        // mid-iteration, with the offending column named.
+        for &missing in schema::REQUIRED_COLUMNS {
+            let path = ShardWriter::new(&format!("part-missing-{missing}.parquet"))
+                .write_batch(batch_without_column(missing));
+            match ShardReader::open(&path) {
+                Err(Error::MissingColumn(c)) => {
+                    assert_eq!(c, missing, "error should name the dropped column");
+                }
+                Err(other) => panic!("dropping `{missing}`: expected MissingColumn, got {other:?}"),
+                Ok(_) => panic!("dropping `{missing}`: expected MissingColumn, got Ok(reader)"),
+            }
+        }
+    }
+
+    #[test]
+    fn decode_rejects_mistyped_required_column() {
+        // `size` present but Utf8 instead of UInt64. By design,
+        // `ShardReader::open` validates column NAMES only
+        // (`validate_schema`), so open must SUCCEED here; the type
+        // mismatch surfaces on the first `into_rows()` item via
+        // `type_err`. Pin the open-vs-decode split explicitly — the
+        // late surfacing is exactly what bit in M2 and a future
+        // open-time type check would be a (welcome) behavior change
+        // this test forces to be made consciously.
+        let path = ShardWriter::new("part-mistyped-size.parquet")
+            .write_batch(batch_with_utf8_column(schema::COL_SIZE));
+        let reader = ShardReader::open(&path)
+            .expect("open is a name-only schema check by design; type drift passes open");
+        let mut it = reader.into_rows().expect("builder re-open succeeds");
+        match it.next() {
+            Some(Err(Error::Other(e))) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unexpected arrow type") && msg.contains(schema::COL_SIZE),
+                    "error should name the column and the type problem: {msg}",
+                );
+            }
+            other => panic!("expected Err(Error::Other(..unexpected arrow type..)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drifted_errors_classify_fatal() {
+        // Bridge test for the classification gap: the worker's
+        // `classify_shard_error` (migration-worker/src/orchestrator.rs)
+        // matches on the error VARIANT alone — `MissingColumn` and
+        // `Other` map to Fatal (terminal Failed claim, operator
+        // intervenes), while e.g. `SchemaVersionMismatch` and `Io` map
+        // to WorkerLocal (release + peer retries). The worker-side
+        // table test (worker_error_classification.rs) pins variant →
+        // class with hand-built errors; this test pins that the errors
+        // the reader ACTUALLY produces for schema drift are those
+        // Fatal variants. If drift ever started surfacing as a
+        // WorkerLocal variant instead, a drifted shard would cycle
+        // through the whole fleet forever instead of failing loudly.
+        let missing_err = match ShardReader::open(
+            &ShardWriter::new("part-classify-missing.parquet")
+                .write_batch(batch_without_column(schema::COL_SIZE)),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("missing column must not open"),
+        };
+        assert!(
+            matches!(missing_err, Error::MissingColumn(_)),
+            "missing-column drift must surface as MissingColumn (classifies Fatal), got {missing_err:?}",
+        );
+
+        let reader = ShardReader::open(
+            &ShardWriter::new("part-classify-mistyped.parquet")
+                .write_batch(batch_with_utf8_column(schema::COL_SIZE)),
+        )
+        .expect("type drift passes the name-only open check");
+        let mistyped_err = match reader.into_rows().unwrap().next() {
+            Some(Err(e)) => e,
+            other => panic!("mistyped column must fail decode, got {other:?}"),
+        };
+        assert!(
+            matches!(mistyped_err, Error::Other(_)),
+            "type drift must surface as Other (classifies Fatal), got {mistyped_err:?}",
+        );
     }
 
     #[test]
