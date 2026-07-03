@@ -27,6 +27,7 @@ pub mod file_mover;
 pub mod libnfs;
 pub mod paths;
 pub mod pipelined_copy;
+pub mod reorder;
 pub mod root_mtime;
 pub mod strategy;
 pub mod uring;

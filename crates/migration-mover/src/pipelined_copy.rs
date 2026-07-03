@@ -40,11 +40,11 @@
 use crate::bucketed_pool::BucketConfig;
 use crate::error::MoveError;
 use crate::libnfs::asyncio::{AsyncNfsContext, AsyncNfsFh, NfsError, NfsStat64};
+use crate::reorder::ReorderState;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
 use migration_core::records::FailurePhase;
-use std::collections::BTreeMap;
 use xxhash_rust::xxh3::Xxh3;
 
 /// Outcome of one `pipelined_copy` invocation. Caller folds this into
@@ -110,17 +110,16 @@ pub async fn pipelined_copy(
     let read_depth: usize = cfg.read_pipeline_depth.max(1) as usize;
     let write_depth: usize = cfg.write_pipeline_depth.max(1) as usize;
 
-    // Two-cursor short-read-safe read pipeline. `next_issue_off`
-    // walks forward as we send pread RPCs; `next_deliver_off` walks
-    // forward as we hand chunks to the writer. NFSv3 does not
-    // guarantee a `pread(off, rsize)` returns `rsize` bytes pre-EOF,
-    // so we may get short reads in the middle of a file (rare on
-    // VAST but the spec permits it); the reorder buffer holds
-    // completions until their offset is the next-to-deliver, at
-    // which point the short-read tail is re-issued automatically
-    // by the offset arithmetic in the read-completion arm.
-    let mut next_issue_off: u64 = 0;
-    let mut next_deliver_off: u64 = 0;
+    // Two-cursor short-read-safe read pipeline, owned by the pure
+    // `ReorderState` (see `reorder.rs`): the issue cursor walks
+    // forward as we send pread RPCs; the deliver cursor walks forward
+    // as we hand chunks to the writer. NFSv3 does not guarantee a
+    // `pread(off, rsize)` returns `rsize` bytes pre-EOF, so we may
+    // get short reads in the middle of a file (rare on VAST but the
+    // spec permits it); the reorder buffer holds completions until
+    // their offset is the next-to-deliver, at which point the
+    // short-read tail is re-issued via `CompletionOutcome::reissue`.
+    let mut state = ReorderState::new(size);
     // `FuturesUnordered<F>` fixes `F` to the first push's type. Two
     // anonymous `async move` blocks have distinct types even if their
     // bodies are identical (rustc E0308), so coerce reads + writes to
@@ -129,7 +128,6 @@ pub async fn pipelined_copy(
     // A completed read resolves to (issue_offset, wanted_len, bytes).
     type ReadFuture<'a> = BoxFuture<'a, Result<(u64, u64, Vec<u8>), NfsError>>;
     let mut reads_inflight: FuturesUnordered<ReadFuture<'_>> = FuturesUnordered::new();
-    let mut reorder_buf: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
 
     // Bounded write pipeline. `FuturesUnordered` of in-flight pwrites
     // is the capacity gate; `submit_write` waits for a free slot.
@@ -143,103 +141,73 @@ pub async fn pipelined_copy(
     // rate even on a fleet of workers.
     let mut hasher = Xxh3::new();
 
-    // Stop reading once we've seen EOF (short read that didn't fill
-    // its requested range AND was the file's actual tail). After EOF
-    // we still need to drain whatever's already in flight and in the
-    // reorder buffer, then writes_inflight, then fsync.
-    let mut hit_eof = false;
-    let mut effective_size: u64 = size;
+    // Reorder-buffer bound (F07): if the read at the deliver cursor
+    // stalls, completed reads pile up in the reorder buffer; without
+    // a cap the pump would buffer the whole remaining file in RAM.
+    // Derived from the bucket config (no new user knob): twice the
+    // pipeline's natural window of `read_depth` chunks of `rsize`
+    // (the largest chunk a read or gap-fill can carry).
+    let max_buffered_bytes = (read_depth as u64).saturating_mul(rsize).saturating_mul(2);
 
     loop {
-        // 1) Pump fresh reads up to depth, capped at the current
-        // effective size (which only shrinks if we observe EOF
-        // earlier than `size` predicted).
-        while !hit_eof && reads_inflight.len() < read_depth && next_issue_off < effective_size {
-            let want = rsize.min(effective_size - next_issue_off);
-            let off = next_issue_off;
+        // 1) Pump fresh reads while the state machine allows it
+        // (below depth, below the current effective size — which
+        // only shrinks if we observe EOF earlier than `size`
+        // predicted — and within the buffered-bytes bound).
+        while state.may_issue(reads_inflight.len(), read_depth, max_buffered_bytes) {
+            let (off, want) = state.take_read(rsize);
             let fut = async move {
                 let bytes = src.pread(src_fh, off, want as usize).await?;
                 Ok::<_, NfsError>((off, want, bytes))
             }
             .boxed();
             reads_inflight.push(fut);
-            next_issue_off += want;
         }
 
-        // 2) Deliver as many in-order chunks as the reorder buffer
-        // currently has at `next_deliver_off`. Each delivery: hash,
-        // then submit to the write pipeline (with backpressure).
-        while let Some(chunk) = reorder_buf.remove(&next_deliver_off) {
-            let chunk_len = chunk.len() as u64;
-            if chunk_len == 0 {
-                // Defensive: empty delivery means we hit EOF at
-                // exactly the boundary. Nothing to hash or write.
-                continue;
-            }
-            hasher.update(&chunk);
-
-            // Write-pipeline backpressure. Drain completed writes
-            // until there's a slot.
-            while writes_inflight.len() >= write_depth {
-                let r: Result<(), NfsError> = writes_inflight
-                    .next()
-                    .await
-                    .expect("writes_inflight non-empty here");
-                r.map_err(write_err)?;
-            }
-
-            let off = next_deliver_off;
-            let fut = pwrite_all(dst, dst_fh, off, chunk).boxed();
-            writes_inflight.push(fut);
-            next_deliver_off += chunk_len;
-        }
-
-        // 3) Exit when: no reads in flight AND nothing left in the
-        // reorder buffer AND either we've delivered everything we
-        // expected, or we've hit EOF early. The write pipeline is
+        // 2) Exit when nothing is in flight and the state machine is
+        // drained (reorder buffer empty, and delivery reached the
+        // effective size or EOF was observed). The write pipeline is
         // drained after the loop.
-        if reads_inflight.is_empty() && reorder_buf.is_empty() {
-            if hit_eof || next_deliver_off >= effective_size {
+        if reads_inflight.is_empty() {
+            if state.drained() {
                 break;
             }
-            // Reads queue is empty but we haven't issued enough to
-            // cover `effective_size`. This is the loop-step-zero
-            // boundary (e.g., the very first iteration on a zero-
-            // byte file). The next iteration's "pump fresh reads"
-            // step covers it; if `effective_size == 0`, the next
-            // iteration's exit check trips.
-            if next_issue_off >= effective_size {
-                break;
-            }
-            continue;
+            // Nothing in flight, not drained, and the pump above
+            // declined to issue: no event can ever make progress.
+            // Structurally unreachable — whenever the reorder buffer
+            // is non-empty the chunk at the deliver cursor is in
+            // flight (issuance is in offset order and the EOF clamp
+            // purges unreachable entries) — so this is a state-machine
+            // accounting bug. Fail the file copy rather than spin on
+            // a core forever holding the inflight-limiter permit
+            // (the F06 livelock shape).
+            return Err(MoveError::new(
+                FailurePhase::Read,
+                "pipelined_copy wedged: no reads in flight but reorder \
+                 state not drained (reorder/EOF accounting bug)",
+            ));
         }
 
-        // 4) Wait for at least one more read to complete, route it
-        // into the reorder buffer, re-issue any short-read tail.
+        // 3) Wait for at least one more read to complete and route it
+        // through the state machine: EOF clamps the effective size,
+        // data completions land in the reorder buffer and release
+        // whatever is now contiguous with the deliver cursor.
         match reads_inflight.next().await {
             Some(Ok((off, expected, bytes))) => {
-                let actual = bytes.len() as u64;
-                if actual == 0 {
+                if bytes.is_empty() {
                     // EOF at `off`. The file is shorter than `size`
-                    // predicted. Clamp `effective_size` so we stop
-                    // issuing past the real end; the reorder buffer
-                    // may still have in-order chunks before this
-                    // offset to deliver.
-                    if off < effective_size {
-                        effective_size = off;
-                    }
-                    hit_eof = true;
+                    // predicted. Clamp so we stop issuing past the
+                    // real end; the reorder buffer may still have
+                    // in-order chunks before this offset to deliver.
+                    state.on_eof_clamp(off);
                     continue;
                 }
-                reorder_buf.insert(off, bytes);
-                if actual < expected {
+                let outcome = state.on_completion(off, expected, bytes);
+                if let Some((gap_off, gap_len)) = outcome.reissue {
                     // Short read mid-file (very rare on VAST but
-                    // NFSv3 permits it). Issue the gap-fill at
-                    // `off + actual` for the remaining bytes. The
-                    // reorder buffer will hold both chunks; delivery
-                    // walks `next_deliver_off` forward through them.
-                    let gap_off = off + actual;
-                    let gap_len = expected - actual;
+                    // NFSv3 permits it). Issue the gap-fill; the
+                    // reorder buffer holds both chunks and delivery
+                    // walks forward through them.
                     let fut = async move {
                         let bytes = src.pread(src_fh, gap_off, gap_len as usize).await?;
                         Ok::<_, NfsError>((gap_off, gap_len, bytes))
@@ -247,16 +215,27 @@ pub async fn pipelined_copy(
                     .boxed();
                     reads_inflight.push(fut);
                 }
-            }
-            Some(Err(e)) => return Err(read_err(e)),
-            None => {
-                // reads_inflight was empty when we polled it; the
-                // top-of-loop pump should have kept it non-empty if
-                // there were more reads to issue. Defensive.
-                if reorder_buf.is_empty() && (hit_eof || next_deliver_off >= effective_size) {
-                    break;
+                // Deliver released in-order chunks: hash, then submit
+                // to the write pipeline (with backpressure).
+                for chunk in outcome.deliver {
+                    hasher.update(&chunk.bytes);
+
+                    // Write-pipeline backpressure. Drain completed
+                    // writes until there's a slot.
+                    while writes_inflight.len() >= write_depth {
+                        let r: Result<(), NfsError> = writes_inflight
+                            .next()
+                            .await
+                            .expect("writes_inflight non-empty here");
+                        r.map_err(write_err)?;
+                    }
+
+                    let fut = pwrite_all(dst, dst_fh, chunk.offset, chunk.bytes).boxed();
+                    writes_inflight.push(fut);
                 }
             }
+            Some(Err(e)) => return Err(read_err(e)),
+            None => unreachable!("reads_inflight checked non-empty above"),
         }
     }
 
@@ -287,7 +266,7 @@ pub async fn pipelined_copy(
 
     Ok(FileCopyResult {
         file_hash,
-        bytes_copied: next_deliver_off,
+        bytes_copied: state.bytes_delivered(),
         torn,
         pre_stat: pre,
         post_stat: post,
