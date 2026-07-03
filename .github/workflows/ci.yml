@@ -73,6 +73,74 @@ jobs:
         run: cargo test --workspace --locked
 
   # ---------------------------------------------------------------------------
+  # MSRV: prove the `rust-version` promise in Cargo.toml. The toolchain
+  # is read from the manifest so the declared value is always the
+  # tested value — bumping one without the other is impossible.
+  # `cargo check` (not test): MSRV verifies compilability; keep it fast.
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: msrv check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          test -n "$msrv" || { echo "no rust-version in Cargo.toml" >&2; exit 1; }
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install libnfs build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnfs-dev pkg-config
+
+      - name: cargo check (MSRV)
+        run: cargo check --workspace --all-targets --locked
+
+  # ---------------------------------------------------------------------------
+  # SCHEMA_CONTRACT.md drift vs the nfs-walker repo. The contract is
+  # vendored byte-identical in both repos and promises "CI in either
+  # repo should fail if its copy diverges from the other".
+  #
+  # The upstream repo location is environment-specific, so this job is
+  # guarded: set the repository variable NFS_WALKER_REPO (e.g.
+  # "blakegolliher/nfs-walker") to enable it; if the repo is private,
+  # also set the NFS_WALKER_TOKEN secret to a read-scoped token. When
+  # the variable is unset the job is skipped entirely — the always-on
+  # local half of this check is the `contract_drift` test in
+  # crates/migration-core/tests/, which pins schema.rs against our copy
+  # of SCHEMA_CONTRACT.md on every `cargo test`.
+  # ---------------------------------------------------------------------------
+  contract-drift:
+    name: schema contract drift vs nfs-walker
+    if: vars.NFS_WALKER_REPO != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out nfs-walker
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.NFS_WALKER_REPO }}
+          token: ${{ secrets.NFS_WALKER_TOKEN || github.token }}
+          path: .nfs-walker-upstream
+
+      - name: Diff vendored SCHEMA_CONTRACT.md copies (byte-wise)
+        run: |
+          diff -u .nfs-walker-upstream/SCHEMA_CONTRACT.md SCHEMA_CONTRACT.md
+          cmp .nfs-walker-upstream/SCHEMA_CONTRACT.md SCHEMA_CONTRACT.md
+
+  # ---------------------------------------------------------------------------
   # cargo-deny: license allowlist, advisory db, banned wildcards,
   # crates.io-only sources. Config in deny.toml.
   # ---------------------------------------------------------------------------
