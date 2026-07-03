@@ -52,8 +52,25 @@ jobs:
     name: build + test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Full debuginfo across ~20 workspace test binaries linking
+      # arrow + the aws stack overflows the runner's disk — ld dies
+      # with SIGBUS (mmap'd output hits ENOSPC) at the largest link.
+      # Line tables keep test backtraces useful at a fraction of the
+      # size. The `test` profile inherits `dev`, so one knob covers
+      # both `cargo build` and `cargo test`.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free runner disk (preinstalled bloat)
+        # ~20 GiB of headroom: none of these toolchains are used by
+        # this job. `df` lines make regressions diagnosable from logs.
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/dotnet /opt/ghc
+          df -h /
 
       - uses: dtolnay/rust-toolchain@stable
 
