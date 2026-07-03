@@ -692,10 +692,23 @@ pub async fn run(client: Client, opts: RunOpts) -> anyhow::Result<()> {
     use ratatui::backend::CrosstermBackend;
     use ratatui::Terminal;
 
+    // F27: restore-on-panic must not depend on Drop (which never runs
+    // under release panic = "abort"). Install before entering raw mode
+    // so there is no window where a panic leaves the terminal raw.
+    install_panic_hook();
+
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
     let _restore = TerminalGuard;
+
+    // Hidden manual-verification hook for F27; see `panic_after_ms`.
+    if let Some(ms) = panic_after_ms(std::env::var("VAMOOSE_TUI_PANIC_AFTER_MS").ok().as_deref()) {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            panic!("VAMOOSE_TUI_PANIC_AFTER_MS={ms} elapsed — deliberate F27 test panic");
+        });
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -790,14 +803,61 @@ pub async fn run(client: Client, opts: RunOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Restore the terminal: raw mode off, back to the main screen.
+///
+/// Single source of truth for restore (F27): both [`TerminalGuard`]'s
+/// Drop and the panic hook installed by [`install_panic_hook`] call
+/// this fn and nothing else. Best-effort and idempotent — safe to run
+/// twice (guard after hook), on a non-tty, or mid-panic.
+pub(crate) fn restore_terminal() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+}
+
+/// Install a panic hook that restores the terminal, then delegates to
+/// the previously installed hook (so the panic message still prints —
+/// now onto the operator's real screen instead of the vanished alt
+/// screen).
+///
+/// Why a hook and not just the guard: `TerminalGuard` is Drop-based,
+/// and Drop never runs under release `panic = "abort"` — a panic would
+/// leave the operator's terminal raw in the alternate screen. Panic
+/// hooks run before the abort, so restore still happens.
+///
+/// Idempotent: only the first call installs; returns whether this call
+/// did the installing. Re-wrapping on every call would chain a restore
+/// per install and re-entrantly grow the hook.
+pub(crate) fn install_panic_hook() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        prev(info);
+    }));
+    true
+}
+
+/// Parse the hidden `VAMOOSE_TUI_PANIC_AFTER_MS` test hook value.
+/// When set to a millisecond count, [`run`] spawns a task that panics
+/// after the delay — the only practical way to verify panic-path
+/// terminal restore in a real terminal (`kill -SEGV` is not a panic).
+/// See the ignored test `manual_panic_abort_restore_via_env_hook` for
+/// the manual recipe. Non-numeric values are ignored.
+fn panic_after_ms(raw: Option<&str>) -> Option<u64> {
+    raw?.trim().parse().ok()
+}
+
 /// Restore the terminal on Drop. Bypasses anyhow — restore should
 /// happen even if the user kills the process via Ctrl-C and main
 /// is unwound.
 struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        restore_terminal();
     }
 }
 
@@ -997,6 +1057,80 @@ mod tests {
     fn jid(s: &str) -> JobId {
         JobId::new(s).unwrap()
     }
+    // ------------------------------------------------------------------
+    // F27: terminal restore under panic = "abort"
+    // ------------------------------------------------------------------
+
+    /// `TerminalGuard` is Drop-based and Drop never runs under release
+    /// `panic = "abort"`, so restore must ALSO be wired through a panic
+    /// hook. The hook and the guard share one `restore_terminal()` —
+    /// single source of truth asserted by construction (both call
+    /// sites name that fn; there is no other restore code).
+    ///
+    /// One test covers install + composition + idempotence because the
+    /// panic hook is process-global state: splitting these into
+    /// separate `#[test]`s would race under the parallel test harness.
+    #[test]
+    fn panic_hook_composes_with_previous_and_is_idempotent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A probe "previous" hook so we can observe composition.
+        let prev_calls = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&prev_calls);
+        std::panic::set_hook(Box::new(move |_| {
+            probe.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        assert!(
+            install_panic_hook(),
+            "first install must take effect and report true",
+        );
+        assert!(
+            !install_panic_hook(),
+            "second install must be a no-op (idempotent) — otherwise \
+             every install would re-wrap the hook chain",
+        );
+
+        // The hook runs on any panic, unwinding or not; catch_unwind
+        // keeps the test alive. restore_terminal() is a no-op-ish
+        // best-effort on a non-tty, so this is safe under the harness.
+        let caught = std::panic::catch_unwind(|| panic!("F27 probe panic"));
+        assert!(caught.is_err());
+        assert_eq!(
+            prev_calls.load(Ordering::SeqCst),
+            1,
+            "previous hook must still run exactly once after restore",
+        );
+    }
+
+    /// Pure parser for the hidden `VAMOOSE_TUI_PANIC_AFTER_MS` env
+    /// hook (manual F27 verification — see the ignored test below).
+    #[test]
+    fn panic_after_ms_parses_or_ignores() {
+        assert_eq!(panic_after_ms(Some("2000")), Some(2000));
+        assert_eq!(panic_after_ms(Some(" 250 ")), Some(250));
+        assert_eq!(panic_after_ms(Some("garbage")), None);
+        assert_eq!(panic_after_ms(Some("")), None);
+        assert_eq!(panic_after_ms(None), None);
+    }
+
+    /// Manual verification recipe for F27 — `kill -SEGV` is not a
+    /// panic, so a real panic in a real terminal is needed:
+    ///
+    /// ```text
+    /// cargo build --release --bin vamoose        # panic = "abort"
+    /// VAMOOSE_TUI_PANIC_AFTER_MS=2000 target/release/vamoose tui --url http://127.0.0.1:8443
+    /// ```
+    ///
+    /// The TUI aborts ~2s after startup. PASS: the shell prompt comes
+    /// back on the main screen, echoing normally (raw mode off, alt
+    /// screen left). FAIL (pre-F27 behavior): terminal stuck raw in
+    /// the alternate screen, needing `reset`.
+    #[test]
+    #[ignore = "manual: needs a real terminal and a panic=abort build"]
+    fn manual_panic_abort_restore_via_env_hook() {}
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
             code,

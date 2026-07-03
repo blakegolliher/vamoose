@@ -399,3 +399,42 @@ fn parse_size(s: &str) -> Option<u64> {
     };
     n.checked_mul(mult)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_size;
+
+    /// F31: table test over the size strings `[logging].max_bytes`
+    /// accepts (and the ones it must refuse).
+    #[test]
+    fn parse_size_table() {
+        // Accepted.
+        assert_eq!(parse_size("50 MiB"), Some(50 << 20));
+        assert_eq!(parse_size("1 GiB"), Some(1 << 30));
+        assert_eq!(parse_size("2 KiB"), Some(2 << 10));
+        assert_eq!(parse_size("10 KB"), Some(10_000));
+        assert_eq!(parse_size("5 MB"), Some(5_000_000));
+        assert_eq!(parse_size("2 GB"), Some(2_000_000_000));
+        assert_eq!(parse_size("1024"), Some(1024), "bare number is bytes");
+        assert_eq!(parse_size("512 B"), Some(512));
+        assert_eq!(
+            parse_size("  50 MiB  "),
+            Some(50 << 20),
+            "whitespace trimmed"
+        );
+        assert_eq!(parse_size("50MiB"), Some(50 << 20), "no space required");
+
+        // Refused.
+        assert_eq!(parse_size("garbage"), None);
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("MiB"), None, "unit without a number");
+        assert_eq!(parse_size("-1 MiB"), None, "negative");
+        assert_eq!(parse_size("1.5 GiB"), None, "fractional not supported");
+        assert_eq!(parse_size("50 XiB"), None, "unknown unit");
+        assert_eq!(
+            parse_size("18446744073709551615 GiB"),
+            None,
+            "overflow is caught, not wrapped",
+        );
+    }
+}

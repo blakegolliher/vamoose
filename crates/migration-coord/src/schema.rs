@@ -51,10 +51,24 @@ pub const SCHEMA_VERSION: u8 = 1;
 pub struct JobId(pub String);
 
 impl JobId {
-    /// Construct a `JobId` after rejecting characters that would break
-    /// the S3 key layout. The only reserved character is `/`, which
-    /// would put job state in the wrong prefix; everything else
-    /// (including underscores, hyphens, and unicode) is allowed.
+    /// Maximum id length in bytes (bytes, not chars — S3 key limits
+    /// are byte-based and the id is embedded in every per-job key).
+    pub const MAX_BYTES: usize = 128;
+
+    /// Construct a `JobId` after rejecting values that would break the
+    /// S3 key layout or operator tooling (F37):
+    ///
+    /// - empty, and `/` anywhere (wrong-prefix keys);
+    /// - the reserved name `_cluster` (its event log would land at
+    ///   `events/_cluster/` — the cluster-events prefix);
+    /// - `.` / `..` (path-traversal-shaped when keys are mirrored to a
+    ///   filesystem);
+    /// - ASCII control characters incl. DEL (break log lines, S3 key
+    ///   handling, and TUI rendering);
+    /// - anything over [`Self::MAX_BYTES`] bytes.
+    ///
+    /// Everything else — underscores, hyphens, dots inside a longer
+    /// id, unicode — is allowed.
     pub fn new(s: impl Into<String>) -> Result<Self, InvalidJobId> {
         let s = s.into();
         if s.is_empty() {
@@ -62,6 +76,19 @@ impl JobId {
         }
         if s.contains('/') {
             return Err(InvalidJobId::ContainsSlash);
+        }
+        if s == "_cluster" {
+            return Err(InvalidJobId::Reserved);
+        }
+        if s == "." || s == ".." {
+            return Err(InvalidJobId::DotSegment);
+        }
+        // `is_ascii_control` covers U+0000..=U+001F and DEL (U+007F).
+        if s.chars().any(|c| c.is_ascii_control()) {
+            return Err(InvalidJobId::ControlChar);
+        }
+        if s.len() > Self::MAX_BYTES {
+            return Err(InvalidJobId::TooLong { len: s.len() });
         }
         Ok(Self(s))
     }
@@ -83,6 +110,14 @@ pub enum InvalidJobId {
     Empty,
     #[error("job id may not contain '/'")]
     ContainsSlash,
+    #[error("job id '_cluster' is reserved (cluster-events prefix)")]
+    Reserved,
+    #[error("job id may not be '.' or '..'")]
+    DotSegment,
+    #[error("job id may not contain control characters")]
+    ControlChar,
+    #[error("job id is {len} bytes; maximum is {max}", max = JobId::MAX_BYTES)]
+    TooLong { len: usize },
 }
 
 /// Coord-assigned worker identity. A UUID v4 minted at register time.
@@ -801,6 +836,73 @@ mod tests {
         let id = jid("bobby");
         let s = serde_json::to_string(&id).unwrap();
         assert_eq!(s, "\"bobby\"");
+    }
+
+    // ------------------------------------------------------------------
+    // F37: tightened JobId validation
+    // ------------------------------------------------------------------
+
+    /// `_cluster` is reserved: a job named `_cluster` would put its
+    /// event log at `events/_cluster/` — the cluster-events prefix
+    /// (`layout::CLUSTER_EVENTS_PREFIX`).
+    #[test]
+    fn job_id_rejects_reserved_cluster() {
+        assert!(JobId::new("_cluster").is_err());
+        // Only the exact reserved name — other underscore ids are
+        // fine (nothing else collides in the layout).
+        assert!(JobId::new("_clusterish").is_ok());
+        assert!(JobId::new("my_cluster").is_ok());
+    }
+
+    /// `.` / `..` are path-traversal-shaped in S3 keys and confuse
+    /// every tool that mirrors keys onto a filesystem.
+    #[test]
+    fn job_id_rejects_dot_segments() {
+        assert!(JobId::new(".").is_err());
+        assert!(JobId::new("..").is_err());
+        // Dots inside a longer id stay legal.
+        assert!(JobId::new("v1.2-migration").is_ok());
+        assert!(JobId::new("..almost").is_ok());
+    }
+
+    /// Control characters break log lines, S3 key handling, and TUI
+    /// rendering.
+    #[test]
+    fn job_id_rejects_control_chars() {
+        assert!(JobId::new("bad\nid").is_err());
+        assert!(JobId::new("bad\tid").is_err());
+        assert!(JobId::new("bad\0id").is_err());
+        assert!(JobId::new("bad\x1bid").is_err());
+        assert!(JobId::new("del\u{7f}id").is_err());
+    }
+
+    /// Unbounded ids blow up key lengths and UI columns; cap at 128
+    /// bytes (bytes, not chars — S3 key limits are byte-based).
+    #[test]
+    fn job_id_rejects_over_128_bytes() {
+        assert!(JobId::new("a".repeat(128)).is_ok());
+        assert!(JobId::new("a".repeat(129)).is_err());
+        // Multi-byte: 43 × "マ" (3 bytes each) = 129 bytes.
+        assert!(JobId::new("マ".repeat(43)).is_err());
+    }
+
+    /// Every id style in use across the codebase's tests, fixtures,
+    /// and docs stays accepted.
+    #[test]
+    fn job_id_existing_valid_ids_still_accepted() {
+        for id in [
+            "bobby",
+            "bobby-migration",
+            "bobby-mig",
+            "test-bobby",
+            "test-archive",
+            "alpha",
+            "job-1",
+            "マイグレ",
+            "my_job",
+        ] {
+            assert!(JobId::new(id).is_ok(), "{id:?} must stay valid");
+        }
     }
 
     #[test]
