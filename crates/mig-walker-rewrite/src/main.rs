@@ -903,6 +903,43 @@ mod tests {
         .unwrap()
     }
 
+    /// Copy of `batch` with the named column removed — the "walker
+    /// stopped emitting a column" drift shape.
+    fn drop_column(batch: &RecordBatch, name: &str) -> RecordBatch {
+        let idx = batch.schema().index_of(name).unwrap();
+        let keep: Vec<usize> = (0..batch.num_columns()).filter(|&i| i != idx).collect();
+        batch.project(&keep).unwrap()
+    }
+
+    /// Copy of `batch` with the named column replaced by `array`
+    /// (same name, different arrow type) — the "walker changed a
+    /// column's type" drift shape.
+    fn replace_column(batch: &RecordBatch, name: &str, array: ArrayRef) -> RecordBatch {
+        let idx = batch.schema().index_of(name).unwrap();
+        let mut fields: Vec<Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields[idx] = Field::new(name, array.data_type().clone(), array.null_count() > 0);
+        let mut columns = batch.columns().to_vec();
+        columns[idx] = array;
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap()
+    }
+
+    /// Write a walker-shape batch to `<dir>/part-r00-00000.parquet`
+    /// the way the walker would (no KV footer — the shim adds that).
+    fn write_walker_parquet(dir: &Path, batch: &RecordBatch) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("part-r00-00000.parquet");
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
     fn tempdir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1003,6 +1040,99 @@ mod tests {
             assert_eq!(r.fsid, None);
             assert_eq!(r.xattr_blob, None);
             assert_eq!(r.symlink_target, None);
+        }
+    }
+
+    #[test]
+    fn walker_shim_rejects_missing_input_column() {
+        // Every column `translate_batch` requires to be PRESENT.
+        // Dropping any one of them must fail the shard rewrite with
+        // the "missing required column" error naming the column —
+        // never silently produce a canonical shard.
+        let required = [
+            "path",
+            "file_type",
+            "permissions",
+            "mtime_us",
+            "inode",
+            "nlink",
+            "uid",
+            "gid",
+            "size",
+        ];
+        let source_root = "/src-test";
+        for missing in required {
+            let work = tempdir(&format!("miss-{missing}"));
+            let batch = drop_column(&synthetic_walker_batch(source_root), missing);
+            let in_path = write_walker_parquet(&work.join("in"), &batch);
+            let out_dir = work.join("out");
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let err = rewrite_shard(
+                &in_path,
+                &out_dir.join("part-r00-00000.parquet"),
+                0,
+                source_root.as_bytes(),
+                "test",
+            )
+            .expect_err("shim must reject a walker shard missing a required column");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!("missing required column `{missing}`")),
+                "dropping `{missing}`: unexpected error: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn walker_shim_rejects_mistyped_input_column() {
+        // Same drift class, wrong-type flavor: the column is present
+        // under the right name but carries a different arrow type.
+        // The pluck helpers must fail with the "is not <Type>" error,
+        // not decode garbage. Three representative type families:
+        // Utf8 (path), UInt16 (permissions), Int64 (mtime_us).
+        let source_root = "/src-test";
+        let cases: [(&str, ArrayRef, &str); 3] = [
+            (
+                "path",
+                // Correct bytes, wrong physical type (Binary vs Utf8).
+                Arc::new(arrow::array::BinaryArray::from_vec(vec![
+                    b"/src-test".as_slice(),
+                    b"/src-test/file.bin",
+                    b"/src-test/link",
+                ])),
+                "walker column `path` is not Utf8",
+            ),
+            (
+                "permissions",
+                // Wider integer than the walker schema promises.
+                Arc::new(UInt32Array::from(vec![0o755u32, 0o644, 0o777])),
+                "walker column `permissions` is not UInt16",
+            ),
+            (
+                "mtime_us",
+                Arc::new(StringArray::from(vec!["1700000000000001"; 3])),
+                "walker column `mtime_us` is not Int64",
+            ),
+        ];
+        for (name, array, want) in cases {
+            let work = tempdir(&format!("mistyped-{name}"));
+            let batch = replace_column(&synthetic_walker_batch(source_root), name, array);
+            let in_path = write_walker_parquet(&work.join("in"), &batch);
+            let out_dir = work.join("out");
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let err = rewrite_shard(
+                &in_path,
+                &out_dir.join("part-r00-00000.parquet"),
+                0,
+                source_root.as_bytes(),
+                "test",
+            )
+            .expect_err("shim must reject a walker shard with a mistyped required column");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(want),
+                "retyping `{name}`: unexpected error: {msg}"
+            );
         }
     }
 

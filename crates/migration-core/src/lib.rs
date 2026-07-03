@@ -23,6 +23,8 @@
 #![allow(clippy::result_large_err)]
 
 pub mod claim;
+#[cfg(test)]
+mod contract_drift_tests;
 pub mod errors;
 pub mod fence;
 pub mod layout;

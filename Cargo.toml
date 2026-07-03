@@ -16,7 +16,12 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Blake Golliher"]
 license = "AGPL-3.0-only"
-rust-version = "1.75"
+# True MSRV of the locked dependency graph: Cargo.lock is version 4
+# (needs cargo >= 1.78) and the aws-sdk crates declare rust-version
+# 1.91.1. Verified by `cargo check --workspace --all-targets --locked`
+# on rustc 1.91.1; CI's `msrv` job re-verifies this exact value on
+# every push (it reads this field, so bumping it here is sufficient).
+rust-version = "1.91.1"
 repository = "https://github.com/blakegolliher/vamoose"
 description = "Distributed NFS-to-NFS migration with S3-based coordination"
 readme = "README.md"

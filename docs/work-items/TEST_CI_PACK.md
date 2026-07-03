@@ -1,6 +1,10 @@
 # Test/CI pack: schema-drift rejection tests + MSRV and contract-drift CI
 
-Status: open — not started.
+Status: done — F32 tests 1-5 green against the existing rejection
+machinery (no silent-accepts found); F43 msrv + contract-drift jobs
+added, and `rust-version` corrected 1.75 → 1.91.1 (1.75 was untrue:
+Cargo.lock is v4, which needs cargo ≥ 1.78, and the locked aws-sdk
+crates require 1.91.1; verified by building the workspace on 1.91.1).
 Ledger: F32, F43 in `docs/REVIEW_LEDGER.md`.
 Priority: medium — F32 is the M2 incident-1 class with zero regression
 coverage; F43 is two promised-but-missing CI guards.
