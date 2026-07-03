@@ -926,11 +926,16 @@ fn is_fatal(e: &ClientError) -> bool {
 /// chunks are deleted from `events/` (F23).
 ///
 /// Consistency: the cursor is re-read after the walk; if events
-/// landed mid-fetch the walk retries (bounded). If the coord never
-/// quiesces, the PRE-walk cursor is kept: replaying the overlap is
-/// deduped by seq for anything already applied, which beats a
-/// post-walk cursor that could silently skip events not yet visible
-/// in earlier pages.
+/// landed mid-fetch the walk retries (bounded), and a walk that never
+/// sees a quiescent coord is a **retryable error** — the driver's
+/// normal backoff loop tries again. There is no safe cursor for a
+/// torn walk: the pieces were read at different seqs, so a pre-walk
+/// cursor replays events whose effects are already baked into
+/// later-read pieces (permanently double-counting aggregates like
+/// error buckets — envelope-seq dedup cannot see into the snapshot),
+/// and a post-walk cursor permanently skips increments missing from
+/// earlier-read pieces. Only a clean pass (same cursor before and
+/// after) is sound.
 pub async fn fetch_bootstrap_snapshot(
     client: &Client,
     now: DateTime<Utc>,
@@ -958,21 +963,22 @@ pub async fn fetch_bootstrap_snapshot(
             }
         }
         let after = client.healthz().await?.last_seq;
-        if after == cursor_seq || attempt == CONSISTENT_ATTEMPTS {
-            if after != cursor_seq {
-                tracing::debug!(
-                    before = cursor_seq,
-                    after,
-                    "bootstrap fetched under write load; resuming from the pre-walk cursor"
-                );
-            }
+        if after == cursor_seq {
             return Ok(crate::state::snapshot_from_rest(
                 jobs, workers, buckets, cursor_seq, now,
             ));
         }
+        tracing::debug!(
+            before = cursor_seq,
+            after,
+            attempt,
+            "bootstrap walk torn by concurrent writes; retrying"
+        );
         cursor_seq = after;
     }
-    unreachable!("the loop returns by its final attempt")
+    Err(crate::client::ClientError::BootstrapTorn {
+        attempts: CONSISTENT_ATTEMPTS,
+    })
 }
 
 /// SSE driver task: REST-bootstrap → open the stream from the

@@ -52,6 +52,13 @@ pub enum ClientError {
 
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// The REST bootstrap walk never saw a quiescent coord (the
+    /// cursor kept moving between the pre- and post-walk reads), so
+    /// no sound resume cursor exists for the fetched pieces.
+    /// Retryable — the driver backs off and bootstraps again.
+    #[error("bootstrap walk torn by concurrent writes after {attempts} attempts")]
+    BootstrapTorn { attempts: usize },
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;
