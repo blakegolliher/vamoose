@@ -43,7 +43,10 @@ fn manifest_with_shards(n: usize) -> Manifest {
                 key: format!("index/{}", shard_name(i)),
                 rows: 10,
                 bytes: 4096,
-                etag: String::new(),
+                // F40: fixture etags must be non-empty — production
+                // code no longer skips verification on empty etags,
+                // and no fixture may rely on that bypass.
+                etag: format!("etag-fixture-{i:04}"),
             })
             .collect(),
         total_rows: (n as u64) * 10,

@@ -1044,9 +1044,25 @@ fn verify_shard_etag(
         .iter()
         .find(|s| key_basename(&s.key) == shard_filename)
         .ok_or_else(|| anyhow::anyhow!("shard {shard_filename} not in manifest"))?;
-    if expected.etag.is_empty() || actual_etag.is_empty() {
-        // Best-effort: some test fixtures don't fill etags.
-        return Ok(());
+    // F40: an empty etag on either side means the integrity check
+    // CANNOT run — that is an error, never a silent pass. These are
+    // deliberately plain (untyped) anyhow errors, matching the
+    // missing-shard style above: `classify_shard_error`'s conservative
+    // untyped default routes them to Fatal, which is correct — an
+    // absent/empty etag is a property of the manifest (or the store),
+    // not of this worker, and would re-occur for any worker that
+    // reclaimed the shard.
+    if expected.etag.is_empty() {
+        anyhow::bail!(
+            "shard {shard_filename}: manifest etag is missing (empty); cannot verify \
+             shard integrity — re-index or repair manifest.json",
+        );
+    }
+    if actual_etag.is_empty() {
+        anyhow::bail!(
+            "shard {shard_filename}: download returned an empty etag; cannot verify \
+             shard integrity against the manifest",
+        );
     }
     if expected.etag != actual_etag {
         return Err(migration_core::Error::ManifestChanged {
@@ -2121,6 +2137,131 @@ mod tests {
         assert!(!check_progress_liveness(
             None, CLAIM_ETAG, future, HB_SEC, now
         ));
+    }
+}
+
+#[cfg(test)]
+mod verify_shard_etag_tests {
+    //! F40 acceptance tests (`docs/work-items/WORKER_RESILIENCE.md`
+    //! item 1): an empty etag on either side of the shard integrity
+    //! check must be an error, never a silent pass. Tests 1–2 were
+    //! written first and observed red (the old code returned `Ok(())`
+    //! when either etag was empty, "best-effort" style).
+
+    use super::verify_shard_etag;
+    use migration_core::errors::Error as CoreError;
+    use migration_core::records::{
+        Endpoint, EndpointKind, Manifest, MigrationOptions, ShardEntry, RUN_FORMAT_VERSION,
+    };
+    use migration_core::time::UtcTime;
+
+    const SHARD: &str = "part-0001.parquet";
+
+    fn manifest_with_etag(etag: &str) -> Manifest {
+        Manifest {
+            format_version: RUN_FORMAT_VERSION,
+            run_id: "f40-verify-etag".into(),
+            created_utc: UtcTime::now(),
+            shards: vec![ShardEntry {
+                key: format!("index/{SHARD}"),
+                rows: 10,
+                bytes: 4096,
+                etag: etag.to_string(),
+            }],
+            total_rows: 10,
+            source: Endpoint {
+                kind: EndpointKind::Nfs,
+                url: "nfs://src/export".into(),
+                root: "/".into(),
+            },
+            dest: Endpoint {
+                kind: EndpointKind::Nfs,
+                url: "nfs://dst/export".into(),
+                root: "/".into(),
+            },
+            options: MigrationOptions::default(),
+        }
+    }
+
+    /// F40 acceptance test 1 (red before fix): a manifest entry with
+    /// `etag: ""` and a non-empty download etag is an error. The
+    /// message names the shard and says the MANIFEST etag is missing,
+    /// so an operator can tell it apart from an etag mismatch.
+    #[test]
+    fn empty_manifest_etag_is_an_error() {
+        let manifest = manifest_with_etag("");
+        let err = verify_shard_etag(&manifest, SHARD, "etag-download-1")
+            .expect_err("empty manifest etag must not bypass verification");
+        let msg = format!("{err}");
+        assert!(msg.contains(SHARD), "error must name the shard: {msg}");
+        assert!(
+            msg.contains("manifest etag") && (msg.contains("missing") || msg.contains("empty")),
+            "error must say the manifest etag is missing/empty: {msg}",
+        );
+        // Classification pin: this is a plain (untyped) anyhow error,
+        // so `classify_shard_error`'s conservative default routes it
+        // to Fatal — correct, because an empty manifest etag recurs
+        // for any worker.
+        assert!(
+            err.downcast_ref::<CoreError>().is_none(),
+            "empty-etag error must NOT reuse a typed CoreError \
+             (it must flow to Fatal via the untyped default)",
+        );
+    }
+
+    /// F40 acceptance test 2 (red before fix): symmetric — the store
+    /// returning an empty etag for the downloaded object is an error,
+    /// with a message distinguishable from test 1's.
+    #[test]
+    fn empty_download_etag_is_an_error() {
+        let manifest = manifest_with_etag("etag-manifest-1");
+        let err = verify_shard_etag(&manifest, SHARD, "")
+            .expect_err("empty download etag must not bypass verification");
+        let msg = format!("{err}");
+        assert!(msg.contains(SHARD), "error must name the shard: {msg}");
+        assert!(
+            msg.contains("download") && (msg.contains("missing") || msg.contains("empty")),
+            "error must say the DOWNLOAD etag is missing/empty: {msg}",
+        );
+        assert!(
+            !msg.contains("manifest etag is missing"),
+            "download-side message must be distinguishable from the manifest-side one: {msg}",
+        );
+        assert!(err.downcast_ref::<CoreError>().is_none());
+    }
+
+    /// F40 acceptance test 3a: matching non-empty etags still pass.
+    #[test]
+    fn matching_etags_pass() {
+        let manifest = manifest_with_etag("etag-abc");
+        verify_shard_etag(&manifest, SHARD, "etag-abc").expect("matching etags must verify");
+    }
+
+    /// F40 acceptance test 3b: a mismatch stays the typed
+    /// `Error::ManifestChanged` (which F13 classifies WorkerLocal —
+    /// release-and-skip, correct for a manifest swap mid-run).
+    #[test]
+    fn mismatched_etags_fail_with_manifest_changed() {
+        let manifest = manifest_with_etag("etag-abc");
+        let err = verify_shard_etag(&manifest, SHARD, "etag-xyz")
+            .expect_err("mismatched etags must fail");
+        match err.downcast_ref::<CoreError>() {
+            Some(CoreError::ManifestChanged { expected, actual }) => {
+                assert_eq!(expected, "etag-abc");
+                assert_eq!(actual, "etag-xyz");
+            }
+            other => panic!("expected ManifestChanged, got {other:?}"),
+        }
+    }
+
+    /// Existing behavior pin: a shard that isn't in the manifest at
+    /// all is an error naming the shard.
+    #[test]
+    fn unknown_shard_is_an_error() {
+        let manifest = manifest_with_etag("etag-abc");
+        let err = verify_shard_etag(&manifest, "part-9999.parquet", "etag-abc")
+            .expect_err("unknown shard must fail");
+        assert!(format!("{err}").contains("part-9999.parquet"));
     }
 }
 
