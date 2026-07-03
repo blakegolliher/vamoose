@@ -337,7 +337,7 @@ revision fixed.
 | R3 | **Fence-window dupes.** Owner is partitioned; peer reclaims; owner keeps committing renames until either (a) its next HEAD sees the new etag, (b) R6 retry-budget exhausts. Since the progress-cross-check landed, peer reclaims at `2 × heartbeat_sec` (faster), but owner's R6 trip is still gated on `lease_timeout` — so the dupe window under sustained partition can widen to ~`lease_timeout - 2 × heartbeat_sec` of overlapping writes. | At-least-once row commits, all bit-identical, atomic. Wider window = more duplicate work, no corruption. M5 assertion F (1.0s concurrent-rename bound) still holds. | Per partition / GC pause / lease overrun event |
 | R4 | ~~Spurious fence after clean `complete()`~~ — **fixed** | Held-claim cell is now cleared *before* `complete()`; heartbeat skips HEAD during complete's window | Fixed |
 | R5 | Reclaim PUT race: fresh `try_acquire` lands between reclaimer's DELETE and PUT | Reclaimer sees `LostRace`; the fresh acquirer owns | Sub-ms window; effectively zero |
-| R6 | ~~Persistent transient HEAD failure never trips fence~~ — **fixed** | Heartbeat now counts consecutive failures; trips after a full lease window's worth (`ceil(lease_timeout / heartbeat_sec)` ticks) | Fixed |
+| R6 | ~~Persistent transient HEAD failure never trips fence~~ — **fixed** | Heartbeat now counts consecutive failures; trips on the budget-th consecutive failure, budget = `max(1, floor(lease_timeout / heartbeat_sec))` (integer division, as implemented) | Fixed |
 | R7 | ~~Local clock jump not detected~~ — **fixed** | Wall-vs-monotonic drift is compared each tick; fence trips on `> lease_timeout / 2` | Fixed |
 | R8 | Mover commits one more rename per row that was already inside `spawn_blocking` at fence-trip time | Bounded by per-file copy time; safe due to bit-identical content | One-per-row at fence-trip; **not fixed**, deferred |
 | R9 | Manifest swapped under us (operator fat-fingers re-upload) | `verify_shard_etag` catches this at download; otherwise undetected | Operator fault |
@@ -429,7 +429,7 @@ heartbeat. Without the backoff, M-1 of M workers all re-issue
 
 Implied derived values:
 
-- R6 retry budget = `ceil(lease_timeout_sec / heartbeat_sec)` ticks
+- R6 retry budget = `max(1, floor(lease_timeout_sec / heartbeat_sec))` ticks (integer division — matches the implementation; the fence trips on the budget-th consecutive failure)
   before preemptive fence. With defaults: 6 ticks ≈ 3 minutes.
 - R7 clock-drift threshold = `lease_timeout_sec / 2` seconds. With
   defaults: 90 seconds.

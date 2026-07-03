@@ -1,10 +1,10 @@
 # Distributed NFS File Migration System — Design (v2)
 
-> **Freshness note (2026-07-01).** This doc predates several shipped
-> changes; where it disagrees with the following, the following win:
-> - Claim protocol: the claim/heartbeat/reclaim mechanics described
->   below are the *v1* design (`PUT If-Match` heartbeats). The shipped
->   protocol is v2 delete-then-create — see `docs/CLAIM_PROTOCOL.md`.
+> **Freshness note (2026-07-03).** The claim-protocol sections below
+> were rewritten to the shipped v2 delete-then-create protocol;
+> `docs/CLAIM_PROTOCOL.md` remains the authoritative as-built
+> reference — where this doc disagrees with it, CLAIM_PROTOCOL.md
+> wins. Still-stale caveats:
 > - Workspace: the crate list below predates `migration-coord`,
 >   `migration-tui`, `mig-walker-rewrite`, and `vamoose-cli` (the
 >   operator plane) — see `README.md`.
@@ -175,20 +175,36 @@ Contents:
 { "host": "worker-07", "claimed_utc": "2026-05-02T10:14:22Z", "epoch": 3 }
 ```
 
-**Claiming uses S3 conditional PUT (`If-None-Match: *`).** VAST S3 supports
-both `If-None-Match: *` and `If-Match: <etag>` per RFC 9110 (confirmed). The
-request either succeeds (worker owns the shard) or returns `412 Precondition
-Failed` (someone else owns it). No race-resolution code in the worker. The
-S3 server is the arbiter.
+**The protocol is v2 delete-then-create.** Four atoms, all arbitrated
+by S3 conditional requests — there is **no `PUT If-Match` anywhere**
+(a conditional overwrite cannot distinguish "I still own this" from
+"someone else's claim happens to be here"); ownership is proven by
+holding the etag of an object this worker created. See
+`docs/CLAIM_PROTOCOL.md` ("The four atoms", "State machine") for the
+authoritative as-built spec; summary:
 
-**Heartbeat refresh**: every 30s the owner overwrites its claim with
-`If-Match: <previous-etag>`, bumping `epoch` and updating `claimed_utc`.
-
-**Reclaim after death**: any worker reading the claim sees a stale
-`claimed_utc`. After `LEASE_TIMEOUT` (3 min) it attempts an `If-Match`
-PUT to overwrite the claim with its own ownership. The original owner can
-no longer refresh because the etag has changed — it will see its `If-Match`
-fail and self-fence (see below).
+- **try_acquire** — `PUT If-None-Match: *`. Success = ownership (the
+  returned etag is the ownership token); `412` = someone else owns it.
+  No race-resolution code in the worker; the S3 server is the arbiter.
+- **refresh (heartbeat)** — `HEAD` the claim and compare etags. **No
+  write**: the claim object and its etag stay stable for the whole
+  ownership window. Etag differs or object gone → the claim was lost →
+  self-fence (see below).
+- **reclaim** — after `LEASE_TIMEOUT`, a worker that judges the claim
+  stale does `DELETE If-Match: <stale-etag>` then
+  `PUT If-None-Match: *` with a bumped `epoch`. The delete only
+  succeeds against the exact stale generation; the create only
+  succeeds if nobody else got there first. Staleness is judged from
+  `claimed_utc` age **plus** a progress-liveness cross-check and a
+  fresh-claim grace window (see §4 and CLAIM_PROTOCOL.md "Worker
+  lifecycle") so a healthy owner is never stolen from.
+- **complete / fail** — `DELETE If-Match: <held-etag>` then
+  `PUT If-None-Match: *` of an **immutable terminal marker**
+  (`Completed` / `Failed`). Terminal states are never overwritten.
+  `fail` is reserved for shard-fatal errors (corrupt parquet — errors
+  that would recur for any worker); worker-local errors instead
+  release the claim (plain `DELETE If-Match`) and skip the shard so a
+  healthy peer can take it.
 
 ### 4. Progress (per-host, observability only)
 
@@ -211,8 +227,14 @@ progress/host-<id>.json
 }
 ```
 
-Updated every 30s. Aggregator reads these. **Workers do not depend on
-progress files for correctness** — they're observability only.
+Updated every 30s. Aggregator reads these. Since v2, progress records
+are **also a reclaim input**: the record carries the writer's
+`held_etag` and `heartbeat_sec`, and a worker judging another's claim
+stale cross-checks the owner's progress heartbeat before reclaiming
+(fresh claims get a `2 × heartbeat_sec` grace window). Progress is
+still not required for the owner's own correctness — a missing or
+stale progress record can delay a reclaim, never corrupt one. See
+CLAIM_PROTOCOL.md "Worker lifecycle".
 
 ### 5. Batch audit trail (per-host, append-only)
 
@@ -227,10 +249,15 @@ Optional; can be turned off at scale.
 ### 6. Per-file failures
 
 ```
-failures/host-<id>.jsonl
+failures/host-<id>/<shard-stem>-e<epoch>.jsonl
 ```
 
-One line per failed file with full context for retry:
+One **immutable object per sink flush** (shard stem + claim epoch make
+the key unique and replay-safe; written with `If-None-Match: *`, never
+overwritten — S3 has no append, and a fixed per-host key would lose
+every earlier shard's records on each flush). Consumers list the
+`failures/host-<id>/` prefix and concatenate. One line per failed file
+with full context for retry:
 
 ```json
 {
@@ -440,27 +467,36 @@ all rows of a hardlink group into the same shard.)
 
 2. **Claim a shard**
    - List `shards/`, identify a parquet shard with no live claim.
-     "Live" = `(now - claimed_utc) < LEASE_TIMEOUT`.
-   - Issue conditional PUT to `shards/<shard>.parquet.claim`:
-     - First-time claim: `If-None-Match: *`.
-     - Reclaim of stale: `If-Match: <stale-etag>`.
-   - On 412, pick another shard.
-   - On success, download `index/<shard>.parquet` to local tmpfs, mmap.
+     "Live" = `(now - claimed_utc) < LEASE_TIMEOUT`, cross-checked
+     against the owner's progress heartbeat, with a fresh-claim grace
+     window (CLAIM_PROTOCOL.md "Worker lifecycle").
+   - Free shard: `try_acquire` (`PUT If-None-Match: *`). Stale claim:
+     `reclaim` (`DELETE If-Match: <stale-etag>` then
+     `PUT If-None-Match: *`, epoch bumped).
+   - On 412 / lost race, back off with jitter and pick another shard.
+   - On success, download `index/<shard>.parquet` to local tmpfs
+     (etag-verified against the manifest), mmap.
 
 3. **Process shard**
    - Walk rows in `row_id` order, building byte-budgeted micro-batches.
    - For each micro-batch, run the mover (strategy selection per row).
-   - On every 30s tick: refresh claim (heartbeat), update `progress/`,
-     append batch audit if enabled.
-   - On any heartbeat refresh failure (412 — someone reclaimed): **stop
-     all in-flight copies, drop libnfs handles for in-flight files, exit
-     this shard.** This is the self-fence.
+   - On every 30s tick: `refresh` the claim (a `HEAD` + etag compare —
+     no write), update `progress/`, append batch audit if enabled.
+   - If refresh observes a different etag or a missing object, the
+     claim is lost: **stop all in-flight copies, drop libnfs handles
+     for in-flight files, exit this shard.** This is the self-fence.
+     (One suppression: if the loss coincides with this worker's own
+     just-finished clean completion — the held-claim cell no longer
+     matches the tick's snapshot — it is not a fence.)
 
 4. **Complete shard**
-   - When all rows in the shard are processed, write a final claim record
-     with `state: "completed"` (overwrite, `If-Match`).
+   - When all rows in the shard are processed, `complete`:
+     `DELETE If-Match: <held-etag>` then `PUT If-None-Match: *` of the
+     immutable `Completed` marker.
    - Delete local mmap'd parquet.
-   - Loop to step 2.
+   - Loop to step 2. (Shard-fatal processing errors take the same
+     shape via `fail`; worker-local errors release the claim and skip
+     the shard instead.)
 
 5. **Exit**
    - When no claimable shards remain (every claim is `completed` or live
@@ -479,14 +515,21 @@ from rows in shard X must hold a valid claim on X.
 **Mechanism**:
 - The mover's batch loop checks an atomic "claim_valid" flag before issuing
   each new file copy.
-- The heartbeat task sets `claim_valid = false` immediately on any of:
-  - HTTP 412 on heartbeat (lost claim).
-  - HTTP 5xx repeated past retry budget.
-  - Local clock jump > `LEASE_TIMEOUT/2`.
+- The heartbeat task sets `claim_valid = false` on any of:
+  - `HEAD` observes a different etag or a missing claim object (lost
+    claim) — **except** when the loss matches this worker's own clean
+    completion in flight (the held-claim cell no longer matches the
+    tick's snapshot; re-checked under the cell lock — a clean
+    completion must not fence the worker).
+  - Transient refresh errors past the retry budget
+    (`floor(lease / heartbeat)` consecutive failures; the counter
+    resets on any success).
+  - Local clock jump > `LEASE_TIMEOUT/2` (wall vs monotonic).
 - When `claim_valid = false`, the mover:
   - Cancels in-flight tasks (`tokio::select!` on a cancellation token).
-  - **Does not** issue further `RENAME` ops. Partial files left on dest
-    are cleaned up by `mig-aggr clean-partials`.
+  - **Does not** issue further `RENAME` ops. (Partial-file cleanup is
+    the planned `mig-aggr clean-partials` — still a stub; see the
+    freshness note.)
   - Exits the shard. The worker may try to claim a new shard.
 
 This is why writes go to `.partial` and only `RENAME` makes them visible:
@@ -508,9 +551,10 @@ assumptions.
 - **Add a host**: it starts, follows the lifecycle. Claims whatever's free.
 - **Remove gracefully**: worker drains current shard, marks claim
   `completed`, exits.
-- **Crash**: claim goes stale (no heartbeat refresh). After
-  `LEASE_TIMEOUT` (3 min), another worker reclaims. Crashed worker, if it
-  comes back, sees its claim has been overwritten and self-fences.
+- **Crash**: claim goes stale (progress heartbeat stops). After
+  `LEASE_TIMEOUT` (3 min), another worker reclaims (delete-then-create,
+  epoch bumped). Crashed worker, if it comes back, HEADs a claim whose
+  etag is no longer its own and self-fences.
 
 ---
 
@@ -518,14 +562,14 @@ assumptions.
 
 | Failure | Detection | Recovery |
 |---|---|---|
-| Worker crashes mid-shard | Heartbeat stale > 3 min | Another worker reclaims via `If-Match` PUT. |
+| Worker crashes mid-shard | Heartbeat stale > 3 min | Another worker reclaims (`DELETE If-Match` + `PUT If-None-Match`, epoch bumped). |
 | Worker partitioned from S3 | Heartbeat refresh fails | Worker self-fences before any other host reclaims. |
 | Source NFS slow / cnode pinning | Throughput metric drops | Surfaced in `progress/`; operator can rebalance shards or add hosts. |
 | Source NFS file gone at copy time | Per-file ENOENT | Logged to `failures/`; batch continues. |
 | Dest NFS full | Per-file ENOSPC | Logged; worker pauses claims (backpressure gate). |
 | Dest NFS partial write | io_uring error | `.partial` file remains; not renamed; logged. |
 | Two workers race for shard | S3 conditional PUT | One gets 412 and picks another shard. |
-| Parquet shard corrupt | Parquet decode error | Worker writes `failed` claim record, picks another shard. |
+| Parquet shard corrupt | Parquet decode error | Worker `fail`s the claim (immutable `Failed` marker via delete-then-create), picks another shard. Worker-local errors (stale binary, scratch I/O) release-and-skip instead. |
 | NFSv4.2 COPY unsupported on path | Server returns NOTSUPP | Mover falls back to READ/WRITE for that file. |
 | Aggregator down | N/A | Workers don't care; observability degraded only. |
 | Manifest swapped underneath us | ETag mismatch on shard re-fetch | Worker logs and exits this run. |
@@ -539,7 +583,15 @@ last 60s) **or** sustained throughput drops below a floor, the worker:
 
 - Stops claiming new shards (does not abandon current).
 - Continues current shard at reduced concurrency.
-- Logs a `degraded` event to `progress/`.
+- Publishes a structured `degraded:<reason>` status to `progress/`.
+
+Degradation recovers via **cooldown probes** rather than trapping the
+worker forever (inputs only update when a shard completes, and degraded
+blocks claiming — so an exit path is required): after a cooldown
+(5 min initially) the gate admits exactly one probe claim
+(status `degraded:<reason>:probe-pending` → `:probing`); a healthy
+outcome clears degradation, an unhealthy one re-degrades with the
+cooldown doubled (capped at 30 min).
 
 Avoids the failure mode where all 100 hosts pile onto a degraded dest and
 generate 100× ENOSPC events.
@@ -553,10 +605,11 @@ generate 100× ENOSPC events.
 | `manifest.json` | Once at startup | KB | Cached. |
 | `index/part-NNNN.parquet` | Once per shard | GB | **Downloaded fully to local tmpfs**; not range-read on the data path. |
 | `shards/*.claim` (LIST) | Every claim attempt + every 30s | KB | LIST returns small set. |
-| `shards/<own>.claim` (PUT) | Every 30s heartbeat + on completion | <1 KB | Conditional PUT. |
-| `progress/host-<self>.json` (PUT) | Every 30s | KB | Overwrite. |
-| `batches/host-<self>.jsonl` (PUT) | Per micro-batch | KB | Append-then-PUT. |
-| `failures/host-<self>.jsonl` (PUT) | Per failed file | KB | Append-then-PUT. |
+| `shards/<own>.claim` (HEAD) | Every 30s heartbeat | — | Etag compare only; no write on the heartbeat path. |
+| `shards/<own>.claim` (PUT/DELETE) | Acquire/reclaim/complete/fail only | <1 KB | Conditional delete-then-create. |
+| `progress/host-<self>.json` (PUT) | Every 30s | KB | Overwrite (single writer). |
+| `batches/host-<self>.jsonl` (PUT) | Per micro-batch | KB | Single-writer key. |
+| `failures/host-<self>/<stem>-e<epoch>.jsonl` (PUT) | Per sink flush | KB | Immutable per-flush object (`If-None-Match: *`); list the prefix to consume. |
 
 At 100 hosts, claim/heartbeat traffic is ~3.3 PUT/s and ~3.3 LIST/s
 **globally**. Shard parquet downloads are the only bulk traffic and happen
