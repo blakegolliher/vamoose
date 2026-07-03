@@ -45,8 +45,9 @@ use crate::errors::Result;
 use crate::events::{list_chunks, read_chunk};
 use crate::layout::EVENTS_PREFIX;
 use crate::schema::{
-    ErrorBucket, EventEnvelope, EventKind, Job, JobConfig, JobId, Phase, PhaseTransition, Progress,
-    Snapshot, Worker, WorkerCounters, WorkerState, ERROR_SAMPLE_CAP,
+    ErrorBucket, ErrorClass, EventEnvelope, EventKind, Job, JobConfig, JobId, Phase,
+    PhaseTransition, Progress, Snapshot, Worker, WorkerCounters, WorkerState, ERROR_BUCKET_CAP,
+    ERROR_OVERFLOW_CLASS, ERROR_SAMPLE_CAP, PHASE_HISTORY_CAP,
 };
 use crate::snapshot;
 use crate::store::CoordStore;
@@ -271,7 +272,21 @@ impl Snapshot {
                 message: _,
             } => {
                 let buckets = self.error_buckets.entry(job_id.clone()).or_default();
-                if let Some(b) = buckets.iter_mut().find(|b| &b.class == class) {
+                // Cardinality cap (ledger F24): `Other(String)` is
+                // free-form, so distinct classes are unbounded. Once
+                // the job has ERROR_BUCKET_CAP buckets, a NEW class
+                // folds into the catch-all bucket instead — its
+                // identity is dropped, its count is not. The vector
+                // therefore holds at most ERROR_BUCKET_CAP + 1
+                // entries (the cap plus the catch-all).
+                let effective_class = if buckets.len() < ERROR_BUCKET_CAP
+                    || buckets.iter().any(|b| &b.class == class)
+                {
+                    class.clone()
+                } else {
+                    ErrorClass::Other(ERROR_OVERFLOW_CLASS.to_string())
+                };
+                if let Some(b) = buckets.iter_mut().find(|b| b.class == effective_class) {
                     b.count = b.count.saturating_add(1);
                     b.last_seen = env.at;
                     push_sample(&mut b.sample_paths, path);
@@ -283,7 +298,7 @@ impl Snapshot {
                     b.retryable = *retryable;
                 } else {
                     buckets.push(ErrorBucket {
-                        class: class.clone(),
+                        class: effective_class,
                         count: 1,
                         first_seen: env.at,
                         last_seen: env.at,
@@ -387,6 +402,12 @@ fn transition_phase(
             at,
             reason: reason.to_string(),
         });
+        // Bound history growth (ledger F24): trim the oldest entry.
+        // Resume-target derivation reads from the tail, so this is
+        // safe for the JobResumed arm.
+        if j.phase_history.len() > PHASE_HISTORY_CAP {
+            j.phase_history.remove(0);
+        }
     }
 }
 
@@ -714,6 +735,122 @@ mod tests {
         assert!(buckets[0]
             .sample_paths
             .contains(&format!("/a/b/{}", ERROR_SAMPLE_CAP + 4)));
+    }
+
+    /// Ledger F24: `ErrorClass::Other(String)` is free-form, so the
+    /// per-job bucket vector must stop growing at `ERROR_BUCKET_CAP`;
+    /// overflow folds into a catch-all bucket. Identities past the
+    /// cap are lossy, counts are not.
+    #[test]
+    fn error_bucket_count_capped_per_job() {
+        use crate::schema::{ERROR_BUCKET_CAP, ERROR_OVERFLOW_CLASS};
+
+        let mut s = Snapshot::empty(at(0));
+        s.apply(&job_created(1, 0, "bobby"));
+        let extra = 25usize;
+        let total = ERROR_BUCKET_CAP + extra;
+        for i in 0..total {
+            s.apply(&env(
+                2 + i as u64,
+                10 + i as i64,
+                EventKind::ErrorEmitted {
+                    job_id: jid("bobby"),
+                    worker_id: WorkerId::new(),
+                    class: ErrorClass::Other(format!("weird-{i}")),
+                    path: format!("/p/{i}"),
+                    retryable: false,
+                    message: "x".into(),
+                },
+            ));
+        }
+
+        let buckets = &s.error_buckets[&jid("bobby")];
+        assert!(
+            buckets.len() <= ERROR_BUCKET_CAP + 1,
+            "bucket vec must stop growing at the cap (+1 catch-all), got {}",
+            buckets.len(),
+        );
+        let overflow = buckets
+            .iter()
+            .find(|b| b.class == ErrorClass::Other(ERROR_OVERFLOW_CLASS.to_string()))
+            .expect("overflow must fold into the catch-all bucket");
+        assert_eq!(
+            overflow.count, extra as u64,
+            "catch-all bucket must count every folded record",
+        );
+        // Counts are exact even though identities are dropped.
+        let sum: u64 = buckets.iter().map(|b| b.count).sum();
+        assert_eq!(sum, total as u64);
+
+        // And it really has stopped growing.
+        let len_before = buckets.len();
+        for i in 0..10u64 {
+            s.apply(&env(
+                2 + total as u64 + i,
+                1000 + i as i64,
+                EventKind::ErrorEmitted {
+                    job_id: jid("bobby"),
+                    worker_id: WorkerId::new(),
+                    class: ErrorClass::Other(format!("more-{i}")),
+                    path: "/q".into(),
+                    retryable: false,
+                    message: "x".into(),
+                },
+            ));
+        }
+        assert_eq!(s.error_buckets[&jid("bobby")].len(), len_before);
+    }
+
+    /// Ledger F24 (cheap-cap note): `phase_history` grows per
+    /// transition; unbounded pause/resume cycles must not bloat
+    /// state and snapshots forever. Oldest entries are trimmed;
+    /// resume still returns to the prior phase because derivation
+    /// reads from the tail.
+    #[test]
+    fn phase_history_capped_and_resume_still_works() {
+        use crate::schema::PHASE_HISTORY_CAP;
+
+        let mut s = Snapshot::empty(at(0));
+        s.apply(&job_created(1, 0, "bobby"));
+        s.apply(&env(
+            2,
+            1,
+            EventKind::JobPhaseChanged {
+                job_id: jid("bobby"),
+                from: Phase::Planned,
+                to: Phase::Copying,
+                reason: "go".into(),
+            },
+        ));
+        let mut seq = 3u64;
+        for i in 0..(PHASE_HISTORY_CAP as i64) {
+            s.apply(&env(
+                seq,
+                10 + 2 * i,
+                EventKind::JobPaused {
+                    job_id: jid("bobby"),
+                    reason: "op".into(),
+                },
+            ));
+            seq += 1;
+            s.apply(&env(
+                seq,
+                11 + 2 * i,
+                EventKind::JobResumed {
+                    job_id: jid("bobby"),
+                    reason: "op".into(),
+                },
+            ));
+            seq += 1;
+        }
+        let j = &s.jobs[&jid("bobby")];
+        assert_eq!(
+            j.phase_history.len(),
+            PHASE_HISTORY_CAP,
+            "history must be capped",
+        );
+        // The final resume still landed back on Copying.
+        assert_eq!(j.phase, Phase::Copying);
     }
 
     #[test]

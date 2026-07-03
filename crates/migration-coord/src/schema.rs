@@ -570,6 +570,38 @@ pub struct ErrorBucket {
 /// Cap on sample paths per error bucket. Enforced by the reducer.
 pub const ERROR_SAMPLE_CAP: usize = 10;
 
+/// Cap on distinct error-class buckets per job (ledger F24).
+/// `ErrorClass::Other(String)` is free-form, so without a cap one
+/// worker emitting distinct strings grows live state, every
+/// snapshot, and replay cost without bound. Once a job has this
+/// many buckets, further new classes fold into a single catch-all
+/// bucket (class `Other(ERROR_OVERFLOW_CLASS)`) — so the bucket
+/// vector holds at most `ERROR_BUCKET_CAP + 1` entries. Identities
+/// past the cap are dropped; counts stay exact.
+pub const ERROR_BUCKET_CAP: usize = 64;
+
+/// Class label of the catch-all bucket new error classes fold into
+/// once a job is at [`ERROR_BUCKET_CAP`].
+pub const ERROR_OVERFLOW_CLASS: &str = "(overflow)";
+
+/// Cap on `Job.phase_history` entries (ledger F24). Oldest entries
+/// are dropped first; resume-target derivation only looks at the
+/// most recent entries, so trimming the front is safe. 256 is weeks
+/// of pause/resume cycles at human cadence.
+pub const PHASE_HISTORY_CAP: usize = 256;
+
+/// Wire cap (COORD_PLAN §3.3, ledger F24): minimum interval between
+/// `ProgressDelta` broadcasts on the SSE bus per (job, worker) — the
+/// 1 Hz coalescing rule. State and the event log still see every
+/// delta; only the bus is capped.
+pub const PROGRESS_STREAM_MIN_INTERVAL_MS: i64 = 1000;
+
+/// Wire cap (COORD_PLAN §3.3, ledger F24): maximum `ErrorEmitted`
+/// broadcasts per error class per second on the SSE bus. Excess
+/// events still reach state (folding into `ErrorBucket.count`) and
+/// the event log; only the bus is capped.
+pub const ERROR_STREAM_MAX_PER_SEC: u32 = 10;
+
 // =============================================================================
 // Event log
 // =============================================================================

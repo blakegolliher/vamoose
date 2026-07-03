@@ -131,6 +131,75 @@ impl RuntimeConfig {
 /// commands number in the tens per day, so this bound is generous.
 const MAX_AUDIT_SEQ_PROBES: u64 = 10_000;
 
+/// Wire-cardinality caps (ledger F24, COORD_PLAN §3.3). Decides, at
+/// the ingest boundary, whether an event goes out on the SSE bus.
+/// The caps are **bus-only**: state applies every event and the
+/// event log carries every event, so durability and replay are
+/// untouched — only what live subscribers see is rate-limited.
+///
+/// - `ProgressDelta`: at most 1 Hz per (job, worker) — a suppressed
+///   delta is still folded into `Job.progress`; clients see the
+///   next delta (or refetch) for the latest values.
+/// - `ErrorEmitted`: at most [`crate::schema::ERROR_STREAM_MAX_PER_SEC`]
+///   per class per second — excess folds into `ErrorBucket.count`
+///   via the reducer as always.
+/// - Everything else streams unconditionally.
+///
+/// `progress_last` grows with the set of (job, worker) pairs seen —
+/// the same cardinality as the workers table, which is itself
+/// unbounded today (noted in the F24 ledger row as a follow-up).
+#[derive(Debug, Default)]
+struct StreamCaps {
+    progress_last:
+        std::collections::HashMap<(crate::schema::JobId, crate::schema::WorkerId), DateTime<Utc>>,
+    error_window_start: Option<DateTime<Utc>>,
+    error_counts: std::collections::HashMap<crate::schema::ErrorClass, u32>,
+}
+
+impl StreamCaps {
+    /// True if `kind` may be broadcast at `now`. Mutates the cap
+    /// bookkeeping; call exactly once per ingested event, under the
+    /// runtime lock.
+    fn should_broadcast(&mut self, kind: &EventKind, now: DateTime<Utc>) -> bool {
+        match kind {
+            EventKind::ProgressDelta {
+                job_id, worker_id, ..
+            } => {
+                let min_interval =
+                    chrono::Duration::milliseconds(crate::schema::PROGRESS_STREAM_MIN_INTERVAL_MS);
+                let key = (job_id.clone(), *worker_id);
+                match self.progress_last.get(&key) {
+                    Some(last) if now.signed_duration_since(*last) < min_interval => false,
+                    _ => {
+                        self.progress_last.insert(key, now);
+                        true
+                    }
+                }
+            }
+            EventKind::ErrorEmitted { class, .. } => {
+                // Tumbling one-second window shared across classes;
+                // per-class token count within it.
+                let stale = match self.error_window_start {
+                    Some(start) => now.signed_duration_since(start) >= chrono::Duration::seconds(1),
+                    None => true,
+                };
+                if stale {
+                    self.error_window_start = Some(now);
+                    self.error_counts.clear();
+                }
+                let n = self.error_counts.entry(class.clone()).or_insert(0);
+                if *n < crate::schema::ERROR_STREAM_MAX_PER_SEC {
+                    *n += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => true,
+        }
+    }
+}
+
 struct RuntimeInner {
     state: Snapshot,
     next_seq: u64,
@@ -153,6 +222,9 @@ struct RuntimeInner {
     /// archive tick from re-LISTing every historical terminal job on
     /// every snapshot.
     archived_jobs: std::collections::BTreeSet<crate::schema::JobId>,
+    /// Bus-only rate caps for high-cardinality event kinds (ledger
+    /// F24). See [`StreamCaps`].
+    stream_caps: StreamCaps,
 }
 
 /// One page of the jobs view, returned from
@@ -212,6 +284,7 @@ impl CoordRuntime {
                 lease_lost: false,
                 archive_eligible: Default::default(),
                 archived_jobs: Default::default(),
+                stream_caps: Default::default(),
             })),
             bus,
             store,
@@ -222,9 +295,10 @@ impl CoordRuntime {
 
     /// Ingest one event. Assigns the next seq, stamps `at`, applies
     /// the reducer, appends to the log, then broadcasts to SSE
-    /// subscribers. Returns the assigned seq.
+    /// subscribers (subject to the bus-only rate caps — see
+    /// [`StreamCaps`]). Returns the assigned seq.
     pub async fn ingest(&self, kind: EventKind) -> Result<u64> {
-        let env = {
+        let (env, broadcast) = {
             let mut guard = self.inner.lock().await;
             if guard.lease_lost {
                 return Err(Error::LeaseLost);
@@ -239,16 +313,20 @@ impl CoordRuntime {
                 kind,
             };
             guard.state.apply(&env);
+            let broadcast = guard.stream_caps.should_broadcast(&env.kind, env.at);
             guard
                 .writer
                 .append(self.store.as_ref(), env.clone())
                 .await?;
-            env
+            (env, broadcast)
         };
         // Broadcast outside the lock — `send` is non-blocking; if
         // there are no subscribers it returns an error we ignore.
-        let _ = self.bus.send(env.clone());
-        Ok(env.seq)
+        let seq = env.seq;
+        if broadcast {
+            let _ = self.bus.send(env);
+        }
+        Ok(seq)
     }
 
     /// Ingest an event whose payload was constructed by a worker
@@ -260,7 +338,7 @@ impl CoordRuntime {
         kind: EventKind,
         worker_at: DateTime<Utc>,
     ) -> Result<u64> {
-        let env = {
+        let (env, broadcast) = {
             let mut guard = self.inner.lock().await;
             if guard.lease_lost {
                 return Err(Error::LeaseLost);
@@ -275,14 +353,18 @@ impl CoordRuntime {
                 kind,
             };
             guard.state.apply(&env);
+            let broadcast = guard.stream_caps.should_broadcast(&env.kind, env.at);
             guard
                 .writer
                 .append(self.store.as_ref(), env.clone())
                 .await?;
-            env
+            (env, broadcast)
         };
-        let _ = self.bus.send(env.clone());
-        Ok(env.seq)
+        let seq = env.seq;
+        if broadcast {
+            let _ = self.bus.send(env);
+        }
+        Ok(seq)
     }
 
     /// Clone the current state. Cheap at deployment scale; if it
@@ -1207,6 +1289,183 @@ mod tests {
         assert!(snap.is_some());
         // Lease released.
         assert!(store.get(crate::layout::LEASE_KEY).await.unwrap().is_none());
+    }
+
+    // =========================================================
+    // Wire-cardinality caps (ledger F24, COORD_PLAN §3.3) — the
+    // SSE bus is rate-capped; state and the event log still see
+    // every event.
+    // =========================================================
+
+    fn progress_delta(job: &str, worker: WorkerId, files: u64) -> EventKind {
+        EventKind::ProgressDelta {
+            job_id: jid(job),
+            worker_id: worker,
+            files_delta: files,
+            bytes_delta: 7,
+            errors_delta: 0,
+        }
+    }
+
+    fn drain_progress_frames(sub: &mut broadcast::Receiver<EventEnvelope>) -> usize {
+        let mut n = 0;
+        while let Ok(env) = sub.try_recv() {
+            if matches!(env.kind, EventKind::ProgressDelta { .. }) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn progress_delta_coalesced_per_job_worker() {
+        let (rt, clock, _store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        let w = WorkerId::new();
+        let mut sub = rt.subscribe();
+
+        // Five deltas inside one injected-clock second.
+        for _ in 0..5 {
+            rt.ingest(progress_delta("bobby", w, 10)).await.unwrap();
+        }
+        // State folds every delta...
+        let snap = rt.state().await;
+        assert_eq!(snap.jobs[&jid("bobby")].progress.files_done, 50);
+        // ...but the bus carried at most 1 Hz for this (job, worker).
+        assert_eq!(
+            drain_progress_frames(&mut sub),
+            1,
+            "five same-second deltas must coalesce to one broadcast",
+        );
+
+        // A different worker in the same second is its own key.
+        let w2 = WorkerId::new();
+        rt.ingest(progress_delta("bobby", w2, 1)).await.unwrap();
+        assert_eq!(
+            drain_progress_frames(&mut sub),
+            1,
+            "coalescing is per (job, worker), not global",
+        );
+
+        // The next second opens a new broadcast slot for w.
+        clock.advance(Duration::seconds(1));
+        rt.ingest(progress_delta("bobby", w, 1)).await.unwrap();
+        assert_eq!(drain_progress_frames(&mut sub), 1);
+
+        // The suppressed deltas still reached the event log.
+        rt.flush_log().await.unwrap();
+        let logged = crate::state::read_job_events(_store.as_ref(), &jid("bobby"), 0)
+            .await
+            .unwrap();
+        let logged_deltas = logged
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::ProgressDelta { .. }))
+            .count();
+        assert_eq!(
+            logged_deltas, 7,
+            "the cap is bus-only; the log must carry every delta",
+        );
+    }
+
+    /// COORD_PLAN §3.3: `WorkerHeartbeat` never streams. There is no
+    /// heartbeat event kind at all — heartbeats mutate worker state
+    /// directly. Pin that: no event, no log write, no broadcast.
+    #[tokio::test]
+    async fn worker_heartbeat_never_streams() {
+        let (rt, _clock, store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        let w = WorkerId::new();
+        rt.ingest(EventKind::WorkerJoined {
+            worker_id: w,
+            job_id: jid("bobby"),
+            host: "h".into(),
+            pid: 42,
+            start_time: at(0),
+            version: "0.6".into(),
+        })
+        .await
+        .unwrap();
+        rt.flush_log().await.unwrap();
+
+        let mut sub = rt.subscribe();
+        let last_seq_before = rt.last_seq().await;
+        let writes_before = store.write_count();
+
+        let updated = rt
+            .record_heartbeat(
+                w,
+                crate::schema::WorkerCounters {
+                    files_per_sec: 1.0,
+                    bytes_per_sec: 2.0,
+                    errors_per_min: 0.0,
+                },
+                crate::schema::WorkerState::Copying,
+                3,
+                4,
+            )
+            .await
+            .unwrap();
+        assert!(updated);
+
+        // State updated...
+        let snap = rt.state().await;
+        assert_eq!(snap.workers[&w].state, crate::schema::WorkerState::Copying);
+        assert_eq!(snap.workers[&w].queue_depth, 4);
+        // ...but nothing was minted, logged, or streamed.
+        assert_eq!(rt.last_seq().await, last_seq_before, "no event minted");
+        assert_eq!(rt.buffered_event_count().await, 0, "nothing buffered");
+        assert_eq!(store.write_count(), writes_before, "nothing written");
+        assert!(
+            matches!(
+                sub.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty),
+            ),
+            "heartbeats must not reach the bus",
+        );
+    }
+
+    /// Regression for the caps: files/bytes totals and bucket counts
+    /// stay exact under coalescing and bucket capping — identity is
+    /// lossy, the counts are not.
+    #[tokio::test]
+    async fn caps_do_not_break_totals() {
+        use crate::schema::{ErrorClass, ERROR_BUCKET_CAP};
+
+        let (rt, _clock, _store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        let w = WorkerId::new();
+
+        // 30 same-second deltas (coalesced on the bus).
+        for _ in 0..30 {
+            rt.ingest(progress_delta("bobby", w, 3)).await.unwrap();
+        }
+        // More distinct error classes than the bucket cap.
+        let total_errors = ERROR_BUCKET_CAP + 10;
+        for i in 0..total_errors {
+            rt.ingest(EventKind::ErrorEmitted {
+                job_id: jid("bobby"),
+                worker_id: w,
+                class: ErrorClass::Other(format!("c{i}")),
+                path: format!("/p/{i}"),
+                retryable: false,
+                message: "x".into(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let snap = rt.state().await;
+        let p = &snap.jobs[&jid("bobby")].progress;
+        assert_eq!(p.files_done, 90, "files total must be exact");
+        assert_eq!(p.bytes_done, 210, "bytes total must be exact");
+        let sum: u64 = snap.error_buckets[&jid("bobby")]
+            .iter()
+            .map(|b| b.count)
+            .sum();
+        assert_eq!(
+            sum, total_errors as u64,
+            "bucket counts must be exact under capping",
+        );
     }
 
     /// Sanity check: dropping the runtime does not panic even if
