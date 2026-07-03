@@ -405,22 +405,54 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
 
         // Backpressure gate per DESIGN.md "Backpressure": if the last
         // shard ended in poor shape, don't pile onto a struggling
-        // dest. Sleep one heartbeat interval and re-check.
+        // dest. Sleep one heartbeat interval and re-check — until the
+        // cooldown elapses, at which point exactly ONE probe shard is
+        // allowed through so the inputs can update at all (F14:
+        // without a probe, `update()` never runs again and degraded
+        // is a one-way trap).
+        //
+        // A leftover `probing` state at the top of the loop means the
+        // previous probe pass consumed the token but its shard never
+        // fed `update()` (nothing claimable, lost claim race, or a
+        // shard-fatal decode error). That pass told us nothing about
+        // destination health — return the token so the probe retries
+        // instead of wedging in `probing` forever.
+        if backpressure.is_probing() {
+            backpressure.reset_probe();
+        }
         if let Some(reason) = backpressure.degraded() {
-            {
-                let mut p = progress.write().await;
-                p.status = format!("degraded:{}", reason.as_str());
+            if backpressure.try_claim_probe() {
+                {
+                    let mut p = progress.write().await;
+                    p.status = format!("degraded:{}:probing", reason.as_str());
+                }
+                tracing::info!(
+                    reason = reason.as_str(),
+                    "backpressure cooldown elapsed; probing with a single shard",
+                );
+                // Fall through: this pass claims and processes exactly
+                // one shard; its `update()` decides recovery (healthy)
+                // vs re-degrade with a doubled cooldown (unhealthy).
+            } else {
+                {
+                    let mut p = progress.write().await;
+                    p.status = format!(
+                        "degraded:{}:{}",
+                        reason.as_str(),
+                        backpressure.probe_phase().unwrap_or("probe-pending"),
+                    );
+                }
+                tracing::warn!(
+                    reason = reason.as_str(),
+                    last_failure_pct = backpressure.last_failure_pct(),
+                    last_throughput_mb_s = backpressure.last_throughput_mb_s(),
+                    "worker degraded; sleeping before next probe window",
+                );
+                tokio::time::sleep(Duration::from_secs(cfg.worker.heartbeat_sec)).await;
+                // Don't continue around — keep evaluating, but don't
+                // spin claims if still degraded after sleep.
+                continue;
             }
-            tracing::warn!(
-                reason = reason.as_str(),
-                last_failure_pct = backpressure.last_failure_pct(),
-                last_throughput_mb_s = backpressure.last_throughput_mb_s(),
-                "worker degraded; sleeping before next claim",
-            );
-            tokio::time::sleep(Duration::from_secs(cfg.worker.heartbeat_sec)).await;
-            // Don't continue around — keep evaluating, but don't spin
-            // claims if still degraded after sleep.
-            continue;
         }
 
         // Self-restart queue drains first — these are shards we
