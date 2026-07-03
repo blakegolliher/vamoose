@@ -16,6 +16,14 @@
 //! pinned by the existing `record_outcome_*` tests in
 //! `src/shard_processor.rs`.
 
+// F42 transient-retry acceptance tests live in a submodule of this
+// binary rather than their own tests/*.rs file: every top-level test
+// file links a separate full-workspace debug executable, and one
+// binary too many has tipped CI runners into linker SIGBUS (disk
+// exhaustion).
+#[path = "worker_error_classification/transient_retry.rs"]
+mod transient_retry;
+
 use std::collections::HashSet;
 use std::time::Duration;
 
