@@ -41,7 +41,7 @@ docs+tests+CI. Full narrative context is in `docs/HANDOFF.md`
 
 | ID  | Area     | Finding | Work item | Status | Notes |
 |-----|----------|---------|-----------|--------|-------|
-| F01 | protocol | Fresh claims stealable: `check_progress_liveness` etag-mismatch/absent branches have no claim-age grace; owner then self-fences and exits. Theft cascade at fleet startup. | [CLAIM_FRESH_GRACE.md](work-items/CLAIM_FRESH_GRACE.md) | in-progress | fix + tests on branch claim-fresh-grace; hardware fast-reclaim-drill pending before verified. Spec bug (PROGRESS_LIVENESS_CROSS_CHECK §4) carried into code; found independently by two tracks. |
+| F01 | protocol | Fresh claims stealable: `check_progress_liveness` etag-mismatch/absent branches have no claim-age grace; owner then self-fences and exits. Theft cascade at fleet startup. | [CLAIM_FRESH_GRACE.md](work-items/CLAIM_FRESH_GRACE.md) | landed | merged in PR #11; hardware fast-reclaim-drill pending before verified. Spec bug (PROGRESS_LIVENESS_CROSS_CHECK §4) carried into code; found independently by two tracks. |
 | F02 | coord    | Lease-lost coord still flushes event log + snapshot on shutdown; deposed coord can clobber its successor's chunks. | [COORD_LEASE_FENCE_WRITES.md](work-items/COORD_LEASE_FENCE_WRITES.md) | scheduled | |
 | F03 | coord    | Events acked to workers before durable (RAM buffer, 1000-event/5-min flush); crash drops acked events incl. pause/cancel and regresses `next_seq`, freezing TUIs. | [COORD_EVENT_ACK_DURABILITY.md](work-items/COORD_EVENT_ACK_DURABILITY.md) | scheduled | |
 
@@ -49,8 +49,8 @@ docs+tests+CI. Full narrative context is in `docs/HANDOFF.md`
 
 | ID  | Area     | Finding | Work item | Status | Notes |
 |-----|----------|---------|-----------|--------|-------|
-| F04 | worker   | Per-host failures/downgrades JSONL overwritten on every shard flush — the at-least-once reconciliation trail silently loses records. | [WORKER_FAILURE_SINK_APPEND.md](work-items/WORKER_FAILURE_SINK_APPEND.md) | in-progress | fix + tests on branch worker-failure-sink-append |
-| F05 | mover    | `FileCopyResult.torn` computed then discarded by `copy_regular`; modified-during-copy files commit silently, no downgrade record. | [MOVER_TORN_COPY_SURFACE.md](work-items/MOVER_TORN_COPY_SURFACE.md) | scheduled | |
+| F04 | worker   | Per-host failures/downgrades JSONL overwritten on every shard flush — the at-least-once reconciliation trail silently loses records. | [WORKER_FAILURE_SINK_APPEND.md](work-items/WORKER_FAILURE_SINK_APPEND.md) | in-progress | fix + tests on branch worker-failure-sink-append (PR #13) |
+| F05 | mover    | `FileCopyResult.torn` computed then discarded by `copy_regular`; modified-during-copy files commit silently, no downgrade record. | [MOVER_TORN_COPY_SURFACE.md](work-items/MOVER_TORN_COPY_SURFACE.md) | in-progress | fix + tests on branch mover-torn-copy-surface (PR #12) |
 | F06 | mover    | EOF-clamp livelock in `pipelined_copy`: source shrinks mid-copy → stale reorder-buf entry never drained → busy-spin holding the inflight permit. | [MOVER_EOF_REORDER_BOUNDS.md](work-items/MOVER_EOF_REORDER_BOUNDS.md) | scheduled | Same doc as F07. |
 | F07 | mover    | `reorder_buf` unbounded: one slow read RPC can buffer the rest of a file in RAM. | [MOVER_EOF_REORDER_BOUNDS.md](work-items/MOVER_EOF_REORDER_BOUNDS.md) | scheduled | |
 | F08 | mover    | `chmod` before `chown` strips setuid/setgid on NFSv3 (kill-priv semantics); rsync order is chown→chmod→utimes. Both sync + async paths. | [MOVER_ATTR_ORDER.md](work-items/MOVER_ATTR_ORDER.md) | scheduled | |
@@ -80,7 +80,7 @@ docs+tests+CI. Full narrative context is in `docs/HANDOFF.md`
 |-----|----------|---------|-----------|--------|-------|
 | F28 | tests    | `heartbeat.rs` has zero tests — the S3-side fence trigger is the only unautomated leg of the anti-dual-writer chain. | [PROTOCOL_TEST_PACK.md](work-items/PROTOCOL_TEST_PACK.md) | scheduled | |
 | F29 | tests    | `s3.rs` has zero tests — the 200/404/412 → outcome mapping IS the at-most-once guarantee. | [PROTOCOL_TEST_PACK.md](work-items/PROTOCOL_TEST_PACK.md) | scheduled | |
-| F30 | tests    | No harness anywhere runs two LIVE workers concurrently (every M5 harness serializes them) — exactly the configuration F01 breaks. | [CLAIM_FRESH_GRACE.md](work-items/CLAIM_FRESH_GRACE.md) | in-progress | fix + tests on branch claim-fresh-grace; hardware fast-reclaim-drill pending before verified. |
+| F30 | tests    | No harness anywhere runs two LIVE workers concurrently (every M5 harness serializes them) — exactly the configuration F01 breaks. | [CLAIM_FRESH_GRACE.md](work-items/CLAIM_FRESH_GRACE.md) | landed | merged in PR #11; hardware fast-reclaim-drill pending before verified. |
 | F31 | tests    | `vamoose-cli` `config.rs` (255 lines, every subcommand funnels through it) has zero tests; no clap `debug_assert` test. | [HARDENING_BATCH_1.md](work-items/HARDENING_BATCH_1.md) | scheduled | |
 | F32 | tests    | `mig-walker-rewrite` schema-drift rejection untested (the M2 incident-1 class); only the happy path is covered. | — | open | |
 

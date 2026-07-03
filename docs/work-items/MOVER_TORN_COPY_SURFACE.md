@@ -1,6 +1,6 @@
 # Surface torn-copy detection instead of discarding it
 
-Status: open — not started.
+Status: in review — fix + tests on branch mover-torn-copy-surface.
 Ledger: F05 in `docs/REVIEW_LEDGER.md`.
 Priority: high — modified-during-copy files currently commit silently.
 Scope: `migration-mover` (`file_mover.rs`, `downgrade.rs`,

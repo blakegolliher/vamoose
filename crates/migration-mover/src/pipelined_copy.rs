@@ -29,9 +29,13 @@
 //!   `pipelined_copy().await?` and `rename().await` with no other
 //!   work in between. R8 from `CORRECTNESS_RULES.md`.
 //! - **Torn-read remediation.** Torn reads are recorded in
-//!   `FileCopyResult::torn`; the multi-pass converging mover re-copies
-//!   torn rows next pass. This function never fails because of a torn
-//!   read.
+//!   `FileCopyResult::torn`; the caller (`file_mover::classify_copy`,
+//!   consumed by `copy_regular`) still commits the file and emits a
+//!   `DowngradeKind::TornCopy` downgrade record carrying the pre/post
+//!   stat brackets, so the tear is operator-visible. There is no
+//!   re-copy today: the multi-pass converging mover that would re-copy
+//!   torn rows is future work (`MULTI_PASS_MOVER.md`, phases 3–8
+//!   unbuilt). This function never fails because of a torn read.
 
 use crate::bucketed_pool::BucketConfig;
 use crate::error::MoveError;
@@ -64,10 +68,16 @@ pub struct FileCopyResult {
     /// the pre- and post-stat brackets. Indicates the source was
     /// modified during the copy; the destination still has *some*
     /// interleaving of pre- and post-versions and the rename still
-    /// publishes it. The convergence guarantee — next pass re-copies
-    /// torn rows because the classifier sees `torn = true` —
-    /// is what makes this correct.
+    /// publishes it. The caller (`file_mover::classify_copy` →
+    /// `copy_regular`) commits the file and emits a
+    /// `DowngradeKind::TornCopy` downgrade record — at-least-once
+    /// semantics with the source intact. Re-copying torn rows is the
+    /// future multi-pass driver's job (`MULTI_PASS_MOVER.md`).
     pub torn: bool,
+    /// `fstat(src_fh)` taken *before* the first read. Paired with
+    /// `post_stat` to populate `DowngradeKind::TornCopy`'s pre/post
+    /// `(size, mtime, ctime)` triples when `torn` is true.
+    pub pre_stat: NfsStat64,
     /// `fstat(src_fh)` taken *after* the last read + fsync. Caller
     /// uses this for the manifest row's authoritative
     /// `size`/`mtime_ns`/`ctime_ns`/`mode` (post-stat wins over the
@@ -279,6 +289,7 @@ pub async fn pipelined_copy(
         file_hash,
         bytes_copied: next_deliver_off,
         torn,
+        pre_stat: pre,
         post_stat: post,
     })
 }

@@ -264,6 +264,13 @@ fn record_outcome(
     match mo.result {
         Ok(()) => {
             outcome.files_ok += 1;
+            // F05: a torn copy still commits (at-least-once; source
+            // intact) — it is a success with a TornCopy downgrade
+            // record already in the sink, not a failure. Count it so
+            // the per-shard summary surfaces the tear.
+            if mo.torn {
+                outcome.files_torn += 1;
+            }
             outcome.bytes_moved = outcome.bytes_moved.saturating_add(mo.bytes_moved);
             throughput.add(mo.bytes_moved);
             // Best-effort: push a per-file event draft. Disabled in
@@ -312,6 +319,12 @@ pub struct ProcessOutcome {
     /// row will be copied by whichever worker reclaims the shard next.
     /// Surfaced for observability so a spike is visible.
     pub files_fenced: u64,
+    /// F05: rows that committed but were modified on the source while
+    /// being copied (`MoveOutcome::torn`). Each also produced a
+    /// `DowngradeKind::TornCopy` downgrade record. Counted inside
+    /// `files_ok` — a torn copy is a success with a caveat, not a
+    /// failure.
+    pub files_torn: u64,
     pub bytes_moved: u64,
     pub fenced: bool,
 }
@@ -494,6 +507,7 @@ mod tests {
             row_id: 42,
             strategy: Strategy::LibnfsIoUring,
             bytes_moved: 0,
+            torn: false,
             result: Err(fenced_err()),
         };
 
@@ -527,6 +541,7 @@ mod tests {
             row_id: 7,
             strategy: Strategy::LibnfsIoUring,
             bytes_moved: 0,
+            torn: false,
             result: Err(MoveError::new(FailurePhase::Write, "ENOSPC")),
         };
 
@@ -555,6 +570,7 @@ mod tests {
             row_id: 1,
             strategy: Strategy::LibnfsIoUring,
             bytes_moved: 4096,
+            torn: false,
             result: Ok(()),
         };
 
@@ -572,5 +588,79 @@ mod tests {
         assert_eq!(outcome.files_fenced, 0);
         assert_eq!(outcome.bytes_moved, 4096);
         assert!(sink.is_empty());
+    }
+
+    // ---- F05: torn-copy wire-up -----------------------------------
+    //
+    // `pipelined_copy` detects a source modified mid-copy; the
+    // classifier (`file_mover::classify_copy`) turns that into a
+    // commit-and-record disposition; `copy_regular` surfaces it on
+    // `MoveOutcome::torn`; and the per-shard summary counts it in
+    // `files_torn`. Drive the real classifier end-to-end here (no
+    // NFS needed) — see docs/work-items/MOVER_TORN_COPY_SURFACE.md.
+
+    #[test]
+    fn files_torn_increments_when_classifier_flags_torn() {
+        use migration_mover::file_mover::classify_copy;
+        use migration_mover::libnfs::asyncio::NfsStat64;
+        use migration_mover::FileCopyResult;
+
+        fn stat(size: u64, mtime: u64, ctime: u64) -> NfsStat64 {
+            NfsStat64 {
+                dev: 0,
+                ino: 1,
+                mode: 0o100644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                size,
+                blksize: 4096,
+                blocks: 0,
+                atime: 0,
+                mtime,
+                ctime,
+                atime_nsec: 0,
+                mtime_nsec: 0,
+                ctime_nsec: 0,
+                used: 0,
+            }
+        }
+
+        let r = row(None, None, None);
+        let copy = FileCopyResult {
+            file_hash: [0; 16],
+            bytes_copied: 1024,
+            torn: true,
+            pre_stat: stat(1024, 100, 100),
+            post_stat: stat(1024, 200, 200),
+        };
+        let disposition = classify_copy(&copy, &r);
+        assert!(disposition.commits(), "torn must still commit");
+
+        let sink = FailureSink::new();
+        let throughput = ThroughputCounter::new();
+        let mut outcome = ProcessOutcome::default();
+        let mo = MoveOutcome {
+            row_id: r.row_id,
+            strategy: Strategy::LibnfsIoUring,
+            bytes_moved: copy.bytes_copied,
+            torn: disposition.downgrade().is_some(),
+            result: Ok(()),
+        };
+
+        record_outcome(
+            b"/data/file",
+            mo,
+            &mut outcome,
+            &sink,
+            &throughput,
+            &crate::coord_driver::EventEmitter::disabled(),
+        );
+
+        assert_eq!(outcome.files_torn, 1, "torn commit must bump files_torn");
+        assert_eq!(outcome.files_ok, 1, "torn still counts as copied");
+        assert_eq!(outcome.files_failed, 0, "torn is NOT a failure");
+        assert!(sink.is_empty(), "torn must not land in the failures sink");
     }
 }
