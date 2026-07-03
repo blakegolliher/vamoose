@@ -787,6 +787,15 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     }
 
     // ---- 7. Shutdown -----------------------------------------------
+    // Capture the run outcome for the hard-exit watchdog NOW, before
+    // the unconditional `fence.trip()` below erases the distinction
+    // between "fenced mid-run" and "fence tripped as part of a normal
+    // shutdown".
+    let watchdog_outcome = if fence.is_valid() {
+        WatchdogRunOutcome::Clean
+    } else {
+        WatchdogRunOutcome::Fenced
+    };
     eprintln!("[shutdown] section 7 entered");
     {
         eprintln!("[shutdown] acquiring progress write lock");
@@ -848,22 +857,65 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     // get past; tokio task scheduling can't help during runtime
     // shutdown when a Drop is blocking the executor.
     eprintln!("[shutdown] spawning hard-exit watchdog");
-    std::thread::spawn(|| {
+    // F17: the exit code and the stderr line are computed HERE, while
+    // allocation is still safe, and moved into the thread — the thread
+    // itself must stay allocation-free past the sleep.
+    let watchdog_code = watchdog_exit_code(watchdog_outcome);
+    let watchdog_msg = format!(
+        "watchdog: forcing process exit {watchdog_code} \
+         (shutdown took >5s; run outcome: {watchdog_outcome:?})\n",
+    );
+    std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(5));
         // Direct kernel syscalls — bypass Rust stdio (which can be
         // buffered or wedged during shutdown) and std::process::exit
         // (which runs atexit handlers that may touch the same C
         // library state that's hanging us). _exit(2) terminates the
         // process at kernel level immediately.
-        let msg: &[u8] = b"watchdog: forcing process exit (shutdown took >5s)\n";
         unsafe {
-            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            libc::_exit(0);
+            libc::write(
+                2,
+                watchdog_msg.as_ptr() as *const libc::c_void,
+                watchdog_msg.len(),
+            );
+            libc::_exit(watchdog_code);
         }
     });
     eprintln!("[shutdown] watchdog spawned, returning Ok(())");
 
     Ok(())
+}
+
+/// How the main loop ended, as known at watchdog-arm time (section 7
+/// of [`run`]). Error returns (`?`) bypass section 7 entirely and
+/// never arm the watchdog — `main.rs` maps them to `_exit(1)` on the
+/// normal path — so the only outcomes the watchdog can observe are
+/// "clean" (all shards terminal, or coord-requested drain/cancel) and
+/// "fenced".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchdogRunOutcome {
+    /// Main loop exited without a fence trip.
+    Clean,
+    /// Worker self-fenced mid-run (claim lost / heartbeat fence).
+    Fenced,
+}
+
+/// Exit code the hard-exit watchdog passes to `libc::_exit` when it
+/// fires (F17).
+///
+/// The watchdog only fires when shutdown wedges past its 5s deadline,
+/// which is a failure regardless of the run's own outcome — so this
+/// never returns 0 (the pre-F17 bug: `_exit(0)` made supervisors see
+/// success for wedged fenced runs). Decision: every wedge exits 2,
+/// keeping 0 (clean) and 1 (run error) unambiguous on the normal
+/// `main.rs` exit path and making "exit 2" a single supervisor signal
+/// for "shutdown wedged"; the run outcome is carried in the watchdog's
+/// stderr line, not the code.
+pub(crate) fn watchdog_exit_code(outcome: WatchdogRunOutcome) -> i32 {
+    match outcome {
+        WatchdogRunOutcome::Clean => 2,
+        WatchdogRunOutcome::Fenced => 2,
+    }
 }
 
 // =============================================================================
@@ -2307,5 +2359,30 @@ mod flush_sinks_tests {
         // still cover everything too.
         assert_eq!(store.list("failures/").await.unwrap().len(), 1);
         assert_eq!(store.list("downgrades/").await.unwrap().len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // F17: shutdown-watchdog exit code
+    // ------------------------------------------------------------------
+
+    /// The watchdog only ever fires when shutdown wedges (>5s past the
+    /// point where all durable state is committed). A wedged shutdown
+    /// is a failure from the supervisor's perspective regardless of how
+    /// the run itself went, so the watchdog exit code is 2 for every
+    /// outcome — never 0. The normal (non-wedged) exit path in
+    /// `main.rs` keeps 0 (clean) / 1 (run error); "clean → 0" is not
+    /// the watchdog's business because the watchdog firing at all means
+    /// the shutdown was not clean.
+    #[test]
+    fn watchdog_exit_code_never_reports_success() {
+        use super::{watchdog_exit_code, WatchdogRunOutcome};
+
+        // Wedged after a clean run → 2 (was the F17 bug: _exit(0)).
+        assert_eq!(watchdog_exit_code(WatchdogRunOutcome::Clean), 2);
+        // Wedged after a fenced run → 2. Decision (doc allowed 2 or 1):
+        // 2 for every wedge, so "exit 2" is a single unambiguous
+        // supervisor signal for "shutdown wedged; watchdog fired"; the
+        // run outcome is carried in the watchdog's stderr line instead.
+        assert_eq!(watchdog_exit_code(WatchdogRunOutcome::Fenced), 2);
     }
 }
