@@ -1,6 +1,8 @@
 # Worker resilience: etag verify, honest byte counts, transient-S3 retry
 
-Status: open — not started.
+Status: done — F40/F41/F42 implemented on branch worker-resilience
+(one commit per item), acceptance tests first with observed reds;
+full gate green.
 Ledger: F40, F41, F42 in `docs/REVIEW_LEDGER.md`.
 Priority: high (F40 integrity bypass, F42 fleet-wide outage vector),
 medium (F41 counter inflation).
