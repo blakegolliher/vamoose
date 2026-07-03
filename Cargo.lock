@@ -2518,7 +2518,9 @@ name = "migration-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "async-trait",
+ "aws-sdk-s3",
  "axum",
  "axum-server",
  "chrono",
@@ -2532,6 +2534,7 @@ dependencies = [
  "migration-coord",
  "migration-core",
  "migration-mover",
+ "parquet",
  "reqwest",
  "serde",
  "serde_json",
