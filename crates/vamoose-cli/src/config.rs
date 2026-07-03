@@ -253,3 +253,76 @@ impl Config {
         Ok((cfg, resolved))
     }
 }
+
+// =============================================================================
+// F31: tests over the unified config schema
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"
+        [global]
+        bucket = "vamoose-test"
+
+        [s3]
+        endpoint = "http://127.0.0.1:9000"
+
+        [nfs]
+        src_url   = "nfs://src-filer/export"
+        dst_url   = "nfs://dst-filer/export"
+        src_mount = "/mnt/src"
+        dst_mount = "/mnt/dst"
+        src_root  = "/data"
+        dst_root  = "/data"
+    "#;
+
+    /// The module-doc promise: a minimal 6-field config parses, with
+    /// defaults for everything else.
+    #[test]
+    fn minimal_config_parses_with_defaults() {
+        let cfg: Config = toml::from_str(MINIMAL).expect("minimal config must parse");
+        assert_eq!(cfg.global.bucket, "vamoose-test");
+        assert_eq!(cfg.s3.region, "us-east-1", "region defaults");
+        assert!(cfg.s3.profile.is_none());
+        assert!(cfg.worker.is_none(), "[worker] is optional");
+        assert!(cfg.logging.is_none(), "[logging] is optional");
+    }
+
+    /// F45 pin: `[nfs]` is REQUIRED by the unified schema for every
+    /// consumer, including `vamoose coord`, which never touches NFS.
+    ///
+    /// Decision: pinned rather than fixed — making `nfs` optional is
+    /// not a one-liner (it ripples through `cmd::worker`'s adapter and
+    /// seven `cfg.nfs.*` reads in `cmd::doctor`), so F45 stays open.
+    /// If this test starts failing because `nfs` became `Option`,
+    /// delete it and close F45 with worker/doctor tests instead.
+    #[test]
+    fn missing_nfs_section_is_currently_an_error_even_for_coord() {
+        let no_nfs = r#"
+            [global]
+            bucket = "vamoose-test"
+
+            [s3]
+            endpoint = "http://127.0.0.1:9000"
+        "#;
+        let err = toml::from_str::<Config>(no_nfs).expect_err("pin: [nfs] is required today");
+        assert!(
+            err.to_string().contains("nfs"),
+            "parse error must name the missing section, got: {err}",
+        );
+    }
+
+    /// `[worker]` defaults are applied per-field when the table is
+    /// present but sparse.
+    #[test]
+    fn sparse_worker_table_gets_field_defaults() {
+        let cfg: Config = toml::from_str(&format!("{MINIMAL}\n[worker]\nconcurrency = 4\n"))
+            .expect("sparse [worker] must parse");
+        let w = cfg.worker.expect("worker table present");
+        assert_eq!(w.concurrency, 4);
+        assert_eq!(w.heartbeat_sec, 30, "heartbeat defaults");
+        assert_eq!(w.bytes_budget, "8 GiB", "budget defaults");
+    }
+}

@@ -115,3 +115,28 @@ async fn main() -> anyhow::Result<()> {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// F31: clap's own consistency checks (conflicting flags, bad
+    /// defaults, duplicate names, malformed subcommand wiring) run at
+    /// test time instead of panicking at first `vamoose --help` in
+    /// the field.
+    #[test]
+    fn clap_wiring_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// An unparsable `--log` filter falls back to `info` rather than
+    /// erroring out before logging exists.
+    #[test]
+    fn build_filter_falls_back_to_info_on_garbage() {
+        let f = build_filter(Some("not[a(filter"));
+        assert_eq!(f.to_string(), "info");
+        let f = build_filter(Some("shutdown=debug"));
+        assert_eq!(f.to_string(), "shutdown=debug");
+    }
+}
