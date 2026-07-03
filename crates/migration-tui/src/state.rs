@@ -16,7 +16,11 @@
 //! The reducer is single-threaded; the TUI owns the state on the
 //! render-loop task. Use [`AppState::apply_envelope`] for every
 //! envelope received from the SSE stream — it routes through
-//! `Snapshot::apply` and updates `last_seen_seq`.
+//! `Snapshot::apply` and updates `last_seen_seq`. REST bootstrap and
+//! Resync recovery (COORD_PLAN §3.4) enter through
+//! [`snapshot_from_rest`] + [`AppState::replace_snapshot`], which
+//! hard-replaces the derived data while only ever advancing the
+//! resume cursor.
 
 use crate::theme::Theme;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -485,6 +489,32 @@ impl ProgressDeltaHistory {
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
+}
+
+/// Build a [`Snapshot`] from the coord's REST views (F26 bootstrap,
+/// COORD_PLAN §3.4): the `/jobs` pages plus each job's `/workers`
+/// and `/errors`, stamped with the `/healthz` cursor. Pure — the
+/// driver does the fetching, this only shapes the result for
+/// [`AppState::replace_snapshot`].
+///
+/// Not reconstructable from REST (deliberately deferred): the
+/// client-side chronological rings — recent errors, verify
+/// mismatches, throughput samples. The coord only keeps aggregates,
+/// so those tails resume from the live stream; the authoritative
+/// counters (progress, error buckets, phases) are restored exactly.
+pub fn snapshot_from_rest(
+    jobs: Vec<Job>,
+    workers: Vec<Worker>,
+    error_buckets: Vec<(JobId, Vec<ErrorBucket>)>,
+    last_seq: u64,
+    now: DateTime<Utc>,
+) -> Snapshot {
+    let mut snap = Snapshot::empty(now);
+    snap.last_seq = last_seq;
+    snap.jobs = jobs.into_iter().map(|j| (j.id.clone(), j)).collect();
+    snap.workers = workers.into_iter().map(|w| (w.id, w)).collect();
+    snap.error_buckets = error_buckets.into_iter().collect();
+    snap
 }
 
 /// Whole client-side state. `Snapshot` is the derived data model
@@ -975,6 +1005,81 @@ mod tests {
         // But the data is now whatever the (older, empty) snapshot
         // says — replace is a hard replace.
         assert!(s.snapshot.jobs.is_empty());
+    }
+
+    #[test]
+    fn replace_snapshot_newer_wins_older_kept() {
+        // F26 bootstrap path: a REST snapshot ahead of anything the
+        // stream has shown must advance the resume cursor to the
+        // snapshot's last_seq; a stale one must never regress it.
+        let mut s = AppState::empty(at(0));
+        s.apply_envelope(&job_created(1, "bobby"));
+        assert_eq!(s.last_seen_seq, 1);
+
+        let mut newer = Snapshot::empty(at(100));
+        newer.last_seq = 10;
+        s.replace_snapshot(newer);
+        assert_eq!(s.last_seen_seq, 10, "newer snapshot wins");
+
+        let mut older = Snapshot::empty(at(200));
+        older.last_seq = 3;
+        s.replace_snapshot(older);
+        assert_eq!(s.last_seen_seq, 10, "older snapshot keeps the cursor");
+    }
+
+    #[test]
+    fn snapshot_from_rest_builds_full_snapshot() {
+        // F26: pure conversion from the REST views (/jobs pages +
+        // per-job /workers and /errors) into the Snapshot shape
+        // replace_snapshot consumes. Donor state derives the same
+        // Job/Worker/bucket values the coord would serve.
+        let mut donor = AppState::empty(at(0));
+        donor.apply_envelope(&job_created(1, "alpha"));
+        let w = WorkerId::new();
+        donor.apply_envelope(&EventEnvelope {
+            seq: 2,
+            at: at(2),
+            schema_version: SCHEMA_VERSION,
+            worker_at: None,
+            kind: EventKind::WorkerJoined {
+                worker_id: w,
+                job_id: jid("alpha"),
+                host: "h".into(),
+                pid: 1,
+                start_time: at(0),
+                version: "0.6".into(),
+            },
+        });
+        donor.apply_envelope(&EventEnvelope {
+            seq: 3,
+            at: at(3),
+            schema_version: SCHEMA_VERSION,
+            worker_at: None,
+            kind: EventKind::ErrorEmitted {
+                job_id: jid("alpha"),
+                worker_id: w,
+                class: ErrorClass::Permission,
+                path: "/p/x".into(),
+                retryable: false,
+                message: "denied".into(),
+            },
+        });
+
+        let jobs: Vec<Job> = donor.snapshot.jobs.values().cloned().collect();
+        let workers: Vec<Worker> = donor.snapshot.workers.values().cloned().collect();
+        let buckets: Vec<(JobId, Vec<ErrorBucket>)> = donor
+            .snapshot
+            .error_buckets
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let snap = snapshot_from_rest(jobs, workers, buckets, 3, at(50));
+        assert_eq!(snap.last_seq, 3);
+        assert_eq!(snap.jobs, donor.snapshot.jobs);
+        assert_eq!(snap.workers, donor.snapshot.workers);
+        assert_eq!(snap.error_buckets, donor.snapshot.error_buckets);
+        assert_eq!(snap.written_at, at(50));
     }
 
     #[test]

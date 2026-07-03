@@ -65,6 +65,10 @@ fn job_created(j: &str) -> EventKind {
 }
 
 async fn spawn_coord() -> (CoordRuntime, SocketAddr, CancellationToken) {
+    spawn_coord_cfg(rt_cfg()).await
+}
+
+async fn spawn_coord_cfg(cfg: RuntimeConfig) -> (CoordRuntime, SocketAddr, CancellationToken) {
     let mem = Arc::new(MemStore::new());
     let store: Arc<dyn CoordStore> = mem.clone();
     let clock = FixedClock::new(
@@ -72,9 +76,7 @@ async fn spawn_coord() -> (CoordRuntime, SocketAddr, CancellationToken) {
             .unwrap()
             .with_timezone(&chrono::Utc),
     );
-    let rt = CoordRuntime::start(store, clock, me(), rt_cfg())
-        .await
-        .unwrap();
+    let rt = CoordRuntime::start(store, clock, me(), cfg).await.unwrap();
     let router = build_router(ServerAppState::with_auth(rt.clone(), AuthConfig::default()));
 
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -482,6 +484,260 @@ async fn unknown_job_command_returns_404() {
         panic!("expected Http error");
     };
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    shutdown.cancel();
+}
+
+// =============================================================================
+// F26 — REST bootstrap + real Resync recovery
+// =============================================================================
+
+fn progress(job: &str, worker: WorkerId, files: u64, bytes: u64) -> EventKind {
+    EventKind::ProgressDelta {
+        job_id: jid(job),
+        worker_id: worker,
+        files_delta: files,
+        bytes_delta: bytes,
+        errors_delta: 0,
+    }
+}
+
+/// Fast reconnects so the driver-level tests don't sit in backoff.
+fn fast_opts() -> migration_tui::app::RunOpts {
+    migration_tui::app::RunOpts {
+        render_tick: Duration::from_millis(50),
+        reconnect_initial: Duration::from_millis(50),
+        reconnect_max: Duration::from_millis(500),
+    }
+}
+
+/// Mimic the event loop: receive one driver input (bounded by
+/// `timeout`) and fold it into `state` through the real reducer.
+/// Returns the input's Debug form so callers can classify what
+/// arrived (the reducer consumes the input itself).
+async fn pump_one(
+    rx: &mut tokio::sync::mpsc::Receiver<migration_tui::app::Input>,
+    state: &Arc<tokio::sync::Mutex<AppState>>,
+    timeout: Duration,
+) -> Option<String> {
+    let input = tokio::time::timeout(timeout, rx.recv())
+        .await
+        .ok()
+        .flatten()?;
+    let tag = format!("{input:?}");
+    let mut s = state.lock().await;
+    migration_tui::app::handle_input(&mut s, input, Utc::now());
+    Some(tag)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bootstrap_fetches_jobs_then_streams_from_last_seq() {
+    // F26 + F23: a terminal job whose event chunks were archived
+    // (moved to archivelogs/ and DELETED from events/) exists in the
+    // coord's /jobs view but can never appear in a seq-0 SSE replay.
+    // The TUI must bootstrap over REST and open the stream from the
+    // healthz cursor, not 0.
+    let (rt, addr, shutdown) = spawn_coord().await;
+    let w = WorkerId::new();
+    rt.ingest(job_created("alpha")).await.unwrap();
+    rt.ingest(progress("alpha", w, 7, 2048)).await.unwrap();
+    rt.ingest(EventKind::JobCompleted {
+        job_id: jid("alpha"),
+    })
+    .await
+    .unwrap();
+    rt.flush_log().await.unwrap();
+    rt.write_snapshot(3).await.unwrap();
+    let archived = rt.archive_terminal_jobs().await.unwrap();
+    assert!(
+        archived.iter().any(|(id, _)| *id == jid("alpha")),
+        "harness: alpha's chunks must actually archive (the F23 path)"
+    );
+    // Live job ingested after the archive pass.
+    rt.ingest(job_created("bravo")).await.unwrap();
+    rt.ingest(progress("bravo", w, 1, 100)).await.unwrap();
+    rt.flush_log().await.unwrap();
+    let coord_seq = rt.last_seq().await;
+
+    let client = client_for(addr);
+    let now = Utc.timestamp_opt(0, 0).unwrap();
+    let state = Arc::new(tokio::sync::Mutex::new(AppState::empty(now)));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let driver = tokio::spawn(migration_tui::app::sse_driver(
+        client,
+        Arc::clone(&state),
+        tx,
+        cancel.clone(),
+        fast_opts(),
+    ));
+
+    // Pump the reducer until both jobs are present and the link is
+    // up, recording every replayed Event frame's debug tag.
+    let mut replayed: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for bootstrap; replayed so far: {replayed:?}"
+        );
+        if let Some(tag) = pump_one(&mut rx, &state, Duration::from_secs(5)).await {
+            if tag.starts_with("SseFrame(Event") {
+                replayed.push(tag);
+            }
+        }
+        let s = state.lock().await;
+        if s.job(&jid("alpha")).is_some()
+            && s.job(&jid("bravo")).is_some()
+            && matches!(s.connection, ConnectionStatus::Connected { .. })
+        {
+            break;
+        }
+    }
+
+    {
+        let s = state.lock().await;
+        // The archived job's state came from REST — SSE can't replay
+        // it, its chunks are gone from events/.
+        let alpha = s.job(&jid("alpha")).unwrap();
+        assert_eq!(alpha.phase, migration_coord::schema::Phase::Completed);
+        assert_eq!(alpha.progress.files_done, 7);
+        assert_eq!(alpha.progress.bytes_done, 2048);
+        // Cursor pinned by proxy (per the work item): a stream opened
+        // at healthz.last_seq replays none of the live job's early
+        // events; seq-0 would have replayed bravo's two.
+        assert!(
+            replayed.is_empty(),
+            "stream must resume from the bootstrap cursor, not 0; replayed: {replayed:?}"
+        );
+        assert_eq!(s.last_seq(), coord_seq);
+    }
+
+    // The live tail still flows after bootstrap (cursor not too high
+    // either): one more event must arrive over SSE.
+    rt.ingest(progress("bravo", w, 2, 50)).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "live event after bootstrap never arrived"
+        );
+        pump_one(&mut rx, &state, Duration::from_secs(5)).await;
+        let s = state.lock().await;
+        if s.job(&jid("bravo")).map(|j| j.progress.files_done) == Some(3) {
+            break;
+        }
+    }
+
+    cancel.cancel();
+    drop(rx);
+    let _ = driver.await;
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_refetches_snapshot_and_resumes() {
+    // F26: when the coord's per-subscriber bus overflows it emits
+    // Resync and drops the tail on the floor (the skipped
+    // ProgressDelta/ErrorEmitted are gone from the stream forever).
+    // The driver must drop the stream, re-fetch the REST snapshot,
+    // apply it via replace_snapshot, and resume from the new cursor
+    // — leaving the client's counters EXACTLY equal to the coord's.
+    let mut cfg = rt_cfg();
+    cfg.bus_capacity = 4; // same tiny bus the coord's stream unit tests use
+    let (rt, addr, shutdown) = spawn_coord_cfg(cfg).await;
+    let w = WorkerId::new();
+    rt.ingest(job_created("alpha")).await.unwrap();
+    rt.ingest(progress("alpha", w, 5, 1024)).await.unwrap();
+    rt.flush_log().await.unwrap();
+
+    let client = client_for(addr);
+    let now = Utc.timestamp_opt(0, 0).unwrap();
+    let state = Arc::new(tokio::sync::Mutex::new(AppState::empty(now)));
+    // Tiny input channel: once we stop pumping, the driver blocks on
+    // send, stops reading its socket, TCP buffers fill, and the
+    // coord-side bus (capacity 4) overflows.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let cancel = CancellationToken::new();
+    let driver = tokio::spawn(migration_tui::app::sse_driver(
+        client,
+        Arc::clone(&state),
+        tx,
+        cancel.clone(),
+        fast_opts(),
+    ));
+
+    // Phase 1: pump until the initial view is synced.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for initial sync"
+        );
+        pump_one(&mut rx, &state, Duration::from_secs(5)).await;
+        let s = state.lock().await;
+        if s.job(&jid("alpha")).map(|j| j.progress.files_done) == Some(5)
+            && matches!(s.connection, ConnectionStatus::Connected { .. })
+        {
+            break;
+        }
+    }
+
+    // Phase 2: stall the consumer and flood the bus with events big
+    // enough to overrun the socket buffering between coord and
+    // client. These are the events the old code lost forever.
+    let big = "x".repeat(128 * 1024);
+    for i in 0..80u32 {
+        rt.ingest(EventKind::ErrorEmitted {
+            job_id: jid("alpha"),
+            worker_id: w,
+            class: migration_coord::schema::ErrorClass::Timeout,
+            path: format!("/p/{i}"),
+            retryable: true,
+            message: big.clone(),
+        })
+        .await
+        .unwrap();
+    }
+    for _ in 0..5 {
+        rt.ingest(progress("alpha", w, 10, 4096)).await.unwrap();
+    }
+
+    // Phase 3: resume pumping. Require that a Resync actually fired
+    // (otherwise the harness proved nothing) and that the client
+    // converges on the coord's exact derived state.
+    let mut saw_resync = false;
+    let mut converged = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(tag) = pump_one(&mut rx, &state, Duration::from_secs(2)).await {
+            if tag.contains("Resync") {
+                saw_resync = true;
+            }
+        }
+        let s = state.lock().await;
+        let coord = rt.state().await;
+        if s.snapshot.jobs == coord.jobs
+            && s.snapshot.workers == coord.workers
+            && s.snapshot.error_buckets == coord.error_buckets
+            && s.last_seq() >= coord.last_seq
+        {
+            converged = true;
+            break;
+        }
+    }
+    assert!(
+        saw_resync,
+        "harness failed to force a bus overflow — Resync never reached the reducer"
+    );
+    assert!(
+        converged,
+        "client never converged with the coord after Resync — the \
+         overflow-dropped counters were lost (the F26 desync)"
+    );
+
+    cancel.cancel();
+    drop(rx);
+    let _ = driver.await;
     shutdown.cancel();
 }
 

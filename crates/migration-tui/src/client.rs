@@ -6,7 +6,10 @@
 //!   [`get_errors`], [`healthz`]. Each is a single round trip; the
 //!   types come from `migration_coord::server::read` so coord and
 //!   client share the wire shape and cargo catches a drift at
-//!   compile time.
+//!   compile time. Together these back the bootstrap/Resync-recovery
+//!   contract of COORD_PLAN §3.4 (`healthz.last_seq` is the resume
+//!   cursor; `/jobs` is the snapshot source) — see
+//!   `crate::app::fetch_bootstrap_snapshot`.
 //!
 //! - SSE consumer: [`Client::stream`] opens `GET /stream` with
 //!   `Last-Event-ID` and yields an `async_stream::try_stream` of
