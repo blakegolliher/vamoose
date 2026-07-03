@@ -157,6 +157,11 @@ struct MemInner {
     /// regardless of outcome. Test-only knob — lets tests assert
     /// "no writes happened" after a lease-lost fence.
     write_calls: u64,
+    /// Chronological log of every store call (`"GET key"`,
+    /// `"LIST prefix"`, ...). Test-only knob — lets tests assert
+    /// which objects a read path actually touched (seq-aware chunk
+    /// skipping, archive/live-path isolation).
+    ops: Vec<String>,
     objects: BTreeMap<String, MemObject>,
 }
 
@@ -211,12 +216,29 @@ impl MemStore {
     pub fn write_count(&self) -> u64 {
         self.inner.lock().unwrap().write_calls
     }
+
+    /// Test-only knob — chronological log of every store call seen so
+    /// far, formatted `"<VERB> <key-or-prefix>"` (`GET`, `HEAD`,
+    /// `PUT`, `PUT_IF_ABSENT`, `DELETE`, `DELETE_IF_MATCH`, `LIST`).
+    /// Lets tests assert which objects a code path actually touched —
+    /// e.g. that seq-aware reads skip low chunks, or that replay never
+    /// reads `archivelogs/`.
+    pub fn ops(&self) -> Vec<String> {
+        self.inner.lock().unwrap().ops.clone()
+    }
+
+    /// Test-only knob — reset the op log (typically after setup so
+    /// assertions only see the code under test).
+    pub fn clear_ops(&self) {
+        self.inner.lock().unwrap().ops.clear();
+    }
 }
 
 #[async_trait]
 impl CoordStore for MemStore {
     async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.ops.push(format!("GET {key}"));
         Ok(inner
             .objects
             .get(key)
@@ -224,12 +246,14 @@ impl CoordStore for MemStore {
     }
 
     async fn head(&self, key: &str) -> Result<Option<String>> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.ops.push(format!("HEAD {key}"));
         Ok(inner.objects.get(key).map(|o| o.etag.clone()))
     }
 
     async fn put(&self, key: &str, body: Vec<u8>) -> Result<String> {
         let mut inner = self.inner.lock().unwrap();
+        inner.ops.push(format!("PUT {key}"));
         inner.write_calls += 1;
         let etag = Self::next_etag(&mut inner);
         inner.objects.insert(
@@ -244,6 +268,7 @@ impl CoordStore for MemStore {
 
     async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<PutOutcome> {
         let mut inner = self.inner.lock().unwrap();
+        inner.ops.push(format!("PUT_IF_ABSENT {key}"));
         inner.write_calls += 1;
         if inner.objects.contains_key(key) {
             return Ok(PutOutcome::AlreadyExists);
@@ -261,12 +286,14 @@ impl CoordStore for MemStore {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        inner.ops.push(format!("DELETE {key}"));
         inner.objects.remove(key);
         Ok(())
     }
 
     async fn delete_if_match(&self, key: &str, etag: &str) -> Result<DeleteOutcome> {
         let mut inner = self.inner.lock().unwrap();
+        inner.ops.push(format!("DELETE_IF_MATCH {key}"));
         match inner.objects.get(key) {
             None => Ok(DeleteOutcome::NotFound),
             Some(o) if o.etag == etag => {
@@ -278,7 +305,8 @@ impl CoordStore for MemStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<ListEntry>> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.ops.push(format!("LIST {prefix}"));
         Ok(inner
             .objects
             .range(prefix.to_string()..)

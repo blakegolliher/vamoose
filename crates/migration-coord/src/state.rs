@@ -380,20 +380,32 @@ fn push_sample(samples: &mut Vec<String>, new: &str) {
 // Replay
 // =============================================================================
 
-/// Discover every event-log chunk under `events/` regardless of route
-/// and return chunk keys grouped by route. Cluster chunks are keyed
-/// under `events/_cluster/`, per-job under `events/<job_id>/`.
+/// Discover every event-log chunk under `events/`, grouped by route
+/// (`events/_cluster/`, `events/<job_id>/`). The LIST is lexical, so
+/// each route's keys are ascending by start seq — the shape
+/// `events::skip_chunks_below` wants.
 ///
 /// Used by replay to walk every chunk on the bucket; individual route
 /// listings live in `events::list_chunks` for callers that know which
 /// route they want.
-async fn discover_all_chunks(store: &dyn CoordStore) -> Result<Vec<String>> {
+async fn discover_chunks_by_route(
+    store: &dyn CoordStore,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
     let entries = store.list(EVENTS_PREFIX).await?;
-    Ok(entries
-        .into_iter()
-        .map(|e| e.key)
-        .filter(|k| k.ends_with(".jsonl"))
-        .collect())
+    let mut by_route = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for entry in entries {
+        if !entry.key.ends_with(".jsonl") {
+            continue;
+        }
+        let Some(slash) = entry.key.rfind('/') else {
+            continue;
+        };
+        by_route
+            .entry(entry.key[..=slash].to_string())
+            .or_default()
+            .push(entry.key);
+    }
+    Ok(by_route)
 }
 
 /// Load `state/snapshot.json` (defaulting to empty), then walk every
@@ -410,13 +422,16 @@ pub async fn replay(store: &dyn CoordStore, now: DateTime<Utc>) -> Result<Replay
         .unwrap_or_else(|| Snapshot::empty(now));
     let snapshot_last_seq = state.last_seq;
 
-    let chunk_keys = discover_all_chunks(store).await?;
+    let by_route = discover_chunks_by_route(store).await?;
     let mut pending: Vec<EventEnvelope> = Vec::new();
-    for key in chunk_keys {
-        let envs = read_chunk(store, &key).await?;
-        for env in envs {
-            if env.seq > state.last_seq {
-                pending.push(env);
+    for keys in by_route.values() {
+        // Seq-aware: skip the leading chunks per route that cannot
+        // contain events past the snapshot's last_seq.
+        for key in crate::events::skip_chunks_below(keys, snapshot_last_seq) {
+            for env in read_chunk(store, key).await? {
+                if env.seq > state.last_seq {
+                    pending.push(env);
+                }
             }
         }
     }
@@ -456,8 +471,10 @@ pub async fn read_job_events(
     let prefix = crate::layout::job_events_prefix(job_id.as_str());
     let chunks = list_chunks(store, &prefix).await?;
     let mut out = Vec::new();
-    for key in chunks {
-        for env in read_chunk(store, &key).await? {
+    // Seq-aware: chunk keys embed their start seq; skip the leading
+    // chunks that cannot contain `seq > since`.
+    for key in crate::events::skip_chunks_below(&chunks, since) {
+        for env in read_chunk(store, key).await? {
             if env.seq > since {
                 out.push(env);
             }

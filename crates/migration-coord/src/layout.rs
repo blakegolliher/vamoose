@@ -24,6 +24,12 @@
 //! Chunk size: every event-log file holds at most 1000 events. Rolled
 //! at the same cadence as the snapshot (1000 events OR 5 minutes).
 //!
+//! Retention: `archivelogs/` has no coord-side compaction or
+//! retention policy in v1 — chunks accumulate until the operator
+//! garbage-collects them (e.g. an S3 bucket lifecycle rule on the
+//! `archivelogs/` prefix). Nothing in the coord hot path reads them;
+//! they exist for audit and a future `restore-from-archive` workflow.
+//!
 //! Sequence width: 20 digits, zero-padded. Lexical sort = numeric sort
 //! up to `2^64 - 1` (`18_446_744_073_709_551_615`), and S3
 //! `ListObjectsV2` returns keys in lexical order — replay walks the

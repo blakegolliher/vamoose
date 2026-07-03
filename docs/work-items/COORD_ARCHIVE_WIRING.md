@@ -1,6 +1,12 @@
 # Wire archive-on-completion; make event reads seq-aware
 
-Status: open — not started.
+Status: done — delivered on branch `coord-archive-wiring`. Archive
+runs on the snapshot tick (`ticks.rs::snapshot_loop` →
+`CoordRuntime::archive_terminal_jobs`, eligibility gated on a
+successful snapshot write); `read_all_events_since`,
+`read_job_events`, and replay skip chunks via the zero-padded
+start-seq (`events.rs::skip_chunks_below`). Acceptance tests in
+`crates/migration-coord/tests/archive_wiring.rs`.
 Ledger: F23 in `docs/REVIEW_LEDGER.md`.
 Priority: medium-high — unbounded event log; O(history) reads on
 every coord start, TUI start, and SSE reconnect.

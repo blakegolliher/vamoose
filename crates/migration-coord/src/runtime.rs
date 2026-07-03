@@ -133,6 +133,19 @@ struct RuntimeInner {
     /// `ingest` calls return [`Error::LeaseLost`] without touching
     /// the store, so a partial-state coord cannot keep writing.
     lease_lost: bool,
+    /// Terminal jobs whose phase is covered by a successfully written
+    /// snapshot and that are therefore safe to archive: replay after
+    /// the archive reconstructs them from that snapshot even though
+    /// their `events/` chunks are gone. Populated by
+    /// [`CoordRuntime::write_snapshot`], drained by
+    /// [`CoordRuntime::archive_terminal_jobs`]. Never persisted — a
+    /// restart rebuilds it from the next snapshot write (re-archiving
+    /// an already-archived job is a cheap no-op).
+    archive_eligible: std::collections::BTreeSet<crate::schema::JobId>,
+    /// Jobs already archived in this process's lifetime — keeps the
+    /// archive tick from re-LISTing every historical terminal job on
+    /// every snapshot.
+    archived_jobs: std::collections::BTreeSet<crate::schema::JobId>,
 }
 
 /// One page of the jobs view, returned from
@@ -190,6 +203,8 @@ impl CoordRuntime {
                 writer,
                 lease,
                 lease_lost: false,
+                archive_eligible: Default::default(),
+                archived_jobs: Default::default(),
             })),
             bus,
             store,
@@ -606,6 +621,12 @@ impl CoordRuntime {
     /// Persist the current state to `state/snapshot.json`. Called
     /// from the snapshot tick. Fenced on the lease: a deposed coord
     /// must not overwrite the successor's snapshot with a plain PUT.
+    ///
+    /// A successful write also marks every terminal job in the
+    /// persisted state as archive-eligible (see
+    /// [`CoordRuntime::archive_terminal_jobs`]): once the terminal
+    /// phase is durable in the snapshot, replay no longer needs the
+    /// job's `events/` chunks.
     pub async fn write_snapshot(&self, history_keep: usize) -> Result<()> {
         let now = self.clock.now();
         let snap = {
@@ -619,7 +640,78 @@ impl CoordRuntime {
             guard.state.schema_version = SCHEMA_VERSION;
             guard.state.clone()
         };
-        crate::snapshot::write(self.store.as_ref(), &snap, history_keep, now).await
+        crate::snapshot::write(self.store.as_ref(), &snap, history_keep, now).await?;
+
+        let mut guard = self.inner.lock().await;
+        for (id, job) in &snap.jobs {
+            if job.phase.is_terminal() && !guard.archived_jobs.contains(id) {
+                guard.archive_eligible.insert(id.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Archive every job that is eligible (terminal phase covered by
+    /// a written snapshot — see [`CoordRuntime::write_snapshot`]) and
+    /// whose event chunks are fully flushed. Called from the snapshot
+    /// tick, never inline in ingest or command paths.
+    ///
+    /// Best-effort: a job whose archive fails (or that still has
+    /// buffered events) stays eligible and is retried on the next
+    /// tick; its chunks remain under `events/` untouched by design
+    /// (`archive_job` copies before it deletes).
+    ///
+    /// Fenced on the lease like every other store-writing method —
+    /// archive DELETEs from `events/`, and a deposed coord must not
+    /// delete chunks the successor is replaying from.
+    pub async fn archive_terminal_jobs(
+        &self,
+    ) -> Result<Vec<(crate::schema::JobId, crate::archive::ArchiveOutcome)>> {
+        let candidates: Vec<crate::schema::JobId> = {
+            let guard = self.inner.lock().await;
+            if guard.lease_lost {
+                return Err(Error::LeaseLost);
+            }
+            guard
+                .archive_eligible
+                .iter()
+                .filter(|id| !guard.writer.has_buffered_for_job(id))
+                .cloned()
+                .collect()
+        };
+
+        let mut archived = Vec::new();
+        for id in candidates {
+            // Re-check the fence per job: the loop does store I/O
+            // between candidates and the lease can drop mid-pass.
+            if self.lease_lost().await {
+                return Err(Error::LeaseLost);
+            }
+            match crate::archive::archive_job(self.store.as_ref(), &id).await {
+                Ok(outcome) => {
+                    tracing::info!(
+                        job = %id,
+                        chunks = outcome.chunks_moved,
+                        bytes = outcome.bytes_moved,
+                        "archived terminal job's event chunks",
+                    );
+                    let mut guard = self.inner.lock().await;
+                    guard.archive_eligible.remove(&id);
+                    guard.archived_jobs.insert(id.clone());
+                    drop(guard);
+                    archived.push((id, outcome));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        job = %id,
+                        error = %e,
+                        "archive failed; chunks stay under events/ and \
+                         the next tick retries",
+                    );
+                }
+            }
+        }
+        Ok(archived)
     }
 
     /// Graceful shutdown: flush the log, write a final snapshot,
