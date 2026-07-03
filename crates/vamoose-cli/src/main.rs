@@ -57,6 +57,19 @@ enum Command {
     Tui(cmd::tui::Args),
 }
 
+/// Pick the logging mode by subcommand (F39, COORD_PLAN §3.7): the
+/// TUI owns the terminal, so it gets the quiet mode — no stderr
+/// layer, no S3 uploader, optional `--log-file`. Everything else
+/// keeps the standard stderr + file + uploader stack.
+fn log_mode_for(command: &Command) -> logging::LogMode {
+    match command {
+        Command::Tui(a) => logging::LogMode::TuiQuiet {
+            log_file: a.log_file.clone(),
+        },
+        _ => logging::LogMode::Standard,
+    }
+}
+
 fn build_filter(arg: Option<&str>) -> tracing_subscriber::EnvFilter {
     match arg {
         Some(f) => tracing_subscriber::EnvFilter::try_new(f)
@@ -73,8 +86,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Load config first so logging::init can read [logging] / [s3] /
     // [global].bucket. If the config is missing or invalid, fall back
-    // to stderr-only tracing so the operator sees the load error
-    // through the normal error path.
+    // to a mode-appropriate minimal subscriber so the operator sees
+    // the load error through the normal error path (F39: the TUI's
+    // fallback must stay off stderr too — the alternate screen is
+    // corrupted by any fmt line).
+    let log_mode = log_mode_for(&cli.command);
     let log_handle = match config::Config::load(cli.config.clone()) {
         Ok(cfg) => {
             let logging_cfg = cfg.logging.clone().unwrap_or_default();
@@ -83,18 +99,10 @@ async fn main() -> anyhow::Result<()> {
                 &logging_cfg,
                 &cfg.s3,
                 &cfg.global.bucket,
+                &log_mode,
             )?)
         }
-        Err(_) => {
-            // No config (yet) — install a minimal stderr subscriber so
-            // the eventual error surfaces. Subcommands that need the
-            // config will re-load it and produce their own error.
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .try_init()
-                .ok();
-            None
-        }
+        Err(_) => logging::init_fallback(filter, &log_mode),
     };
 
     let result = match cli.command {
@@ -128,6 +136,42 @@ mod tests {
     #[test]
     fn clap_wiring_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// F39: the `tui` subcommand gets the quiet log mode (no stderr
+    /// layer, no uploader, `--log-file` honored); everything else
+    /// keeps Standard.
+    #[test]
+    fn tui_subcommand_selects_quiet_log_mode() {
+        let cli = Cli::parse_from([
+            "vamoose",
+            "tui",
+            "--coord-url",
+            "http://127.0.0.1:8443",
+            "--log-file",
+            "/tmp/tui-trace.log",
+        ]);
+        match log_mode_for(&cli.command) {
+            logging::LogMode::TuiQuiet { log_file } => {
+                assert_eq!(
+                    log_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/tui-trace.log"))
+                );
+            }
+            other => panic!("tui must be TuiQuiet, got {other:?}"),
+        }
+        // Without the flag: still quiet, just fileless.
+        let cli = Cli::parse_from(["vamoose", "tui", "--coord-url", "http://127.0.0.1:8443"]);
+        match log_mode_for(&cli.command) {
+            logging::LogMode::TuiQuiet { log_file } => assert!(log_file.is_none()),
+            other => panic!("tui must be TuiQuiet, got {other:?}"),
+        }
+        // A non-TUI subcommand keeps today's behavior.
+        let cli = Cli::parse_from(["vamoose", "doctor"]);
+        assert!(matches!(
+            log_mode_for(&cli.command),
+            logging::LogMode::Standard
+        ));
     }
 
     /// An unparsable `--log` filter falls back to `info` rather than
