@@ -1,6 +1,6 @@
 # Coord guards: durable audit keys, phase legality, cardinality caps
 
-Status: done — in review. F22, F25, F24 implemented test-first on
+Status: landed — merged in PR #25. F22, F25, F24 implemented test-first on
 branch `coord-guards` (one commit each); full gate green.
 Ledger: F22, F25, F24 in `docs/REVIEW_LEDGER.md`.
 Priority: high (F22 silent audit loss, F25 state corruption via

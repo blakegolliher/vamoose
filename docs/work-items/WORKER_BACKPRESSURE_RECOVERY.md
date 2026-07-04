@@ -1,6 +1,6 @@
 # Backpressure must be able to recover
 
-Status: in review — fix + tests on branch worker-backpressure-recovery.
+Status: landed — merged in PR #19.
 Ledger: F14 in `docs/REVIEW_LEDGER.md`.
 Priority: high — a tripped worker idles forever.
 Scope: `migration-worker/src/backpressure.rs`, its orchestrator

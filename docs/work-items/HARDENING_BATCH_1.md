@@ -1,6 +1,6 @@
 # Hardening batch 1 — small, independent operator-facing fixes
 
-Status: in review — items A–G on branch `hardening-batch-1`, one
+Status: landed — merged in PR #22 (items A–G), one
 commit per item, full gate green. Per-item outcomes:
 
 - A (F17): fixed — watchdog exits 2 on any wedge (decision: 2 for

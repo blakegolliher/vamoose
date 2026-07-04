@@ -1,6 +1,6 @@
 # Fix the EOF-clamp livelock and bound the reorder buffer
 
-Status: in review — fix + tests on branch `mover-eof-reorder-bounds`; hardware `pipelined_copy_smoke` pending before verified.
+Status: landed — merged in PR #15; hardware `pipelined_copy_smoke` pending before verified.
 Ledger: F06, F07 in `docs/REVIEW_LEDGER.md`.
 Priority: high — a live (shrinking) source file can wedge a worker.
 Scope: `migration-mover/src/pipelined_copy.rs` (+ a small pure module).

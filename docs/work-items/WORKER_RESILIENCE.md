@@ -1,6 +1,6 @@
 # Worker resilience: etag verify, honest byte counts, transient-S3 retry
 
-Status: done — F40/F41/F42 implemented on branch worker-resilience
+Status: landed — merged in PR #27. F40/F41/F42 implemented test-first;
 (one commit per item), acceptance tests first with observed reds;
 full gate green.
 Ledger: F40, F41, F42 in `docs/REVIEW_LEDGER.md`.

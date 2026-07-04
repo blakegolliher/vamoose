@@ -1,6 +1,6 @@
 # Test/CI pack: schema-drift rejection tests + MSRV and contract-drift CI
 
-Status: done — F32 tests 1-5 green against the existing rejection
+Status: landed — merged in PR #24. F32 tests 1-5 green against the existing rejection
 machinery (no silent-accepts found); F43 msrv + contract-drift jobs
 added, and `rust-version` corrected 1.75 → 1.91.1 (1.75 was untrue:
 Cargo.lock is v4, which needs cargo ≥ 1.78, and the locked aws-sdk

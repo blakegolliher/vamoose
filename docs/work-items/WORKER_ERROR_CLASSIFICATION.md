@@ -1,6 +1,6 @@
 # Classify shard errors: worker-local vs shard-fatal
 
-Status: in review — fix + tests on branch worker-error-classification.
+Status: landed — merged in PR #18.
 Ledger: F13 in `docs/REVIEW_LEDGER.md` (F42 is the follow-up).
 Priority: high — one stale/sick worker can terminal-`Failed` shards
 the rest of the fleet could process.
