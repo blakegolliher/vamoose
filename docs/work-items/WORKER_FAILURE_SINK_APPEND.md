@@ -1,6 +1,6 @@
 # Stop overwriting the per-host failure/downgrade sinks
 
-Status: in review — fix + tests on branch worker-failure-sink-append.
+Status: landed — merged in PR #13.
 Ledger: F04 in `docs/REVIEW_LEDGER.md`.
 Priority: high — silent loss of the at-least-once reconciliation trail.
 Scope: `migration-core/src/layout.rs`, `migration-worker/src/orchestrator.rs`.

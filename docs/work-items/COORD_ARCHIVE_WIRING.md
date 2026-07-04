@@ -1,6 +1,6 @@
 # Wire archive-on-completion; make event reads seq-aware
 
-Status: done — delivered on branch `coord-archive-wiring`. Archive
+Status: landed — merged in PR #21. Archive
 runs on the snapshot tick (`ticks.rs::snapshot_loop` →
 `CoordRuntime::archive_terminal_jobs`, eligibility gated on a
 successful snapshot write); `read_all_events_since`,

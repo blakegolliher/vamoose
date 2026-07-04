@@ -1,6 +1,6 @@
 # TUI robustness: REST bootstrap, unknown-event tolerance, quiet logging
 
-Status: in review — all three items implemented on `tui-robustness` (F38 → F26 → F39, one commit each); acceptance tests written first and observed red; full gate green.
+Status: landed — merged in PR #26 (F38 → F26 → F39). Post-review fix: a torn bootstrap walk is a retryable error (pre-walk cursor double-counted aggregates).
 Ledger: F26, F38, F39 in `docs/REVIEW_LEDGER.md`.
 Priority: high — F26 is now actively wrong (F23 archives history out
 from under the seq-0 bootstrap), F38 bricks every deployed TUI on the

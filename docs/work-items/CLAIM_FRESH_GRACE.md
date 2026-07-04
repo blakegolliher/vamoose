@@ -1,6 +1,6 @@
 # Fresh-claim grace window for the progress cross-check
 
-Status: in review — fix + tests on branch claim-fresh-grace; hardware
+Status: landed — merged in PR #11; hardware
 fast-reclaim-drill pending before ledger `verified`.
 Ledger: F01, F30 in `docs/REVIEW_LEDGER.md`.
 Priority: critical — blocks the M6 multi-worker milestone.

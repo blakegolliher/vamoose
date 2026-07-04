@@ -1,6 +1,6 @@
 # Protocol test pack: heartbeat.rs + s3.rs (+ the R4 TOCTOU fix)
 
-Status: in review — tests + F16 fix + F34 deletion on branch protocol-test-pack.
+Status: landed — merged in PR #20.
 Ledger: F28, F29, F16, F34 in `docs/REVIEW_LEDGER.md`.
 Priority: high — these are the only unautomated legs of the
 anti-dual-writer chain.

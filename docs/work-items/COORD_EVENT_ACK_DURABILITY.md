@@ -1,6 +1,6 @@
 # Make event acks mean durable; close the SSE catch-up gap
 
-Status: in review — fix + tests on branch coord-event-ack-durability.
+Status: landed — merged in PR #17.
 Ledger: F03, F18 in `docs/REVIEW_LEDGER.md`.
 Priority: critical (F03) + major (F18) — same root cause.
 Scope: `migration-coord` (`runtime.rs`, `events.rs`,

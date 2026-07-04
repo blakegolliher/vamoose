@@ -1,6 +1,6 @@
 # Gate all coord store writes on the lease
 
-Status: in review — fix + tests on branch coord-lease-fence-writes.
+Status: landed — merged in PR #14.
 Ledger: F02 in `docs/REVIEW_LEDGER.md`.
 Priority: critical — split-brain corruption of the event log.
 Scope: `migration-coord` (`runtime.rs`, `ticks.rs`),
