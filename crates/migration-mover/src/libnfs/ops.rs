@@ -237,6 +237,21 @@ pub fn stat_times(ctx: &mut NfsContext, path: &[u8]) -> Result<(i64, i32, i64, i
     ))
 }
 
+/// Stat a path (follows symlinks) and return its fileid (`nfs_ino`).
+/// Used by hardlink EEXIST recovery (F10) to decide replay vs
+/// conflict, hence the `Hardlink` phase on failure. Sibling of
+/// [`stat_times`]; if a third consumer arrives, promote both to a
+/// single wrapper returning the full `nfs_stat_64`.
+pub fn stat_fileid(ctx: &mut NfsContext, path: &[u8]) -> Result<u64, MoveError> {
+    let c = cstr_from_bytes(path)?;
+    let mut st: nfs_stat_64 = nfs_stat_64::default();
+    let rc = unsafe { super::nfs_stat64(ctx.raw(), c.as_ptr(), &mut st as *mut _) };
+    if rc < 0 {
+        return Err(err_from_rc(ctx, rc, FailurePhase::Hardlink));
+    }
+    Ok(st.nfs_ino)
+}
+
 pub fn rename(ctx: &mut NfsContext, old: &[u8], new: &[u8]) -> Result<(), MoveError> {
     let oc = cstr_from_bytes(old)?;
     let nc = cstr_from_bytes(new)?;
