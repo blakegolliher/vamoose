@@ -1,13 +1,14 @@
 //! `mig-aggr` — read-only observability sidecar.
 //!
-//! Subcommands:
-//!   - `watch`            : TUI dashboard.
-//!   - `summary`          : one-shot JSON summary to stdout.
-//!   - `metrics`          : Prometheus exporter on /metrics.
-//!   - `inspect <shard>`  : pre-flight parquet analysis (size hist,
-//!     dir rollups, hardlink groups).
-//!   - `verify`           : diff src vs dst metadata after a run.
-//!   - `clean-partials`   : sweep `.partial` files left by fenced workers.
+//! Implemented subcommand:
+//!   - `clean-partials`   : lease-aware sweep of orphaned `.partial`
+//!     files left by fenced/killed workers. Dry run by default;
+//!     `--delete` arms deletion, gated on claim liveness.
+//!
+//! The observability subcommands (`watch`, `summary`, `metrics`,
+//! `inspect <shard>`, `verify`) are not implemented: each returns a
+//! clear error (never a panic) pointing at the alternative — the
+//! migration-tui dashboard covers live observability.
 
 use clap::{Parser, Subcommand};
 
@@ -116,7 +117,6 @@ mod tests {
     /// Acceptance test 6: the five observability stubs must return
     /// `Err` (with a message naming the subcommand) — never panic.
     #[tokio::test]
-    #[ignore = "red against the todo!() stubs; the bail! conversion lands in a later commit (F36)"]
     async fn stub_subcommands_bail_not_panic() {
         let cases: Vec<(&str, anyhow::Result<()>)> = vec![
             ("watch", super::tui::run("http://e", "r", "b").await),
