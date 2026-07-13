@@ -409,6 +409,18 @@ impl Mover {
     /// `SYMLINK_MODE_NFSV3` downgrade record and counts the row as
     /// success. The destination symlink ends up with whatever default
     /// mode the server assigns. See BUGFIX_PLAN.md "Fix 5".
+    ///
+    /// Symlink is the commit point (R8), and replay is idempotent
+    /// (F10): under at-least-once delivery a worker can die
+    /// post-symlink-pre-ack and the row comes back. When `nfs_symlink`
+    /// reports `EEXIST`, the destination is readlink'd on the dst
+    /// context and [`resolve_symlink_eexist`] treats a byte-equal
+    /// target as our own committed work (`Ok`, continuing with the
+    /// idempotent post-commit steps), a mismatch as a real conflict
+    /// (fail, naming both targets), and a readlink failure as the
+    /// original `EEXIST` failure. Unlink-then-create was rejected as
+    /// the recovery strategy: it destroys pre-existing data at the
+    /// destination and opens a crash window with the link missing.
     fn do_symlink(&self, pair: &mut ContextPair, row: &RowView) -> Result<(), MoveError> {
         let src = self.src_path(row);
         let dst = self.dst_path(row);
@@ -889,12 +901,33 @@ fn resolve_hardlink_eexist(
 /// on the destination context during recovery.
 fn resolve_symlink_eexist(
     link_err: MoveError,
-    _intended: &[u8],
-    _dst_readlink: Result<Vec<u8>, MoveError>,
+    intended: &[u8],
+    dst_readlink: Result<Vec<u8>, MoveError>,
 ) -> Result<(), MoveError> {
-    // Honest stub — status-quo behavior: every EEXIST stays a
-    // failure, passing the original symlink error through untouched.
-    Err(link_err)
+    match dst_readlink {
+        // Matching target bytes: the dst symlink already points at
+        // the intended target — our own committed symlink replayed
+        // after a died-post-symlink-pre-ack worker. Idempotent
+        // success.
+        Ok(existing) if existing == intended => Ok(()),
+        // Different target: a real conflict — some other symlink
+        // occupies the destination. Name both targets
+        // (lossy-rendered) so the operator can tell conflict from
+        // replay in the failure log.
+        Ok(existing) => Err(MoveError::new(
+            FailurePhase::Symlink,
+            format!(
+                "EEXIST: dst symlink target \"{}\" != intended target \
+                 \"{}\" (conflict, not a replay)",
+                String::from_utf8_lossy(&existing),
+                String::from_utf8_lossy(intended),
+            ),
+        )),
+        // readlink failed (including EINVAL: the existing entry is
+        // not a symlink at all): recovery must never mask the primary
+        // failure — surface the ORIGINAL EEXIST symlink error.
+        Err(_) => Err(link_err),
+    }
 }
 
 #[cfg(test)]
@@ -1371,7 +1404,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "red against the status-quo stub; fix lands in the next commit (F10)"]
     fn symlink_eexist_matching_target_is_success() {
         // Byte-compare, not string-compare: the second target is not
         // valid UTF-8 and must still match.
@@ -1386,7 +1418,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "red against the status-quo stub; fix lands in the next commit (F10)"]
     fn symlink_eexist_different_target_stays_failure() {
         let e = resolve_symlink_eexist(
             eexist_symlink_err(),
