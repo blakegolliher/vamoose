@@ -2407,7 +2407,11 @@ name = "migration-aggr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "migration-core",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
 ]
