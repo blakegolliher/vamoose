@@ -689,6 +689,16 @@ async fn resync_refetches_snapshot_and_resumes() {
     // Phase 2: stall the consumer and flood the bus with events big
     // enough to overrun the socket buffering between coord and
     // client. These are the events the old code lost forever.
+    //
+    // Two floods. The ErrorEmitted burst exercises error-bucket
+    // divergence, but the F24 bus caps admit only ~10 of it per
+    // class per second, which left the forced overflow dependent on
+    // socket-buffer timing (passed solo in 0.1s, failed under
+    // full-workspace load — see LESSONS.md "Outbound caps starve
+    // overflow-forcing harnesses"). The VerifyFileMismatch burst is
+    // the deterministic overflow: uncapped by StreamCaps and a
+    // reducer no-op, so 80 big frames must queue behind the blocked
+    // SSE writer and lag the 4-slot bus regardless of scheduling.
     let big = "x".repeat(128 * 1024);
     for i in 0..80u32 {
         rt.ingest(EventKind::ErrorEmitted {
@@ -698,6 +708,16 @@ async fn resync_refetches_snapshot_and_resumes() {
             path: format!("/p/{i}"),
             retryable: true,
             message: big.clone(),
+        })
+        .await
+        .unwrap();
+    }
+    for i in 0..80u32 {
+        rt.ingest(EventKind::VerifyFileMismatch {
+            job_id: jid("alpha"),
+            path: format!("/v/{i}"),
+            expected: big.clone(),
+            got: big.clone(),
         })
         .await
         .unwrap();
