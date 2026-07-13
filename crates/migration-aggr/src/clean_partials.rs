@@ -59,28 +59,137 @@ pub struct SweepReport {
 
 /// Does `name` match the mover's partial-file shape
 /// `.<base>.<host>.<pid>.partial`?
-// Stub: only tests call this until the sweep wires it in.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn is_partial_name(_name: &OsStr) -> bool {
-    // Honest stub — implemented with the sweep.
-    false
+///
+/// Pinned to `migration-mover/src/paths.rs::partial_path`, which
+/// emits `<dir>/.<base>.<host>.<pid>.partial` — a hidden dot-prefixed
+/// sibling whose name has at least four dot-separated fields ending
+/// in `partial`, with a numeric `<pid>`. `<base>` may itself contain
+/// dots, so the trailing fields are parsed from the right. Operates
+/// on raw bytes because source basenames are not guaranteed UTF-8 and
+/// `partial_path` round-trips them byte-for-byte.
+pub fn is_partial_name(name: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = name.as_bytes();
+    let Some(rest) = bytes.strip_prefix(b".") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(b".partial") else {
+        return false;
+    };
+    // rest is `<base>.<host>.<pid>`; split from the right so a dotted
+    // base stays intact.
+    let mut fields = rest.rsplitn(3, |&b| b == b'.');
+    let (Some(pid), Some(host), Some(base)) = (fields.next(), fields.next(), fields.next()) else {
+        return false;
+    };
+    !pid.is_empty() && pid.iter().all(u8::is_ascii_digit) && !host.is_empty() && !base.is_empty()
 }
 
 /// Walk `root` and collect every regular file whose name matches the
-/// partial pattern. Never follows symlinks.
-pub fn plan_sweep(_root: &Path) -> anyhow::Result<Vec<Candidate>> {
-    // Honest stub — implemented with the sweep.
-    Ok(Vec::new())
+/// partial pattern. Never follows symlinks: symlinked directories are
+/// not descended into and a symlink whose name matches is not a
+/// candidate (`DirEntry::file_type` does not traverse links).
+pub fn plan_sweep(root: &Path) -> anyhow::Result<Vec<Candidate>> {
+    fn walk(dir: &Path, out: &mut Vec<Candidate>) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let entry = entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("stat {}", entry.path().display()))?;
+            if file_type.is_dir() {
+                walk(&entry.path(), out)?;
+            } else if file_type.is_file() && is_partial_name(&entry.file_name()) {
+                // DirEntry::metadata also never traverses symlinks.
+                let md = entry
+                    .metadata()
+                    .with_context(|| format!("stat {}", entry.path().display()))?;
+                out.push(Candidate {
+                    path: entry.path(),
+                    size: md.len(),
+                    mtime: md.modified().ok(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    walk(root, &mut out)?;
+    // Deterministic order for reporting and tests.
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
 }
+
+/// The lease window used to judge claim liveness. The freshness rule
+/// mirrors the worker's reclaim policy (`stale_by_lease` in
+/// `migration-worker/src/orchestrator.rs::scan_shards`): a claim is
+/// stale only once `now - claimed_utc` exceeds the lease window.
+/// migration-core's `DEFAULT_LEASE_TIMEOUT_SEC` is the protocol
+/// default; the sweep has no access to a worker config that might
+/// lengthen it, so operators running longer leases should wait it out
+/// or use `--force` deliberately.
+const LEASE: std::time::Duration =
+    std::time::Duration::from_secs(migration_core::time::DEFAULT_LEASE_TIMEOUT_SEC);
 
 /// List claims in the bucket and return the ones whose lease is still
 /// live. READ-ONLY: list/get only, no writes.
 pub async fn live_claims(
-    _store: &dyn ClaimStore,
-    _now: DateTime<Utc>,
+    store: &dyn ClaimStore,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<Vec<LiveClaim>> {
-    // Honest stub — implemented with the sweep.
-    Ok(Vec::new())
+    let entries = store
+        .list(migration_core::layout::SHARDS_PREFIX)
+        .await
+        .context("listing claims in the run bucket")?;
+    let mut live = Vec::new();
+    for entry in &entries {
+        if migration_core::layout::shard_from_claim_key(&entry.key).is_none() {
+            // Not a claim object (e.g. a stray shard upload).
+            continue;
+        }
+        let Some((body, _etag)) = store
+            .get(&entry.key)
+            .await
+            .with_context(|| format!("reading claim {}", entry.key))?
+        else {
+            // Deleted between LIST and GET — a completing worker; in
+            // any case no longer a claim we could judge.
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<migration_core::records::ClaimRecord>(&body)
+        else {
+            // Unparseable claim record: we cannot prove the run is
+            // dead, so it blocks deletion. (The worker likewise
+            // treats an unparseable claim as needing an operator.)
+            live.push(LiveClaim {
+                key: entry.key.clone(),
+                detail: "unparseable claim record".to_string(),
+            });
+            continue;
+        };
+        if !matches!(record.state, migration_core::records::ClaimState::Active) {
+            // Completed/Failed are terminal — never live.
+            continue;
+        }
+        let age = now.signed_duration_since(record.claimed_utc.0);
+        // Same math as the worker's stale_by_lease: only a positive
+        // age beyond the lease counts as expired. A future
+        // `claimed_utc` (clock skew) fails the to_std() conversion
+        // and is treated as live — conservative for deletion.
+        let stale = age.to_std().map(|d| d > LEASE).unwrap_or(false);
+        if !stale {
+            live.push(LiveClaim {
+                key: entry.key.clone(),
+                detail: format!(
+                    "host {}, age {}s, lease {}s",
+                    record.host,
+                    age.num_seconds(),
+                    LEASE.as_secs(),
+                ),
+            });
+        }
+    }
+    Ok(live)
 }
 
 fn format_live(live: &[LiveClaim]) -> String {
@@ -113,11 +222,55 @@ pub async fn sweep(
         );
     }
 
-    Ok(SweepReport {
+    let mut report = SweepReport {
         candidates,
         live,
         ..Default::default()
-    })
+    };
+
+    if opts.delete {
+        for candidate in &report.candidates {
+            // Re-check right before unlinking: only something that is
+            // still a regular file goes away. `remove_file` has
+            // unlink semantics (never follows a symlink), so even a
+            // link swapped in after this check would itself be
+            // unlinked, never its target.
+            match std::fs::symlink_metadata(&candidate.path) {
+                Ok(md) if md.is_file() => match std::fs::remove_file(&candidate.path) {
+                    Ok(()) => {
+                        report.deleted_files += 1;
+                        report.deleted_bytes += candidate.size;
+                    }
+                    Err(e) => {
+                        // Reported and skipped, not fatal; the caller
+                        // exits non-zero at the end if any failed.
+                        tracing::error!(
+                            path = %candidate.path.display(),
+                            error = %e,
+                            "failed to delete partial",
+                        );
+                        report.failed_deletions += 1;
+                    }
+                },
+                Ok(_) => {
+                    tracing::warn!(
+                        path = %candidate.path.display(),
+                        "no longer a regular file since planning; skipped",
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        path = %candidate.path.display(),
+                        error = %e,
+                        "failed to stat partial before deletion",
+                    );
+                    report.failed_deletions += 1;
+                }
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 /// Entry point for `mig-aggr clean-partials`.
@@ -221,7 +374,6 @@ mod tests {
     /// test (and the literal below, lifted from its `nested_path`
     /// unit test) must change with it.
     #[test]
-    #[ignore = "red against the honest stubs; implementation lands in the next commit (F36)"]
     fn partial_name_matcher_pins_mover_format() {
         assert!(is_partial_name(OsStr::new(
             ".data.bin.host-a.12345.partial"
@@ -245,7 +397,6 @@ mod tests {
     /// Acceptance test 2: the default invocation (no `--delete`)
     /// reports matches and deletes nothing.
     #[tokio::test]
-    #[ignore = "red against the honest stubs; implementation lands in the next commit (F36)"]
     async fn dry_run_deletes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -286,7 +437,6 @@ mod tests {
     /// DIRECTORY whose name matches, and a symlink whose name matches
     /// all survive.
     #[tokio::test]
-    #[ignore = "red against the honest stubs; implementation lands in the next commit (F36)"]
     async fn delete_removes_only_matches() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -356,7 +506,6 @@ mod tests {
     /// Acceptance test 4: one live claim → the sweep refuses (Err →
     /// non-zero exit) and deletes nothing.
     #[tokio::test]
-    #[ignore = "red against the honest stubs; implementation lands in the next commit (F36)"]
     async fn live_lease_blocks_delete() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -393,7 +542,6 @@ mod tests {
     /// Acceptance test 5: `--force --delete` with the same live store
     /// proceeds — and the gate's finding is still reported.
     #[tokio::test]
-    #[ignore = "red against the honest stubs; implementation lands in the next commit (F36)"]
     async fn force_overrides_liveness() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

@@ -18,6 +18,7 @@ path = "src/main.rs"
 migration-core = { workspace = true }
 tokio      = { workspace = true }
 anyhow     = { workspace = true }
+tracing    = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap       = { workspace = true }
 chrono     = { workspace = true }
