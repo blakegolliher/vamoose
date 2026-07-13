@@ -1,6 +1,6 @@
 # Hardlink replay idempotency: EEXIST + fileid match = success
 
-Status: in progress on branch `f10-link-idempotency`.
+Status: landed — merged in PR #30. Symlink counterpart queued in NEXT.md §3 (same decision, readlink compare).
 Ledger: F10 in `docs/REVIEW_LEDGER.md` (do NOT edit the ledger or
 `docs/NEXT.md` from this branch — the coordinator sweeps those).
 Priority: medium (at-least-once replay of a committed hardlink lands

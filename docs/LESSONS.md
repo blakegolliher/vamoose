@@ -80,6 +80,14 @@ least one broken build, conflict, or wasted CI cycle to learn.
   (tiny channel, stalled consumer, 128 KiB events) found a genuine
   production bug — the torn-bootstrap double-count — that no clean
   harness would have hit.
+- **Outbound caps starve overflow-forcing harnesses.** After the F24
+  bus caps, the resync test's 80-event same-class ErrorEmitted flood
+  put only ~10 frames on the live bus — whether that still overflowed
+  the 4-slot channel depended on socket-buffer timing (passed solo in
+  0.1s, failed under full-workspace load). A harness that must
+  overflow a rate-limited path needs an event kind the limiter
+  ignores (here: VerifyFileMismatch, uncapped and a reducer no-op).
+  Audit flood-based tests whenever a new cap lands.
 - **Envelope-seq dedup cannot see into a snapshot.** Replaying events
   whose effects are already baked into REST-fetched state
   double-counts aggregates. A torn multi-request walk has NO sound

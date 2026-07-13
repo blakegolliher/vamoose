@@ -2,8 +2,9 @@
 
 Living tally. Update this whenever an item lands or a decision is
 made; `docs/REVIEW_LEDGER.md` rows stay the per-finding source of
-truth. State as of 2026-07-04 (post PR #29): **36 of 45 ledger
-findings landed; 9 open.**
+truth. State as of 2026-07-13 (post PR #31): **37 of 45 ledger
+findings landed; 8 open** (of which F10 is in progress — hardlink
+half merged in PR #30, symlink half queued in §3).
 
 ## 1. Design decisions needed (blocks the remaining ledger findings)
 
@@ -13,29 +14,51 @@ test-first work item:
 | Finding | Decision to make |
 |---|---|
 | F09 | NFS COMMIT on the sync path: add an `nfs_fsync` binding (protected-FFI design work) vs document VAST-only durability (NVRAM ack). |
-| F10 | Link idempotency under at-least-once retry: EEXIST-with-matching-target = success, vs unlink-then-create. |
 | F11 | Error path sends `Close` with pread/pwrite in flight (potential UAF inside libnfs): drain-before-close vs verify against the linked .so. |
 | F12 | Data-plane I/O deadlines: needs a new `nfs_set_timeout` FFI binding + config plumbing — design together with F09/F11 as one protected-FFI batch. |
 | F15 | Hardlink groups straddling batch boundaries: fold into the multi-pass design (MULTI_PASS_MOVER phases 3–8) or pre-shard by group. |
 | F19 | Lease fencing tokens for coord (refresh is HEAD-then-unconditional-PUT; F02's write gate is the containment, not the fix). |
 | F20 | Worker-endpoint trust boundary: EventKind allow-list per role, idempotency keys, atomic batches. |
-| F36 | `migration-aggr`: implement `clean-partials`/`verify` or gut to `bail!` like `vamoose aggr`. Nothing cleans orphaned `.partial` files today. |
 | F45 | Coord's unused `[nfs]` config requirement (pinned in PR #22 — not a one-liner) + runtime mutex held across S3 PUT during chunk flush (perf at 10k events/s). |
 
-Suggested batching when taken up: (F09+F11+F12) as one protected-FFI
-design doc; (F19+F20) as a coord trust/fencing design doc; F10 and
-F36 are quick calls; F15 rides the multi-pass design.
+Design docs are DRAFTED for the two batches and await the owner's
+calls (drafted 2026-07-13, on the `design-docs` branch until then):
+`docs/design/PROTECTED_FFI_DATA_PLANE.md` (F09+F11+F12, decisions
+D1–D5) and `docs/design/COORD_TRUST_AND_FENCING.md` (F19+F20,
+decisions D1–D6). F15 rides the multi-pass design. The former F10
+and F36 quick calls were made 2026-07-13 and landed (§Done).
 
 ## 2. Hardware verification (needs the VAST rig; flips rows to `verified`)
 
 - [ ] F01/F30 — `scripts/fast-reclaim-drill.sh`: kill -9 → reclaim
       latency grows by ≤ one grace window; no theft cascade.
 - [ ] F06/F07 — `pipelined_copy_smoke` (`#[ignore]`d) re-run.
+- [ ] F10 — `hardlink_replay_is_idempotent` in `file_mover_smoke.rs`
+      (`#[ignore]`d, added in PR #30): replayed `move_hardlink`
+      succeeds, both paths share an inode, `nlink == 2`.
 - [ ] F08 — MANUAL_VERIFY.md check [5]: migrate a `4755` root-owned
       file; destination `stat` must show `4755`.
 
 ## 3. Small follow-ups (codeable now, none urgent)
 
+- [ ] F10 symlink half: `do_symlink` has the same
+      commit-point-replay shape PR #30 fixed for hardlinks — on
+      EEXIST, `readlink` the destination and compare with the
+      intended target; match = replay = success. The owner's F10
+      decision (EEXIST-with-matching-target = success,
+      unlink-then-create rejected) already covers it; flips the F10
+      ledger row to landed.
+- [ ] `clean-partials` `--lease-timeout-sec` override: the liveness
+      gate uses the protocol default (180s), so deployments with a
+      longer configured `worker.lease_timeout_sec` could pass the
+      gate while a worker still holds a claim (documented in
+      `clean_partials.rs`; PR #31 note).
+- [ ] `records.rs` `ClaimRecord.epoch` doc comment says "increments
+      on each heartbeat" — stale v1 wording; v2 owners never rewrite
+      a held claim (claim.rs header). Docs-only sweep in
+      migration-core; flagged independently by two sessions.
+- [ ] deny.toml: `Unicode-DFS-2016` license allowance no longer
+      matches anything in the tree (pre-existing warning).
 - [ ] F24 residue (noted in its ledger row): log-side coalescing
       decision, worker-row eviction, trailing-edge flush (a burst's
       last ProgressDelta is dropped from the live bus until the next
@@ -70,4 +93,7 @@ F36 are quick calls; F15 rides the multi-pass design.
 
 Rounds 1–2 of the review ledger: F01–F08, F13/F14, F16–F18,
 F21–F35, F37–F44 — landed via PRs #11–#28; ledger sweep in PR #29.
+Quick-calls round (2026-07-13): F36 landed in PR #31
+(`clean-partials` real + stubs bail); F10 hardlink half landed in
+PR #30 (symlink half in §3).
 Process and pitfalls: `docs/LESSONS.md`.
