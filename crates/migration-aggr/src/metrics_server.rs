@@ -1,4 +1,5 @@
-//! Stub for `mig-aggr metrics_server`. See main.rs for the full subcommand list.
+//! Stub for `mig-aggr metrics`: bails with a clear error instead of
+//! panicking. See main.rs for the full subcommand list.
 
 pub async fn run(
     _endpoint: &str,
@@ -6,5 +7,5 @@ pub async fn run(
     _bucket: &str,
     _listen: &str,
 ) -> anyhow::Result<()> {
-    todo!("metrics_server")
+    anyhow::bail!("`mig-aggr metrics` is not implemented; no Prometheus exporter exists yet")
 }

@@ -1,4 +1,5 @@
-//! Stub for `mig-aggr inspect`. See main.rs for the full subcommand list.
+//! Stub for `mig-aggr inspect`: bails with a clear error instead of
+//! panicking. See main.rs for the full subcommand list.
 
 pub async fn run(
     _endpoint: &str,
@@ -6,5 +7,5 @@ pub async fn run(
     _bucket: &str,
     _shard: &str,
 ) -> anyhow::Result<()> {
-    todo!("inspect")
+    anyhow::bail!("`mig-aggr inspect` is not implemented; no pre-flight shard analysis exists yet")
 }
