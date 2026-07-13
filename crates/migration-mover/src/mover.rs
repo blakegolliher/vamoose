@@ -481,6 +481,17 @@ impl Mover {
     /// within the same shard. Both `target` and `linkpath` are
     /// `row.path`-style (relative to the export root); the mover
     /// composes the absolute dest paths via [`Self::dst_path`].
+    ///
+    /// Link is the commit point (R8), and replay is idempotent (F10):
+    /// under at-least-once delivery a worker can die post-link-pre-ack
+    /// and the row comes back. When `nfs_link` reports `EEXIST`, both
+    /// sides are stat'd on the dest context and
+    /// [`resolve_hardlink_eexist`] treats a fileid match as our own
+    /// committed work (`Ok`), a mismatch as a real conflict (fail,
+    /// naming both fileids), and a stat failure as the original
+    /// `EEXIST` failure. Unlink-then-create was rejected as the
+    /// recovery strategy: it destroys pre-existing data at the
+    /// linkpath and opens a crash window with the link missing.
     fn do_hardlink(
         &self,
         pair: &mut ContextPair,
@@ -834,12 +845,28 @@ fn is_eexist(err: &MoveError) -> bool {
 /// linkpath on the destination context during recovery.
 fn resolve_hardlink_eexist(
     link_err: MoveError,
-    _target_stat: Result<u64, MoveError>,
-    _linkpath_stat: Result<u64, MoveError>,
+    target_stat: Result<u64, MoveError>,
+    linkpath_stat: Result<u64, MoveError>,
 ) -> Result<(), MoveError> {
-    // Honest stub — status-quo behavior: every EEXIST stays a
-    // failure, passing the original link error through untouched.
-    Err(link_err)
+    match (target_stat, linkpath_stat) {
+        // Same fileid: the linkpath already IS the target — our own
+        // committed link replayed after a died-post-link-pre-ack
+        // worker. Idempotent success.
+        (Ok(target_id), Ok(linkpath_id)) if target_id == linkpath_id => Ok(()),
+        // Different fileid: a real conflict — some other file
+        // occupies the linkpath. Name both fileids so the operator
+        // can tell conflict from replay in the failure log.
+        (Ok(target_id), Ok(linkpath_id)) => Err(MoveError::new(
+            FailurePhase::Hardlink,
+            format!(
+                "EEXIST: linkpath fileid {linkpath_id} != target fileid \
+                 {target_id} (conflict, not a replay)"
+            ),
+        )),
+        // Either stat failed: recovery must never mask the primary
+        // failure — surface the ORIGINAL EEXIST link error.
+        _ => Err(link_err),
+    }
 }
 
 #[cfg(test)]
@@ -1244,7 +1271,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "red against the status-quo stub; fix lands in the next commit (F10)"]
     fn eexist_same_fileid_is_success() {
         let r = resolve_hardlink_eexist(eexist_link_err(), Ok(42), Ok(42));
         assert!(
@@ -1254,7 +1280,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "red against the status-quo stub; fix lands in the next commit (F10)"]
     fn eexist_different_fileid_stays_failure() {
         let e = resolve_hardlink_eexist(eexist_link_err(), Ok(111), Ok(222))
             .expect_err("different fileids are a real conflict, not a replay");
