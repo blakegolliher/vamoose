@@ -426,7 +426,21 @@ impl Mover {
         // symlink-replace primitive). Fence-check immediately before
         // issuing it.
         self.check_fence()?;
-        ops::symlink(pair.dst(), &target, &dst)?;
+        if let Err(e) = ops::symlink(pair.dst(), &target, &dst) {
+            if !is_eexist(&e) {
+                return Err(e);
+            }
+            // EEXIST recovery — readlink the destination on the dst
+            // context and let `resolve_symlink_eexist` decide replay
+            // vs conflict. Runs strictly after `ops::symlink`
+            // returned, so the R8 fence check above still guards the
+            // commit point. On Ok, fall THROUGH to the post-commit
+            // steps below (mode-downgrade record, best-effort
+            // lutimes): they are identical to the first run and
+            // idempotent under at-least-once replay.
+            let dst_readlink = ops::readlink(pair.dst(), &dst);
+            resolve_symlink_eexist(e, &target, dst_readlink)?;
+        }
 
         if self.cfg.policy.preserve_mode {
             let link_mode = row.mode & 0o7777;
@@ -832,9 +846,9 @@ where
 /// True iff a link-layer error is `EEXIST`. Same errno-name
 /// convention as the rest of the safe-wrapper layer (`MoveError.error`
 /// carries the errno name from `libnfs::errno_name` — see
-/// `ops::mkdir`'s EEXIST handling). `do_hardlink` enters EEXIST
-/// recovery only behind this guard; every other link error passes
-/// through unchanged.
+/// `ops::mkdir`'s EEXIST handling). `do_hardlink` and `do_symlink`
+/// enter EEXIST recovery only behind this guard; every other
+/// link/symlink error passes through unchanged.
 fn is_eexist(err: &MoveError) -> bool {
     err.error == "EEXIST"
 }
@@ -867,6 +881,20 @@ fn resolve_hardlink_eexist(
         // failure — surface the ORIGINAL EEXIST link error.
         _ => Err(link_err),
     }
+}
+
+/// Decide the outcome of a symlink EEXIST: `Ok(())` iff the existing
+/// dst entry is a symlink whose target byte-equals `intended`.
+/// `dst_readlink` is the result of readlink-ing the destination path
+/// on the destination context during recovery.
+fn resolve_symlink_eexist(
+    link_err: MoveError,
+    _intended: &[u8],
+    _dst_readlink: Result<Vec<u8>, MoveError>,
+) -> Result<(), MoveError> {
+    // Honest stub — status-quo behavior: every EEXIST stays a
+    // failure, passing the original symlink error through untouched.
+    Err(link_err)
 }
 
 #[cfg(test)]
@@ -1324,6 +1352,85 @@ mod tests {
         for name in ["ENOSPC", "EACCES", "EIO", "ENOENT", "errno=999"] {
             assert!(
                 !is_eexist(&MoveError::new(FailurePhase::Hardlink, name)),
+                "{name} must pass through, not enter EEXIST recovery"
+            );
+        }
+    }
+
+    // ---- symlink EEXIST recovery (F10, symlink half) ---------------
+    //
+    // At-least-once replay of a committed symlink row: the worker
+    // died post-symlink-pre-ack, the row is redelivered, and
+    // nfs_symlink reports EEXIST. A dst symlink whose target
+    // byte-equals the intended target IS our own committed work — the
+    // row must resolve Ok instead of landing in the failure sink. See
+    // docs/work-items/SYMLINK_REPLAY_IDEMPOTENCY.md.
+
+    fn eexist_symlink_err() -> MoveError {
+        MoveError::new(FailurePhase::Symlink, "EEXIST")
+    }
+
+    #[test]
+    #[ignore = "red against the status-quo stub; fix lands in the next commit (F10)"]
+    fn symlink_eexist_matching_target_is_success() {
+        // Byte-compare, not string-compare: the second target is not
+        // valid UTF-8 and must still match.
+        let targets: [&[u8]; 2] = [b"/t/plain", b"/t/\xff\xfe"];
+        for intended in targets {
+            let r = resolve_symlink_eexist(eexist_symlink_err(), intended, Ok(intended.to_vec()));
+            assert!(
+                r.is_ok(),
+                "matching target = replay of committed work, must be Ok: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "red against the status-quo stub; fix lands in the next commit (F10)"]
+    fn symlink_eexist_different_target_stays_failure() {
+        let e = resolve_symlink_eexist(
+            eexist_symlink_err(),
+            b"/t/intended",
+            Ok(b"/t/existing".to_vec()),
+        )
+        .expect_err("different targets are a real conflict, not a replay");
+        assert_eq!(e.phase, FailurePhase::Symlink);
+        assert!(
+            e.error.contains("/t/intended") && e.error.contains("/t/existing"),
+            "conflict message must name both targets (lossy-rendered) so \
+             the operator can tell conflict from replay, got: {}",
+            e.error
+        );
+    }
+
+    #[test]
+    fn symlink_eexist_readlink_failure_preserves_original_error() {
+        // Recovery must never mask the primary failure. EINVAL is the
+        // entry-is-not-a-symlink shape (readlink on a non-symlink
+        // entry); the returned error must be the ORIGINAL EEXIST
+        // symlink error, not the readlink error.
+        let readlink_err = MoveError::new(FailurePhase::Symlink, "EINVAL");
+        let e = resolve_symlink_eexist(eexist_symlink_err(), b"/t/intended", Err(readlink_err))
+            .expect_err("readlink failure during recovery must stay a failure");
+        assert_eq!(e.phase, FailurePhase::Symlink);
+        assert_eq!(
+            e.error, "EEXIST",
+            "must return the ORIGINAL symlink error, not the readlink error"
+        );
+    }
+
+    #[test]
+    fn symlink_non_eexist_errors_pass_through() {
+        // Wiring-level guarantee: `do_symlink` enters the recovery
+        // arm only behind the shared `is_eexist` guard (an early
+        // `return Err(e)` otherwise), so `resolve_symlink_eexist` is
+        // unreachable for any other symlink error. The guard
+        // classifies by errno name alone; pin that it holds for
+        // Symlink-phase errors exactly as for Hardlink-phase ones.
+        assert!(is_eexist(&MoveError::new(FailurePhase::Symlink, "EEXIST")));
+        for name in ["ENOSPC", "EACCES", "EIO", "ENOENT", "EINVAL", "errno=999"] {
+            assert!(
+                !is_eexist(&MoveError::new(FailurePhase::Symlink, name)),
                 "{name} must pass through, not enter EEXIST recovery"
             );
         }

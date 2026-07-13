@@ -396,3 +396,139 @@ async fn hardlink_replay_is_idempotent() {
     let _ = pair.dst.unlink(link_full.as_bytes()).await;
     let _ = pair.dst.unlink(dst_full.as_bytes()).await;
 }
+
+/// F10 symlink replay idempotency: `move_one` a symlink row, then
+/// `move_one` the SAME row again (simulating at-least-once redelivery
+/// after a worker died post-symlink-pre-ack). The replay must succeed
+/// — nfs_symlink's EEXIST resolves to Ok because the dst symlink
+/// already points at the intended target — and the destination
+/// readlink must still equal the intended target afterwards. VAST rig
+/// pass only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn symlink_replay_is_idempotent() {
+    let src_url_s = src_url();
+    let dst_url_s = dst_url();
+
+    let src_relative_inside_export = src_path();
+
+    // Same env contract and root layout as the end-to-end smoke
+    // above: split the configured src path into source_root +
+    // row.path, land dest under a per-run dir. The symlink target
+    // comes from the row (`symlink_target`), so the source file is
+    // never read — the split is kept for env-contract symmetry.
+    let suffix = timestamp_suffix();
+    let last_slash = src_relative_inside_export
+        .iter()
+        .rposition(|&b| b == b'/')
+        .expect("VAMOOSE_TEST_NFS_PATH must be absolute");
+    let source_root = String::from_utf8(src_relative_inside_export[..last_slash].to_vec())
+        .expect("source root utf8");
+    let mut link_basename = src_relative_inside_export[last_slash..].to_vec(); // starts with /
+    link_basename.extend_from_slice(b".sym");
+    let dest_root = format!("{}/symlink-replay-smoke-{suffix}", write_dir());
+
+    // The intended target: the source file's absolute path. It need
+    // not resolve on the destination export — symlinks may dangle —
+    // what matters is that the byte string round-trips.
+    let target = src_relative_inside_export.clone();
+
+    let cfg = Arc::new(MoverConfig {
+        source_url: src_url_s.clone(),
+        dest_url: dst_url_s.clone(),
+        source_root: source_root.clone(),
+        dest_root: dest_root.clone(),
+        same_server_v42: false,
+        policy: AttrPolicy::from_options(&MigrationOptions::default()),
+        server_side_copy: ServerSideCopy::Off,
+        server_side_copy_min_bytes: 64 * 1024,
+        uring: UringConfig::default(),
+        inflight: InflightProfile::default(),
+        require_chown: false,
+        require_unchanged_size: false,
+    });
+
+    let downgrades = DowngradeSink::new();
+    let fence = Fence::new();
+
+    let sync_pool = SimplePool::build(&src_url_s, &dst_url_s).expect("SimplePool::build");
+    let sync_mover = Mover::new(
+        (*cfg).clone(),
+        sync_pool,
+        "test-host",
+        downgrades.clone(),
+        fence.clone(),
+    );
+
+    let async_pool = Arc::new(
+        BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+            .await
+            .expect("BucketedAsyncPool::new"),
+    );
+
+    let file_mover = AsyncBucketedFileMover::new(
+        async_pool,
+        sync_mover,
+        cfg.clone(),
+        fence.clone(),
+        "test-host",
+        downgrades.clone(),
+    );
+
+    // 1. Create the symlink row — symlink IS the commit point (R8).
+    let row = RowView {
+        row_id: 1,
+        path: link_basename.clone(),
+        size: 0,
+        mtime_sec: Some(1_700_000_000),
+        mtime_nsec: Some(0),
+        atime_sec: Some(1_700_000_000),
+        atime_nsec: Some(0),
+        mode: 0o777,
+        uid: Some(0),
+        gid: Some(0),
+        nlink: Some(1),
+        inode: None,
+        fsid: None,
+        xattr_blob: None,
+        symlink_target: Some(target.clone()),
+        file_type: FileTypeTag::Symlink,
+    };
+    let first = file_mover.move_one(&row).await;
+    assert!(
+        first.result.is_ok(),
+        "first symlink move_one failed: {:?}",
+        first.result
+    );
+
+    // 2. Replay the SAME symlink row — simulates redelivery after a
+    //    died-post-symlink-pre-ack worker. Must succeed, not
+    //    EEXIST-fail.
+    let replay = file_mover.move_one(&row).await;
+    assert!(
+        replay.result.is_ok(),
+        "replayed symlink move_one must be idempotent, got: {:?}",
+        replay.result
+    );
+    assert_eq!(replay.bytes_moved, 0, "symlink rows move no file data");
+
+    // 3. The destination readlink must still equal the intended
+    //    target, byte for byte.
+    let pool = BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+        .await
+        .expect("verify pool");
+    let link_full = format!("{dest_root}{}", String::from_utf8_lossy(&link_basename));
+    let pair = pool.pair_by_name("small").expect("small bucket");
+    let read_back = pair
+        .dst
+        .readlink(link_full.as_bytes())
+        .await
+        .expect("readlink dst");
+    assert_eq!(
+        read_back, target,
+        "destination symlink target must equal the intended target after replay"
+    );
+
+    // Best-effort cleanup, same policy as the smokes above.
+    let _ = pair.dst.unlink(link_full.as_bytes()).await;
+}
