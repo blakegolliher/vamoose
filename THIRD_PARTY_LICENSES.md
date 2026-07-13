@@ -10083,7 +10083,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 > SPDX identifier: `MIT`
 > Crates using this license: 1
 
-- [`spin`](https://crates.io/crates/spin) v0.10.0
+- [`spin`](https://crates.io/crates/spin) v0.10.1
 
 <details>
 <summary>License text</summary>
