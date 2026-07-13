@@ -481,6 +481,17 @@ impl Mover {
     /// within the same shard. Both `target` and `linkpath` are
     /// `row.path`-style (relative to the export root); the mover
     /// composes the absolute dest paths via [`Self::dst_path`].
+    ///
+    /// Link is the commit point (R8), and replay is idempotent (F10):
+    /// under at-least-once delivery a worker can die post-link-pre-ack
+    /// and the row comes back. When `nfs_link` reports `EEXIST`, both
+    /// sides are stat'd on the dest context and
+    /// [`resolve_hardlink_eexist`] treats a fileid match as our own
+    /// committed work (`Ok`), a mismatch as a real conflict (fail,
+    /// naming both fileids), and a stat failure as the original
+    /// `EEXIST` failure. Unlink-then-create was rejected as the
+    /// recovery strategy: it destroys pre-existing data at the
+    /// linkpath and opens a crash window with the link missing.
     fn do_hardlink(
         &self,
         pair: &mut ContextPair,
@@ -497,7 +508,18 @@ impl Mover {
         // .partial + rename pattern, the linkpath is the final dest.
         // Fence-check immediately before issuing it.
         self.check_fence()?;
-        ops::link(pair.dst(), &target_abs, &linkpath_abs)?;
+        if let Err(e) = ops::link(pair.dst(), &target_abs, &linkpath_abs) {
+            if !is_eexist(&e) {
+                return Err(e);
+            }
+            // EEXIST recovery — stat both sides on the dest context
+            // and let `resolve_hardlink_eexist` decide replay vs
+            // conflict. Runs strictly after `ops::link` returned, so
+            // the R8 fence check above still guards the commit point.
+            let target_stat = ops::stat_fileid(pair.dst(), &target_abs);
+            let linkpath_stat = ops::stat_fileid(pair.dst(), &linkpath_abs);
+            return resolve_hardlink_eexist(e, target_stat, linkpath_stat);
+        }
         Ok(())
     }
 
@@ -805,6 +827,46 @@ where
         remaining -= n as u64;
     }
     Ok(off)
+}
+
+/// True iff a link-layer error is `EEXIST`. Same errno-name
+/// convention as the rest of the safe-wrapper layer (`MoveError.error`
+/// carries the errno name from `libnfs::errno_name` — see
+/// `ops::mkdir`'s EEXIST handling). `do_hardlink` enters EEXIST
+/// recovery only behind this guard; every other link error passes
+/// through unchanged.
+fn is_eexist(err: &MoveError) -> bool {
+    err.error == "EEXIST"
+}
+
+/// Decide the outcome of a hardlink EEXIST: `Ok(())` iff the existing
+/// linkpath already IS the target (same fileid). `target_stat` /
+/// `linkpath_stat` are the results of statting the target and the
+/// linkpath on the destination context during recovery.
+fn resolve_hardlink_eexist(
+    link_err: MoveError,
+    target_stat: Result<u64, MoveError>,
+    linkpath_stat: Result<u64, MoveError>,
+) -> Result<(), MoveError> {
+    match (target_stat, linkpath_stat) {
+        // Same fileid: the linkpath already IS the target — our own
+        // committed link replayed after a died-post-link-pre-ack
+        // worker. Idempotent success.
+        (Ok(target_id), Ok(linkpath_id)) if target_id == linkpath_id => Ok(()),
+        // Different fileid: a real conflict — some other file
+        // occupies the linkpath. Name both fileids so the operator
+        // can tell conflict from replay in the failure log.
+        (Ok(target_id), Ok(linkpath_id)) => Err(MoveError::new(
+            FailurePhase::Hardlink,
+            format!(
+                "EEXIST: linkpath fileid {linkpath_id} != target fileid \
+                 {target_id} (conflict, not a replay)"
+            ),
+        )),
+        // Either stat failed: recovery must never mask the primary
+        // failure — surface the ORIGINAL EEXIST link error.
+        _ => Err(link_err),
+    }
 }
 
 #[cfg(test)]
@@ -1193,5 +1255,77 @@ mod tests {
         fence.trip("late trip after Mover constructed");
         let err = mover.check_fence().expect_err("late trip must propagate");
         assert_eq!(err.phase, FailurePhase::Fenced);
+    }
+
+    // ---- hardlink EEXIST recovery (F10) ---------------------------
+    //
+    // At-least-once replay of a committed hardlink row: the worker
+    // died post-link-pre-ack, the row is redelivered, and nfs_link
+    // reports EEXIST. Same fileid on both sides means the linkpath
+    // already IS the target — our own committed work — and the row
+    // must resolve Ok instead of landing in the failure sink. See
+    // docs/work-items/HARDLINK_REPLAY_IDEMPOTENCY.md.
+
+    fn eexist_link_err() -> MoveError {
+        MoveError::new(FailurePhase::Hardlink, "EEXIST")
+    }
+
+    #[test]
+    fn eexist_same_fileid_is_success() {
+        let r = resolve_hardlink_eexist(eexist_link_err(), Ok(42), Ok(42));
+        assert!(
+            r.is_ok(),
+            "same fileid = replay of committed work, must be Ok: {r:?}"
+        );
+    }
+
+    #[test]
+    fn eexist_different_fileid_stays_failure() {
+        let e = resolve_hardlink_eexist(eexist_link_err(), Ok(111), Ok(222))
+            .expect_err("different fileids are a real conflict, not a replay");
+        assert_eq!(e.phase, FailurePhase::Hardlink);
+        assert!(
+            e.error.contains("111") && e.error.contains("222"),
+            "conflict message must name both fileids so the operator \
+             can tell conflict from replay, got: {}",
+            e.error
+        );
+    }
+
+    #[test]
+    fn eexist_stat_failure_preserves_original_error() {
+        // Recovery must never mask the primary failure: whichever
+        // stat fails, the returned error is the ORIGINAL EEXIST link
+        // error, not the stat error.
+        let stat_err = || MoveError::new(FailurePhase::Hardlink, "EACCES");
+        let cases: [(Result<u64, MoveError>, Result<u64, MoveError>); 3] = [
+            (Err(stat_err()), Ok(42)),
+            (Ok(42), Err(stat_err())),
+            (Err(stat_err()), Err(stat_err())),
+        ];
+        for (target_stat, linkpath_stat) in cases {
+            let e = resolve_hardlink_eexist(eexist_link_err(), target_stat, linkpath_stat)
+                .expect_err("stat failure during recovery must stay a failure");
+            assert_eq!(e.phase, FailurePhase::Hardlink);
+            assert_eq!(
+                e.error, "EEXIST",
+                "must return the ORIGINAL link error, not the stat error"
+            );
+        }
+    }
+
+    #[test]
+    fn non_eexist_errors_pass_through() {
+        // Wiring-level guarantee: `do_hardlink` enters the recovery
+        // arm only behind `is_eexist` (an early `return Err(e)`
+        // otherwise), so `resolve_hardlink_eexist` is unreachable for
+        // any other link error. Pin the guard's classification here.
+        assert!(is_eexist(&MoveError::new(FailurePhase::Hardlink, "EEXIST")));
+        for name in ["ENOSPC", "EACCES", "EIO", "ENOENT", "errno=999"] {
+            assert!(
+                !is_eexist(&MoveError::new(FailurePhase::Hardlink, name)),
+                "{name} must pass through, not enter EEXIST recovery"
+            );
+        }
     }
 }

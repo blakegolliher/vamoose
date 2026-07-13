@@ -249,3 +249,150 @@ async fn async_bucketed_mover_copies_regular_file_end_to_end() {
         .unlink(dst_full.as_bytes())
         .await;
 }
+
+/// F10 hardlink replay idempotency: copy a file, `move_hardlink` a
+/// second path to it, then call `move_hardlink` AGAIN for the same
+/// row (simulating at-least-once redelivery after a worker died
+/// post-link-pre-ack). The replay must succeed — nfs_link's EEXIST
+/// resolves to Ok because both paths already share a fileid — and
+/// both paths must share an inode afterwards. VAST rig pass only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn hardlink_replay_is_idempotent() {
+    let src_url_s = src_url();
+    let dst_url_s = dst_url();
+
+    let src_relative_inside_export = src_path();
+    let size = expected_size();
+    assert!(size > 0, "test file must be non-empty");
+
+    // Same env contract and root layout as the end-to-end smoke
+    // above: split the configured src path into source_root +
+    // row.path, land dest under a per-run dir.
+    let suffix = timestamp_suffix();
+    let last_slash = src_relative_inside_export
+        .iter()
+        .rposition(|&b| b == b'/')
+        .expect("VAMOOSE_TEST_NFS_PATH must be absolute");
+    let source_root = String::from_utf8(src_relative_inside_export[..last_slash].to_vec())
+        .expect("source root utf8");
+    let basename = src_relative_inside_export[last_slash..].to_vec(); // starts with /
+    let dest_root = format!("{}/hardlink-replay-smoke-{suffix}", write_dir());
+
+    let cfg = Arc::new(MoverConfig {
+        source_url: src_url_s.clone(),
+        dest_url: dst_url_s.clone(),
+        source_root: source_root.clone(),
+        dest_root: dest_root.clone(),
+        same_server_v42: false,
+        policy: AttrPolicy::from_options(&MigrationOptions::default()),
+        server_side_copy: ServerSideCopy::Off,
+        server_side_copy_min_bytes: 64 * 1024,
+        uring: UringConfig::default(),
+        inflight: InflightProfile::default(),
+        require_chown: false,
+        require_unchanged_size: false,
+    });
+
+    let downgrades = DowngradeSink::new();
+    let fence = Fence::new();
+
+    let sync_pool = SimplePool::build(&src_url_s, &dst_url_s).expect("SimplePool::build");
+    let sync_mover = Mover::new(
+        (*cfg).clone(),
+        sync_pool,
+        "test-host",
+        downgrades.clone(),
+        fence.clone(),
+    );
+
+    let async_pool = Arc::new(
+        BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+            .await
+            .expect("BucketedAsyncPool::new"),
+    );
+
+    let file_mover = AsyncBucketedFileMover::new(
+        async_pool,
+        sync_mover,
+        cfg.clone(),
+        fence.clone(),
+        "test-host",
+        downgrades.clone(),
+    );
+
+    // 1. Copy the file — this becomes the hardlink group's "first
+    //    path" (the final, post-rename link target — R5).
+    let row = RowView {
+        row_id: 1,
+        path: basename.clone(),
+        size,
+        mtime_sec: Some(1_700_000_000),
+        mtime_nsec: Some(0),
+        atime_sec: Some(1_700_000_000),
+        atime_nsec: Some(0),
+        mode: 0o644,
+        uid: Some(0),
+        gid: Some(0),
+        nlink: Some(2),
+        inode: None,
+        fsid: None,
+        xattr_blob: None,
+        symlink_target: None,
+        file_type: FileTypeTag::Regular,
+    };
+    let copy_outcome = file_mover.move_one(&row).await;
+    assert!(
+        copy_outcome.result.is_ok(),
+        "copy move_one failed: {:?}",
+        copy_outcome.result
+    );
+
+    // 2. Hardlink a second path to it.
+    let mut link_basename = basename.clone();
+    link_basename.extend_from_slice(b".link");
+    let link_row = RowView {
+        row_id: 2,
+        path: link_basename.clone(),
+        ..row.clone()
+    };
+    let first = file_mover.move_hardlink(&link_row, &basename).await;
+    assert!(
+        first.result.is_ok(),
+        "first move_hardlink failed: {:?}",
+        first.result
+    );
+
+    // 3. Replay the SAME hardlink row — simulates redelivery after a
+    //    died-post-link-pre-ack worker. Must succeed, not EEXIST-fail.
+    let replay = file_mover.move_hardlink(&link_row, &basename).await;
+    assert!(
+        replay.result.is_ok(),
+        "replayed move_hardlink must be idempotent, got: {:?}",
+        replay.result
+    );
+    assert_eq!(replay.bytes_moved, 0, "hardlink rows move no file data");
+
+    // 4. Both paths must share an inode on the destination.
+    let pool = BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+        .await
+        .expect("verify pool");
+    let dst_full = format!("{dest_root}{}", String::from_utf8_lossy(&basename));
+    let link_full = format!("{dest_root}{}", String::from_utf8_lossy(&link_basename));
+    let pair = pool.pair_by_name("small").expect("small bucket");
+    let target_stat = pair.dst.stat(dst_full.as_bytes()).await.expect("stat dst");
+    let link_stat = pair
+        .dst
+        .stat(link_full.as_bytes())
+        .await
+        .expect("stat link");
+    assert_eq!(
+        target_stat.ino, link_stat.ino,
+        "target and linkpath must share an inode after replay"
+    );
+    assert_eq!(target_stat.nlink, 2, "link count must be exactly 2");
+
+    // Best-effort cleanup, same policy as the smoke above.
+    let _ = pair.dst.unlink(link_full.as_bytes()).await;
+    let _ = pair.dst.unlink(dst_full.as_bytes()).await;
+}
