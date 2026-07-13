@@ -1,6 +1,6 @@
 # mig-aggr: implement `clean-partials`, bail the other stubs
 
-Status: in progress on branch `f36-aggr-clean-partials`.
+Status: landed — merged in PR #31.
 Ledger: F36 in `docs/REVIEW_LEDGER.md` (do NOT edit the ledger or
 `docs/NEXT.md` from this branch — the coordinator sweeps those).
 Priority: medium (every `mig-aggr` subcommand today is a `todo!()`
