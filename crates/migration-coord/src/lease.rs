@@ -11,10 +11,11 @@
 //! conditional primitives the v2 claim protocol uses:
 //!
 //! - **Cold acquire** — `PUT If-None-Match: *` on `coord/lease`. The
-//!   only writer-side primitive VAST S3 honors atomically.
-//! - **Refresh** — unconditional `PUT` while we hold it. Safe because
-//!   only one coord can hold the lease at any time (enforced by the
-//!   acquire path).
+//!   only writer-side create primitive VAST S3 honors atomically.
+//! - **Refresh** — `DELETE If-Match` the lease we hold, then
+//!   `PUT If-None-Match: *` the extended body — the same two atoms
+//!   takeover uses. Any conflict (or store error) at either step
+//!   means we can no longer prove ownership: `LeaseLost`.
 //! - **Takeover** — read current lease, verify expiry (with a clock-
 //!   drift grace), `DELETE If-Match` the stale lease, then
 //!   `PUT If-None-Match: *` a fresh one. Both conditionals lose
@@ -253,40 +254,81 @@ pub async fn try_acquire(
 
 /// Refresh an owned lease. The new body keeps `holder_id`,
 /// `lease_id`, and `acquired_at` from the existing handle and pushes
-/// `expires_at` forward by `cfg.ttl`.
+/// `expires_at` forward by `cfg.ttl` — `lease_id` rotates only on
+/// acquire/takeover, never on refresh.
 ///
-/// Returns `Error::LeaseLost` if we no longer own the lease (the
-/// store's current etag doesn't match ours, or the object is gone).
-/// In that case the caller must stop writing and exit; another coord
-/// has taken over and any further writes from us would clobber its
-/// state.
+/// Refresh composes the same two conditional atoms takeover uses —
+/// the only write-side conditionals VAST S3 honors — to get a
+/// conditional refresh without `PUT If-Match` (which VAST S3 does
+/// not honor) and without an unconditional `PUT` (last-write-wins:
+/// a deposed holder's stale refresh would silently overwrite a
+/// completed takeover, and the F02 write gate would never trip):
+///
+/// 1. `DELETE If-Match` our held etag. A stale etag or missing
+///    object means someone else took over (or we released):
+///    `LeaseLost`.
+/// 2. `PUT If-None-Match: *` the extended body. `AlreadyExists`
+///    means a candidate slipped into the delete-create gap and now
+///    owns the epoch: `LeaseLost`.
+///
+/// Every failure mode of every step — conflict outcomes and store
+/// errors alike — resolves to `Error::LeaseLost`, the one signal the
+/// F02 write gate consumes (`ticks.rs` maps it to
+/// `mark_lease_lost`; the caller must stop writing coord-owned keys
+/// and exit). A store error maps to `LeaseLost` because a failed
+/// call is ambiguous: the mutation may have landed server-side,
+/// leaving the lease key absent and claimable. Forfeiting the lease
+/// on a transient error is the accepted fail-safe direction. A crash
+/// between delete and create leaves the lease object briefly absent
+/// — an ordinary cold-acquire opportunity for candidates, an
+/// availability blip, never split-brain.
 pub async fn refresh(
     store: &dyn CoordStore,
     handle: &LeaseHandle,
     cfg: LeaseConfig,
     now: DateTime<Utc>,
 ) -> Result<LeaseHandle> {
-    // Pre-flight: confirm the lease still has our etag. The store-
-    // level write itself is unconditional (last-write-wins), so we
-    // need this read-modify guard to detect takeover. The race
-    // window between this head and the put is tight; we accept it
-    // because the alternative — a conditional PUT — is the primitive
-    // VAST S3 doesn't honor.
-    match store.head(LEASE_KEY).await? {
-        Some(etag) if etag == handle.etag => {}
-        Some(_) | None => return Err(Error::LeaseLost),
-    }
-
+    // Serialize before touching the store so the only failures past
+    // this point are store failures, all of which map to LeaseLost.
     let new_body = LeaseBody {
         expires_at: now + cfg.ttl,
         ..handle.body.clone()
     };
     let payload = serde_json::to_vec(&new_body)?;
-    let new_etag = store.put(LEASE_KEY, payload).await?;
-    Ok(LeaseHandle {
-        body: new_body,
-        etag: new_etag,
-    })
+
+    // 1. Conditionally delete the lease we hold. Proves our etag was
+    //    still current at the moment of deletion.
+    match store.delete_if_match(LEASE_KEY, &handle.etag).await {
+        Ok(DeleteOutcome::Deleted) => {}
+        Ok(DeleteOutcome::EtagMismatch | DeleteOutcome::NotFound) => {
+            return Err(Error::LeaseLost);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "store error during lease-refresh delete; treating as lease lost",
+            );
+            return Err(Error::LeaseLost);
+        }
+    }
+
+    // 2. Conditionally create the extended lease in the slot we just
+    //    vacated. Losing this race means a candidate's lease is now
+    //    the current epoch — we must not disturb it.
+    match store.put_if_absent(LEASE_KEY, payload).await {
+        Ok(PutOutcome::Created(etag)) => Ok(LeaseHandle {
+            body: new_body,
+            etag,
+        }),
+        Ok(PutOutcome::AlreadyExists) => Err(Error::LeaseLost),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "store error during lease-refresh create; treating as lease lost",
+            );
+            Err(Error::LeaseLost)
+        }
+    }
 }
 
 /// Release the lease — delete `coord/lease` if it still has our
@@ -442,6 +484,244 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::LeaseLost));
+    }
+
+    // === F19: refresh must be delete-then-create, never PUT ===
+
+    /// The F19 headline: a refresh is exactly one conditional delete
+    /// followed by one conditional create — the two VAST-safe atoms.
+    /// An unconditional `PUT` (last-write-wins) anywhere in the
+    /// refresh path is the split-brain bug: a deposed holder's PUT
+    /// silently overwrites a completed takeover.
+    #[tokio::test]
+    async fn refresh_never_writes_unconditionally() {
+        let s = MemStore::new();
+        let h = acquired(try_acquire(&s, &me("A"), cfg(), t0()).await.unwrap());
+        s.clear_ops();
+
+        refresh(&s, &h, cfg(), t0() + Duration::seconds(5))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.ops(),
+            vec![
+                format!("DELETE_IF_MATCH {LEASE_KEY}"),
+                format!("PUT_IF_ABSENT {LEASE_KEY}"),
+            ],
+            "refresh must be exactly delete_if_match then put_if_absent — \
+             no unconditional PUT, ever",
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rotates_etag_and_extends_expiry() {
+        let s = MemStore::new();
+        let h = acquired(try_acquire(&s, &me("A"), cfg(), t0()).await.unwrap());
+
+        let h2 = refresh(&s, &h, cfg(), t0() + Duration::seconds(5))
+            .await
+            .unwrap();
+        assert_ne!(h2.etag, h.etag, "every refresh write rotates the etag");
+        assert_eq!(h2.expires_at(), t0() + Duration::seconds(35));
+        assert!(h2.expires_at() > h.expires_at());
+        assert_eq!(
+            h2.lease_id(),
+            h.lease_id(),
+            "lease_id rotates only on takeover"
+        );
+
+        // The refreshed handle must itself be refreshable — the new
+        // etag is the store's current one.
+        let h3 = refresh(&s, &h2, cfg(), t0() + Duration::seconds(10))
+            .await
+            .unwrap();
+        assert_eq!(h3.lease_id(), h.lease_id());
+        assert_eq!(h3.expires_at(), t0() + Duration::seconds(40));
+    }
+
+    /// Wraps `MemStore` to force the create-race interleave inside
+    /// refresh: the instant the holder's `delete_if_match` on the
+    /// lease succeeds, a candidate's `put_if_absent` lands in the
+    /// delete→create gap. The holder's own create must then lose
+    /// with `AlreadyExists`.
+    #[derive(Debug)]
+    struct CreateRaceStore {
+        inner: MemStore,
+        candidate_body: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoordStore for CreateRaceStore {
+        async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            self.inner.get(key).await
+        }
+        async fn head(&self, key: &str) -> Result<Option<String>> {
+            self.inner.head(key).await
+        }
+        async fn put(&self, key: &str, body: Vec<u8>) -> Result<String> {
+            self.inner.put(key, body).await
+        }
+        async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<PutOutcome> {
+            self.inner.put_if_absent(key, body).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn delete_if_match(&self, key: &str, etag: &str) -> Result<DeleteOutcome> {
+            let out = self.inner.delete_if_match(key, etag).await?;
+            if key == LEASE_KEY && out == DeleteOutcome::Deleted {
+                // Candidate wins the race for the now-absent key.
+                let seeded = self
+                    .inner
+                    .put_if_absent(key, self.candidate_body.clone())
+                    .await?;
+                assert!(
+                    matches!(seeded, PutOutcome::Created(_)),
+                    "race seed must land on the just-deleted key",
+                );
+            }
+            Ok(out)
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<crate::store::ListEntry>> {
+            self.inner.list(prefix).await
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_loses_create_race_returns_lease_lost() {
+        let candidate_body =
+            serde_json::to_vec(&build_body(&me("B"), cfg(), t0() + Duration::seconds(5))).unwrap();
+        let s = CreateRaceStore {
+            inner: MemStore::new(),
+            candidate_body: candidate_body.clone(),
+        };
+        let h = acquired(try_acquire(&s, &me("A"), cfg(), t0()).await.unwrap());
+
+        // A's refresh: its delete succeeds, then B's create slips
+        // into the gap before A's own create.
+        let res = refresh(&s, &h, cfg(), t0() + Duration::seconds(5)).await;
+        match res {
+            // Must be the exact variant ticks.rs maps to
+            // mark_lease_lost (the F02 write gate's only input).
+            Err(Error::LeaseLost) => {}
+            other => panic!(
+                "candidate won the create race — refresh must return LeaseLost, got {other:?}",
+            ),
+        }
+
+        // B's lease survives untouched: A never overwrote it.
+        let (body, _etag) = s.inner.get(LEASE_KEY).await.unwrap().unwrap();
+        assert_eq!(body, candidate_body, "the race winner's lease must survive");
+    }
+
+    /// Wraps `MemStore` to fail chosen store calls on the lease key
+    /// with a transport-style error, pinning the fail-safe mapping:
+    /// any store error inside refresh resolves to `LeaseLost` (a
+    /// failed call is ambiguous — the mutation may have landed
+    /// server-side — so the holder must forfeit rather than keep
+    /// writing).
+    #[derive(Debug)]
+    struct ErrStore {
+        inner: MemStore,
+        fail_delete_if_match: bool,
+        fail_put_if_absent: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CoordStore for ErrStore {
+        async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            self.inner.get(key).await
+        }
+        async fn head(&self, key: &str) -> Result<Option<String>> {
+            self.inner.head(key).await
+        }
+        async fn put(&self, key: &str, body: Vec<u8>) -> Result<String> {
+            self.inner.put(key, body).await
+        }
+        async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<PutOutcome> {
+            if key == LEASE_KEY && self.fail_put_if_absent {
+                return Err(Error::Other(anyhow::anyhow!("injected create failure")));
+            }
+            self.inner.put_if_absent(key, body).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn delete_if_match(&self, key: &str, etag: &str) -> Result<DeleteOutcome> {
+            if key == LEASE_KEY && self.fail_delete_if_match {
+                return Err(Error::Other(anyhow::anyhow!("injected delete failure")));
+            }
+            self.inner.delete_if_match(key, etag).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<crate::store::ListEntry>> {
+            self.inner.list(prefix).await
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_delete_store_error_returns_lease_lost() {
+        let s = ErrStore {
+            inner: MemStore::new(),
+            fail_delete_if_match: true,
+            fail_put_if_absent: false,
+        };
+        let h = acquired(try_acquire(&s, &me("A"), cfg(), t0()).await.unwrap());
+
+        let err = refresh(&s, &h, cfg(), t0() + Duration::seconds(5))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::LeaseLost),
+            "store error at delete must fail safe to LeaseLost, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_create_store_error_returns_lease_lost() {
+        let s = ErrStore {
+            inner: MemStore::new(),
+            fail_delete_if_match: false,
+            fail_put_if_absent: false,
+        };
+        // Acquire while creates still work...
+        let h = acquired(try_acquire(&s, &me("A"), cfg(), t0()).await.unwrap());
+        // ...then fail every subsequent create on the lease key.
+        let s = ErrStore {
+            fail_put_if_absent: true,
+            ..s
+        };
+
+        let err = refresh(&s, &h, cfg(), t0() + Duration::seconds(5))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::LeaseLost),
+            "store error at create must fail safe to LeaseLost, got {err:?}",
+        );
+        // The delete landed and the create failed: the lease key is
+        // absent — a cold-acquire opportunity, not split-brain.
+        assert!(s.inner.get(LEASE_KEY).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_delete_conflict_returns_lease_lost() {
+        let s = MemStore::new();
+        let h = acquired(try_acquire(&s, &me("A"), cfg(), t0()).await.unwrap());
+
+        // The lease object was rewritten out from under us — same
+        // body, but the etag rotated, so our held etag is stale.
+        s.put(LEASE_KEY, serde_json::to_vec(&h.body).unwrap())
+            .await
+            .unwrap();
+
+        let err = refresh(&s, &h, cfg(), t0() + Duration::seconds(5))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::LeaseLost),
+            "stale etag at delete time must resolve to LeaseLost, got {err:?}",
+        );
     }
 
     #[tokio::test]
