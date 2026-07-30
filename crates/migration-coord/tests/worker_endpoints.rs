@@ -539,7 +539,6 @@ fn entry(kind: &EventKind) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "red against current behavior; fix lands in the next commit (F20 D2+D3)"]
 async fn worker_route_rejects_operator_kinds() {
     let (app, rt, _store) = fresh_app().await;
     rt.ingest(job_created("bobby")).await.unwrap();
@@ -628,7 +627,6 @@ async fn worker_route_rejects_operator_kinds() {
 }
 
 #[tokio::test]
-#[ignore = "red against current behavior; fix lands in the next commit (F20 D2+D3)"]
 async fn worker_route_rejects_foreign_worker_id() {
     let (app, rt, _store) = fresh_app().await;
     rt.ingest(job_created("bobby")).await.unwrap();
@@ -659,7 +657,6 @@ async fn worker_route_rejects_foreign_worker_id() {
 }
 
 #[tokio::test]
-#[ignore = "red against current behavior; fix lands in the next commit (F20 D2+D3)"]
 async fn worker_route_rejects_unregistered_caller() {
     let (app, rt, _store) = fresh_app().await;
     rt.ingest(job_created("bobby")).await.unwrap();
@@ -687,7 +684,6 @@ async fn worker_route_rejects_unregistered_caller() {
 }
 
 #[tokio::test]
-#[ignore = "red against current behavior; fix lands in the next commit (F20 D2+D3)"]
 async fn worker_fenced_self_only() {
     let (app, rt, _store) = fresh_app().await;
     rt.ingest(job_created("bobby")).await.unwrap();
@@ -739,7 +735,6 @@ async fn worker_fenced_self_only() {
 }
 
 #[tokio::test]
-#[ignore = "red against current behavior; fix lands in the next commit (F20 D2+D3)"]
 async fn one_bad_entry_rejects_whole_batch() {
     let (app, rt, _store) = fresh_app().await;
     rt.ingest(job_created("bobby")).await.unwrap();
@@ -899,7 +894,9 @@ async fn fence_marks_worker_and_emits_event() {
 async fn worker_events_ack_implies_durable() {
     let (app, rt, mem, clock) = fresh_app_with_clock().await;
     rt.ingest(job_created("bobby")).await.unwrap();
-    let wid = WorkerId::new();
+    // Registered caller — the F20 trust boundary rejects events for
+    // unknown worker ids before they reach the log.
+    let wid = register_one(&app, "bobby").await;
 
     let body = serde_json::json!({
         "events": [delta_event(&wid, 5), delta_event(&wid, 3)],
@@ -948,7 +945,7 @@ async fn worker_events_ack_implies_durable() {
 async fn seq_never_regresses_across_restart() {
     let (app, rt, mem, clock) = fresh_app_with_clock().await;
     rt.ingest(job_created("bobby")).await.unwrap();
-    let wid = WorkerId::new();
+    let wid = register_one(&app, "bobby").await;
 
     let body = serde_json::json!({
         "events": [delta_event(&wid, 1), delta_event(&wid, 2), delta_event(&wid, 3)],
@@ -983,8 +980,13 @@ async fn seq_never_regresses_across_restart() {
 async fn fenced_coord_never_acks() {
     let (app, rt, mem, _clock) = fresh_app_with_clock().await;
     rt.ingest(job_created("bobby")).await.unwrap();
+    // Register while the lease is still held (register itself
+    // flushes), so the events POST below passes the F20 registration
+    // check and fails on the lease fence, which is what this test
+    // pins.
+    let wid = register_one(&app, "bobby").await;
     rt.flush_log().await.unwrap();
-    let wid = WorkerId::new();
+    let pre_fence_seq = rt.last_seq().await;
 
     rt.mark_lease_lost().await;
     let writes_before = mem.write_count();
@@ -1002,7 +1004,7 @@ async fn fenced_coord_never_acks() {
         "a fenced coord must not write to the store on the events path",
     );
     // Nothing new became durable either.
-    let durable = migration_coord::events::read_all_events_since(mem.as_ref(), 1)
+    let durable = migration_coord::events::read_all_events_since(mem.as_ref(), pre_fence_seq)
         .await
         .unwrap();
     assert!(
@@ -1021,10 +1023,11 @@ async fn fenced_coord_never_acks() {
 async fn events_batch_1000_amortizes_flush_writes() {
     let (app, rt, mem, _clock) = fresh_app_with_clock().await;
     rt.ingest(job_created("bobby")).await.unwrap();
-    // Clear the setup event so the write count below isolates the
-    // batch itself.
+    let wid = register_one(&app, "bobby").await;
+    // Clear the setup events (register flushes its own WorkerJoined)
+    // so the write count below isolates the batch itself.
     rt.flush_log().await.unwrap();
-    let wid = WorkerId::new();
+    let seq_before = rt.last_seq().await;
 
     let events: Vec<Value> = (0..1000).map(|_| delta_event(&wid, 1)).collect();
     let writes_before = mem.write_count();
@@ -1044,7 +1047,7 @@ async fn events_batch_1000_amortizes_flush_writes() {
     );
 
     // And every acked event is durable.
-    let durable = migration_coord::events::read_all_events_since(mem.as_ref(), 1)
+    let durable = migration_coord::events::read_all_events_since(mem.as_ref(), seq_before)
         .await
         .unwrap();
     assert_eq!(durable.len(), 1000);
@@ -1058,7 +1061,7 @@ async fn events_batch_1000_amortizes_flush_writes() {
 async fn bench_events_batch_throughput() {
     let (app, rt, _mem, _clock) = fresh_app_with_clock().await;
     rt.ingest(job_created("bobby")).await.unwrap();
-    let wid = WorkerId::new();
+    let wid = register_one(&app, "bobby").await;
 
     const BATCHES: usize = 10;
     const PER_BATCH: usize = 1000;
