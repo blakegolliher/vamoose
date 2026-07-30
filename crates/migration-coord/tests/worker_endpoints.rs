@@ -1130,7 +1130,6 @@ async fn durable_since(mem: &MemStore, since: u64) -> Vec<migration_coord::schem
 /// last_seq, and the durable log contents must be identical to the
 /// single send.
 #[tokio::test]
-#[ignore = "F20 D4 red: no client_seq dedup yet; ignore is removed by the fix commit"]
 async fn resend_after_lost_response_is_idempotent() {
     let (app, rt, mem) = fresh_app().await;
     rt.ingest(job_created("bobby")).await.unwrap();
@@ -1214,7 +1213,6 @@ async fn resend_after_lost_response_is_idempotent() {
 /// harness's replay pattern), then resend the old batch to the NEW
 /// runtime: still deduped.
 #[tokio::test]
-#[ignore = "F20 D4 red: no client_seq dedup yet; ignore is removed by the fix commit"]
 async fn replay_reconstructs_hwm() {
     let (app, rt, mem, clock) = fresh_app_with_clock().await;
     rt.ingest(job_created("bobby")).await.unwrap();
@@ -1327,7 +1325,6 @@ impl CoordStore for FailEventPuts {
 /// send. `max_events_per_chunk = 2` forces chunk flushes mid-loop so
 /// the injected `put` failure lands between entries.
 #[tokio::test]
-#[ignore = "F20 D5 red: retry after mid-batch storage failure double-applies; ignore is removed by the fix commit"]
 async fn storage_failure_then_retry_converges() {
     let mem = Arc::new(MemStore::new());
     let flaky = Arc::new(FailEventPuts::new(mem.clone()));
@@ -1445,7 +1442,6 @@ async fn unstamped_entries_keep_legacy_semantics() {
 /// and must not corrupt the high-water mark for later stamped
 /// traffic.
 #[tokio::test]
-#[ignore = "F20 D4 red: no client_seq dedup yet; ignore is removed by the fix commit"]
 async fn mixed_stamped_unstamped_batch_dedups_only_stamped() {
     let (app, rt, _mem) = fresh_app().await;
     rt.ingest(job_created("bobby")).await.unwrap();
@@ -1510,7 +1506,6 @@ async fn mixed_stamped_unstamped_batch_dedups_only_stamped() {
 /// rejected 400-class and nothing applies. (Cross-batch forward gaps
 /// stay legitimate; the other tests cover them.)
 #[tokio::test]
-#[ignore = "F20 D4 red: no in-batch monotonicity check yet; ignore is removed by the fix commit"]
 async fn non_monotonic_batch_rejected() {
     let (app, rt, _mem) = fresh_app().await;
     rt.ingest(job_created("bobby")).await.unwrap();

@@ -23,8 +23,8 @@
 //!   `worker_id` is unknown.
 //!
 //! - **POST /workers/{id}/events** — batched event submission.
-//!   Body: `{events: [{kind, ...payload, worker_at?}]}`. Trust
-//!   boundary (ledger F20, D2+D3): the URL id must belong to a
+//!   Body: `{events: [{kind, ...payload, worker_at?, client_seq?}]}`.
+//!   Trust boundary (ledger F20, D2+D3): the URL id must belong to a
 //!   registered worker (404 `worker_not_found`, exactly like
 //!   heartbeat), and the ENTIRE batch is validated against the
 //!   [`validate_worker_event`] allow-list + identity binding before
@@ -32,6 +32,33 @@
 //!   batch with 403 and nothing applied. Each surviving entry is
 //!   then ingested individually (coord assigns seq); the response
 //!   reports the assigned seqs.
+//!
+//!   **Idempotency (ledger F20, D4+D5):** a stamping worker marks
+//!   each entry with a per-worker, monotonically increasing
+//!   `client_seq`. Entries at or below the caller's high-water mark
+//!   (reducer state, so it survives crash + replay) are SKIPPED as
+//!   already-applied — no ingest, no seq — which makes a resend
+//!   after a lost 200, or a retry after a mid-batch storage
+//!   failure, converge to exactly-once effective application.
+//!   Forward gaps are legitimate (the worker's buffer drops under
+//!   budget pressure); stamps out of order WITHIN one batch mean a
+//!   buggy client and reject the whole batch with 400
+//!   `client_seq_not_monotonic` before anything is ingested.
+//!   Unstamped entries (pre-upgrade workers) keep the documented
+//!   at-least-once semantics — applied on every send, never
+//!   deduped, and they neither read nor advance the mark.
+//!
+//!   **Response shape (D4 choice):** `{seqs, deduped}`. `seqs`
+//!   holds the coord-assigned seqs of the APPLIED entries in batch
+//!   order; `deduped` counts the skipped ones, so
+//!   `seqs.len() + deduped == events.len()`. Chosen over per-entry
+//!   `Option<u64>` because both compatibility constraints fall out
+//!   for free: an old worker never stamps, so nothing is ever
+//!   skipped for it and `seqs` keeps its old exact shape (the extra
+//!   `deduped` field is ignored by its deserializer); a new worker
+//!   treats any 200 as "batch settled" and drops its resend buffer
+//!   exactly as today — neither worker generation needs to
+//!   correlate seqs to entries.
 //!
 //! - **POST /workers/{id}/fence** — self-fence. Body: `{reason}`.
 //!   Coord emits `WorkerFenced`, which the reducer routes to the
@@ -237,6 +264,12 @@ pub struct WorkerEventEntry {
     pub kind: EventKind,
     #[serde(default)]
     pub worker_at: Option<DateTime<Utc>>,
+    /// Per-worker idempotency stamp (ledger F20, D4). Absent means a
+    /// pre-upgrade worker: the entry keeps at-least-once semantics
+    /// (applied on every send). Present means the coord dedups it
+    /// against the caller's replay-durable high-water mark.
+    #[serde(default)]
+    pub client_seq: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -246,8 +279,16 @@ pub struct EventsBatchBody {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventsBatchResponse {
-    /// Seqs assigned to each event in order. Matches `events.len()`.
+    /// Seqs assigned to the APPLIED entries, in batch order.
+    /// `seqs.len() + deduped == events.len()`. For a worker that
+    /// does not stamp `client_seq` nothing is ever deduped, so this
+    /// keeps its original shape (one seq per entry).
     pub seqs: Vec<u64>,
+    /// Entries skipped as already-applied (`client_seq` at or below
+    /// the caller's high-water mark). The whole batch is settled
+    /// either way — the worker drops its resend buffer on any 200.
+    #[serde(default)]
+    pub deduped: u64,
 }
 
 /// Trust boundary for the worker events route (ledger F20, D2+D3 —
@@ -353,33 +394,65 @@ pub async fn events_batch(
     // D2+D3 batch semantics: validate the ENTIRE batch before
     // ingesting anything, so one bad entry cannot smuggle siblings
     // in and an allow-list/binding rejection can never cause partial
-    // application. (Storage failures mid-loop below keep today's
-    // documented partial semantics — that residue is D4/D5.)
+    // application.
     for entry in &body.events {
         validate_worker_event(&entry.kind, worker_id)?;
     }
+    // D4 in-batch monotonicity, also validated before anything is
+    // ingested: stamped entries must be STRICTLY increasing within
+    // the batch. Out-of-order (or duplicate) stamps in one batch are
+    // a buggy client, not a replay — a replay resends whole batches
+    // in original order — so the whole batch is rejected 400-class.
+    // (Gaps are legitimate: the worker's buffer drops under budget
+    // pressure. Unstamped entries are simply not part of the chain.)
+    let mut prev_stamp: Option<u64> = None;
+    for entry in &body.events {
+        if let Some(cs) = entry.client_seq {
+            if prev_stamp.is_some_and(|p| cs <= p) {
+                return Err(ApiError::bad_request(
+                    "client_seq_not_monotonic",
+                    format!(
+                        "client_seq {cs} follows {} within one batch; \
+                         stamps must be strictly increasing",
+                        prev_stamp.unwrap_or(0),
+                    ),
+                ));
+            }
+            prev_stamp = Some(cs);
+        }
+    }
+    // D4 dedup: entries stamped at or below the caller's high-water
+    // mark are already applied — a resend after a lost 200, or a
+    // retry after a mid-batch storage failure re-offering the
+    // already-applied prefix. Skip them: no ingest, no seq. The mark
+    // lives in reducer state (advanced when the stamped envelope is
+    // applied, live or on replay), so reading it once up front is
+    // sound — the in-batch check above guarantees the entries we DO
+    // apply climb strictly above it. D5 falls out: the only mid-loop
+    // failure left after validation is storage, and the worker's
+    // retry of the same batch converges to exactly-once.
+    let hwm = state.runtime.client_seq_hwm(worker_id).await;
     let mut seqs = Vec::with_capacity(body.events.len());
+    let mut deduped = 0u64;
     for entry in body.events {
-        let seq = match entry.worker_at {
-            Some(at) => state
-                .runtime
-                .ingest_with_worker_at(entry.kind, at)
-                .await
-                .map_err(ApiError::storage)?,
-            None => state
-                .runtime
-                .ingest(entry.kind)
-                .await
-                .map_err(ApiError::storage)?,
-        };
+        if entry.client_seq.is_some_and(|cs| cs <= hwm) {
+            deduped += 1;
+            continue;
+        }
+        let seq = state
+            .runtime
+            .ingest_worker_event(entry.kind, entry.worker_at, entry.client_seq)
+            .await
+            .map_err(ApiError::storage)?;
         seqs.push(seq);
     }
-    // Ack == durable (ledger F03): the worker treats returned seqs
-    // as delivered and drops them from its resend buffer, so the
-    // buffered chunks must hit the store before we respond. Fenced
-    // on the lease — a deposed coord fails here instead of acking.
+    // Ack == durable (ledger F03): the worker treats a 200 as the
+    // whole batch settled and drops it from its resend buffer, so
+    // the buffered chunks must hit the store before we respond.
+    // Fenced on the lease — a deposed coord fails here instead of
+    // acking.
     state.runtime.flush_log().await.map_err(ApiError::storage)?;
-    Ok(Json(EventsBatchResponse { seqs }))
+    Ok(Json(EventsBatchResponse { seqs, deduped }))
 }
 
 // =============================================================================
