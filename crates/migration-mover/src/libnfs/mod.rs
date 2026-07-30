@@ -194,6 +194,82 @@ extern "C" {
     pub fn nfs_stat64(nfs: *mut nfs_context, path: *const c_char, st: *mut nfs_stat_64) -> c_int;
 }
 
+// =============================================================================
+// PROTECTED_FFI_BATCH additions (F12/F09). Both signatures verified
+// 2026-07-30 as byte-identical between the pinned source tree
+// (~/projects/libnfs, tag libnfs-6.0.2-148-gdc7e6f8), the installed
+// header (/usr/local/include/nfsc/libnfs.h), and exported by the
+// linked /usr/local/lib/libnfs.so.16.0.2:
+//
+//   grep -n "nfs_fsync(\|nfs_set_timeout(" /usr/local/include/nfsc/libnfs.h \
+//       ~/projects/libnfs/include/nfsc/libnfs.h | grep -v async
+//   nm -D /usr/local/lib/libnfs.so.16.0.2 | grep -wE "nfs_fsync|nfs_set_timeout"
+//
+// Kept in their own block so the long-verified block above stays
+// textually untouched.
+// =============================================================================
+
+extern "C" {
+    /// F12: per-RPC timeout in milliseconds for every subsequent RPC
+    /// on this context (`lib/libnfs.c:nfs_set_timeout` — stores the
+    /// value in both `nfs_context_internal` and the rpc context, so
+    /// the MOUNT dance is bounded too when called pre-mount). The
+    /// pinned tree's built-in default is 60_000 ms
+    /// (`lib/init.c: rpc->timeout = 60 * 1000`); timed-out RPCs fire
+    /// their callback with `-EINTR` / `"Command timed out"`.
+    pub fn nfs_set_timeout(nfs: *mut nfs_context, milliseconds: c_int);
+
+    /// F09: sync whole-file NFS COMMIT for an open fh. Drives
+    /// `nfs_fsync_async` → COMMIT3 with `offset = 0, count = 0`
+    /// (`lib/nfs_v3.c:nfs3_fsync_async`) and waits for the reply.
+    /// Returns 0 on success, negative `-errno` on failure — same
+    /// convention as the rest of the sync surface. The write path
+    /// needs it because the linked libnfs issues WRITEs UNSTABLE
+    /// unless the fh was opened `O_SYNC`
+    /// (`lib/nfs_v3.c:nfs3_fill_WRITE3args`).
+    pub fn nfs_fsync(nfs: *mut nfs_context, nfsfh: *mut nfsfh) -> c_int;
+}
+
+/// F12 default per-RPC timeout, in milliseconds. Matches the pinned
+/// libnfs's implicit default (`lib/init.c`), now explicit at every
+/// context-creation point and configurable via
+/// `[mover] rpc_timeout_ms`. `0` means "leave the library default
+/// untouched" — see [`effective_rpc_timeout`].
+pub const DEFAULT_RPC_TIMEOUT_MS: u32 = 60_000;
+
+/// Pure seam for the F12 timeout policy: what value, if any, should
+/// be passed to `nfs_set_timeout` for a configured `rpc_timeout_ms`.
+///
+/// - `0` → `None`: do not call `nfs_set_timeout` at all (the
+///   documented "leave the libnfs built-in default untouched" value).
+/// - anything else → `Some(ms)`, clamped to `c_int::MAX` because the
+///   FFI takes a C `int` and libnfs treats a negative timeout as
+///   "no timeout" — a silent wrap would disable the bound the
+///   operator asked for.
+pub fn effective_rpc_timeout(rpc_timeout_ms: u32) -> Option<c_int> {
+    match rpc_timeout_ms {
+        0 => None,
+        ms => Some(ms.min(c_int::MAX as u32) as c_int),
+    }
+}
+
+/// Apply the configured per-RPC timeout to a freshly created context.
+/// Must run before `nfs_mount` / `nfs_mount_async` so the mount's own
+/// RPCs are bounded as well. No-op when `rpc_timeout_ms == 0`.
+///
+/// Deliberately not `unsafe fn` (same rationale as [`last_error`]):
+/// every caller passes a context pointer it owns, and the body
+/// null-checks before handing it to the FFI.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub(crate) fn apply_rpc_timeout(ctx: *mut nfs_context, rpc_timeout_ms: u32) {
+    if ctx.is_null() {
+        return;
+    }
+    if let Some(ms) = effective_rpc_timeout(rpc_timeout_ms) {
+        unsafe { nfs_set_timeout(ctx, ms) };
+    }
+}
+
 /// Last error string from a context, as a borrowed `&str`.
 ///
 /// Deliberately not `unsafe fn`: every caller passes a context pointer
@@ -235,13 +311,21 @@ impl NfsContext {
     /// bare URL and crashes in `nfs4_mount_1_cb` against VAST.
     /// Failure to init, set version, or mount returns an error
     /// containing the libnfs error string.
-    pub fn mount_url(url: &str) -> anyhow::Result<Self> {
+    ///
+    /// `rpc_timeout_ms` (F12) is applied immediately after the
+    /// context is created, before the mount, so every RPC — the mount
+    /// dance included — is bounded. `0` leaves the libnfs built-in
+    /// default untouched. The parameter is non-optional by design:
+    /// no creation point may forget the decision.
+    pub fn mount_url(url: &str, rpc_timeout_ms: u32) -> anyhow::Result<Self> {
         let (server, export) = parse_nfs_url(url)?;
         let raw = unsafe { nfs_init_context() };
         if raw.is_null() {
             anyhow::bail!("nfs_init_context returned null for {url}");
         }
         let me = Self { raw };
+        // F12: bound every RPC on this context (including the mount).
+        apply_rpc_timeout(me.raw, rpc_timeout_ms);
         let rc = unsafe { nfs_set_version(me.raw, 3) };
         if rc < 0 {
             let err = last_error(me.raw).to_string();
@@ -364,6 +448,34 @@ mod tests {
     #[test]
     fn parse_nfs_url_rejects_no_export() {
         assert!(parse_nfs_url("nfs://server").is_err());
+    }
+
+    // ---- F12: per-RPC timeout seam ---------------------------------
+
+    /// `0` means "leave the libnfs default untouched": the wrapper
+    /// must NOT call `nfs_set_timeout` at all. Everything else maps
+    /// to `Some(ms)` for the FFI call.
+    #[test]
+    fn effective_rpc_timeout_zero_skips_the_call() {
+        assert_eq!(effective_rpc_timeout(0), None);
+    }
+
+    #[test]
+    fn effective_rpc_timeout_default_is_60000() {
+        assert_eq!(effective_rpc_timeout(DEFAULT_RPC_TIMEOUT_MS), Some(60_000));
+        assert_eq!(DEFAULT_RPC_TIMEOUT_MS, 60_000);
+    }
+
+    /// `nfs_set_timeout` takes a C `int`; a u32 config value above
+    /// `c_int::MAX` must clamp rather than wrap negative (libnfs
+    /// treats timeout < 0 as "no timeout", which would silently
+    /// disable the bound the operator asked for).
+    #[test]
+    fn effective_rpc_timeout_clamps_to_c_int_max() {
+        assert_eq!(
+            effective_rpc_timeout(u32::MAX),
+            Some(std::os::raw::c_int::MAX)
+        );
     }
 
     #[test]

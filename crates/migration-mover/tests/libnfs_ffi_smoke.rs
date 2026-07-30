@@ -45,7 +45,8 @@ async fn nfs_pread_returns_actual_bytes() {
     // worker uses at runtime; sharing the pool surface is part of
     // what makes this an FFI-signature smoke test rather than a
     // narrower unit test.
-    let pool = SimplePool::build(&url, &url).expect("SimplePool::build");
+    let pool = SimplePool::build(&url, &url, migration_mover::DEFAULT_RPC_TIMEOUT_MS)
+        .expect("SimplePool::build");
     let mut pair = pool.acquire().await.expect("acquire pair");
 
     let path_bytes = path.as_bytes();

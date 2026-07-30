@@ -120,7 +120,8 @@ async fn perf_sync_via_spawn_blocking() {
     // reference workload. One pool, many spawn_blocking calls,
     // serialized by the pair mutex inside the pool — same shape as
     // M2's `do_libnfs_copy` worst case.
-    let pool = SimplePool::build(&url, &url).expect("SimplePool::build");
+    let pool = SimplePool::build(&url, &url, migration_mover::DEFAULT_RPC_TIMEOUT_MS)
+        .expect("SimplePool::build");
 
     let start = Instant::now();
     let mut handles = Vec::with_capacity(CONCURRENCY);

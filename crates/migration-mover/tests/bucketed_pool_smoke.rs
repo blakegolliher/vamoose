@@ -55,7 +55,7 @@ async fn bucketed_pool_mounts_and_stats() {
     let dst = dst_url();
     let path = probe_path();
 
-    let pool = BucketedAsyncPool::new(&src, &dst)
+    let pool = BucketedAsyncPool::new(&src, &dst, migration_mover::DEFAULT_RPC_TIMEOUT_MS)
         .await
         .expect("BucketedAsyncPool::new against real VAST");
 
@@ -97,7 +97,7 @@ async fn pair_for_size_routes_and_opens() {
     let src = src_url();
     let dst = dst_url();
     let path = probe_path();
-    let pool = BucketedAsyncPool::new(&src, &dst)
+    let pool = BucketedAsyncPool::new(&src, &dst, migration_mover::DEFAULT_RPC_TIMEOUT_MS)
         .await
         .expect("BucketedAsyncPool::new against real VAST");
 

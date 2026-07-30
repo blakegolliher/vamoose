@@ -89,6 +89,28 @@ pub fn create_write(ctx: &mut NfsContext, path: &[u8], mode: u32) -> Result<NfsF
     Ok(NfsFh::from_raw(fh))
 }
 
+/// F09: whole-file NFS COMMIT (sync `nfs_fsync`) for an open write
+/// fh — durabilizes every UNSTABLE WRITE issued on it. Called by
+/// `do_libnfs_copy` after the streaming loop, before `close_fh` on
+/// the write fh, mirroring the async path's `dst.fsync`.
+///
+/// Failure phase: reuses `FailurePhase::Write` with a
+/// `COMMIT:`-prefixed error tag (e.g. `COMMIT:EIO`) instead of a new
+/// `FailurePhase::Commit` variant. `FailurePhase` is serialized into
+/// the published failure-record JSONL (SCHEMA_CONTRACT.md; records
+/// are parsed downstream), so a new variant would widen that wire
+/// enum for every consumer; the prefixed tag keeps COMMIT failures
+/// distinguishable in the failure log without touching the schema.
+pub fn fsync(ctx: &mut NfsContext, fh: &NfsFh) -> Result<(), MoveError> {
+    let rc = unsafe { super::nfs_fsync(ctx.raw(), fh.raw()) };
+    if rc < 0 {
+        let mut e = err_from_rc(ctx, rc, FailurePhase::Write);
+        e.error = format!("COMMIT:{}", e.error);
+        return Err(e);
+    }
+    Ok(())
+}
+
 pub fn close_fh(ctx: &mut NfsContext, fh: NfsFh, phase: FailurePhase) -> Result<(), MoveError> {
     let rc = unsafe { super::nfs_close(ctx.raw(), fh.raw()) };
     if rc < 0 {

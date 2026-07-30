@@ -216,6 +216,107 @@ async fn rejects_non_v3() {
     );
 }
 
+/// F11 hardware case (PROTECTED_FFI_BATCH.md Item 2): force an error
+/// return from `pipelined_copy` while reads are genuinely in flight,
+/// and assert the context remains usable afterwards — the drain
+/// awaited the orphan RPC completions, so the (caller-issued) closes
+/// act on quiescent fhs and later opens/reads on the same context
+/// still work; the process doesn't crash.
+///
+/// Error injection: the "dst" fh is opened RDONLY on the same
+/// context/file, so the first pwrite is rejected
+/// (`nfs_pwrite_async` refuses read-only fhs) after the read pump
+/// has already loaded the pipeline — reads are in flight at the
+/// moment the error surfaces. Needs the known-good file to span
+/// several rsize chunks (the standard perf-smoke file does).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn error_path_leaves_context_usable_after_drain() {
+    use migration_mover::{bucket_for_size, pipelined_copy};
+
+    let ctx = mount().await;
+    let path = env_path();
+    let expected = env_expected_size();
+    assert!(
+        expected > 4 * 1024 * 1024,
+        "test wants a file large enough to keep reads in flight \
+         when the first write fails (got {expected} bytes)"
+    );
+
+    let src_fh = ctx
+        .open(path.as_bytes(), Flags::rdonly())
+        .await
+        .expect("open src");
+    let dst_fh = ctx
+        .open(path.as_bytes(), Flags::rdonly())
+        .await
+        .expect("open dst (deliberately RDONLY)");
+
+    let cfg = bucket_for_size(expected);
+    let res = pipelined_copy(&ctx, &src_fh, &ctx, &dst_fh, expected, cfg).await;
+    assert!(
+        res.is_err(),
+        "pwrite against an RDONLY fh must fail the copy"
+    );
+
+    // The fhs must be closeable (the drain already quiesced them —
+    // this mirrors copy_regular's unconditional closes)...
+    ctx.close(src_fh).await.expect("close src after drain");
+    ctx.close(dst_fh).await.expect("close dst after drain");
+
+    // ...and the context must still service fresh RPCs.
+    let fh = ctx
+        .open(path.as_bytes(), Flags::rdonly())
+        .await
+        .expect("re-open after error path");
+    let bytes = ctx
+        .pread(&fh, 0, 4096)
+        .await
+        .expect("pread after error path");
+    assert!(!bytes.is_empty(), "context wedged after drained error");
+    ctx.close(fh).await.expect("close");
+    ctx.shutdown().await.expect("shutdown");
+}
+
+/// F12 hardware case (PROTECTED_FFI_BATCH.md Item 1): a context
+/// created with an explicit `rpc_timeout_ms` must fail a mount
+/// against an unreachable (blackholed) address within ~2× the
+/// configured timeout, not hang toward the 60 s library default —
+/// the hang shape `parallel_mounts_in_one_runtime_dont_collide`
+/// below documents. The timeout is applied at context creation,
+/// before `nfs_mount_async`, so the mount's own RPCs are bounded;
+/// with libnfs's `retrans = 0` default even never-sent outqueue
+/// pdus time out (`lib/socket.c:rpc_timeout_scan`, which runs at
+/// most once per second — hence the +1.5 s slack below).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn mount_unreachable_addr_fails_within_2x_rpc_timeout() {
+    // TEST-NET-1 (RFC 5737): reserved for documentation, never
+    // routed — SYNs blackhole. Override if the lab network differs.
+    let url = env::var("VAMOOSE_TEST_NFS_UNREACHABLE_URL")
+        .unwrap_or_else(|_| "nfs://192.0.2.1/timeout-probe".to_string());
+    const TIMEOUT_MS: u64 = 3_000;
+
+    let opts = MountOpts {
+        rpc_timeout_ms: TIMEOUT_MS as u32,
+        ..MountOpts::default()
+    };
+    let started = std::time::Instant::now();
+    let res = AsyncNfsContext::mount(&url, opts).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        res.is_err(),
+        "mount against unreachable {url} unexpectedly succeeded"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(2 * TIMEOUT_MS + 1_500),
+        "mount failure took {elapsed:?} with rpc_timeout_ms={TIMEOUT_MS}; \
+         expected ~2x the configured timeout — is nfs_set_timeout \
+         applied at context creation?"
+    );
+}
+
 /// Regression for the 2026-05-18 async-mount fd-swap bug:
 /// `nfs_mount_async` on NFSv3 walks portmap → mountd → portmap →
 /// nfsd, disconnecting and reconnecting at each step (each transition

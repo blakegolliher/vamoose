@@ -128,6 +128,9 @@ fn build_worker_config(cfg: &Config) -> anyhow::Result<wcfg::Config> {
             src_url: cfg.nfs.src_url.clone(),
             dst_url: cfg.nfs.dst_url.clone(),
             nfs_connections: worker.concurrency.max(1) as u32,
+            // F12: unified config exposes no rpc-timeout knob yet;
+            // use the explicit library-matching default (60_000 ms).
+            rpc_timeout_ms: migration_mover::DEFAULT_RPC_TIMEOUT_MS,
             pipeline_depth: 8,
             io_uring_queue_depth: 256,
             fixed_buffer_count: 256,

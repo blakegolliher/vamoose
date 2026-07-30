@@ -71,9 +71,13 @@ fn timestamp_suffix() -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn pipelined_copy_roundtrip_byte_perfect() {
-    let pool = BucketedAsyncPool::new(&src_url(), &dst_url())
-        .await
-        .expect("BucketedAsyncPool::new");
+    let pool = BucketedAsyncPool::new(
+        &src_url(),
+        &dst_url(),
+        migration_mover::DEFAULT_RPC_TIMEOUT_MS,
+    )
+    .await
+    .expect("BucketedAsyncPool::new");
 
     let size = expected_size();
     assert!(size > 0, "test file must be non-empty");

@@ -102,6 +102,13 @@ pub struct MountOpts {
     /// `docs/CORRECTNESS_RULES.md` "NFSv3 is the protocol baseline".
     /// Setting any other value returns `UnsupportedOpt`.
     pub version: u8,
+    /// F12: per-RPC timeout in milliseconds, applied via
+    /// `nfs_set_timeout` immediately after the context is created —
+    /// before the mount, so the mount dance is bounded too. `0`
+    /// leaves the libnfs built-in default untouched (the call is
+    /// skipped; see `crate::libnfs::effective_rpc_timeout`). Timed
+    /// -out RPCs complete with `-EINTR` / `"Command timed out"`.
+    pub rpc_timeout_ms: u32,
 }
 
 impl Default for MountOpts {
@@ -111,6 +118,7 @@ impl Default for MountOpts {
             wsize: 1024 * 1024,
             nconnect: 1,
             version: 3,
+            rpc_timeout_ms: crate::libnfs::DEFAULT_RPC_TIMEOUT_MS,
         }
     }
 }
@@ -235,7 +243,8 @@ impl AsyncNfsContext {
     /// Steps (each one failure-routed back to the caller):
     /// 1. Parse the URL into server/export bytes.
     /// 2. Validate `MountOpts` (version, nconnect, rsize/wsize).
-    /// 3. `nfs_init_context`.
+    /// 3. `nfs_init_context`, then `nfs_set_timeout(rpc_timeout_ms)`
+    ///    (F12; skipped when 0) so the mount itself is bounded.
     /// 4. `nfs_set_version(3)`.
     /// 5. `nfs_set_readmax(rsize)`, `nfs_set_writemax(wsize)`.
     /// 6. `nfs_get_fd` — capture the socket fd to drive readiness.
@@ -259,6 +268,11 @@ impl AsyncNfsContext {
                 "nfs_init_context returned NULL for {url}"
             )));
         }
+
+        // F12: bound every RPC on this context (the mount included).
+        // Applied immediately after creation; skipped when the
+        // configured value is 0 ("leave the library default").
+        crate::libnfs::apply_rpc_timeout(raw, opts.rpc_timeout_ms);
 
         // Helper: destroy the context if we bail out before the
         // service task takes ownership.
@@ -714,6 +728,31 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(format!("{e}").contains("wsize"));
+    }
+
+    /// F12: every async context gets an explicit per-RPC timeout at
+    /// creation; the default MountOpts must carry 60_000 ms so no
+    /// mount site can accidentally fall back to "whatever the library
+    /// does".
+    #[test]
+    fn mount_opts_default_rpc_timeout_is_60000() {
+        assert_eq!(
+            MountOpts::default().rpc_timeout_ms,
+            crate::libnfs::DEFAULT_RPC_TIMEOUT_MS
+        );
+        assert_eq!(MountOpts::default().rpc_timeout_ms, 60_000);
+    }
+
+    /// F12: `rpc_timeout_ms: 0` ("leave library default") passes
+    /// validation — it is a documented value, not a config error.
+    #[test]
+    fn mount_opts_accepts_zero_rpc_timeout() {
+        MountOpts {
+            rpc_timeout_ms: 0,
+            ..MountOpts::default()
+        }
+        .validate()
+        .expect("rpc_timeout_ms=0 must validate (means: skip set_timeout)");
     }
 
     #[test]

@@ -86,6 +86,15 @@ pub struct FileCopyResult {
     pub post_stat: NfsStat64,
 }
 
+// `FuturesUnordered<F>` fixes `F` to the first push's type. Two
+// anonymous `async move` blocks have distinct types even if their
+// bodies are identical (rustc E0308), so coerce reads + writes to
+// `BoxFuture`. The Box pin is one heap alloc per in-flight RPC —
+// dwarfed by the per-RPC syscall path.
+// A completed read resolves to (issue_offset, wanted_len, bytes).
+type ReadFuture<'a> = BoxFuture<'a, Result<(u64, u64, Vec<u8>), NfsError>>;
+type WriteFuture<'a> = BoxFuture<'a, Result<(), NfsError>>;
+
 /// Per-file async copy. See module docs for the call contract.
 ///
 /// Both `src_fh` and `dst_fh` are caller-owned; this function neither
@@ -93,6 +102,23 @@ pub struct FileCopyResult {
 /// the correct stability flag — `Flags::wronly_sync()` for cutover
 /// passes, plain `Flags::wronly().with_create()` for bulk. The body
 /// is identical between the two.
+///
+/// ## Error path: drain before return (F11)
+///
+/// On ANY error the in-flight read/write RPCs are awaited to
+/// completion (results discarded) BEFORE the error is returned —
+/// dropping the futures would not cancel the RPCs (libnfs has no
+/// NFSv3 cancel; see `asyncio/mod.rs` "Cancellation"), and the
+/// caller's unconditional closes (`file_mover.rs::copy_regular`)
+/// must act on quiescent fhs: in the pinned libnfs, close on a
+/// non-dirty fh frees the `nfsfh` struct immediately, and close on a
+/// dirty fh can free it while a WRITE reply is still outstanding —
+/// a use-after-free window (audited in the F11 commit message).
+/// This is enforced by construction: the whole copy body lives in
+/// [`copy_pipeline_body`], and this wrapper is the only caller — its
+/// single `Err` arm is the one exit that can carry an error out,
+/// and it drains both pipelines first. With F12's per-RPC timeout,
+/// the drain wait is bounded.
 pub async fn pipelined_copy(
     src: &AsyncNfsContext,
     src_fh: &AsyncNfsFh,
@@ -100,6 +126,68 @@ pub async fn pipelined_copy(
     dst_fh: &AsyncNfsFh,
     size: u64,
     cfg: BucketConfig,
+) -> Result<FileCopyResult, MoveError> {
+    let mut reads_inflight: FuturesUnordered<ReadFuture<'_>> = FuturesUnordered::new();
+    let mut writes_inflight: FuturesUnordered<WriteFuture<'_>> = FuturesUnordered::new();
+
+    match copy_pipeline_body(
+        src,
+        src_fh,
+        dst,
+        dst_fh,
+        size,
+        cfg,
+        &mut reads_inflight,
+        &mut writes_inflight,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            // F11: quiesce both fhs before the caller's closes.
+            let drained_reads = drain_all(&mut reads_inflight).await;
+            let drained_writes = drain_all(&mut writes_inflight).await;
+            tracing::debug!(
+                drained_reads,
+                drained_writes,
+                error = %e,
+                "pipelined_copy error path: awaited in-flight RPCs before returning",
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Await every future in `inflight`, discarding results. Returns how
+/// many futures were consumed. The pure seam behind the F11 drain:
+/// generic over any unpinned stream so unit tests can pin the
+/// awaits-everything contract with plain tokio futures (no FFI).
+async fn drain_all<S>(inflight: &mut S) -> usize
+where
+    S: futures::Stream + Unpin,
+{
+    let mut drained = 0usize;
+    while inflight.next().await.is_some() {
+        drained += 1;
+    }
+    drained
+}
+
+/// The copy body proper. MUST only be called by [`pipelined_copy`]:
+/// every `?`/`return Err` in here relies on the wrapper's Err arm to
+/// drain `reads_inflight` / `writes_inflight` before the error
+/// escapes to the caller (F11 — reviewable by construction: the
+/// queues outlive the body because the wrapper owns them).
+#[allow(clippy::too_many_arguments)]
+async fn copy_pipeline_body<'a>(
+    src: &'a AsyncNfsContext,
+    src_fh: &'a AsyncNfsFh,
+    dst: &'a AsyncNfsContext,
+    dst_fh: &'a AsyncNfsFh,
+    size: u64,
+    cfg: BucketConfig,
+    reads_inflight: &mut FuturesUnordered<ReadFuture<'a>>,
+    writes_inflight: &mut FuturesUnordered<WriteFuture<'a>>,
 ) -> Result<FileCopyResult, MoveError> {
     // Pre-stat for torn-read detection. Doing it via `fstat(fh)`
     // rather than `stat(path)` so a concurrent unlink-and-recreate
@@ -119,23 +207,13 @@ pub async fn pipelined_copy(
     // spec permits it); the reorder buffer holds completions until
     // their offset is the next-to-deliver, at which point the
     // short-read tail is re-issued via `CompletionOutcome::reissue`.
-    let mut state = ReorderState::new(size);
-    // `FuturesUnordered<F>` fixes `F` to the first push's type. Two
-    // anonymous `async move` blocks have distinct types even if their
-    // bodies are identical (rustc E0308), so coerce reads + writes to
-    // `BoxFuture`. The Box pin is one heap alloc per in-flight RPC —
-    // dwarfed by the per-RPC syscall path.
-    // A completed read resolves to (issue_offset, wanted_len, bytes).
-    type ReadFuture<'a> = BoxFuture<'a, Result<(u64, u64, Vec<u8>), NfsError>>;
-    let mut reads_inflight: FuturesUnordered<ReadFuture<'_>> = FuturesUnordered::new();
-
-    // Bounded write pipeline. `FuturesUnordered` of in-flight pwrites
-    // is the capacity gate; `submit_write` waits for a free slot.
+    //
+    // The read/write queues are caller-owned (`pipelined_copy`) so
+    // the F11 drain can run after any error return from this body.
     // Writes don't have to return in order — `pwrite` is per-offset
     // and the resulting bytes are positionally addressed on the dst
     // fh. The fsync at the end is the durability barrier.
-    let mut writes_inflight: FuturesUnordered<BoxFuture<'_, Result<(), NfsError>>> =
-        FuturesUnordered::new();
+    let mut state = ReorderState::new(size);
 
     // Inline hasher. xxh3_128 runs at ~10 GB/s; well below the wire
     // rate even on a fleet of workers.
@@ -352,6 +430,83 @@ mod tests {
         let expected_hex = "7f498d4624c30160d8984701d306aa99";
         let got_hex: String = h.iter().map(|b| format!("{:02x}", b)).collect();
         assert_eq!(got_hex, expected_hex);
+    }
+
+    // ---- F11: drain-before-close (PROTECTED_FFI_BATCH.md Item 2) --
+
+    /// The drain helper must AWAIT every future it is handed — not
+    /// drop them — because dropping a libnfs future does not cancel
+    /// the underlying RPC (`asyncio/mod.rs` "Cancellation"): the RPC
+    /// would still complete against an fh the caller is about to
+    /// close. Plain tokio futures stand in for RPCs: half complete
+    /// only after a deferred signal, so a drain that merely drops
+    /// pending futures (or returns before the stream is exhausted)
+    /// fails the completion count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_all_awaits_every_future_it_is_handed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const N: usize = 8;
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut inflight: FuturesUnordered<BoxFuture<'static, Result<(), NfsError>>> =
+            FuturesUnordered::new();
+
+        let mut senders = Vec::new();
+        for i in 0..N {
+            let completed = Arc::clone(&completed);
+            if i % 2 == 0 {
+                // Immediately ready (a mix of Ok and Err results —
+                // drain must discard both without short-circuiting).
+                inflight.push(
+                    async move {
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        if i % 4 == 0 {
+                            Ok(())
+                        } else {
+                            Err(NfsError::Closed)
+                        }
+                    }
+                    .boxed(),
+                );
+            } else {
+                // Genuinely pending until its oneshot fires.
+                let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                senders.push(tx);
+                inflight.push(
+                    async move {
+                        let _ = rx.await;
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                    .boxed(),
+                );
+            }
+        }
+        // Fire the pending halves' signals shortly after drain_all
+        // starts polling, so the drain demonstrably *waits*.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            for tx in senders {
+                let _ = tx.send(());
+            }
+        });
+
+        let drained = drain_all(&mut inflight).await;
+        assert_eq!(drained, N, "drain_all must consume every future");
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            N,
+            "every future must have run to completion (awaited, not dropped)"
+        );
+        assert!(inflight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_all_on_empty_stream_returns_zero() {
+        let mut inflight: FuturesUnordered<BoxFuture<'static, Result<(), NfsError>>> =
+            FuturesUnordered::new();
+        assert_eq!(drain_all(&mut inflight).await, 0);
     }
 
     #[test]

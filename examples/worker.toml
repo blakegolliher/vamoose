@@ -24,6 +24,13 @@ dst_url              = "nfs://dst-server/dest-export"
 # Source and destination MUST be distinct exports OR distinct roots
 # on the same export. The worker refuses to start if they overlap.
 nfs_connections      = 16
+# Per-RPC timeout (milliseconds), applied to every libnfs context at
+# creation — bounds each RPC, including the mount itself. Timed-out
+# RPCs surface as "Command timed out" and classify as
+# retryable/transient, never as shard corruption. 0 = leave the
+# libnfs built-in default untouched (nfs_set_timeout is not called).
+# Default: 60000 — matches libnfs's implicit 60 s, now explicit.
+rpc_timeout_ms       = 60000
 pipeline_depth       = 8
 io_uring_queue_depth = 256
 fixed_buffer_count   = 256

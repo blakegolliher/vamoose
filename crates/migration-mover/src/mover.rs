@@ -114,6 +114,12 @@ pub struct MoverConfig {
     /// `SCHEMA_CONTRACT.md` "Size semantics". Default false: source
     /// truth wins over walker's stale `size`.
     pub require_unchanged_size: bool,
+    /// F12: per-RPC timeout in milliseconds, applied to every libnfs
+    /// context (sync pools and the bucketed async pool) at creation.
+    /// `0` = leave the libnfs built-in default untouched. Seeded to
+    /// [`crate::libnfs::DEFAULT_RPC_TIMEOUT_MS`] by `from_options`;
+    /// the orchestrator overrides it from `[mover] rpc_timeout_ms`.
+    pub rpc_timeout_ms: u32,
 }
 
 impl MoverConfig {
@@ -138,6 +144,7 @@ impl MoverConfig {
             inflight: InflightProfile::default(),
             require_chown: true,
             require_unchanged_size: false,
+            rpc_timeout_ms: crate::libnfs::DEFAULT_RPC_TIMEOUT_MS,
         }
     }
 }
@@ -610,10 +617,26 @@ impl Mover {
 
         let result = stream_copy(pair, &src_fh, &dst_fh, row.row_id, row.size);
 
+        // F09: whole-file NFS COMMIT before the write fh closes and
+        // before the rename below — the streaming loop's WRITEs are
+        // UNSTABLE (see DESIGN.md "Durability model"), and the rename
+        // must never publish bytes the server hasn't acknowledged as
+        // stable. Mirrors the async path's `dst.fsync` in
+        // `pipelined_copy`. Skipped when the copy already failed —
+        // the row fails anyway and nothing gets renamed. A COMMIT
+        // failure fails the row through the normal MoveError path
+        // (phase Write, error tag `COMMIT:<errno>`); the closes below
+        // still run unconditionally for fh hygiene.
+        let commit = match &result {
+            Ok(_) => ops::fsync(pair.dst(), &dst_fh),
+            Err(_) => Ok(()),
+        };
+
         let close_src = ops::close_fh(pair.src(), src_fh, FailurePhase::Read);
         let close_dst = ops::close_fh(pair.dst(), dst_fh, FailurePhase::Write);
 
         let written = result?;
+        commit?;
         close_src?;
         close_dst?;
 
@@ -1135,6 +1158,7 @@ mod tests {
             inflight: InflightProfile::default(),
             require_chown: false,
             require_unchanged_size: false,
+            rpc_timeout_ms: crate::libnfs::DEFAULT_RPC_TIMEOUT_MS,
         };
         Mover::new(
             cfg,
@@ -1143,6 +1167,22 @@ mod tests {
             crate::downgrade::DowngradeSink::new(),
             fence,
         )
+    }
+
+    /// F12: `MoverConfig::from_options` seeds the explicit per-RPC
+    /// timeout default (60_000 ms); the orchestrator overrides it
+    /// from `[mover] rpc_timeout_ms` before mounting any pool.
+    #[test]
+    fn from_options_defaults_rpc_timeout_to_60000() {
+        let cfg = MoverConfig::from_options(
+            "nfs://src/exp".into(),
+            "nfs://dst/exp".into(),
+            "/".into(),
+            "/".into(),
+            false,
+            &MigrationOptions::default(),
+        );
+        assert_eq!(cfg.rpc_timeout_ms, crate::libnfs::DEFAULT_RPC_TIMEOUT_MS);
     }
 
     // ---- F41: honest byte counts ----------------------------------

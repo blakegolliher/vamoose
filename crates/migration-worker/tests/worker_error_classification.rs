@@ -220,6 +220,64 @@ fn classifier_table() {
 }
 
 // ---------------------------------------------------------------------------
+// F12: RPC-timeout-shaped errors are transient/worker-local, never
+// shard corruption (docs/work-items/PROTECTED_FFI_BATCH.md, Item 1
+// step 3).
+// ---------------------------------------------------------------------------
+
+/// A libnfs RPC timeout surfacing as an untyped whole-shard error
+/// must land in the retryable/WorkerLocal bucket: a timeout says
+/// nothing about the shard bytes — any healthy peer (or this worker
+/// a moment later) can process the shard. libnfs surfaces timeouts
+/// as the nfs-level callback string `"Command timed out"` (err =
+/// -EINTR; `lib/nfs_v3.c:check_nfs3_error`) and the rpc-level error
+/// string `"command timed out"` (`lib/socket.c:rpc_timeout_scan`,
+/// status `RPC_STATUS_TIMEOUT`).
+#[test]
+fn timeout_shaped_untyped_error_is_worker_local() {
+    use migration_mover::libnfs::asyncio::NfsError;
+    use migration_worker::orchestrator::classify_shard_error;
+
+    // The exact message shape the async FFI surface renders for a
+    // timed-out RPC: NfsError::Errno { errno: EINTR, detail:
+    // "Command timed out" } (see callbacks.rs::err_from_cb).
+    let async_shape = NfsError::Errno {
+        errno: libc::EINTR,
+        detail: "Command timed out".into(),
+    };
+
+    let cases: Vec<anyhow::Error> = vec![
+        anyhow::anyhow!("pipelined read failed: {async_shape}"),
+        // rpc-level error string (lowercase) from rpc_timeout_scan.
+        anyhow::anyhow!("libnfs: command timed out"),
+        // Explicit status tag, in case a future wrapper surfaces it.
+        anyhow::anyhow!("mount failed: RPC_STATUS_TIMEOUT"),
+    ];
+    for c in cases {
+        let msg = format!("{c:#}");
+        let err = Error::Other(c);
+        assert_eq!(
+            classify_shard_error(&err),
+            ShardErrorClass::WorkerLocal,
+            "timeout-shaped error must be retryable (WorkerLocal), \
+             not shard-fatal: {msg}",
+        );
+    }
+}
+
+/// A kernel/std-shaped timeout (`io::ErrorKind::TimedOut`) already
+/// classifies WorkerLocal via the `Error::Io` arm — pin it so the
+/// F12 guarantee holds for both shapes.
+#[test]
+fn io_timeout_error_is_worker_local() {
+    let err = Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "libnfs: Command timed out",
+    ));
+    assert_eq!(classify_shard_error(&err), ShardErrorClass::WorkerLocal);
+}
+
+// ---------------------------------------------------------------------------
 // Test 2 (red before fix): worker-local error releases the claim
 // (absent → reclaimable by any peer), never writes Failed, and the
 // shard lands in the per-run skip set.
