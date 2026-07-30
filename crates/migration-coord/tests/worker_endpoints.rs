@@ -2,6 +2,7 @@
 //! (server::worker). Same in-process harness as the read + command
 //! endpoint tests.
 
+use async_trait::async_trait;
 use http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use migration_coord::lease::{Identity, LeaseConfig};
@@ -11,7 +12,8 @@ use migration_coord::schema::{
     ConfigHash, ErrorClass, EventKind, JobId, Phase, ShardId, WorkerId, WorkerState,
 };
 use migration_coord::server::{build_router, AppState};
-use migration_coord::store::{CoordStore, MemStore};
+use migration_coord::store::{CoordStore, ListEntry, MemStore, PutOutcome};
+use migration_core::claim::DeleteOutcome;
 use serde_json::Value;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -1084,4 +1086,475 @@ async fn bench_events_batch_throughput() {
         rate > 10_000.0,
         "flush-before-ack must sustain the 10k events/s target; measured {rate:.0}/s",
     );
+}
+
+// =============================================================================
+// events batch — idempotency (F20 D4+D5,
+// docs/work-items/COORD_EVENT_IDEMPOTENCY.md).
+//
+// Workers stamp each batch entry with a per-worker, monotonically
+// increasing `client_seq`. The coord keeps a per-worker high-water
+// mark in reducer state (so snapshots and replay carry it) and skips
+// entries at or below it — a resend after a lost 200, or a retry of
+// a batch that died mid-flush, converges to exactly-once effective
+// application. Unstamped entries keep today's documented
+// at-least-once semantics (pre-upgrade workers, no flag day).
+// Forward gaps in client_seq are legitimate (the worker's buffer
+// drops under budget pressure); only order matters — stamps out of
+// order WITHIN one batch mean a buggy client and reject the batch.
+// =============================================================================
+
+/// Stamp a wire-form batch entry with a `client_seq`.
+fn with_cs(mut entry: Value, cs: u64) -> Value {
+    entry["client_seq"] = serde_json::json!(cs);
+    entry
+}
+
+fn stamped_delta(wid: &WorkerId, files: u64, cs: u64) -> Value {
+    with_cs(delta_event(wid, files), cs)
+}
+
+/// Durable (flushed-to-store) envelopes with `seq > since`, in seq
+/// order — the ground truth the convergence assertions compare.
+async fn durable_since(mem: &MemStore, since: u64) -> Vec<migration_coord::schema::EventEnvelope> {
+    migration_coord::events::read_all_events_since(mem, since)
+        .await
+        .unwrap()
+}
+
+/// Acceptance test 1 (work item): a stamped batch applied once, then
+/// the IDENTICAL batch again (the 200 was lost on the wire and the
+/// worker's resend buffer re-sent everything). The second response
+/// must succeed — the worker needs its 200 to drop the buffer — but
+/// nothing may apply twice: job counters, error buckets, coord
+/// last_seq, and the durable log contents must be identical to the
+/// single send.
+#[tokio::test]
+#[ignore = "F20 D4 red: no client_seq dedup yet; ignore is removed by the fix commit"]
+async fn resend_after_lost_response_is_idempotent() {
+    let (app, rt, mem) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+    rt.flush_log().await.unwrap();
+    let seq_before = rt.last_seq().await;
+
+    let batch = serde_json::json!({ "events": [
+        stamped_delta(&wid, 5, 1),
+        stamped_delta(&wid, 3, 2),
+        with_cs(
+            entry(&EventKind::ErrorEmitted {
+                job_id: jid("bobby"),
+                worker_id: wid,
+                class: ErrorClass::Timeout,
+                path: "/a/b".into(),
+                retryable: true,
+                message: "timed out".into(),
+            }),
+            3,
+        ),
+    ] });
+
+    let (status, resp) = post_json(
+        app.clone(),
+        &format!("/workers/{wid}/events"),
+        batch.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first send must apply: {resp}");
+    assert_eq!(resp["seqs"].as_array().unwrap().len(), 3);
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(job.progress.files_done, 8);
+    let durable_once = durable_since(&mem, seq_before).await;
+    assert_eq!(durable_once.len(), 3, "flush-before-ack: batch durable");
+
+    // The 200 is lost; the worker re-sends the identical batch.
+    let (status, resp) = post_json(app, &format!("/workers/{wid}/events"), batch).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a resend of an already-applied batch must still succeed \
+         (the worker needs the 200 to drop its resend buffer): {resp}",
+    );
+    assert_eq!(
+        resp["seqs"].as_array().unwrap().len(),
+        0,
+        "no new seqs may be assigned for already-applied entries: {resp}",
+    );
+    assert_eq!(
+        resp["deduped"].as_u64().unwrap_or(0),
+        3,
+        "the response must report the skipped entries: {resp}",
+    );
+    assert_eq!(
+        rt.last_seq().await,
+        seq_before + 3,
+        "the resend must not grow the event log",
+    );
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(
+        job.progress.files_done, 8,
+        "job counters must be identical to a single send",
+    );
+    let snap = rt.state().await;
+    assert_eq!(
+        snap.error_buckets[&jid("bobby")][0].count,
+        1,
+        "error buckets must be identical to a single send",
+    );
+    let durable_twice = durable_since(&mem, seq_before).await;
+    assert_eq!(
+        durable_twice, durable_once,
+        "durable log contents must be identical to a single send",
+    );
+}
+
+/// Acceptance test 2 (work item): the high-water mark must survive
+/// crash + replay — it rides the durable event stream, not process
+/// RAM. Ingest stamped events, crash-restart the coord (the
+/// harness's replay pattern), then resend the old batch to the NEW
+/// runtime: still deduped.
+#[tokio::test]
+#[ignore = "F20 D4 red: no client_seq dedup yet; ignore is removed by the fix commit"]
+async fn replay_reconstructs_hwm() {
+    let (app, rt, mem, clock) = fresh_app_with_clock().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+    rt.flush_log().await.unwrap();
+    let seq_before = rt.last_seq().await;
+
+    let batch = serde_json::json!({ "events": [
+        stamped_delta(&wid, 5, 1),
+        stamped_delta(&wid, 3, 2),
+    ] });
+    let (status, _) = post_json(app, &format!("/workers/{wid}/events"), batch.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let durable_once = durable_since(&mem, seq_before).await;
+
+    // Coord crashes; a fresh runtime replays snapshot + log.
+    let rt2 = crash_restart(&mem, &clock).await;
+    let app2 = build_router(AppState::new(rt2.clone()));
+    let seq_after_replay = rt2.last_seq().await;
+
+    // The worker never saw the (lost) 200 and re-sends the old batch.
+    let (status, resp) = post_json(app2, &format!("/workers/{wid}/events"), batch).await;
+    assert_eq!(status, StatusCode::OK, "resend must succeed: {resp}");
+    assert_eq!(
+        resp["seqs"].as_array().unwrap().len(),
+        0,
+        "replay must reconstruct the HWM — old entries stay deduped: {resp}",
+    );
+    assert_eq!(
+        rt2.last_seq().await,
+        seq_after_replay,
+        "the deduped resend must not grow the event log after replay",
+    );
+    let job = rt2.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(
+        job.progress.files_done, 8,
+        "counters must be identical to the single pre-crash send",
+    );
+    let durable_twice = durable_since(&mem, seq_before).await;
+    assert_eq!(
+        durable_twice, durable_once,
+        "durable log must be identical to the single pre-crash send",
+    );
+}
+
+/// Store double for the storage-failure test: delegates to a
+/// MemStore, but while armed, fails every `put` under `events/` —
+/// the chunk-flush seam the ingest loop `?`-propagates from. Same
+/// pattern as `FailArchivePuts` in archive_wiring.rs.
+#[derive(Debug)]
+struct FailEventPuts {
+    inner: Arc<MemStore>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl FailEventPuts {
+    fn new(inner: Arc<MemStore>) -> Self {
+        Self {
+            inner,
+            armed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn disarm(&self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl CoordStore for FailEventPuts {
+    async fn get(&self, key: &str) -> migration_coord::Result<Option<(Vec<u8>, String)>> {
+        self.inner.get(key).await
+    }
+    async fn head(&self, key: &str) -> migration_coord::Result<Option<String>> {
+        self.inner.head(key).await
+    }
+    async fn put(&self, key: &str, body: Vec<u8>) -> migration_coord::Result<String> {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) && key.starts_with("events/") {
+            return Err(anyhow::anyhow!("injected storage failure writing {key}").into());
+        }
+        self.inner.put(key, body).await
+    }
+    async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> migration_coord::Result<PutOutcome> {
+        self.inner.put_if_absent(key, body).await
+    }
+    async fn delete(&self, key: &str) -> migration_coord::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn delete_if_match(
+        &self,
+        key: &str,
+        etag: &str,
+    ) -> migration_coord::Result<DeleteOutcome> {
+        self.inner.delete_if_match(key, etag).await
+    }
+    async fn list(&self, prefix: &str) -> migration_coord::Result<Vec<ListEntry>> {
+        self.inner.list(prefix).await
+    }
+}
+
+/// Acceptance test 3 (work item, the headline): a storage failure
+/// mid-batch (the ingest loop `?`-propagates from a chunk flush)
+/// leaves a prefix applied with no record; the worker's retry of the
+/// SAME batch must converge to exactly-once effective application —
+/// state, log contents, and counters identical to a single clean
+/// send. `max_events_per_chunk = 2` forces chunk flushes mid-loop so
+/// the injected `put` failure lands between entries.
+#[tokio::test]
+#[ignore = "F20 D5 red: retry after mid-batch storage failure double-applies; ignore is removed by the fix commit"]
+async fn storage_failure_then_retry_converges() {
+    let mem = Arc::new(MemStore::new());
+    let flaky = Arc::new(FailEventPuts::new(mem.clone()));
+    let store: Arc<dyn CoordStore> = flaky.clone();
+    let clock = FixedClock::new(
+        chrono::DateTime::parse_from_rfc3339("2026-05-29T14:32:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    );
+    let mut cfg = rt_cfg();
+    cfg.events.max_events_per_chunk = 2; // flush (and fail) mid-batch
+    let rt = CoordRuntime::start(store, clock, me("A"), cfg)
+        .await
+        .unwrap();
+    let app = build_router(AppState::new(rt.clone()));
+
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+    rt.flush_log().await.unwrap();
+    let seq_before = rt.last_seq().await;
+
+    // Distinct powers of two so any double-apply shows up in the sum.
+    let batch = serde_json::json!({ "events": [
+        stamped_delta(&wid, 1, 1),
+        stamped_delta(&wid, 2, 2),
+        stamped_delta(&wid, 4, 3),
+        stamped_delta(&wid, 8, 4),
+        stamped_delta(&wid, 16, 5),
+    ] });
+
+    flaky.arm();
+    let (status, _) = post_json(
+        app.clone(),
+        &format!("/workers/{wid}/events"),
+        batch.clone(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the injected chunk-flush failure must fail the batch",
+    );
+
+    // Storage recovers; the worker retries the whole batch.
+    flaky.disarm();
+    let (status, resp) = post_json(app, &format!("/workers/{wid}/events"), batch).await;
+    assert_eq!(status, StatusCode::OK, "retry must succeed: {resp}");
+
+    // Exactly-once convergence: identical to a single clean send.
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(
+        job.progress.files_done, 31,
+        "every entry must apply exactly once across failure + retry",
+    );
+    assert_eq!(
+        rt.last_seq().await,
+        seq_before + 5,
+        "exactly one seq per logical event across failure + retry",
+    );
+    let durable = durable_since(&mem, seq_before).await;
+    assert_eq!(
+        durable.len(),
+        5,
+        "durable log must hold each event exactly once: {durable:#?}",
+    );
+    let seqs: Vec<u64> = durable.iter().map(|e| e.seq).collect();
+    assert_eq!(
+        seqs,
+        (seq_before + 1..=seq_before + 5).collect::<Vec<u64>>(),
+        "durable seqs must be contiguous — no gaps, no duplicates",
+    );
+}
+
+/// Acceptance test 4a (work item): entries WITHOUT `client_seq` (a
+/// pre-upgrade worker) keep today's at-least-once semantics — every
+/// send applies. GREEN today; must stay green (no flag day).
+#[tokio::test]
+async fn unstamped_entries_keep_legacy_semantics() {
+    let (app, rt, _mem) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+
+    let batch = serde_json::json!({ "events": [
+        delta_event(&wid, 5),
+        delta_event(&wid, 3),
+    ] });
+    for round in 1..=2u64 {
+        let (status, resp) = post_json(
+            app.clone(),
+            &format!("/workers/{wid}/events"),
+            batch.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            resp["seqs"].as_array().unwrap().len(),
+            2,
+            "unstamped entries apply on every send (round {round}): {resp}",
+        );
+        assert_eq!(
+            resp["deduped"].as_u64().unwrap_or(0),
+            0,
+            "unstamped entries are never deduped (round {round}): {resp}",
+        );
+    }
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(
+        job.progress.files_done, 16,
+        "at-least-once for pre-upgrade workers: both sends apply",
+    );
+}
+
+/// Acceptance test 4b (work item): mixed stamped/unstamped batches —
+/// resends dedup the stamped entries, re-apply the unstamped ones,
+/// and must not corrupt the high-water mark for later stamped
+/// traffic.
+#[tokio::test]
+#[ignore = "F20 D4 red: no client_seq dedup yet; ignore is removed by the fix commit"]
+async fn mixed_stamped_unstamped_batch_dedups_only_stamped() {
+    let (app, rt, _mem) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+
+    let batch = serde_json::json!({ "events": [
+        stamped_delta(&wid, 1, 1),
+        delta_event(&wid, 10), // unstamped rider
+        stamped_delta(&wid, 100, 2),
+    ] });
+    let (status, resp) = post_json(
+        app.clone(),
+        &format!("/workers/{wid}/events"),
+        batch.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["seqs"].as_array().unwrap().len(), 3);
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(job.progress.files_done, 111);
+
+    // Resend: stamped entries dedup, the unstamped rider re-applies
+    // (documented at-least-once for unstamped).
+    let (status, resp) = post_json(app.clone(), &format!("/workers/{wid}/events"), batch).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(
+        resp["seqs"].as_array().unwrap().len(),
+        1,
+        "only the unstamped rider may re-apply: {resp}",
+    );
+    assert_eq!(
+        resp["deduped"].as_u64().unwrap_or(0),
+        2,
+        "both stamped entries must be skipped: {resp}",
+    );
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(
+        job.progress.files_done, 121,
+        "resend: stamped deduped (no +101), unstamped re-applied (+10)",
+    );
+
+    // The unstamped rider must not have corrupted the HWM: fresh
+    // stamped traffic above it still applies exactly once.
+    let next = serde_json::json!({ "events": [stamped_delta(&wid, 1000, 3)] });
+    let (status, resp) =
+        post_json(app.clone(), &format!("/workers/{wid}/events"), next.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["seqs"].as_array().unwrap().len(), 1);
+    let (status, resp) = post_json(app, &format!("/workers/{wid}/events"), next).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(
+        resp["deduped"].as_u64().unwrap_or(0),
+        1,
+        "the new stamp must dedup on ITS resend: {resp}",
+    );
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(job.progress.files_done, 1121);
+}
+
+/// Acceptance test 5 (work item): stamps out of order WITHIN one
+/// batch mean a buggy client, not a replay — the whole batch is
+/// rejected 400-class and nothing applies. (Cross-batch forward gaps
+/// stay legitimate; the other tests cover them.)
+#[tokio::test]
+#[ignore = "F20 D4 red: no in-batch monotonicity check yet; ignore is removed by the fix commit"]
+async fn non_monotonic_batch_rejected() {
+    let (app, rt, _mem) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+    let seq_before = rt.last_seq().await;
+
+    // Out of order.
+    let (status, body) = post_json(
+        app.clone(),
+        &format!("/workers/{wid}/events"),
+        serde_json::json!({ "events": [
+            stamped_delta(&wid, 1, 5),
+            stamped_delta(&wid, 2, 3),
+        ] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "descending client_seq within a batch must reject the whole batch",
+    );
+    assert_eq!(body["code"], "client_seq_not_monotonic");
+
+    // Equal stamps are the same bug (strictly increasing required).
+    let (status, _body) = post_json(
+        app,
+        &format!("/workers/{wid}/events"),
+        serde_json::json!({ "events": [
+            stamped_delta(&wid, 1, 4),
+            stamped_delta(&wid, 2, 4),
+        ] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "equal client_seq within a batch must reject the whole batch",
+    );
+
+    assert_eq!(
+        rt.last_seq().await,
+        seq_before,
+        "rejected batches must never partially apply",
+    );
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(job.progress.files_done, 0, "nothing may have applied");
 }
