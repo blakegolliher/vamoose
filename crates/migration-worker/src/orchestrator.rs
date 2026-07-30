@@ -178,8 +178,14 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     // M3: pre-mount cfg.mover.nfs_connections context pairs so
     // concurrent shard dispatch has distinct contexts to draw from.
     let pool_size = cfg.mover.nfs_connections.max(1) as usize;
-    let pool: Arc<dyn LibnfsContextPool> =
-        MultiPool::build(&manifest.source.url, &manifest.dest.url, pool_size)?;
+    let pool: Arc<dyn LibnfsContextPool> = MultiPool::build(
+        &manifest.source.url,
+        &manifest.dest.url,
+        pool_size,
+        // F12: explicit per-RPC timeout at every context creation;
+        // 0 = leave the libnfs default untouched.
+        cfg.mover.rpc_timeout_ms,
+    )?;
     // Keep a clone for the end-of-run root-mtime restore (slice 3 of
     // MTIME_PARITY_FIX). `pool` itself is moved into Mover::new below.
     let pool_for_root_mtime = Arc::clone(&pool);
@@ -200,6 +206,9 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     );
     mover_cfg.require_chown = require_chown && cap_chown;
     mover_cfg.require_unchanged_size = cfg.copy.require_unchanged_size;
+    // F12: [mover] rpc_timeout_ms flows config → MoverConfig →
+    // MountOpts (both pools read it from here / from cfg.mover).
+    mover_cfg.rpc_timeout_ms = cfg.mover.rpc_timeout_ms;
     // Apply the [batch].inflight_* profile so the mover and the
     // shard processor share the same view of size-class concurrency.
     mover_cfg.inflight = InflightProfile {
@@ -224,8 +233,14 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     // for the non-regular-file fallback rows (symlinks / hardlinks /
     // dirs / empty / skip) per Phase 2 Decision #3.
     let mover: Arc<dyn FileMover> = if cfg.mover.use_bucketed_pool {
-        let async_pool =
-            Arc::new(BucketedAsyncPool::new(&manifest.source.url, &manifest.dest.url).await?);
+        let async_pool = Arc::new(
+            BucketedAsyncPool::new(
+                &manifest.source.url,
+                &manifest.dest.url,
+                mover_cfg.rpc_timeout_ms,
+            )
+            .await?,
+        );
         tracing::info!(
             src = %manifest.source.url,
             dst = %manifest.dest.url,
@@ -1767,7 +1782,18 @@ pub fn classify_shard_error(e: &CoreError) -> ShardErrorClass {
         // refactor forgets to type: an unknown misclassified as Fatal
         // degrades to the old loud, operator-visible failure mode
         // rather than an unbounded fleet-wide claim/release loop.
-        CoreError::Other(_) => ShardErrorClass::Fatal,
+        //
+        // F12 carve-out: an RPC-timeout-shaped message is transient
+        // by definition — it says nothing about the shard bytes and
+        // must never poison the shard with a terminal `Failed`. See
+        // `error_is_timeout_shaped`.
+        CoreError::Other(inner) => {
+            if error_is_timeout_shaped(&format!("{inner:#}")) {
+                ShardErrorClass::WorkerLocal
+            } else {
+                ShardErrorClass::Fatal
+            }
+        }
 
         // Worker-local: nothing about the shard itself is wrong.
         //  - SchemaVersionMismatch: this binary is stale for the
@@ -1793,6 +1819,24 @@ pub fn classify_shard_error(e: &CoreError) -> ShardErrorClass {
         | CoreError::ManifestChanged { .. }
         | CoreError::SourceDestOverlap { .. } => ShardErrorClass::WorkerLocal,
     }
+}
+
+/// F12: true iff an error message carries libnfs's RPC-timeout
+/// signature. The pinned libnfs (`libnfs-6.0.2-148-gdc7e6f8`)
+/// surfaces timed-out RPCs two ways:
+///
+/// - nfs-level callbacks fire with `-EINTR` and the detail string
+///   `"Command timed out"` (`lib/nfs_v3.c:check_nfs3_error`);
+/// - the rpc-level error string is lowercase `"command timed out"`
+///   (`lib/socket.c:rpc_timeout_scan`, status `RPC_STATUS_TIMEOUT`).
+///
+/// Matched case-insensitively, plus the status tag itself in case a
+/// future wrapper surfaces it verbatim. Deliberately narrow: only
+/// the strings the linked library actually produces, so ordinary
+/// decode errors keep the conservative `Other → Fatal` default.
+fn error_is_timeout_shaped(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("command timed out") || msg.contains("RPC_STATUS_TIMEOUT")
 }
 
 /// Inputs `handle_process_error` borrows from the orchestrator loop.

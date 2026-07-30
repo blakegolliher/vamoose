@@ -41,7 +41,9 @@ pub use downgrade::DowngradeSink;
 pub use error::MoveError;
 pub use failure::FailureSink;
 pub use file_mover::{AsyncBucketedFileMover, FileMover};
-pub use libnfs::{ContextPair, LibnfsContextPool, MultiPool, NfsContext, SimplePool};
+pub use libnfs::{
+    ContextPair, LibnfsContextPool, MultiPool, NfsContext, SimplePool, DEFAULT_RPC_TIMEOUT_MS,
+};
 pub use mover::{MoveOutcome, Mover, MoverConfig};
 pub use paths::join_root;
 pub use pipelined_copy::{pipelined_copy, FileCopyResult};

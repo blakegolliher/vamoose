@@ -216,6 +216,45 @@ async fn rejects_non_v3() {
     );
 }
 
+/// F12 hardware case (PROTECTED_FFI_BATCH.md Item 1): a context
+/// created with an explicit `rpc_timeout_ms` must fail a mount
+/// against an unreachable (blackholed) address within ~2× the
+/// configured timeout, not hang toward the 60 s library default —
+/// the hang shape `parallel_mounts_in_one_runtime_dont_collide`
+/// below documents. The timeout is applied at context creation,
+/// before `nfs_mount_async`, so the mount's own RPCs are bounded;
+/// with libnfs's `retrans = 0` default even never-sent outqueue
+/// pdus time out (`lib/socket.c:rpc_timeout_scan`, which runs at
+/// most once per second — hence the +1.5 s slack below).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn mount_unreachable_addr_fails_within_2x_rpc_timeout() {
+    // TEST-NET-1 (RFC 5737): reserved for documentation, never
+    // routed — SYNs blackhole. Override if the lab network differs.
+    let url = env::var("VAMOOSE_TEST_NFS_UNREACHABLE_URL")
+        .unwrap_or_else(|_| "nfs://192.0.2.1/timeout-probe".to_string());
+    const TIMEOUT_MS: u64 = 3_000;
+
+    let opts = MountOpts {
+        rpc_timeout_ms: TIMEOUT_MS as u32,
+        ..MountOpts::default()
+    };
+    let started = std::time::Instant::now();
+    let res = AsyncNfsContext::mount(&url, opts).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        res.is_err(),
+        "mount against unreachable {url} unexpectedly succeeded"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(2 * TIMEOUT_MS + 1_500),
+        "mount failure took {elapsed:?} with rpc_timeout_ms={TIMEOUT_MS}; \
+         expected ~2x the configured timeout — is nfs_set_timeout \
+         applied at context creation?"
+    );
+}
+
 /// Regression for the 2026-05-18 async-mount fd-swap bug:
 /// `nfs_mount_async` on NFSv3 walks portmap → mountd → portmap →
 /// nfsd, disconnecting and reconnecting at each step (each transition

@@ -102,9 +102,12 @@ pub struct SimplePool {
 }
 
 impl SimplePool {
-    pub fn build(src_url: &str, dst_url: &str) -> anyhow::Result<Arc<Self>> {
+    /// `rpc_timeout_ms` (F12): per-RPC timeout applied to both
+    /// contexts at creation; `0` = leave the libnfs default. See
+    /// [`super::DEFAULT_RPC_TIMEOUT_MS`].
+    pub fn build(src_url: &str, dst_url: &str, rpc_timeout_ms: u32) -> anyhow::Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            inner: MultiPool::build_inner(src_url, dst_url, 1)?,
+            inner: MultiPool::build_inner(src_url, dst_url, 1, rpc_timeout_ms)?,
         }))
     }
 }
@@ -132,19 +135,38 @@ impl MultiPool {
     /// Mount `n` (src, dst) pairs against the same URLs and return the
     /// pool. Mount failures during seeding return early — already-mounted
     /// pairs drop cleanly via `NfsContext::Drop`.
-    pub fn build(src_url: &str, dst_url: &str, n: usize) -> anyhow::Result<Arc<Self>> {
-        Ok(Arc::new(Self::build_inner(src_url, dst_url, n)?))
+    ///
+    /// `rpc_timeout_ms` (F12): per-RPC timeout applied to every
+    /// context at creation; `0` = leave the libnfs default. See
+    /// [`super::DEFAULT_RPC_TIMEOUT_MS`].
+    pub fn build(
+        src_url: &str,
+        dst_url: &str,
+        n: usize,
+        rpc_timeout_ms: u32,
+    ) -> anyhow::Result<Arc<Self>> {
+        Ok(Arc::new(Self::build_inner(
+            src_url,
+            dst_url,
+            n,
+            rpc_timeout_ms,
+        )?))
     }
 
-    fn build_inner(src_url: &str, dst_url: &str, n: usize) -> anyhow::Result<Self> {
+    fn build_inner(
+        src_url: &str,
+        dst_url: &str,
+        n: usize,
+        rpc_timeout_ms: u32,
+    ) -> anyhow::Result<Self> {
         if n == 0 {
             anyhow::bail!("MultiPool requires n >= 1, got 0");
         }
         let (sender, receiver) = mpsc::unbounded_channel();
         for i in 0..n {
-            let src = NfsContext::mount_url(src_url)
+            let src = NfsContext::mount_url(src_url, rpc_timeout_ms)
                 .map_err(|e| anyhow::anyhow!("mount source {src_url} (#{i}): {e}"))?;
-            let dst = NfsContext::mount_url(dst_url)
+            let dst = NfsContext::mount_url(dst_url, rpc_timeout_ms)
                 .map_err(|e| anyhow::anyhow!("mount dest {dst_url} (#{i}): {e}"))?;
             sender
                 .send((src, dst))

@@ -26,7 +26,7 @@ use migration_mover::bucketed_pool::BucketedAsyncPool;
 use migration_mover::file_mover::AsyncBucketedFileMover;
 use migration_mover::libnfs::SimplePool;
 use migration_mover::uring::UringConfig;
-use migration_mover::{DowngradeSink, FileMover, Mover, MoverConfig};
+use migration_mover::{DowngradeSink, FileMover, Mover, MoverConfig, DEFAULT_RPC_TIMEOUT_MS};
 
 fn src_url() -> String {
     env::var("VAMOOSE_TEST_NFS_URL").expect("VAMOOSE_TEST_NFS_URL not set")
@@ -150,12 +150,14 @@ async fn async_bucketed_mover_copies_regular_file_end_to_end() {
         inflight: InflightProfile::default(),
         require_chown: false, // running as root in the test but be defensive
         require_unchanged_size: false,
+        rpc_timeout_ms: DEFAULT_RPC_TIMEOUT_MS,
     });
 
     let downgrades = DowngradeSink::new();
     let fence = Fence::new();
 
-    let sync_pool = SimplePool::build(&src_url_s, &dst_url_s).expect("SimplePool::build");
+    let sync_pool = SimplePool::build(&src_url_s, &dst_url_s, DEFAULT_RPC_TIMEOUT_MS)
+        .expect("SimplePool::build");
     let sync_mover = Mover::new(
         (*cfg).clone(),
         sync_pool,
@@ -165,7 +167,7 @@ async fn async_bucketed_mover_copies_regular_file_end_to_end() {
     );
 
     let async_pool = Arc::new(
-        BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+        BucketedAsyncPool::new(&src_url_s, &dst_url_s, DEFAULT_RPC_TIMEOUT_MS)
             .await
             .expect("BucketedAsyncPool::new"),
     );
@@ -215,7 +217,7 @@ async fn async_bucketed_mover_copies_regular_file_end_to_end() {
     // Verify the file landed at the expected path on dst with the
     // expected size. We reuse the bucketed pool's small bucket
     // (any bucket's dst ctx sees the same namespace) for the stat.
-    let pool = BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+    let pool = BucketedAsyncPool::new(&src_url_s, &dst_url_s, DEFAULT_RPC_TIMEOUT_MS)
         .await
         .expect("verify pool");
     let dst_full = format!("{dest_root}{}", String::from_utf8_lossy(&basename));
@@ -292,12 +294,14 @@ async fn hardlink_replay_is_idempotent() {
         inflight: InflightProfile::default(),
         require_chown: false,
         require_unchanged_size: false,
+        rpc_timeout_ms: DEFAULT_RPC_TIMEOUT_MS,
     });
 
     let downgrades = DowngradeSink::new();
     let fence = Fence::new();
 
-    let sync_pool = SimplePool::build(&src_url_s, &dst_url_s).expect("SimplePool::build");
+    let sync_pool = SimplePool::build(&src_url_s, &dst_url_s, DEFAULT_RPC_TIMEOUT_MS)
+        .expect("SimplePool::build");
     let sync_mover = Mover::new(
         (*cfg).clone(),
         sync_pool,
@@ -307,7 +311,7 @@ async fn hardlink_replay_is_idempotent() {
     );
 
     let async_pool = Arc::new(
-        BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+        BucketedAsyncPool::new(&src_url_s, &dst_url_s, DEFAULT_RPC_TIMEOUT_MS)
             .await
             .expect("BucketedAsyncPool::new"),
     );
@@ -374,7 +378,7 @@ async fn hardlink_replay_is_idempotent() {
     assert_eq!(replay.bytes_moved, 0, "hardlink rows move no file data");
 
     // 4. Both paths must share an inode on the destination.
-    let pool = BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+    let pool = BucketedAsyncPool::new(&src_url_s, &dst_url_s, DEFAULT_RPC_TIMEOUT_MS)
         .await
         .expect("verify pool");
     let dst_full = format!("{dest_root}{}", String::from_utf8_lossy(&basename));
@@ -446,12 +450,14 @@ async fn symlink_replay_is_idempotent() {
         inflight: InflightProfile::default(),
         require_chown: false,
         require_unchanged_size: false,
+        rpc_timeout_ms: DEFAULT_RPC_TIMEOUT_MS,
     });
 
     let downgrades = DowngradeSink::new();
     let fence = Fence::new();
 
-    let sync_pool = SimplePool::build(&src_url_s, &dst_url_s).expect("SimplePool::build");
+    let sync_pool = SimplePool::build(&src_url_s, &dst_url_s, DEFAULT_RPC_TIMEOUT_MS)
+        .expect("SimplePool::build");
     let sync_mover = Mover::new(
         (*cfg).clone(),
         sync_pool,
@@ -461,7 +467,7 @@ async fn symlink_replay_is_idempotent() {
     );
 
     let async_pool = Arc::new(
-        BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+        BucketedAsyncPool::new(&src_url_s, &dst_url_s, DEFAULT_RPC_TIMEOUT_MS)
             .await
             .expect("BucketedAsyncPool::new"),
     );
@@ -514,7 +520,7 @@ async fn symlink_replay_is_idempotent() {
 
     // 3. The destination readlink must still equal the intended
     //    target, byte for byte.
-    let pool = BucketedAsyncPool::new(&src_url_s, &dst_url_s)
+    let pool = BucketedAsyncPool::new(&src_url_s, &dst_url_s, DEFAULT_RPC_TIMEOUT_MS)
         .await
         .expect("verify pool");
     let link_full = format!("{dest_root}{}", String::from_utf8_lossy(&link_basename));

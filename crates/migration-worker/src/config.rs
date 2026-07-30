@@ -91,6 +91,16 @@ pub struct MoverCfg {
     pub dst_url: String,
     #[serde(default = "default_nfs_connections")]
     pub nfs_connections: u32,
+    /// F12: per-RPC timeout (milliseconds) applied to every libnfs
+    /// context at creation — the sync `MultiPool` pairs and the six
+    /// bucketed-async contexts alike — bounding each RPC including
+    /// the mount itself. `0` = leave the libnfs built-in default
+    /// untouched (`nfs_set_timeout` is never called). Defaults to
+    /// 60_000, which matches libnfs's implicit 60 s. Timed-out RPCs
+    /// surface as `"Command timed out"` and classify as
+    /// retryable/worker-local, never shard corruption.
+    #[serde(default = "default_rpc_timeout_ms")]
+    pub rpc_timeout_ms: u32,
     #[serde(default = "default_pipeline_depth")]
     pub pipeline_depth: u32,
     #[serde(default = "default_io_uring_qd")]
@@ -113,6 +123,9 @@ fn default_strategy() -> String {
 }
 fn default_nfs_connections() -> u32 {
     16
+}
+fn default_rpc_timeout_ms() -> u32 {
+    migration_mover::DEFAULT_RPC_TIMEOUT_MS
 }
 fn default_pipeline_depth() -> u32 {
     8
@@ -351,6 +364,48 @@ mod tests {
         // field defaults to None. Existing operator configs must
         // continue to parse without edits.
         assert!(cfg.coord.is_none());
+    }
+
+    /// F12: `[mover] rpc_timeout_ms` defaults to 60_000 ms when the
+    /// key is omitted — existing operator TOMLs upgrade to an
+    /// explicit-and-configurable version of the timeout libnfs was
+    /// already applying implicitly.
+    #[test]
+    fn mover_cfg_rpc_timeout_defaults_to_60000() {
+        let toml_str = r#"
+            src_url = "nfs://src-server/source-export"
+            dst_url = "nfs://dst-server/dest-export"
+        "#;
+        let m: MoverCfg = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            m.rpc_timeout_ms, 60_000,
+            "rpc_timeout_ms must default to libnfs's implicit 60s",
+        );
+    }
+
+    /// F12: explicit values parse; `0` is the documented "leave the
+    /// library default untouched — never call nfs_set_timeout" value.
+    #[test]
+    fn mover_cfg_rpc_timeout_parses_override_and_zero() {
+        let m: MoverCfg = toml::from_str(
+            r#"
+            src_url        = "nfs://src/export"
+            dst_url        = "nfs://dst/export"
+            rpc_timeout_ms = 5000
+        "#,
+        )
+        .unwrap();
+        assert_eq!(m.rpc_timeout_ms, 5_000);
+
+        let m: MoverCfg = toml::from_str(
+            r#"
+            src_url        = "nfs://src/export"
+            dst_url        = "nfs://dst/export"
+            rpc_timeout_ms = 0
+        "#,
+        )
+        .unwrap();
+        assert_eq!(m.rpc_timeout_ms, 0, "0 = leave libnfs default");
     }
 
     #[test]

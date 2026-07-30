@@ -121,15 +121,19 @@ impl BucketedAsyncPool {
     /// Mount all six contexts (src+dst × small/medium/large)
     /// concurrently. Returns once every mount has completed.
     ///
+    /// `rpc_timeout_ms` (F12): per-RPC timeout applied to all six
+    /// contexts at creation; `0` = leave the libnfs default. See
+    /// [`crate::libnfs::DEFAULT_RPC_TIMEOUT_MS`].
+    ///
     /// On any single mount failure the partial result drops and the
     /// already-mounted contexts wind down through `AsyncNfsContext`'s
     /// own Drop (which signals the service task to shut down). No
     /// extra cleanup is needed at this layer.
-    pub async fn new(src_url: &str, dst_url: &str) -> Result<Self, NfsError> {
+    pub async fn new(src_url: &str, dst_url: &str, rpc_timeout_ms: u32) -> Result<Self, NfsError> {
         let (large, medium, small) = tokio::try_join!(
-            mount_pair(src_url, dst_url, BUCKETS[0]),
-            mount_pair(src_url, dst_url, BUCKETS[1]),
-            mount_pair(src_url, dst_url, BUCKETS[2]),
+            mount_pair(src_url, dst_url, BUCKETS[0], rpc_timeout_ms),
+            mount_pair(src_url, dst_url, BUCKETS[1], rpc_timeout_ms),
+            mount_pair(src_url, dst_url, BUCKETS[2], rpc_timeout_ms),
         )?;
         Ok(Self {
             large,
@@ -193,12 +197,14 @@ async fn mount_pair(
     src_url: &str,
     dst_url: &str,
     cfg: BucketConfig,
+    rpc_timeout_ms: u32,
 ) -> Result<AsyncNfsContextPair, NfsError> {
     let opts = MountOpts {
         rsize: cfg.rsize,
         wsize: cfg.wsize,
         nconnect: 1,
         version: 3,
+        rpc_timeout_ms,
     };
     let (src, dst) = tokio::try_join!(
         AsyncNfsContext::mount(src_url, opts.clone()),
