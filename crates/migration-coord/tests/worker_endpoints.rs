@@ -7,7 +7,9 @@ use http_body_util::BodyExt;
 use migration_coord::lease::{Identity, LeaseConfig};
 use migration_coord::runtime::test_clock::FixedClock;
 use migration_coord::runtime::{CoordRuntime, RuntimeConfig};
-use migration_coord::schema::{ConfigHash, EventKind, JobId, WorkerId, WorkerState};
+use migration_coord::schema::{
+    ConfigHash, ErrorClass, EventKind, JobId, Phase, ShardId, WorkerId, WorkerState,
+};
 use migration_coord::server::{build_router, AppState};
 use migration_coord::store::{CoordStore, MemStore};
 use serde_json::Value;
@@ -496,6 +498,370 @@ async fn events_batch_400s_on_bad_worker_id() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "invalid_worker_id");
+}
+
+// =============================================================================
+// events batch — trust boundary (F20 D2+D3,
+// docs/work-items/COORD_WORKER_EVENT_TRUST.md).
+//
+// The worker route accepts only worker-nature kinds, bound to the
+// caller's URL id. Operator/lifecycle kinds stay on the admin
+// command path (bearer auth + audit rows); `WorkerJoined`/
+// `WorkerLeft` are synthesized by register/heartbeat and are not
+// accepted raw. Unknown callers are rejected with the same status
+// heartbeat uses for an unknown worker. The whole batch is
+// validated before anything is ingested — one bad entry rejects
+// the batch wholesale.
+// =============================================================================
+
+async fn register_with_host(app: &axum::Router, job: &str, host: &str) -> WorkerId {
+    let (status, body) = post_json(
+        app.clone(),
+        "/workers/register",
+        serde_json::json!({
+            "job_id": job,
+            "host": host,
+            "pid": 1,
+            "start_time": "2026-05-29T14:31:55Z",
+            "version": "0.6",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    WorkerId(Uuid::parse_str(body["worker_id"].as_str().unwrap()).unwrap())
+}
+
+/// Wire form of one batch entry: `EventKind` is `#[serde(tag =
+/// "kind")]`, so its serialization is exactly the flattened entry
+/// shape the route expects (no `worker_at`).
+fn entry(kind: &EventKind) -> Value {
+    serde_json::to_value(kind).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "red against current behavior; fix lands in the next commit (F20 D2+D3)"]
+async fn worker_route_rejects_operator_kinds() {
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+    let seq_before = rt.last_seq().await;
+
+    // The nine operator/lifecycle kinds from the work item, plus the
+    // two register/heartbeat-synthesized kinds that must not be
+    // accepted raw either.
+    let forbidden = vec![
+        job_created("bobby"),
+        EventKind::JobPaused {
+            job_id: jid("bobby"),
+            reason: "rogue".into(),
+        },
+        EventKind::JobResumed {
+            job_id: jid("bobby"),
+            reason: "rogue".into(),
+        },
+        EventKind::JobCancelled {
+            job_id: jid("bobby"),
+            reason: "rogue".into(),
+        },
+        EventKind::JobCompleted {
+            job_id: jid("bobby"),
+        },
+        EventKind::JobFailed {
+            job_id: jid("bobby"),
+            reason: "rogue".into(),
+        },
+        EventKind::JobPhaseChanged {
+            job_id: jid("bobby"),
+            from: Phase::Planned,
+            to: Phase::Cutover,
+            reason: "rogue".into(),
+        },
+        EventKind::VerifyStarted {
+            job_id: jid("bobby"),
+        },
+        EventKind::VerifyCompleted {
+            job_id: jid("bobby"),
+            mismatches: 0,
+        },
+        EventKind::WorkerJoined {
+            worker_id: WorkerId::new(),
+            job_id: jid("bobby"),
+            host: "h".into(),
+            pid: 9,
+            start_time: "2026-05-29T14:31:55Z".parse().unwrap(),
+            version: "0.6".into(),
+        },
+        EventKind::WorkerLeft {
+            worker_id: wid,
+            reason: "rogue".into(),
+        },
+    ];
+    for kind in forbidden {
+        let name = kind.name();
+        let (status, body) = post_json(
+            app.clone(),
+            &format!("/workers/{wid}/events"),
+            serde_json::json!({ "events": [entry(&kind)] }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{name} must be 403 on the worker events route",
+        );
+        assert!(
+            body["message"].as_str().unwrap_or("").contains(name),
+            "error must name the rejected kind {name}, got: {body}",
+        );
+        assert_eq!(
+            rt.last_seq().await,
+            seq_before,
+            "{name}: nothing may enter the event log",
+        );
+    }
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(
+        job.phase,
+        Phase::Planned,
+        "job lifecycle must be untouched by rejected operator kinds",
+    );
+}
+
+#[tokio::test]
+#[ignore = "red against current behavior; fix lands in the next commit (F20 D2+D3)"]
+async fn worker_route_rejects_foreign_worker_id() {
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let a = register_with_host(&app, "bobby", "host-a").await;
+    let b = register_with_host(&app, "bobby", "host-b").await;
+    let seq_before = rt.last_seq().await;
+
+    // Worker A reports progress attributed to worker B.
+    let (status, body) = post_json(
+        app,
+        &format!("/workers/{a}/events"),
+        serde_json::json!({ "events": [delta_event(&b, 5)] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a worker must not submit events attributed to another worker",
+    );
+    let msg = body["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains(&a.to_string()) && msg.contains(&b.to_string()),
+        "error must name both the caller and the payload id, got: {body}",
+    );
+    assert_eq!(rt.last_seq().await, seq_before, "state must be unchanged");
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(job.progress.files_done, 0, "foreign delta must not apply");
+}
+
+#[tokio::test]
+#[ignore = "red against current behavior; fix lands in the next commit (F20 D2+D3)"]
+async fn worker_route_rejects_unregistered_caller() {
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let ghost = WorkerId::new();
+    let seq_before = rt.last_seq().await;
+
+    // Never registered — even a well-formed self-attributed
+    // ProgressDelta is rejected. Same status heartbeat uses for an
+    // unknown worker (404 worker_not_found).
+    let (status, body) = post_json(
+        app,
+        &format!("/workers/{ghost}/events"),
+        serde_json::json!({ "events": [delta_event(&ghost, 5)] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unregistered caller must be rejected like heartbeat rejects unknown workers",
+    );
+    assert_eq!(body["code"], "worker_not_found");
+    assert_eq!(rt.last_seq().await, seq_before, "state must be unchanged");
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(job.progress.files_done, 0);
+}
+
+#[tokio::test]
+#[ignore = "red against current behavior; fix lands in the next commit (F20 D2+D3)"]
+async fn worker_fenced_self_only() {
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let a = register_with_host(&app, "bobby", "host-a").await;
+    let b = register_with_host(&app, "bobby", "host-b").await;
+    let seq_before = rt.last_seq().await;
+
+    // A tries to fence B → 403, B untouched.
+    let (status, _body) = post_json(
+        app.clone(),
+        &format!("/workers/{a}/events"),
+        serde_json::json!({ "events": [entry(&EventKind::WorkerFenced {
+            worker_id: b,
+            reason: "rogue".into(),
+        })] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "one worker must not fence another via the events route",
+    );
+    let snap = rt.state().await;
+    assert_ne!(
+        snap.workers[&b].state,
+        WorkerState::Fenced,
+        "the foreign fence must not be applied",
+    );
+    assert_eq!(rt.last_seq().await, seq_before);
+
+    // A reports its own fence → applied.
+    let (status, resp) = post_json(
+        app,
+        &format!("/workers/{a}/events"),
+        serde_json::json!({ "events": [entry(&EventKind::WorkerFenced {
+            worker_id: a,
+            reason: "self-fence R7".into(),
+        })] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "self-fence report must flow");
+    assert_eq!(resp["seqs"].as_array().unwrap().len(), 1);
+    let snap = rt.state().await;
+    assert_eq!(snap.workers[&a].state, WorkerState::Fenced);
+    assert_eq!(
+        snap.workers[&a].fence_reason.as_deref(),
+        Some("self-fence R7")
+    );
+}
+
+#[tokio::test]
+#[ignore = "red against current behavior; fix lands in the next commit (F20 D2+D3)"]
+async fn one_bad_entry_rejects_whole_batch() {
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+    let seq_before = rt.last_seq().await;
+
+    // A perfectly valid self-attributed ProgressDelta riding next to
+    // a smuggled JobCancelled: the whole batch dies, NEITHER applies.
+    let (status, _body) = post_json(
+        app,
+        &format!("/workers/{wid}/events"),
+        serde_json::json!({ "events": [
+            delta_event(&wid, 5),
+            entry(&EventKind::JobCancelled {
+                job_id: jid("bobby"),
+                reason: "smuggled".into(),
+            }),
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        rt.last_seq().await,
+        seq_before,
+        "rejected batches must never partially apply",
+    );
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(
+        job.progress.files_done, 0,
+        "the valid sibling must not be smuggled in",
+    );
+    assert_eq!(job.phase, Phase::Planned, "the job must not be cancelled");
+}
+
+#[tokio::test]
+async fn allowed_kinds_still_flow() {
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+    // Unregistered peer id — legal in claim-conflict ROLE fields
+    // (holder/contender/winner name both parties of a conflict by
+    // design; they are not caller attribution).
+    let peer = WorkerId::new();
+    let seq_before = rt.last_seq().await;
+
+    let events = vec![
+        entry(&EventKind::ProgressDelta {
+            job_id: jid("bobby"),
+            worker_id: wid,
+            files_delta: 7,
+            bytes_delta: 2048,
+            errors_delta: 0,
+        }),
+        entry(&EventKind::ErrorEmitted {
+            job_id: jid("bobby"),
+            worker_id: wid,
+            class: ErrorClass::Timeout,
+            path: "/a/b".into(),
+            retryable: true,
+            message: "timed out".into(),
+        }),
+        entry(&EventKind::WorkerStateChanged {
+            worker_id: wid,
+            from: WorkerState::Idle,
+            to: WorkerState::Copying,
+        }),
+        entry(&EventKind::ClaimConflictDetected {
+            job_id: jid("bobby"),
+            shard_id: ShardId("s1".into()),
+            holder: peer,
+            contender: wid,
+        }),
+        entry(&EventKind::ClaimConflictResolved {
+            job_id: jid("bobby"),
+            shard_id: ShardId("s1".into()),
+            winner: peer,
+        }),
+        entry(&EventKind::VerifyFileMismatch {
+            job_id: jid("bobby"),
+            path: "/a/c".into(),
+            expected: "aa".into(),
+            got: "bb".into(),
+        }),
+        entry(&EventKind::WorkerFenced {
+            worker_id: wid,
+            reason: "self-fence R7".into(),
+        }),
+        entry(&EventKind::WorkerRecovered { worker_id: wid }),
+    ];
+    let n = events.len() as u64;
+    let (status, resp) = post_json(
+        app,
+        &format!("/workers/{wid}/events"),
+        serde_json::json!({ "events": events }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "allow-listed kinds must flow: {resp}"
+    );
+    let seqs: Vec<u64> = resp["seqs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs.len() as u64, n);
+    for (i, s) in seqs.iter().enumerate() {
+        assert_eq!(*s, seq_before + 1 + i as u64, "seqs assigned in order");
+    }
+
+    // The events reached state exactly as before.
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(job.progress.files_done, 7);
+    assert_eq!(job.progress.bytes_done, 2048);
+    let snap = rt.state().await;
+    assert_eq!(snap.error_buckets[&jid("bobby")][0].count, 1);
+    // Fence then recover: reducer saw both, worker ends Idle with the
+    // fence reason cleared.
+    assert_eq!(snap.workers[&wid].state, WorkerState::Idle);
+    assert_eq!(snap.workers[&wid].fence_reason, None);
 }
 
 // =============================================================================
