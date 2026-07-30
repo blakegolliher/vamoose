@@ -2,31 +2,23 @@
 
 Living tally. Update this whenever an item lands or a decision is
 made; `docs/REVIEW_LEDGER.md` rows stay the per-finding source of
-truth. State as of 2026-07-13 (post PR #34): **38 of 45 ledger
-findings landed; 7 open.** Everything open is design-decision work
-(§1), hardware verification (§2), or small follow-ups (§3).
+truth. State as of 2026-07-30 (post PR #40): **43 of 45 ledger
+findings landed; 2 open** (F15, F45). What remains is those two
+design items, hardware verification (§2), and small follow-ups (§3).
 
 ## 1. Design decisions needed (blocks the remaining ledger findings)
 
-Each needs a call from the project owner before it can become a
-test-first work item:
-
 | Finding | Decision to make |
 |---|---|
-| F09 | NFS COMMIT on the sync path: add an `nfs_fsync` binding (protected-FFI design work) vs document VAST-only durability (NVRAM ack). |
-| F11 | Error path sends `Close` with pread/pwrite in flight (potential UAF inside libnfs): drain-before-close vs verify against the linked .so. |
-| F12 | Data-plane I/O deadlines: needs a new `nfs_set_timeout` FFI binding + config plumbing — design together with F09/F11 as one protected-FFI batch. |
 | F15 | Hardlink groups straddling batch boundaries: fold into the multi-pass design (MULTI_PASS_MOVER phases 3–8) or pre-shard by group. |
-| F19 | Lease fencing tokens for coord (refresh is HEAD-then-unconditional-PUT; F02's write gate is the containment, not the fix). |
-| F20 | Worker-endpoint trust boundary: EventKind allow-list per role, idempotency keys, atomic batches. |
 | F45 | Coord's unused `[nfs]` config requirement (pinned in PR #22 — not a one-liner) + runtime mutex held across S3 PUT during chunk flush (perf at 10k events/s). |
 
-Design docs are DRAFTED for the two batches and await the owner's
-calls (drafted 2026-07-13, on the `design-docs` branch until then):
-`docs/design/PROTECTED_FFI_DATA_PLANE.md` (F09+F11+F12, decisions
-D1–D5) and `docs/design/COORD_TRUST_AND_FENCING.md` (F19+F20,
-decisions D1–D6). F15 rides the multi-pass design. The former F10
-and F36 quick calls were made 2026-07-13 and landed (§Done).
+The 2026-07-30 design-decision batch is DONE: both design docs
+(`docs/design/PROTECTED_FFI_DATA_PLANE.md`,
+`docs/design/COORD_TRUST_AND_FENCING.md`, merged in PR #36 with the
+owner's calls recorded) are fully executed — F12/F11/F09 in PR #39,
+F19 in PR #37, F20 in PRs #38+#40. F15 still rides the multi-pass
+design; F45 still needs its own call.
 
 ## 2. Hardware verification (needs the VAST rig; flips rows to `verified`)
 
@@ -40,6 +32,16 @@ and F36 quick calls were made 2026-07-13 and landed (§Done).
       byte-equals the intended target.
 - [ ] F08 — MANUAL_VERIFY.md check [5]: migrate a `4755` root-owned
       file; destination `stat` must show `4755`.
+- [ ] F12 — `libnfs_async_integration.rs` bounded-timeout case
+      (`#[ignore]`d, PR #39): mount vs blackholed address fails
+      within ~2× `rpc_timeout_ms` instead of hanging.
+- [ ] F11 — `error_path_leaves_context_usable_after_drain`
+      (`#[ignore]`d, PR #39): forced write failure with reads in
+      flight; context stays usable.
+- [ ] F09 — `sync_write_fsync_commit_readback` in
+      `file_mover_smoke.rs` (`#[ignore]`d, PR #39); plus the
+      MANUAL_VERIFY.md crash-drill note (kill the server mid-run) —
+      rig exercise, not a test.
 
 ## 3. Small follow-ups (codeable now, none urgent)
 
@@ -54,6 +56,18 @@ and F36 quick calls were made 2026-07-13 and landed (§Done).
       migration-core; flagged independently by two sessions.
 - [ ] deny.toml: `Unicode-DFS-2016` license allowance no longer
       matches anything in the tree (pre-existing warning).
+- [ ] F20 residue (PR #40 note): non-attributed kinds
+      (`ClaimConflict*`, `VerifyFileMismatch`) can't advance the
+      client_seq HWM (no caller attribution on the envelope), so a
+      stamped tail entry of those kinds re-applies on resend unless
+      a later attributed entry covers it. Unreachable with today's
+      worker; closing it = caller attribution on the envelope
+      (small additive design call).
+- [ ] `errno_name` has no EINTR entry (PR #39 note): row-level
+      timeout failures log as `errno=4` in the failures JSONL;
+      adding it changes published failure strings — owner call.
+- [ ] DESIGN.md's "Configuration" example TOML doesn't list
+      `rpc_timeout_ms` (PR #39 note); `examples/worker.toml` does.
 - [ ] F24 residue (noted in its ledger row): log-side coalescing
       decision, worker-row eviction, trailing-edge flush (a burst's
       last ProgressDelta is dropped from the live bus until the next
@@ -91,4 +105,10 @@ F21–F35, F37–F44 — landed via PRs #11–#28; ledger sweep in PR #29.
 Quick-calls round (2026-07-13): F36 landed in PR #31
 (`clean-partials` real + stubs bail); F10 landed across PR #30
 (hardlink half) and PR #34 (symlink half).
+Design-decision batch (2026-07-30): design docs decided + merged
+(PR #36); F19 delete-then-create lease refresh (PR #37); F20
+worker-event trust in two phases — allow-list + binding (PR #38),
+client_seq idempotency (PR #40); protected-FFI batch F12+F11+F09
+(PR #39, two new externs total; the F11 .so audit confirmed the
+close-while-inflight UAF is real in the linked libnfs).
 Process and pitfalls: `docs/LESSONS.md`.

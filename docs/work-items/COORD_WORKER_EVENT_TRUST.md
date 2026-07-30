@@ -1,6 +1,6 @@
 # F20 phase 1: worker-event allow-list + caller/payload identity binding
 
-Status: in progress on branch `f20-event-trust`.
+Status: landed — merged in PR #38.
 Ledger: F20 in `docs/REVIEW_LEDGER.md` (do NOT edit the ledger or
 `docs/NEXT.md` from this branch).
 Design: `docs/design/COORD_TRUST_AND_FENCING.md` Part 2, DECIDED
