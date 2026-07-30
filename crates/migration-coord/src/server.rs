@@ -179,6 +179,14 @@ impl ApiError {
         Self::new(StatusCode::UNAUTHORIZED, code, message)
     }
 
+    /// 403 — the caller is authenticated, but the request exceeds
+    /// what that caller is allowed to do (e.g. a worker submitting
+    /// operator event kinds or events attributed to another worker,
+    /// ledger F20).
+    pub fn forbidden(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, code, message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
