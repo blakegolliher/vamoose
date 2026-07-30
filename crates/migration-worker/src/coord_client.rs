@@ -16,7 +16,14 @@
 //!   batches and POSTs them. On overflow the OLDEST events are
 //!   dropped and a counter is incremented; the worker logs the drop
 //!   but does not block ingest. Losing tail is better than wedging
-//!   the copy loop.
+//!   the copy loop. Every push is stamped with a per-worker,
+//!   monotonically increasing `client_seq` (ledger F20, D4) that
+//!   rides the entry through drain, resend, and the coord's durable
+//!   log — the coord skips stamps at or below its per-worker
+//!   high-water mark, so a resend after a lost 200 (or a retry after
+//!   a coord-side storage failure) applies exactly once. Dropped
+//!   entries take their stamps with them: forward gaps are fine,
+//!   only order matters, and a stamp is never reused.
 //!
 //! - [`Backoff`] — exponential reconnect schedule, 1s → 30s. Reset
 //!   to 1s on the first successful HTTP exchange after a series of
@@ -26,6 +33,16 @@
 //! HTTP batches; heartbeat ticks; reconnect loop) lands in a later
 //! Phase 3 step alongside the orchestrator wire-up. This module
 //! provides the pieces.
+//!
+//! ## Batch response contract (F20 D4)
+//!
+//! `EventsBatchResponse` is `{seqs, deduped}`: `seqs` covers the
+//! entries the coord APPLIED (in batch order) and `deduped` counts
+//! the ones it skipped as already-applied. Any 200 means the whole
+//! batch is settled — the driver drops it from the resend buffer
+//! exactly as it always has, without correlating seqs to entries; a
+//! pre-D4 worker that only reads `seqs` stays correct because its
+//! unstamped entries are never deduped.
 
 use migration_coord::schema::{EventEnvelope, JobId, WorkerId};
 use migration_coord::server::worker::{
@@ -97,6 +114,11 @@ pub struct EventBuffer {
     bytes: usize,
     budget: usize,
     drops: u64,
+    /// Next `client_seq` stamp (ledger F20, D4). Starts at 1;
+    /// consumed by every push — including pushes that are dropped on
+    /// the spot — so a stamp is never reused and drops surface as
+    /// forward gaps, which the coord tolerates by design.
+    next_client_seq: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +139,7 @@ impl EventBuffer {
             bytes: 0,
             budget: budget_bytes,
             drops: 0,
+            next_client_seq: 1,
         }
     }
 
@@ -143,7 +166,15 @@ impl EventBuffer {
     /// An event larger than the entire budget is still dropped
     /// immediately (with the same accounting) — the buffer never
     /// stores a single oversize entry.
-    pub fn push(&mut self, envelope: EventEnvelope) -> usize {
+    ///
+    /// Every push consumes a `client_seq` stamp (F20 D4), written
+    /// onto the envelope so it survives drain + requeue and rides
+    /// the wire to the coord. Stamping happens here — not at send
+    /// time — precisely so a resend carries the ORIGINAL stamps and
+    /// the coord can recognize the replay.
+    pub fn push(&mut self, mut envelope: EventEnvelope) -> usize {
+        envelope.client_seq = Some(self.next_client_seq);
+        self.next_client_seq += 1;
         let size = match serde_json::to_vec(&envelope) {
             Ok(b) => b.len(),
             Err(_) => {
@@ -373,13 +404,17 @@ impl CoordClient {
     }
 
     /// `POST /workers/{id}/events`. Sends a batch in a single round
-    /// trip. The returned `seqs` vec is parallel to `events`: each
-    /// entry is the seq the coord assigned to the corresponding
-    /// event.
+    /// trip. The returned `seqs` vec covers the entries the coord
+    /// APPLIED, in batch order; entries the coord skipped as
+    /// already-applied (`client_seq` dedup on a resend) are counted
+    /// in the response's `deduped` field and get no seq. Any `Ok`
+    /// means the whole batch is settled — the caller drops it from
+    /// the resend buffer without correlating seqs to entries.
     ///
-    /// `worker_at` is set to `chrono::Utc::now()` on every entry —
+    /// `worker_at` is set to the envelope's `at` on every entry —
     /// preserved for diagnostics only; the coord never compares it
-    /// across nodes.
+    /// across nodes. `client_seq` carries the stamp the
+    /// [`EventBuffer`] wrote at push time (F20 D4).
     pub async fn events_batch(
         &self,
         worker_id: WorkerId,
@@ -390,6 +425,7 @@ impl CoordClient {
                 .into_iter()
                 .map(|e| WorkerEventEntry {
                     worker_at: Some(e.at),
+                    client_seq: e.client_seq,
                     kind: e.kind,
                 })
                 .collect(),
@@ -460,6 +496,7 @@ mod tests {
             at: at(seq as i64),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::JobCreated {
                 job_id: JobId::new("bobby").unwrap(),
                 name: "bobby-mig".into(),
@@ -541,6 +578,76 @@ mod tests {
         assert_eq!(seqs[0], 1, "older requeued entry must lead");
         assert_eq!(seqs[1], 2);
         assert!(buf.drops() > 0, "tail eviction must bump drops");
+    }
+
+    /// F20 D4 acceptance (work item COORD_EVENT_IDEMPOTENCY.md): the
+    /// buffer stamps every push with a per-worker, monotonically
+    /// increasing `client_seq` starting at 1. Stamps survive
+    /// drain + requeue (the resend path re-sends the SAME stamps, so
+    /// the coord can dedup), drops under budget pressure leave
+    /// forward gaps, and the counter never reuses a stamp.
+    #[test]
+    fn event_buffer_stamps_monotonic_client_seq() {
+        let mut buf = EventBuffer::new(64 * 1024);
+        for s in 1..=3 {
+            buf.push(job_created(s));
+        }
+        let batch = buf.drain_batch(usize::MAX);
+        let stamps: Vec<u64> = batch
+            .iter()
+            .map(|e| e.client_seq.expect("push must stamp client_seq"))
+            .collect();
+        assert_eq!(stamps, vec![1, 2, 3], "stamps start at 1 and increase");
+
+        // Resend path: a failed POST requeues the batch; the retry
+        // must carry the ORIGINAL stamps (that is what lets the coord
+        // dedup a replay), not fresh ones.
+        buf.requeue_front(batch);
+        let batch = buf.drain_batch(usize::MAX);
+        let stamps: Vec<u64> = batch.iter().map(|e| e.client_seq.unwrap()).collect();
+        assert_eq!(stamps, vec![1, 2, 3], "requeue + drain preserves stamps");
+
+        // New pushes continue the sequence — the counter lives on the
+        // buffer, not on the batch.
+        buf.push(job_created(4));
+        let batch = buf.drain_batch(usize::MAX);
+        assert_eq!(
+            batch[0].client_seq,
+            Some(4),
+            "counter continues after drain"
+        );
+
+        // Drops under budget pressure: evicted entries take their
+        // stamps with them (forward gap), and no stamp is ever
+        // reused. Budget for ~2 events; five pushes evict the oldest.
+        let sample = serde_json::to_vec(&job_created(0)).unwrap().len() + 32;
+        let mut small = EventBuffer::new(sample * 2 + sample / 2);
+        for s in 1..=5 {
+            small.push(job_created(s));
+        }
+        assert!(small.drops() > 0, "budget pressure must have dropped");
+        let batch = small.drain_batch(usize::MAX);
+        let stamps: Vec<u64> = batch.iter().map(|e| e.client_seq.unwrap()).collect();
+        for w in stamps.windows(2) {
+            assert!(w[0] < w[1], "stamps stay strictly increasing: {stamps:?}");
+        }
+        assert_eq!(
+            *stamps.last().unwrap(),
+            5,
+            "the newest push holds the newest stamp: {stamps:?}",
+        );
+        assert!(
+            !stamps.contains(&1),
+            "the evicted oldest entry's stamp is gone for good (forward gap): {stamps:?}",
+        );
+        // The counter never rewinds to fill the gap.
+        small.push(job_created(6));
+        let batch = small.drain_batch(usize::MAX);
+        assert_eq!(
+            batch.last().unwrap().client_seq,
+            Some(6),
+            "dropped stamps are never reused",
+        );
     }
 
     #[test]

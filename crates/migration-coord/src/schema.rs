@@ -627,6 +627,14 @@ pub struct EventEnvelope {
     /// only — coord never compares it across nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_at: Option<DateTime<Utc>>,
+    /// Per-worker idempotency stamp (ledger F20, D4). Present only on
+    /// events a stamping worker submitted through the events route.
+    /// It rides the durable stream so replay reconstructs the
+    /// per-worker high-water mark in [`Snapshot::last_client_seq`] —
+    /// an in-memory dedup table would die with the process. Additive
+    /// and backward-compatible: old log chunks deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_seq: Option<u64>,
     #[serde(flatten)]
     pub kind: EventKind,
 }
@@ -808,6 +816,42 @@ impl EventKind {
             | Self::WorkerRecovered { .. } => None,
         }
     }
+
+    /// The worker this event is *attributed to* — exactly the kinds
+    /// whose payload `worker_id` the events route binds to the caller
+    /// (F20 D3). The reducer pairs this with
+    /// [`EventEnvelope::client_seq`] to maintain the per-worker
+    /// high-water mark in [`Snapshot::last_client_seq`].
+    ///
+    /// Deliberately `None` for `ClaimConflictDetected` /
+    /// `ClaimConflictResolved` / `VerifyFileMismatch`: their worker
+    /// fields (`holder`, `contender`, `winner`) are conflict *roles*
+    /// naming other parties, not caller attribution. And `None` for
+    /// operator/register-path kinds, which never carry a stamp.
+    pub fn attributed_worker(&self) -> Option<WorkerId> {
+        match self {
+            Self::ProgressDelta { worker_id, .. }
+            | Self::ErrorEmitted { worker_id, .. }
+            | Self::WorkerStateChanged { worker_id, .. }
+            | Self::WorkerFenced { worker_id, .. }
+            | Self::WorkerRecovered { worker_id } => Some(*worker_id),
+
+            Self::JobCreated { .. }
+            | Self::JobPhaseChanged { .. }
+            | Self::JobPaused { .. }
+            | Self::JobResumed { .. }
+            | Self::JobCancelled { .. }
+            | Self::JobCompleted { .. }
+            | Self::JobFailed { .. }
+            | Self::WorkerJoined { .. }
+            | Self::WorkerLeft { .. }
+            | Self::ClaimConflictDetected { .. }
+            | Self::ClaimConflictResolved { .. }
+            | Self::VerifyStarted { .. }
+            | Self::VerifyFileMismatch { .. }
+            | Self::VerifyCompleted { .. } => None,
+        }
+    }
 }
 
 // =============================================================================
@@ -844,6 +888,14 @@ pub struct Snapshot {
     /// UTC. Empty on fresh start.
     #[serde(default)]
     pub audit_seq_date: String,
+    /// Per-worker `client_seq` high-water mark (ledger F20, D4).
+    /// Maintained by the reducer from envelopes carrying worker
+    /// attribution plus a `client_seq` stamp, so snapshots and replay
+    /// carry it like every other piece of reducer state. The events
+    /// route skips entries at or below the caller's mark as
+    /// already-applied. Old snapshots deserialize to empty (additive).
+    #[serde(default)]
+    pub last_client_seq: BTreeMap<WorkerId, u64>,
 }
 
 impl Snapshot {
@@ -857,6 +909,7 @@ impl Snapshot {
             error_buckets: BTreeMap::new(),
             audit_seq_today: 0,
             audit_seq_date: String::new(),
+            last_client_seq: BTreeMap::new(),
         }
     }
 }
@@ -1125,6 +1178,7 @@ mod tests {
             at: at(),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::JobCreated {
                 job_id: jid("bobby"),
                 name: "bobby-migration".into(),
@@ -1250,6 +1304,7 @@ mod tests {
                 at: at(),
                 schema_version: SCHEMA_VERSION,
                 worker_at: None,
+                client_seq: None,
                 kind,
             };
             let s = serde_json::to_string(&env).unwrap();

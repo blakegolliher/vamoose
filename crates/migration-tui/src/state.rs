@@ -903,6 +903,7 @@ mod tests {
             at: at(seq as i64),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::JobCreated {
                 job_id: jid(job),
                 name: format!("{job}-mig"),
@@ -920,6 +921,7 @@ mod tests {
             at: at(seq as i64),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::ProgressDelta {
                 job_id: jid(job),
                 worker_id: WorkerId::new(),
@@ -1041,6 +1043,7 @@ mod tests {
             at: at(2),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::WorkerJoined {
                 worker_id: w,
                 job_id: jid("alpha"),
@@ -1055,6 +1058,7 @@ mod tests {
             at: at(3),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::ErrorEmitted {
                 job_id: jid("alpha"),
                 worker_id: w,
@@ -1130,6 +1134,7 @@ mod tests {
             at: at(2),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::WorkerJoined {
                 worker_id: w1,
                 job_id: jid("bobby"),
@@ -1192,6 +1197,7 @@ mod tests {
             at: at(secs),
             schema_version: migration_coord::schema::SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::ProgressDelta {
                 job_id: jid(job),
                 worker_id: WorkerId::new(),
@@ -1427,6 +1433,7 @@ mod tests {
             at: at(seq as i64),
             schema_version: migration_coord::schema::SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::ErrorEmitted {
                 job_id: jid(job),
                 worker_id: WorkerId::new(),
@@ -1527,6 +1534,7 @@ mod tests {
             at: at(secs),
             schema_version: migration_coord::schema::SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::VerifyFileMismatch {
                 job_id: jid(job),
                 path: path.into(),
@@ -1545,6 +1553,7 @@ mod tests {
             at: at(100),
             schema_version: migration_coord::schema::SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::VerifyStarted {
                 job_id: jid("alpha"),
             },
@@ -1554,6 +1563,7 @@ mod tests {
             at: at(200),
             schema_version: migration_coord::schema::SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::VerifyCompleted {
                 job_id: jid("alpha"),
                 mismatches: 7,

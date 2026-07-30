@@ -186,6 +186,7 @@ fn cluster_env(seq: u64) -> EventEnvelope {
         at: Utc::now(),
         schema_version: SCHEMA_VERSION,
         worker_at: None,
+        client_seq: None,
         kind: EventKind::WorkerLeft {
             worker_id: WorkerId::new(),
             reason: "test".into(),
@@ -199,6 +200,7 @@ fn job_env(seq: u64, job: &str) -> EventEnvelope {
         at: Utc::now(),
         schema_version: SCHEMA_VERSION,
         worker_at: None,
+        client_seq: None,
         kind: EventKind::VerifyStarted {
             job_id: JobId::new(job).unwrap(),
         },
@@ -322,6 +324,7 @@ async fn replay_snapshot_plus_log_round_trip() {
             at: Utc::now(),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::JobCreated {
                 job_id: job.clone(),
                 name: "test-bobby".into(),
@@ -336,6 +339,7 @@ async fn replay_snapshot_plus_log_round_trip() {
             at: Utc::now(),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::ProgressDelta {
                 job_id: job.clone(),
                 worker_id: WorkerId::new(),
@@ -349,6 +353,7 @@ async fn replay_snapshot_plus_log_round_trip() {
             at: Utc::now(),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::JobCompleted {
                 job_id: job.clone(),
             },

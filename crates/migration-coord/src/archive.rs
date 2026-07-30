@@ -129,6 +129,7 @@ mod tests {
             at: Utc.with_ymd_and_hms(2026, 5, 29, 14, 32, 0).unwrap(),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::VerifyStarted {
                 job_id: JobId::new(job).unwrap(),
             },

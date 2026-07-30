@@ -298,6 +298,42 @@ impl CoordRuntime {
     /// subscribers (subject to the bus-only rate caps — see
     /// [`StreamCaps`]). Returns the assigned seq.
     pub async fn ingest(&self, kind: EventKind) -> Result<u64> {
+        self.ingest_inner(kind, None, None).await
+    }
+
+    /// Ingest an event whose payload was constructed by a worker
+    /// (carrying its own `worker_at`). Same semantics as `ingest`
+    /// but preserves the worker's local timestamp on the envelope
+    /// for diagnostic correlation.
+    pub async fn ingest_with_worker_at(
+        &self,
+        kind: EventKind,
+        worker_at: DateTime<Utc>,
+    ) -> Result<u64> {
+        self.ingest_inner(kind, Some(worker_at), None).await
+    }
+
+    /// Ingest an event submitted on the worker events route: optional
+    /// worker-local timestamp plus the optional per-worker
+    /// `client_seq` idempotency stamp (ledger F20, D4). The stamp is
+    /// carried on the envelope into the durable log, so the reducer —
+    /// live and on replay — maintains the per-worker high-water mark
+    /// the events handler dedups against.
+    pub async fn ingest_worker_event(
+        &self,
+        kind: EventKind,
+        worker_at: Option<DateTime<Utc>>,
+        client_seq: Option<u64>,
+    ) -> Result<u64> {
+        self.ingest_inner(kind, worker_at, client_seq).await
+    }
+
+    async fn ingest_inner(
+        &self,
+        kind: EventKind,
+        worker_at: Option<DateTime<Utc>>,
+        client_seq: Option<u64>,
+    ) -> Result<u64> {
         let (env, broadcast) = {
             let mut guard = self.inner.lock().await;
             if guard.lease_lost {
@@ -309,7 +345,8 @@ impl CoordRuntime {
                 seq,
                 at: self.clock.now(),
                 schema_version: SCHEMA_VERSION,
-                worker_at: None,
+                worker_at,
+                client_seq,
                 kind,
             };
             guard.state.apply(&env);
@@ -329,42 +366,19 @@ impl CoordRuntime {
         Ok(seq)
     }
 
-    /// Ingest an event whose payload was constructed by a worker
-    /// (carrying its own `worker_at`). Same semantics as `ingest`
-    /// but preserves the worker's local timestamp on the envelope
-    /// for diagnostic correlation.
-    pub async fn ingest_with_worker_at(
-        &self,
-        kind: EventKind,
-        worker_at: DateTime<Utc>,
-    ) -> Result<u64> {
-        let (env, broadcast) = {
-            let mut guard = self.inner.lock().await;
-            if guard.lease_lost {
-                return Err(Error::LeaseLost);
-            }
-            let seq = guard.next_seq;
-            guard.next_seq += 1;
-            let env = EventEnvelope {
-                seq,
-                at: self.clock.now(),
-                schema_version: SCHEMA_VERSION,
-                worker_at: Some(worker_at),
-                kind,
-            };
-            guard.state.apply(&env);
-            let broadcast = guard.stream_caps.should_broadcast(&env.kind, env.at);
-            guard
-                .writer
-                .append(self.store.as_ref(), env.clone())
-                .await?;
-            (env, broadcast)
-        };
-        let seq = env.seq;
-        if broadcast {
-            let _ = self.bus.send(env);
-        }
-        Ok(seq)
+    /// Per-worker `client_seq` high-water mark from reducer state
+    /// (ledger F20, D4). `0` for a worker that has never submitted a
+    /// stamped event — every real stamp starts at 1, so `0` never
+    /// masks one.
+    pub async fn client_seq_hwm(&self, worker_id: crate::schema::WorkerId) -> u64 {
+        self.inner
+            .lock()
+            .await
+            .state
+            .last_client_seq
+            .get(&worker_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Clone the current state. Cheap at deployment scale; if it

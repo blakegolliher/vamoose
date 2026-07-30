@@ -78,6 +78,18 @@ impl Snapshot {
     /// that bookkeeping out of the match keeps the reducer easier to
     /// audit.
     pub fn apply(&mut self, env: &EventEnvelope) {
+        // Per-worker client_seq high-water mark (ledger F20, D4).
+        // Runs in the reducer — not the ingest handler — so replay
+        // reconstructs the mark from the durable stream and the
+        // snapshot carries it like every other piece of state. Only
+        // envelopes with worker attribution can advance it; the
+        // `max` keeps replay idempotent and tolerates historical
+        // out-of-order logs without regressing the mark.
+        if let (Some(cs), Some(worker)) = (env.client_seq, env.kind.attributed_worker()) {
+            let hwm = self.last_client_seq.entry(worker).or_insert(0);
+            *hwm = (*hwm).max(cs);
+        }
+
         match &env.kind {
             EventKind::JobCreated {
                 job_id,
@@ -570,6 +582,7 @@ mod tests {
             at: at(secs),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind,
         }
     }

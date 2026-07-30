@@ -1326,6 +1326,7 @@ mod tests {
             at: at(seq as i64),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::JobCreated {
                 job_id: jid(j),
                 name: format!("{j}-mig"),
@@ -1890,6 +1891,7 @@ mod tests {
             at: at(seq as i64),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::WorkerJoined {
                 worker_id: wid,
                 job_id: jid(job),
