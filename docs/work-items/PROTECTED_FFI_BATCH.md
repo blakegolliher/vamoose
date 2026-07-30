@@ -1,6 +1,6 @@
 # Protected-FFI batch: I/O deadlines (F12), drain-before-close (F11), sync COMMIT (F09)
 
-Status: in progress on branch `protected-ffi-batch`.
+Status: landed — merged in PR #39.
 Ledger: F09, F11, F12 in `docs/REVIEW_LEDGER.md` (do NOT edit the
 ledger or `docs/NEXT.md` from this branch).
 Design: `docs/design/PROTECTED_FFI_DATA_PLANE.md` (DECIDED

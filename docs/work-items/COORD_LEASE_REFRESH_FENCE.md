@@ -1,6 +1,6 @@
 # F19: coord lease refresh via delete-then-create (no more unconditional PUT)
 
-Status: in progress on branch `f19-lease-refresh-fence`.
+Status: landed — merged in PR #37.
 Ledger: F19 in `docs/REVIEW_LEDGER.md` (do NOT edit the ledger or
 `docs/NEXT.md` from this branch).
 Design: `docs/design/COORD_TRUST_AND_FENCING.md` Part 1, DECIDED
