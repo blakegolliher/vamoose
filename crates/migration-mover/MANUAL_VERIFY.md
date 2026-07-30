@@ -135,6 +135,19 @@ Any `.partial` survivors point to a worker that crashed or fenced
 mid-copy. M2 does not implement automatic cleanup; that's a separate
 follow-up task before M3 (`mig-aggr clean-partials`).
 
+## Crash durability (F09) — rig drill, not a test claim
+
+Both copy paths issue UNSTABLE WRITEs followed by one whole-file NFS
+COMMIT before the commit-point rename (DESIGN.md "Durability model").
+No automated test can verify what the *server* does with a COMMIT —
+proving it requires a kill-the-server drill: power-fail (or force a
+failover of) the destination filer mid-run, bring it back, and re-run
+the full step-4 content verification over everything that had already
+been renamed to its final name. Every published (post-rename) file
+must verify byte-for-byte; `.partial` survivors are expected and fine.
+If you run the drill, record the result in `M2_NOTES.md` like any
+other verification incident.
+
 ## Recording results
 
 Append to `M2_NOTES.md` at the workspace root:

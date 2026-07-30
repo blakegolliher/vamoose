@@ -617,10 +617,26 @@ impl Mover {
 
         let result = stream_copy(pair, &src_fh, &dst_fh, row.row_id, row.size);
 
+        // F09: whole-file NFS COMMIT before the write fh closes and
+        // before the rename below — the streaming loop's WRITEs are
+        // UNSTABLE (see DESIGN.md "Durability model"), and the rename
+        // must never publish bytes the server hasn't acknowledged as
+        // stable. Mirrors the async path's `dst.fsync` in
+        // `pipelined_copy`. Skipped when the copy already failed —
+        // the row fails anyway and nothing gets renamed. A COMMIT
+        // failure fails the row through the normal MoveError path
+        // (phase Write, error tag `COMMIT:<errno>`); the closes below
+        // still run unconditionally for fh hygiene.
+        let commit = match &result {
+            Ok(_) => ops::fsync(pair.dst(), &dst_fh),
+            Err(_) => Ok(()),
+        };
+
         let close_src = ops::close_fh(pair.src(), src_fh, FailurePhase::Read);
         let close_dst = ops::close_fh(pair.dst(), dst_fh, FailurePhase::Write);
 
         let written = result?;
+        commit?;
         close_src?;
         close_dst?;
 

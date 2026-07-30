@@ -218,6 +218,16 @@ extern "C" {
     /// (`lib/init.c: rpc->timeout = 60 * 1000`); timed-out RPCs fire
     /// their callback with `-EINTR` / `"Command timed out"`.
     pub fn nfs_set_timeout(nfs: *mut nfs_context, milliseconds: c_int);
+
+    /// F09: sync whole-file NFS COMMIT for an open fh. Drives
+    /// `nfs_fsync_async` → COMMIT3 with `offset = 0, count = 0`
+    /// (`lib/nfs_v3.c:nfs3_fsync_async`) and waits for the reply.
+    /// Returns 0 on success, negative `-errno` on failure — same
+    /// convention as the rest of the sync surface. The write path
+    /// needs it because the linked libnfs issues WRITEs UNSTABLE
+    /// unless the fh was opened `O_SYNC`
+    /// (`lib/nfs_v3.c:nfs3_fill_WRITE3args`).
+    pub fn nfs_fsync(nfs: *mut nfs_context, nfsfh: *mut nfsfh) -> c_int;
 }
 
 /// F12 default per-RPC timeout, in milliseconds. Matches the pinned

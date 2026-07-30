@@ -538,3 +538,58 @@ async fn symlink_replay_is_idempotent() {
     // Best-effort cleanup, same policy as the smokes above.
     let _ = pair.dst.unlink(link_full.as_bytes()).await;
 }
+
+/// F09 hardware case (PROTECTED_FFI_BATCH.md Item 3): sync
+/// write → `ops::fsync` (whole-file NFS COMMIT via the new
+/// `nfs_fsync` binding) → read-back. Exercises the new wrapper
+/// end-to-end against real VAST: the COMMIT must succeed on a dirty
+/// write fh, and the committed bytes must read back identical
+/// through a fresh fh. CI cannot cover the COMMIT itself (FFI + a
+/// real server); this smoke is the verification vehicle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn sync_write_fsync_commit_readback() {
+    use migration_core::records::FailurePhase;
+    use migration_mover::libnfs::ops;
+    use migration_mover::LibnfsContextPool;
+
+    let url = dst_url();
+    let dir = write_dir();
+
+    let pool = SimplePool::build(&url, &url, DEFAULT_RPC_TIMEOUT_MS).expect("SimplePool::build");
+    let mut pair = pool.acquire().await.expect("acquire pair");
+
+    let path = format!("{dir}/fsync-smoke-{}.bin", timestamp_suffix()).into_bytes();
+    let payload: Vec<u8> = b"vamoose F09 COMMIT smoke payload / "
+        .iter()
+        .copied()
+        .cycle()
+        .take(96 * 1024)
+        .collect();
+
+    // Write UNSTABLE (create_write opens without O_SYNC), then COMMIT.
+    let fh = ops::create_write(pair.dst(), &path, 0o600).expect("create_write");
+    let mut off = 0usize;
+    while off < payload.len() {
+        let n = ops::pwrite(pair.dst(), &fh, off as u64, &payload[off..]).expect("pwrite");
+        assert!(n > 0, "pwrite wrote 0 bytes at offset {off}");
+        off += n;
+    }
+    ops::fsync(pair.dst(), &fh).expect("ops::fsync (whole-file NFS COMMIT) must succeed");
+    ops::close_fh(pair.dst(), fh, FailurePhase::Write).expect("close after commit");
+
+    // Read back through a fresh fh: committed bytes must be intact.
+    let fh = ops::open_read(pair.dst(), &path).expect("open_read for read-back");
+    let mut buf = vec![0u8; payload.len()];
+    let mut off = 0usize;
+    while off < buf.len() {
+        let n = ops::pread(pair.dst(), &fh, off as u64, &mut buf[off..]).expect("pread");
+        assert!(n > 0, "EOF at {off} before full read-back");
+        off += n;
+    }
+    ops::close_quietly(pair.dst(), fh);
+    assert_eq!(buf, payload, "committed bytes must read back identical");
+
+    // Best-effort cleanup, same policy as the smokes above.
+    let _ = ops::unlink(pair.dst(), &path);
+}

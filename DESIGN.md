@@ -440,6 +440,42 @@ On success, atomic `RENAME` to the final name. On failure, the partial
 file remains (cleaned up by a separate `mig-aggr clean-partials` mode).
 This guarantees: a reader on the dest never sees a half-written file.
 
+### Durability model (F09)
+
+Data WRITEs on both copy paths are issued UNSTABLE — NFSv3 lets the
+server acknowledge them from volatile buffers (the linked libnfs sets
+`stable = UNSTABLE` unless the fh was opened `O_SYNC`; see
+`lib/nfs_v3.c:nfs3_fill_WRITE3args`). Durability comes from one
+whole-file COMMIT issued after the write loop, before the write fh is
+closed and before the `.partial → final` rename publishes the file,
+on BOTH paths:
+
+- **bucketed-async**: `pipelined_copy` drains the write pipeline,
+  then `dst.fsync(dst_fh)` (`nfs_fsync_async` → COMMIT3 with
+  `offset = 0, count = 0`, i.e. whole-file).
+- **sync**: `do_libnfs_copy` calls `ops::fsync(dst_ctx, dst_fh)`
+  (sync `nfs_fsync`, the same whole-file COMMIT3) after
+  `stream_copy`, before `close_fh`/rename.
+
+So the commit-point rename never publishes bytes the server has not
+acknowledged as stable. A COMMIT failure fails the row through the
+normal `MoveError` path (phase `write`, error tag `COMMIT:<errno>` —
+distinguishable in the failure log without widening the published
+`FailurePhase` schema).
+
+NFSv3 metadata operations (CREATE, MKDIR, RENAME, LINK, SYMLINK,
+SETATTR) are protocol-synchronous — the server must reach stable
+storage before replying — so they need no COMMIT bracket; empty-file,
+symlink, hardlink, and dir-attr rows carry no unstable data.
+
+Historical note: before F09 the sync path issued no COMMIT at all.
+On VAST that gap was mitigated (not licensed) by the cluster's
+NVRAM-backed write path, which makes UNSTABLE writes effectively
+stable on ack; against a server without that property, a crash of
+the destination filer after rename-but-before-flush could have
+published a file whose tail was never durable. The async path has
+issued the COMMIT since it shipped.
+
 ### Hardlinks
 
 Hardlink groups are detected by `inode` collisions within the index. The
