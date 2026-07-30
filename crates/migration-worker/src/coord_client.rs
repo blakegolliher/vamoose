@@ -460,6 +460,7 @@ mod tests {
             at: at(seq as i64),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::JobCreated {
                 job_id: JobId::new("bobby").unwrap(),
                 name: "bobby-mig".into(),
@@ -541,6 +542,77 @@ mod tests {
         assert_eq!(seqs[0], 1, "older requeued entry must lead");
         assert_eq!(seqs[1], 2);
         assert!(buf.drops() > 0, "tail eviction must bump drops");
+    }
+
+    /// F20 D4 acceptance (work item COORD_EVENT_IDEMPOTENCY.md): the
+    /// buffer stamps every push with a per-worker, monotonically
+    /// increasing `client_seq` starting at 1. Stamps survive
+    /// drain + requeue (the resend path re-sends the SAME stamps, so
+    /// the coord can dedup), drops under budget pressure leave
+    /// forward gaps, and the counter never reuses a stamp.
+    #[test]
+    #[ignore = "F20 D4 red: EventBuffer does not stamp client_seq yet; ignore is removed by the fix commit"]
+    fn event_buffer_stamps_monotonic_client_seq() {
+        let mut buf = EventBuffer::new(64 * 1024);
+        for s in 1..=3 {
+            buf.push(job_created(s));
+        }
+        let batch = buf.drain_batch(usize::MAX);
+        let stamps: Vec<u64> = batch
+            .iter()
+            .map(|e| e.client_seq.expect("push must stamp client_seq"))
+            .collect();
+        assert_eq!(stamps, vec![1, 2, 3], "stamps start at 1 and increase");
+
+        // Resend path: a failed POST requeues the batch; the retry
+        // must carry the ORIGINAL stamps (that is what lets the coord
+        // dedup a replay), not fresh ones.
+        buf.requeue_front(batch);
+        let batch = buf.drain_batch(usize::MAX);
+        let stamps: Vec<u64> = batch.iter().map(|e| e.client_seq.unwrap()).collect();
+        assert_eq!(stamps, vec![1, 2, 3], "requeue + drain preserves stamps");
+
+        // New pushes continue the sequence — the counter lives on the
+        // buffer, not on the batch.
+        buf.push(job_created(4));
+        let batch = buf.drain_batch(usize::MAX);
+        assert_eq!(
+            batch[0].client_seq,
+            Some(4),
+            "counter continues after drain"
+        );
+
+        // Drops under budget pressure: evicted entries take their
+        // stamps with them (forward gap), and no stamp is ever
+        // reused. Budget for ~2 events; five pushes evict the oldest.
+        let sample = serde_json::to_vec(&job_created(0)).unwrap().len() + 32;
+        let mut small = EventBuffer::new(sample * 2 + sample / 2);
+        for s in 1..=5 {
+            small.push(job_created(s));
+        }
+        assert!(small.drops() > 0, "budget pressure must have dropped");
+        let batch = small.drain_batch(usize::MAX);
+        let stamps: Vec<u64> = batch.iter().map(|e| e.client_seq.unwrap()).collect();
+        for w in stamps.windows(2) {
+            assert!(w[0] < w[1], "stamps stay strictly increasing: {stamps:?}");
+        }
+        assert_eq!(
+            *stamps.last().unwrap(),
+            5,
+            "the newest push holds the newest stamp: {stamps:?}",
+        );
+        assert!(
+            !stamps.contains(&1),
+            "the evicted oldest entry's stamp is gone for good (forward gap): {stamps:?}",
+        );
+        // The counter never rewinds to fill the gap.
+        small.push(job_created(6));
+        let batch = small.drain_batch(usize::MAX);
+        assert_eq!(
+            batch.last().unwrap().client_seq,
+            Some(6),
+            "dropped stamps are never reused",
+        );
     }
 
     #[test]

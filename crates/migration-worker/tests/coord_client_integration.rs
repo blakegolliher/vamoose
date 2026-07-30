@@ -175,6 +175,7 @@ async fn register_heartbeat_events_fence_end_to_end() {
             at: Utc.timestamp_opt(1_700_000_001, 0).unwrap(),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::ProgressDelta {
                 job_id: job.clone(),
                 worker_id,
@@ -188,6 +189,7 @@ async fn register_heartbeat_events_fence_end_to_end() {
             at: Utc.timestamp_opt(1_700_000_002, 0).unwrap(),
             schema_version: SCHEMA_VERSION,
             worker_at: None,
+            client_seq: None,
             kind: EventKind::ProgressDelta {
                 job_id: job.clone(),
                 worker_id,

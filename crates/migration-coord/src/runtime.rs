@@ -310,6 +310,7 @@ impl CoordRuntime {
                 at: self.clock.now(),
                 schema_version: SCHEMA_VERSION,
                 worker_at: None,
+                client_seq: None,
                 kind,
             };
             guard.state.apply(&env);
@@ -350,6 +351,7 @@ impl CoordRuntime {
                 at: self.clock.now(),
                 schema_version: SCHEMA_VERSION,
                 worker_at: Some(worker_at),
+                client_seq: None,
                 kind,
             };
             guard.state.apply(&env);
