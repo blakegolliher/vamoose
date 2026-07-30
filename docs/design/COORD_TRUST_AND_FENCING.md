@@ -1,6 +1,13 @@
 # Design: coord lease fencing (F19) and worker trust boundary (F20)
 
-Status: DRAFT — decision document, nothing here is implemented.
+Status: DECIDED 2026-07-30 — every recommendation accepted by the
+project owner. D1: Option A, delete-then-create refresh. D2–D5:
+full bundle — strict EventKind allow-list + worker-id binding as
+one work item, per-worker `client_seq` HWM + validate-whole-batch
+stacked on it as a second. D6 out-of-scope list stands.
+Execution: `docs/work-items/COORD_LEASE_REFRESH_FENCE.md`,
+`docs/work-items/COORD_WORKER_EVENT_TRUST.md` (D2+D3), then
+`docs/work-items/COORD_EVENT_IDEMPOTENCY.md` (D4+D5, stacked).
 Ledger: F19, F20 in `docs/REVIEW_LEDGER.md`.
 Prior art this must stay consistent with: the v2 claim atoms in
 `migration-core/src/claim.rs` (untouchable), the F02 write gate

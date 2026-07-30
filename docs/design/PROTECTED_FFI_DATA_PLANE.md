@@ -1,6 +1,18 @@
 # Design: protected-FFI data-plane batch — durability (F09), close-while-inflight (F11), I/O deadlines (F12)
 
-Status: DRAFT — decision document, nothing here is implemented.
+Status: DECIDED 2026-07-30 — every recommendation accepted by the
+project owner. D1: bind sync `nfs_fsync`, whole-file COMMIT per
+regular file, plus document the durability model in DESIGN.md.
+D2: drain-before-close (one-time .so audit during implementation).
+D3: bind `nfs_set_timeout`, `[mover] rpc_timeout_ms` default
+60_000, timeouts classify retryable. D4: per-RPC granularity
+accepted. D5: one work item, order F12 → F11 → F09.
+Signatures verified 2026-07-30 — identical in the pinned tree
+(`libnfs-6.0.2-148-gdc7e6f8`) and the installed header, and both
+exported by the linked `libnfs.so.16.0.2`:
+`int nfs_fsync(struct nfs_context *, struct nfsfh *)`,
+`void nfs_set_timeout(struct nfs_context *, int milliseconds)`.
+Execution: `docs/work-items/PROTECTED_FFI_BATCH.md`.
 Ledger: F09, F11, F12 in `docs/REVIEW_LEDGER.md`.
 Why one doc: all three land in or against the protected FFI layer
 (`crates/migration-mover/src/libnfs/`), where every change must be
