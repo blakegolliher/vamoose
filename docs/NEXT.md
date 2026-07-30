@@ -2,9 +2,9 @@
 
 Living tally. Update this whenever an item lands or a decision is
 made; `docs/REVIEW_LEDGER.md` rows stay the per-finding source of
-truth. State as of 2026-07-13 (post PR #31): **37 of 45 ledger
-findings landed; 8 open** (of which F10 is in progress — hardlink
-half merged in PR #30, symlink half queued in §3).
+truth. State as of 2026-07-13 (post PR #34): **38 of 45 ledger
+findings landed; 7 open.** Everything open is design-decision work
+(§1), hardware verification (§2), or small follow-ups (§3).
 
 ## 1. Design decisions needed (blocks the remaining ledger findings)
 
@@ -33,21 +33,16 @@ and F36 quick calls were made 2026-07-13 and landed (§Done).
 - [ ] F01/F30 — `scripts/fast-reclaim-drill.sh`: kill -9 → reclaim
       latency grows by ≤ one grace window; no theft cascade.
 - [ ] F06/F07 — `pipelined_copy_smoke` (`#[ignore]`d) re-run.
-- [ ] F10 — `hardlink_replay_is_idempotent` in `file_mover_smoke.rs`
-      (`#[ignore]`d, added in PR #30): replayed `move_hardlink`
-      succeeds, both paths share an inode, `nlink == 2`.
+- [ ] F10 — `hardlink_replay_is_idempotent` (PR #30) and
+      `symlink_replay_is_idempotent` (PR #34) in
+      `file_mover_smoke.rs` (`#[ignore]`d): replayed rows succeed;
+      hardlinks share an inode (`nlink == 2`), symlink readlink
+      byte-equals the intended target.
 - [ ] F08 — MANUAL_VERIFY.md check [5]: migrate a `4755` root-owned
       file; destination `stat` must show `4755`.
 
 ## 3. Small follow-ups (codeable now, none urgent)
 
-- [ ] F10 symlink half: `do_symlink` has the same
-      commit-point-replay shape PR #30 fixed for hardlinks — on
-      EEXIST, `readlink` the destination and compare with the
-      intended target; match = replay = success. The owner's F10
-      decision (EEXIST-with-matching-target = success,
-      unlink-then-create rejected) already covers it; flips the F10
-      ledger row to landed.
 - [ ] `clean-partials` `--lease-timeout-sec` override: the liveness
       gate uses the protocol default (180s), so deployments with a
       longer configured `worker.lease_timeout_sec` could pass the
@@ -94,6 +89,6 @@ and F36 quick calls were made 2026-07-13 and landed (§Done).
 Rounds 1–2 of the review ledger: F01–F08, F13/F14, F16–F18,
 F21–F35, F37–F44 — landed via PRs #11–#28; ledger sweep in PR #29.
 Quick-calls round (2026-07-13): F36 landed in PR #31
-(`clean-partials` real + stubs bail); F10 hardlink half landed in
-PR #30 (symlink half in §3).
+(`clean-partials` real + stubs bail); F10 landed across PR #30
+(hardlink half) and PR #34 (symlink half).
 Process and pitfalls: `docs/LESSONS.md`.

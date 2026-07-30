@@ -1,6 +1,6 @@
 # Symlink replay idempotency: EEXIST + readlink match = success
 
-Status: in progress on branch `f10-symlink-idempotency`.
+Status: landed — merged in PR #34.
 Ledger: F10 in `docs/REVIEW_LEDGER.md` (do NOT edit the ledger or
 `docs/NEXT.md` from this branch — the coordinator sweeps those).
 This is the second half of F10: PR #30 landed the hardlink half

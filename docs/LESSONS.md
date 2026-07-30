@@ -59,6 +59,17 @@ least one broken build, conflict, or wasted CI cycle to learn.
 - **GitHub mergeability shows UNKNOWN for minutes after pushes.**
   Don't poll — `git merge-tree --write-tree origin/main branch`
   answers locally and instantly.
+- **Key CI watchers to the commit SHA, not the PR.** A
+  `gh pr checks N` until-loop exits on the PREVIOUS run's completed
+  results when you re-push (the new run hasn't registered as pending
+  yet) — it did so twice in a row on PR #34. Poll
+  `gh run list --commit <sha>` for the pushed SHA until a run exists
+  AND completes, then read the checks.
+- **After a merge, verify the branch TIP is what merged.** PR #34 was
+  merged while its final commit (a license-bundle regen) raced the
+  merge click and silently missed main, leaving CI broken for every
+  later branch. One line catches it:
+  `git merge-base --is-ancestor <branch-tip> origin/main`.
 - **Re-running a failed CI job reproduces deterministic failures.**
   Rerun-once is a fine flakiness probe, but read the log signature
   first: of this campaign's three "flaky" failures, one was infra
