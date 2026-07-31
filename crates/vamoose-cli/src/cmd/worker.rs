@@ -3,14 +3,33 @@
 //! `migration_worker::config::Config`; fields the unified TOML omits
 //! are filled with defaults (mostly delegated to the existing
 //! `serde(default)` handlers).
+//!
+//! # Exit codes
+//!
+//! See [`EXIT_CODES_HELP`] (rendered in `vamoose worker --help`):
+//! 0 clean completion, 1 run error, 2 wedged shutdown (hard-exit
+//! watchdog), 3 run ended because the worker fenced. The 0-vs-3
+//! mapping is `migration_worker::orchestrator::exit_code_for_outcome`,
+//! pinned by tests there; [`run`] returns the code and `main.rs`
+//! applies it after log shutdown.
 
 use crate::config::Config;
 use anyhow::Context;
 use clap::Args as ClapArgs;
 use migration_worker::config as wcfg;
+use migration_worker::orchestrator::exit_code_for_outcome;
 use std::path::PathBuf;
 
+/// Exit-code contract, shown in `vamoose worker --help`. Codes 0/1/2
+/// predate the fenced code and must not be renumbered.
+const EXIT_CODES_HELP: &str = "Exit codes:
+  0  migration ran to clean completion (or a coord-requested drain/cancel)
+  1  run error (config, S3, or orchestrator failure)
+  2  shutdown wedged past its deadline; the hard-exit watchdog fired
+  3  run ended because the worker fenced (claim lost / clock jump / 412 storm)";
+
 #[derive(ClapArgs)]
+#[command(after_help = EXIT_CODES_HELP, after_long_help = EXIT_CODES_HELP)]
 pub struct Args {
     /// Override worker host_id (default: `<hostname>-<pid>`).
     #[arg(long)]
@@ -23,7 +42,9 @@ pub struct Args {
     pub use_bucketed_pool: bool,
 }
 
-pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
+/// Returns the process exit code for a completed run (0 clean,
+/// 3 fenced — see [`EXIT_CODES_HELP`]); `Err` keeps meaning exit 1.
+pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<i32> {
     let path = config_path.unwrap_or_else(|| PathBuf::from("vamoose.toml"));
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config from {}", path.display()))?;
@@ -48,7 +69,12 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
     });
 
     tracing::info!(host_id = %host_id, "vamoose worker starting");
-    migration_worker::orchestrator::run(worker_cfg, host_id).await
+    let outcome = migration_worker::orchestrator::run(worker_cfg, host_id).await?;
+    let code = exit_code_for_outcome(outcome);
+    if code != 0 {
+        tracing::warn!(?outcome, code, "worker run ended fenced; exiting non-zero");
+    }
+    Ok(code)
 }
 
 /// Dual-format config parse (the seam every worker start funnels

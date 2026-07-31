@@ -64,7 +64,12 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
+/// Returns how the run ended ([`RunOutcome::Clean`] vs
+/// [`RunOutcome::Fenced`]); callers map it to the process exit code
+/// via [`exit_code_for_outcome`] so a fenced-but-clean shutdown is
+/// distinguishable from a completed migration at the supervisor
+/// level.
+pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     // Worker-process start time. Captured before any awaits so the
     // value reflects the actual process boot, not the first config
     // I/O — coord-side register dedup pairs this with (host, pid)
@@ -892,10 +897,10 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     // the unconditional `fence.trip()` below erases the distinction
     // between "fenced mid-run" and "fence tripped as part of a normal
     // shutdown".
-    let watchdog_outcome = if fence.is_valid() {
-        WatchdogRunOutcome::Clean
+    let run_outcome = if fence.is_valid() {
+        RunOutcome::Clean
     } else {
-        WatchdogRunOutcome::Fenced
+        RunOutcome::Fenced
     };
     tracing::debug!(target: "shutdown", "section 7 entered");
     {
@@ -961,10 +966,10 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
     // F17: the exit code and the stderr line are computed HERE, while
     // allocation is still safe, and moved into the thread — the thread
     // itself must stay allocation-free past the sleep.
-    let watchdog_code = watchdog_exit_code(watchdog_outcome);
+    let watchdog_code = watchdog_exit_code(run_outcome);
     let watchdog_msg = format!(
         "watchdog: forcing process exit {watchdog_code} \
-         (shutdown took >5s; run outcome: {watchdog_outcome:?})\n",
+         (shutdown took >5s; run outcome: {run_outcome:?})\n",
     );
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(5));
@@ -982,23 +987,42 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<()> {
             libc::_exit(watchdog_code);
         }
     });
-    tracing::debug!(target: "shutdown", "watchdog spawned, returning Ok(())");
+    tracing::debug!(target: "shutdown", "watchdog spawned, returning run outcome");
 
-    Ok(())
+    Ok(run_outcome)
 }
 
-/// How the main loop ended, as known at watchdog-arm time (section 7
-/// of [`run`]). Error returns (`?`) bypass section 7 entirely and
-/// never arm the watchdog — `main.rs` maps them to `_exit(1)` on the
-/// normal path — so the only outcomes the watchdog can observe are
-/// "clean" (all shards terminal, or coord-requested drain/cancel) and
-/// "fenced".
+/// How the main loop ended, as known at section 7 of [`run`] (the
+/// watchdog-arm point). Error returns (`?`) bypass section 7 entirely
+/// — the process exit paths map them to code 1 — so the only
+/// non-error outcomes are "clean" (all shards terminal, or
+/// coord-requested drain/cancel) and "fenced". Was the internal
+/// `WatchdogRunOutcome`; promoted to the function's return value so
+/// callers (`main.rs`, `vamoose worker`) can map "fenced" to its
+/// dedicated process exit code via [`exit_code_for_outcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WatchdogRunOutcome {
+pub enum RunOutcome {
     /// Main loop exited without a fence trip.
     Clean,
     /// Worker self-fenced mid-run (claim lost / heartbeat fence).
     Fenced,
+}
+
+/// Process exit code for a [`run`] that returned `Ok(outcome)` — the
+/// normal (non-wedged, non-error) exit path.
+///
+/// A fenced run shuts down cleanly but must NOT exit 0: supervisors
+/// need to tell "fenced — alert/restart" apart from "migration
+/// complete". Codes already spoken for and left untouched: 0 = clean
+/// completion, 1 = run error (the `Err` path in `main.rs` /
+/// anyhow-from-`vamoose`), 2 = shutdown wedged ([`watchdog_exit_code`],
+/// also clap usage errors). Fenced therefore gets the dedicated
+/// code 3.
+pub fn exit_code_for_outcome(outcome: RunOutcome) -> i32 {
+    match outcome {
+        RunOutcome::Clean => 0,
+        RunOutcome::Fenced => 3,
+    }
 }
 
 /// Exit code the hard-exit watchdog passes to `libc::_exit` when it
@@ -1012,10 +1036,10 @@ pub(crate) enum WatchdogRunOutcome {
 /// `main.rs` exit path and making "exit 2" a single supervisor signal
 /// for "shutdown wedged"; the run outcome is carried in the watchdog's
 /// stderr line, not the code.
-pub(crate) fn watchdog_exit_code(outcome: WatchdogRunOutcome) -> i32 {
+pub(crate) fn watchdog_exit_code(outcome: RunOutcome) -> i32 {
     match outcome {
-        WatchdogRunOutcome::Clean => 2,
-        WatchdogRunOutcome::Fenced => 2,
+        RunOutcome::Clean => 2,
+        RunOutcome::Fenced => 2,
     }
 }
 
@@ -2754,14 +2778,52 @@ mod flush_sinks_tests {
     /// the shutdown was not clean.
     #[test]
     fn watchdog_exit_code_never_reports_success() {
-        use super::{watchdog_exit_code, WatchdogRunOutcome};
+        use super::{watchdog_exit_code, RunOutcome};
 
         // Wedged after a clean run → 2 (was the F17 bug: _exit(0)).
-        assert_eq!(watchdog_exit_code(WatchdogRunOutcome::Clean), 2);
+        assert_eq!(watchdog_exit_code(RunOutcome::Clean), 2);
         // Wedged after a fenced run → 2. Decision (doc allowed 2 or 1):
         // 2 for every wedge, so "exit 2" is a single unambiguous
         // supervisor signal for "shutdown wedged; watchdog fired"; the
         // run outcome is carried in the watchdog's stderr line instead.
-        assert_eq!(watchdog_exit_code(WatchdogRunOutcome::Fenced), 2);
+        assert_eq!(watchdog_exit_code(RunOutcome::Fenced), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Fenced-run exit code (BETA_POLISH_BATCH Item 2)
+    // ------------------------------------------------------------------
+
+    /// A run that ended because the worker fenced must exit with the
+    /// dedicated code 3 so supervisors can tell "fenced —
+    /// alert/restart" apart from "migration complete" (0) and from
+    /// plain run errors (1).
+    #[test]
+    fn fenced_outcome_maps_to_exit_3() {
+        use super::{exit_code_for_outcome, RunOutcome};
+        assert_eq!(
+            exit_code_for_outcome(RunOutcome::Fenced),
+            3,
+            "fenced clean shutdown must exit with the dedicated code 3",
+        );
+    }
+
+    /// Clean completion stays 0, and no existing code is renumbered:
+    /// 1 (run error) and 2 (wedged shutdown / watchdog) remain out of
+    /// bounds for the normal-outcome mapping.
+    #[test]
+    fn clean_outcome_maps_to_exit_0_and_existing_codes_are_untouched() {
+        use super::{exit_code_for_outcome, watchdog_exit_code, RunOutcome};
+        assert_eq!(exit_code_for_outcome(RunOutcome::Clean), 0);
+        for outcome in [RunOutcome::Clean, RunOutcome::Fenced] {
+            let code = exit_code_for_outcome(outcome);
+            assert_ne!(code, 1, "1 stays reserved for run errors: {outcome:?}");
+            assert_ne!(
+                code, 2,
+                "2 stays reserved for wedged shutdowns: {outcome:?}"
+            );
+        }
+        // The watchdog mapping is untouched by the fenced-exit work.
+        assert_eq!(watchdog_exit_code(RunOutcome::Clean), 2);
+        assert_eq!(watchdog_exit_code(RunOutcome::Fenced), 2);
     }
 }
