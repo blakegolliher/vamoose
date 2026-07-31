@@ -1,6 +1,6 @@
 # Beta polish batch: optional [nfs] for coord (F45a), fenced exit code, EINTR errno name
 
-Status: in progress on branch `beta-polish-batch`.
+Status: landed — merged in PR #42.
 Ledger: F45 row in `docs/REVIEW_LEDGER.md` (do NOT edit the ledger
 or `docs/NEXT.md` from this branch).
 Decisions (owner, 2026-07-31): F45a make `[nfs]` optional now;

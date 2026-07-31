@@ -1,6 +1,6 @@
 # Coord runtime batch: flush outside the lock (F45b), HWM attribution (F20 residue), trailing-edge flush + row eviction (F24 residue)
 
-Status: in progress on branch `coord-runtime-batch`.
+Status: landed — merged in PR #43.
 Ledger: F45, F20, F24 rows in `docs/REVIEW_LEDGER.md` (do NOT edit
 the ledger or `docs/NEXT.md` from this branch).
 Decisions (owner, 2026-07-31): F45b fix-before-beta (single-flusher,
