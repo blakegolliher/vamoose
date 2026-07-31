@@ -149,6 +149,22 @@ impl RuntimeConfig {
 /// commands number in the tens per day, so this bound is generous.
 const MAX_AUDIT_SEQ_PROBES: u64 = 10_000;
 
+/// Snapshot-write-time eviction window for worker rows (ledger F24
+/// residue): a worker whose state is `Disconnected` and whose last
+/// activity (`last_heartbeat` — stamped by the join event and every
+/// heartbeat) is at least this old at snapshot-write time is omitted
+/// from the written snapshot, and dropped from live state once that
+/// write succeeds. `Fenced` rows are never evicted — a fence is
+/// operator-relevant until acted on. Eviction happens ONLY at
+/// snapshot write (never wall-clock pruning of live state on a
+/// tick), so replay stays deterministic: the pruning decision is
+/// embodied in the durable snapshot both sides share, and replay =
+/// pruned snapshot + events(seq > last_seq) converges with the live
+/// coord. 24 hours keeps a full operator day of disconnected rows
+/// visible for debugging while bounding live-state growth by the
+/// snapshot cadence.
+pub const WORKER_EVICT_AFTER_SECS: i64 = 24 * 60 * 60;
+
 /// Wire-cardinality caps (ledger F24, COORD_PLAN §3.3). Decides, at
 /// the ingest boundary, whether an event goes out on the SSE bus.
 /// The caps are **bus-only**: state applies every event and the
@@ -164,22 +180,35 @@ const MAX_AUDIT_SEQ_PROBES: u64 = 10_000;
 /// - Everything else streams unconditionally.
 ///
 /// `progress_last` grows with the set of (job, worker) pairs seen —
-/// the same cardinality as the workers table, which is itself
-/// unbounded today (noted in the F24 ledger row as a follow-up).
+/// the same cardinality as the workers table, which is bounded by
+/// the snapshot-write-time row eviction ([`WORKER_EVICT_AFTER_SECS`]).
+///
+/// Trailing edge (F24 residue, 3a): a suppressed `ProgressDelta` is
+/// retained per (job, worker), latest wins; the flush tick calls
+/// [`StreamCaps::take_due_trailing`] to re-broadcast retained deltas
+/// once the cap interval has passed, so a quieting burst's final
+/// values reach live subscribers. Retention is bus-only bookkeeping
+/// — the envelope was already applied and logged at ingest.
 #[derive(Debug, Default)]
 struct StreamCaps {
     progress_last:
         std::collections::HashMap<(crate::schema::JobId, crate::schema::WorkerId), DateTime<Utc>>,
+    /// Latest SUPPRESSED delta per (job, worker) — the trailing edge
+    /// the tick re-broadcasts. Cleared whenever a fresh delta for
+    /// the key broadcasts (the retained frame is then stale) and on
+    /// delivery.
+    retained_progress:
+        std::collections::HashMap<(crate::schema::JobId, crate::schema::WorkerId), EventEnvelope>,
     error_window_start: Option<DateTime<Utc>>,
     error_counts: std::collections::HashMap<crate::schema::ErrorClass, u32>,
 }
 
 impl StreamCaps {
-    /// True if `kind` may be broadcast at `now`. Mutates the cap
-    /// bookkeeping; call exactly once per ingested event, under the
-    /// runtime lock.
-    fn should_broadcast(&mut self, kind: &EventKind, now: DateTime<Utc>) -> bool {
-        match kind {
+    /// True if `env` may be broadcast at `now`. Mutates the cap
+    /// bookkeeping (including trailing-edge retention); call exactly
+    /// once per ingested event, under the runtime lock.
+    fn should_broadcast(&mut self, env: &EventEnvelope, now: DateTime<Utc>) -> bool {
+        match &env.kind {
             EventKind::ProgressDelta {
                 job_id, worker_id, ..
             } => {
@@ -187,8 +216,17 @@ impl StreamCaps {
                     chrono::Duration::milliseconds(crate::schema::PROGRESS_STREAM_MIN_INTERVAL_MS);
                 let key = (job_id.clone(), *worker_id);
                 match self.progress_last.get(&key) {
-                    Some(last) if now.signed_duration_since(*last) < min_interval => false,
+                    Some(last) if now.signed_duration_since(*last) < min_interval => {
+                        // Suppressed: retain the trailing edge so the
+                        // flush tick can deliver the burst's final
+                        // values (latest wins).
+                        self.retained_progress.insert(key, env.clone());
+                        false
+                    }
                     _ => {
+                        // A fresh broadcast supersedes any retained
+                        // older frame for this key.
+                        self.retained_progress.remove(&key);
                         self.progress_last.insert(key, now);
                         true
                     }
@@ -215,6 +253,36 @@ impl StreamCaps {
             }
             _ => true,
         }
+    }
+
+    /// Remove and return every retained trailing delta whose key has
+    /// gone at least the cap interval without a broadcast. Each
+    /// delivery counts as that key's broadcast (its `progress_last`
+    /// advances to `now`), so the tick never exceeds the 1 Hz cap.
+    fn take_due_trailing(&mut self, now: DateTime<Utc>) -> Vec<EventEnvelope> {
+        let min_interval =
+            chrono::Duration::milliseconds(crate::schema::PROGRESS_STREAM_MIN_INTERVAL_MS);
+        let due: Vec<_> = self
+            .retained_progress
+            .keys()
+            .filter(|key| match self.progress_last.get(*key) {
+                Some(last) => now.signed_duration_since(*last) >= min_interval,
+                // Unreachable (retention implies a prior broadcast),
+                // but deliver rather than leak if it ever happens.
+                None => true,
+            })
+            .cloned()
+            .collect();
+        let mut out = Vec::with_capacity(due.len());
+        for key in due {
+            if let Some(env) = self.retained_progress.remove(&key) {
+                self.progress_last.insert(key, now);
+                out.push(env);
+            }
+        }
+        // Deterministic delivery order for multi-key ticks.
+        out.sort_by_key(|e| e.seq);
+        out
     }
 }
 
@@ -386,7 +454,7 @@ impl CoordRuntime {
                 kind,
             };
             guard.state.apply(&env);
-            let broadcast = guard.stream_caps.should_broadcast(&env.kind, env.at);
+            let broadcast = guard.stream_caps.should_broadcast(&env, env.at);
             // Pure bookkeeping under the lock; the PUT (if the route
             // crossed the chunk threshold) runs below, outside it.
             let out = guard.writer.buffer(env.clone());
@@ -713,6 +781,32 @@ impl CoordRuntime {
         }
     }
 
+    /// Trailing-edge flush for the ProgressDelta wire cap (ledger
+    /// F24 residue, item 3a): re-broadcast the latest SUPPRESSED
+    /// delta per (job, worker) once the cap interval has passed
+    /// since that key's last broadcast, so a quieting burst's final
+    /// values reach live subscribers within ~2×
+    /// [`crate::schema::PROGRESS_STREAM_MIN_INTERVAL_MS`] (cap
+    /// interval + tick cadence) instead of hanging stale until the
+    /// next event. Bus-only: the frame is a re-broadcast of an
+    /// already-ingested, already-logged envelope — same seq, no new
+    /// event, no log write; log and replay are untouched. Driven by
+    /// the flush tick ([`crate::ticks::flush_aged_loop`]). Returns
+    /// the number of frames re-broadcast.
+    pub async fn flush_trailing_progress(&self) -> usize {
+        let now = self.clock.now();
+        let due = {
+            let mut guard = self.inner.lock().await;
+            guard.stream_caps.take_due_trailing(now)
+        };
+        let n = due.len();
+        // Send outside the lock, like every other broadcast.
+        for env in due {
+            let _ = self.bus.send(env);
+        }
+        n
+    }
+
     /// Subscribe to live events. Returns a `broadcast::Receiver`;
     /// the SSE handler typically wraps it in a stream and emits
     /// each envelope as a wire frame.
@@ -828,11 +922,31 @@ impl CoordRuntime {
             // already populated by the reducer.
             guard.state.written_at = now;
             guard.state.schema_version = SCHEMA_VERSION;
-            guard.state.clone()
+            let mut snap = guard.state.clone();
+            // Worker-row eviction (ledger F24 residue): omit rows
+            // that are Disconnected and stale — see
+            // [`WORKER_EVICT_AFTER_SECS`] for why this happens only
+            // here. Replay soundness: any event at seq <=
+            // snap.last_seq referencing an omitted row is below the
+            // replay cut; any later event either no-ops on the
+            // missing row (the reducer's get_mut arms) or is a
+            // WorkerJoined, which resurrects it identically on both
+            // sides.
+            snap.workers.retain(|_, w| !worker_evictable(w, now));
+            snap
         };
         crate::snapshot::write(self.store.as_ref(), &snap, history_keep, now).await?;
 
         let mut guard = self.inner.lock().await;
+        // Drop the same rows from live state only now that the
+        // pruned snapshot is durable — a failed write leaves live
+        // state untouched. The criteria are re-evaluated on the
+        // current rows: a worker that rejoined or changed state
+        // while the write was in flight stays live, and the event
+        // that changed it has seq > snap.last_seq, so replay
+        // re-applies it on top of the pruned snapshot and both
+        // sides converge.
+        guard.state.workers.retain(|_, w| !worker_evictable(w, now));
         for (id, job) in &snap.jobs {
             if job.phase.is_terminal() && !guard.archived_jobs.contains(id) {
                 guard.archive_eligible.insert(id.clone());
@@ -944,6 +1058,15 @@ impl std::fmt::Debug for EventTailReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventTailReader").finish_non_exhaustive()
     }
+}
+
+/// Eviction predicate for [`CoordRuntime::write_snapshot`]: only
+/// Disconnected rows past [`WORKER_EVICT_AFTER_SECS`] since their
+/// last activity qualify. Fenced (and every other) state never does.
+fn worker_evictable(w: &crate::schema::Worker, now: DateTime<Utc>) -> bool {
+    w.state == crate::schema::WorkerState::Disconnected
+        && now.signed_duration_since(w.last_heartbeat)
+            >= chrono::Duration::seconds(WORKER_EVICT_AFTER_SECS)
 }
 
 async fn acquire_with_backoff(
@@ -1073,6 +1196,24 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 5, 29, 14, 32, 0).unwrap() + Duration::seconds(secs)
     }
 
+    fn worker_joined(w: WorkerId, job: &str) -> EventKind {
+        EventKind::WorkerJoined {
+            worker_id: w,
+            job_id: jid(job),
+            host: "h".into(),
+            pid: 42,
+            start_time: at(0),
+            version: "0.6".into(),
+        }
+    }
+
+    fn worker_left(w: WorkerId) -> EventKind {
+        EventKind::WorkerLeft {
+            worker_id: w,
+            reason: "drain".into(),
+        }
+    }
+
     async fn fresh_runtime() -> (CoordRuntime, Arc<FixedClock>, Arc<MemStore>) {
         // Keep an `Arc<MemStore>` for direct test access (peeks at
         // raw keys, asserts list/get outcomes) and hand the runtime
@@ -1154,9 +1295,14 @@ mod tests {
     #[tokio::test]
     async fn restart_replays_prior_state() {
         // Run 1: ingest events, gracefully shut down (which writes
-        // a snapshot and flushes the log).
+        // a snapshot and flushes the log). Includes a worker that
+        // disconnected long ago (evicted at snapshot write, F24
+        // residue 3b) and one that disconnected recently (kept).
         let store: Arc<dyn CoordStore> = Arc::new(MemStore::new());
         let clock = FixedClock::new(at(0));
+        let w_stale = WorkerId::new();
+        let w_fresh = WorkerId::new();
+        let live_workers;
         {
             let rt = CoordRuntime::start(store.clone(), clock.clone(), me("A"), cfg_for_tests())
                 .await
@@ -1171,7 +1317,13 @@ mod tests {
             })
             .await
             .unwrap();
+            rt.ingest(worker_joined(w_stale, "bobby")).await.unwrap();
+            rt.ingest(worker_left(w_stale)).await.unwrap();
+            clock.advance(Duration::seconds(WORKER_EVICT_AFTER_SECS + 60));
+            rt.ingest(worker_joined(w_fresh, "bobby")).await.unwrap();
+            rt.ingest(worker_left(w_fresh)).await.unwrap();
             rt.shutdown(3).await.unwrap();
+            live_workers = rt.state().await.workers;
         }
 
         // Run 2: restart against the same bucket. State should
@@ -1183,10 +1335,27 @@ mod tests {
         let snap = rt2.state().await;
         assert_eq!(snap.jobs[&jid("bobby")].progress.files_done, 100);
         assert_eq!(snap.jobs[&jid("bobby")].phase, Phase::Planned);
-        assert_eq!(rt2.last_seq().await, 2);
-        // Next ingest gets seq 3.
-        let s3 = rt2.ingest(job_created("mary")).await.unwrap();
-        assert_eq!(s3, 3);
+        // 3b replay equality: the stale Disconnected row was pruned
+        // at snapshot write, the fresh one survives, and the replayed
+        // worker table converges with the live coord's post-prune
+        // state.
+        assert!(
+            !snap.workers.contains_key(&w_stale),
+            "stale Disconnected row must not survive the restart",
+        );
+        assert!(
+            snap.workers.contains_key(&w_fresh),
+            "recently Disconnected row must survive the restart",
+        );
+        assert_eq!(
+            snap.workers, live_workers,
+            "replayed worker table must converge with live post-prune state",
+        );
+        assert_eq!(rt2.last_seq().await, 6);
+        // Next ingest gets seq 7 — eviction never disturbs the seq
+        // stream.
+        let s7 = rt2.ingest(job_created("mary")).await.unwrap();
+        assert_eq!(s7, 7);
     }
 
     #[tokio::test]
@@ -1238,6 +1407,102 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snap.written_at, at(123));
+    }
+
+    // =========================================================
+    // F24 residue 3b — worker-row eviction at snapshot-write time
+    // only (COORD_RUNTIME_BATCH item 3b). Never wall-clock pruning
+    // of live state; the pruning decision is embodied in the
+    // durable snapshot, so replay = snapshot + events converges
+    // with the live coord.
+    // =========================================================
+
+    /// The snapshot writer omits rows that are Disconnected AND
+    /// stale (>= WORKER_EVICT_AFTER_SECS since last activity);
+    /// fresh Disconnected rows and Fenced rows (operator-relevant)
+    /// stay. On a successful write the live table drops the same
+    /// rows, bounding live memory by snapshot cadence.
+    #[tokio::test]
+    async fn snapshot_omits_stale_disconnected_workers() {
+        let (rt, clock, store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        let w_stale = WorkerId::new();
+        let w_fenced = WorkerId::new();
+        let w_fresh = WorkerId::new();
+        rt.ingest(worker_joined(w_stale, "bobby")).await.unwrap();
+        rt.ingest(worker_left(w_stale)).await.unwrap();
+        rt.ingest(worker_joined(w_fenced, "bobby")).await.unwrap();
+        rt.ingest(EventKind::WorkerFenced {
+            worker_id: w_fenced,
+            reason: "stuck".into(),
+        })
+        .await
+        .unwrap();
+        // Jump past the eviction window, then a recent disconnect.
+        clock.advance(Duration::seconds(WORKER_EVICT_AFTER_SECS + 1));
+        rt.ingest(worker_joined(w_fresh, "bobby")).await.unwrap();
+        rt.ingest(worker_left(w_fresh)).await.unwrap();
+
+        rt.write_snapshot(3).await.unwrap();
+
+        let snap = crate::snapshot::load(store.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !snap.workers.contains_key(&w_stale),
+            "stale Disconnected row must be omitted from the snapshot",
+        );
+        assert!(
+            snap.workers.contains_key(&w_fenced),
+            "Fenced rows are operator-relevant and must never be evicted",
+        );
+        assert!(
+            snap.workers.contains_key(&w_fresh),
+            "a fresh Disconnected row must be kept",
+        );
+        // Live state dropped the same row once the write succeeded.
+        let live = rt.state().await;
+        assert!(!live.workers.contains_key(&w_stale));
+        assert!(live.workers.contains_key(&w_fenced));
+        assert!(live.workers.contains_key(&w_fresh));
+    }
+
+    /// A WorkerJoined for an evicted id resurrects the row cleanly,
+    /// live and on replay.
+    #[tokio::test]
+    async fn worker_rejoin_after_eviction_resurrects() {
+        let (rt, clock, store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        let w = WorkerId::new();
+        rt.ingest(worker_joined(w, "bobby")).await.unwrap();
+        rt.ingest(worker_left(w)).await.unwrap();
+        clock.advance(Duration::seconds(WORKER_EVICT_AFTER_SECS + 1));
+        rt.write_snapshot(3).await.unwrap();
+        assert!(
+            !rt.state().await.workers.contains_key(&w),
+            "test setup: the row must be evicted at snapshot write",
+        );
+
+        // The same id reappears in the log after the eviction.
+        rt.ingest(worker_joined(w, "bobby")).await.unwrap();
+        let live = rt.state().await;
+        assert_eq!(
+            live.workers[&w].state,
+            crate::schema::WorkerState::Idle,
+            "a rejoin must resurrect the evicted row cleanly",
+        );
+
+        // Replay from the pruned snapshot + post-snapshot events
+        // converges with live.
+        rt.flush_log().await.unwrap();
+        let replayed = crate::state::replay(store.as_ref(), clock.now())
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed.state.workers, live.workers,
+            "replay must converge with live after eviction + rejoin",
+        );
     }
 
     // =========================================================
@@ -1448,6 +1713,73 @@ mod tests {
             logged_deltas, 7,
             "the cap is bus-only; the log must carry every delta",
         );
+
+        // ---- F24 residue 3a: trailing-edge flush ----
+        // A fresh burst in a new second: the first delta broadcasts,
+        // the burst's FINAL delta is suppressed. Leading-edge-only
+        // coalescing left that final value invisible to live
+        // subscribers until the next event arrived.
+        clock.advance(Duration::seconds(1));
+        rt.ingest(progress_delta("bobby", w, 100)).await.unwrap();
+        assert_eq!(drain_progress_frames(&mut sub), 1);
+        rt.ingest(progress_delta("bobby", w, 42)).await.unwrap();
+        assert_eq!(
+            drain_progress_frames(&mut sub),
+            0,
+            "the burst's final delta is suppressed by the cap",
+        );
+        let last_seq = rt.last_seq().await;
+        let writes_before = _store.write_count();
+
+        // One cap interval later the tick delivers the suppressed
+        // final VALUES — as a re-broadcast of the already-ingested
+        // envelope: same seq, no new event, no log write.
+        clock.advance(Duration::seconds(1));
+        assert_eq!(
+            rt.flush_trailing_progress().await,
+            1,
+            "the retained trailing delta must re-broadcast on the tick",
+        );
+        let env = sub
+            .try_recv()
+            .expect("the trailing frame must reach the subscriber");
+        match &env.kind {
+            EventKind::ProgressDelta { files_delta, .. } => assert_eq!(
+                *files_delta, 42,
+                "the trailing frame must carry the burst's final values",
+            ),
+            other => panic!("expected the trailing ProgressDelta, got {other:?}"),
+        }
+        assert_eq!(
+            env.seq, last_seq,
+            "a re-broadcast of the already-ingested envelope, not a new event",
+        );
+        assert_eq!(rt.last_seq().await, last_seq, "no new event may be minted");
+        assert_eq!(
+            _store.write_count(),
+            writes_before,
+            "the trailing flush is bus-only — no log write",
+        );
+
+        // Cleared after delivery: nothing re-broadcasts twice.
+        clock.advance(Duration::seconds(1));
+        assert_eq!(
+            rt.flush_trailing_progress().await,
+            0,
+            "a delivered trailing frame must not repeat",
+        );
+        // And when the final delta WAS broadcast (nothing suppressed
+        // behind it), the tick stays silent — no duplicate of a frame
+        // that was already the last broadcast one.
+        rt.ingest(progress_delta("bobby", w, 7)).await.unwrap();
+        assert_eq!(drain_progress_frames(&mut sub), 1);
+        clock.advance(Duration::seconds(2));
+        assert_eq!(
+            rt.flush_trailing_progress().await,
+            0,
+            "no trailing re-broadcast when the last frame was already broadcast",
+        );
+        assert_eq!(drain_progress_frames(&mut sub), 0);
     }
 
     /// COORD_PLAN §3.3: `WorkerHeartbeat` never streams. There is no

@@ -18,11 +18,12 @@
 //!   Either firing writes a snapshot (and history copy, pruned to
 //!   `history_keep`). Both counters reset.
 //!
-//! - **Flush-aged** ([`flush_aged_loop`]) — calls
-//!   [`CoordRuntime::flush_aged`] on `cfg.flush_check_interval`
-//!   (default 60s). This is what keeps a long-tail per-job chunk
-//!   from sitting in memory past the documented
-//!   `max_chunk_age`.
+//! - **Flush** ([`flush_aged_loop`]) — on `cfg.flush_check_interval`
+//!   (default 1s) calls [`CoordRuntime::flush_trailing_progress`]
+//!   (trailing-edge re-broadcast for the ProgressDelta wire cap,
+//!   ledger F24 residue) and [`CoordRuntime::flush_aged`], which
+//!   keeps a long-tail per-job chunk from sitting in memory past
+//!   the documented `max_chunk_age`.
 //!
 //! All three are joined under one [`CancellationToken`] so a
 //! shutdown request from the caller (or a `LeaseLost` from the
@@ -60,7 +61,14 @@ impl TickerConfig {
             snapshot_interval: Duration::from_secs(5 * 60),
             snapshot_events: 1000,
             history_keep: 24,
-            flush_check_interval: Duration::from_secs(60),
+            // 1s (was 60s): the flush tick now also delivers the
+            // trailing-edge ProgressDelta re-broadcast (F24 residue),
+            // whose ~2× PROGRESS_STREAM_MIN_INTERVAL_MS delivery
+            // bound needs a tick at or below the 1 Hz cap interval.
+            // The aged-chunk check it also drives is a cheap in-
+            // memory scan against a 5-minute threshold — ticking it
+            // 60× more often costs microseconds.
+            flush_check_interval: Duration::from_secs(1),
             lease: LeaseConfig::default_for_prod(),
         }
     }
@@ -202,6 +210,16 @@ pub async fn snapshot_loop(
 /// Flush-aged loop. Flushes any open chunk older than
 /// `EventLogConfig::max_chunk_age` so a low-traffic job's events
 /// don't sit in memory indefinitely.
+///
+/// Also the trailing-edge tick for the ProgressDelta wire cap
+/// (ledger F24 residue): each tick re-broadcasts any retained
+/// suppressed delta whose cap interval has elapsed
+/// ([`CoordRuntime::flush_trailing_progress`] — bus-only, no store
+/// I/O), so a quieting burst's final values reach live subscribers
+/// within roughly `flush_check_interval` +
+/// `PROGRESS_STREAM_MIN_INTERVAL_MS` of the burst's end. Keep
+/// `flush_check_interval` at or below the cap interval to hold the
+/// documented ~2× bound.
 pub async fn flush_aged_loop(
     rt: CoordRuntime,
     cfg: TickerConfig,
@@ -215,6 +233,7 @@ pub async fn flush_aged_loop(
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             _ = tick.tick() => {
+                let _ = rt.flush_trailing_progress().await;
                 if let Err(e) = rt.flush_aged().await {
                     tracing::warn!(error = %e, "flush_aged failed; retry next tick");
                 }
@@ -444,6 +463,72 @@ mod tests {
             .await
             .expect("run_all should return after shutdown");
         res.unwrap().unwrap();
+    }
+
+    /// F24 residue 3a: the flush tick re-broadcasts a suppressed
+    /// trailing ProgressDelta so live subscribers see a quieting
+    /// burst's final values without a new event. The frame is a
+    /// re-broadcast of the already-ingested envelope — same seq, no
+    /// new event minted.
+    #[tokio::test]
+    async fn flush_loop_broadcasts_trailing_progress() {
+        let (rt, clock, _store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        let w = WorkerId::new();
+        let delta = |files: u64| EventKind::ProgressDelta {
+            job_id: jid("bobby"),
+            worker_id: w,
+            files_delta: files,
+            bytes_delta: 0,
+            errors_delta: 0,
+        };
+        let mut sub = rt.subscribe();
+
+        // Burst: the first delta broadcasts, the final one is
+        // suppressed by the 1 Hz cap.
+        rt.ingest(delta(1)).await.unwrap();
+        rt.ingest(delta(42)).await.unwrap();
+        let first = sub.try_recv().expect("leading delta must broadcast");
+        assert!(matches!(
+            first.kind,
+            EventKind::ProgressDelta { files_delta: 1, .. },
+        ));
+        assert!(
+            matches!(
+                sub.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty),
+            ),
+            "the trailing delta must be suppressed at ingest",
+        );
+        let last_seq = rt.last_seq().await;
+
+        // Past the cap interval, the running flush loop must deliver
+        // the retained trailing values.
+        clock.advance(chrono::Duration::seconds(2));
+        let shutdown = CancellationToken::new();
+        let cfg = ticker_cfg_short();
+        let task = tokio::spawn(flush_aged_loop(rt.clone(), cfg, shutdown.clone()));
+
+        let env = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("the flush tick must re-broadcast the trailing delta")
+            .unwrap();
+        assert!(
+            matches!(
+                env.kind,
+                EventKind::ProgressDelta {
+                    files_delta: 42,
+                    ..
+                }
+            ),
+            "the trailing frame must carry the burst's final values, got {:?}",
+            env.kind,
+        );
+        assert_eq!(env.seq, last_seq, "re-broadcast, not a new event");
+        assert_eq!(rt.last_seq().await, last_seq, "no new event minted");
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
