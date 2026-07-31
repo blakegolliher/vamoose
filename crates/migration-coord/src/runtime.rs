@@ -72,7 +72,7 @@
 use crate::errors::{Error, Result};
 use crate::events::{EventLogConfig, EventLogWriter, FlushScope, PendingFlush};
 use crate::lease::{self, AcquireOutcome, Identity, LeaseConfig, LeaseHandle};
-use crate::schema::{EventEnvelope, EventKind, Snapshot, SCHEMA_VERSION};
+use crate::schema::{EventEnvelope, EventKind, Snapshot, WorkerId, SCHEMA_VERSION};
 use crate::state;
 use crate::store::CoordStore;
 use chrono::{DateTime, Utc};
@@ -323,7 +323,7 @@ impl CoordRuntime {
     /// subscribers (subject to the bus-only rate caps — see
     /// [`StreamCaps`]). Returns the assigned seq.
     pub async fn ingest(&self, kind: EventKind) -> Result<u64> {
-        self.ingest_inner(kind, None, None).await
+        self.ingest_inner(kind, None, None, None).await
     }
 
     /// Ingest an event whose payload was constructed by a worker
@@ -335,7 +335,7 @@ impl CoordRuntime {
         kind: EventKind,
         worker_at: DateTime<Utc>,
     ) -> Result<u64> {
-        self.ingest_inner(kind, Some(worker_at), None).await
+        self.ingest_inner(kind, Some(worker_at), None, None).await
     }
 
     /// Ingest an event submitted on the worker events route: optional
@@ -344,13 +344,22 @@ impl CoordRuntime {
     /// carried on the envelope into the durable log, so the reducer —
     /// live and on replay — maintains the per-worker high-water mark
     /// the events handler dedups against.
+    ///
+    /// `caller` is the registered worker id from the URL — already
+    /// validated by the route's trust boundary — stamped onto the
+    /// envelope as `from_worker` (F20 residue) so stamped kinds
+    /// without payload attribution can still advance the mark.
+    /// Admin/internal ingest paths ([`Self::ingest`],
+    /// [`Self::ingest_with_worker_at`]) leave it `None`.
     pub async fn ingest_worker_event(
         &self,
         kind: EventKind,
         worker_at: Option<DateTime<Utc>>,
         client_seq: Option<u64>,
+        caller: WorkerId,
     ) -> Result<u64> {
-        self.ingest_inner(kind, worker_at, client_seq).await
+        self.ingest_inner(kind, worker_at, client_seq, Some(caller))
+            .await
     }
 
     async fn ingest_inner(
@@ -358,6 +367,7 @@ impl CoordRuntime {
         kind: EventKind,
         worker_at: Option<DateTime<Utc>>,
         client_seq: Option<u64>,
+        from_worker: Option<WorkerId>,
     ) -> Result<u64> {
         let (env, broadcast, threshold_route) = {
             let mut guard = self.inner.lock().await;
@@ -372,6 +382,7 @@ impl CoordRuntime {
                 schema_version: SCHEMA_VERSION,
                 worker_at,
                 client_seq,
+                from_worker,
                 kind,
             };
             guard.state.apply(&env);

@@ -439,9 +439,13 @@ pub async fn events_batch(
             deduped += 1;
             continue;
         }
+        // The envelope carries the caller id (from_worker, F20
+        // residue) so stamped kinds without payload attribution —
+        // ClaimConflict*/VerifyFileMismatch — still advance the
+        // caller's high-water mark, live and on replay.
         let seq = state
             .runtime
-            .ingest_worker_event(entry.kind, entry.worker_at, entry.client_seq)
+            .ingest_worker_event(entry.kind, entry.worker_at, entry.client_seq, worker_id)
             .await
             .map_err(ApiError::storage)?;
         seqs.push(seq);

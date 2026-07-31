@@ -85,7 +85,15 @@ impl Snapshot {
         // envelopes with worker attribution can advance it; the
         // `max` keeps replay idempotent and tolerates historical
         // out-of-order logs without regressing the mark.
-        if let (Some(cs), Some(worker)) = (env.client_seq, env.kind.attributed_worker()) {
+        //
+        // Attribution prefers the envelope's `from_worker` caller
+        // stamp (F20 residue — set by the worker events route, so
+        // stamped kinds whose payload carries only conflict roles
+        // still advance the mark) and falls back to the kind's
+        // payload attribution for envelopes from older coords, whose
+        // HWM behavior stays byte-identical.
+        let attributed = env.from_worker.or_else(|| env.kind.attributed_worker());
+        if let (Some(cs), Some(worker)) = (env.client_seq, attributed) {
             let hwm = self.last_client_seq.entry(worker).or_insert(0);
             *hwm = (*hwm).max(cs);
         }
@@ -583,6 +591,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
+            from_worker: None,
             kind,
         }
     }
@@ -913,6 +922,47 @@ mod tests {
 
         // assigned_workers was populated by WorkerJoined.
         assert_eq!(s.jobs[&jid("bobby")].assigned_workers, vec![w]);
+
+        // Legacy envelopes (this fixture carries no caller
+        // attribution — the pre-F20-residue wire shape) keep their
+        // HWM behavior byte-identical: a stamped envelope of an
+        // attributed kind advances the mark via attributed_worker()…
+        let mut legacy = env(
+            6,
+            14,
+            EventKind::WorkerStateChanged {
+                worker_id: w,
+                from: WorkerState::Idle,
+                to: WorkerState::Copying,
+            },
+        );
+        legacy.client_seq = Some(7);
+        s.apply(&legacy);
+        assert_eq!(
+            s.last_client_seq.get(&w).copied(),
+            Some(7),
+            "legacy stamped attributed envelope must advance the HWM",
+        );
+        // …and a stamped envelope of a non-attributed kind does NOT —
+        // its winner field is a conflict role, and without a caller
+        // stamp the reducer must not guess.
+        let mut legacy_tail = env(
+            7,
+            15,
+            EventKind::ClaimConflictResolved {
+                job_id: jid("bobby"),
+                shard_id: crate::schema::ShardId("s1".into()),
+                winner: w,
+            },
+        );
+        legacy_tail.client_seq = Some(9);
+        s.apply(&legacy_tail);
+        assert_eq!(
+            s.last_client_seq.get(&w).copied(),
+            Some(7),
+            "a legacy stamped envelope without attribution must not \
+             advance the mark — byte-identical legacy behavior",
+        );
     }
 
     #[test]

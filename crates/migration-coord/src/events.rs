@@ -490,6 +490,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
+            from_worker: None,
             kind: EventKind::VerifyStarted { job_id: jid(job) },
         }
     }
@@ -501,6 +502,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
+            from_worker: None,
             kind: EventKind::WorkerLeft {
                 worker_id: WorkerId::new(),
                 reason: "drain".into(),

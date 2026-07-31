@@ -450,6 +450,7 @@ impl ProgressAccum {
             schema_version: migration_coord::schema::SCHEMA_VERSION,
             worker_at: Some(at),
             client_seq: None,
+            from_worker: None,
             kind: migration_coord::schema::EventKind::ProgressDelta {
                 job_id,
                 worker_id,
