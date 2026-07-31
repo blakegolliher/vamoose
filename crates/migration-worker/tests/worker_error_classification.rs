@@ -265,6 +265,38 @@ fn timeout_shaped_untyped_error_is_worker_local() {
     }
 }
 
+/// BETA_POLISH_BATCH Item 3: the F12 carve-out keys on the libnfs
+/// DETAIL string ("Command timed out"), which flows from libnfs
+/// itself (`lib/nfs_v3.c:check_nfs3_error`, carried through the
+/// callback's data slot) — not from `errno_name`. Adding the EINTR
+/// arm to `errno_name` therefore changes only the errno prefix of
+/// the rendered message, never the timeout detection. Pin BOTH
+/// renderings — the numeric-fallback prefix (`errno=4`, what the
+/// failures JSONL recorded before the EINTR arm) and the named
+/// prefix (`EINTR`) — so the two representations stay covered
+/// whichever way the message was produced.
+#[test]
+fn eintr_named_timeout_error_is_worker_local() {
+    use migration_worker::orchestrator::classify_shard_error;
+
+    let cases: Vec<anyhow::Error> = vec![
+        // Pre-EINTR-arm rendering of NfsError::Errno { errno: 4,
+        // detail: "Command timed out" }.
+        anyhow::anyhow!("pipelined read failed: libnfs errno=4: Command timed out"),
+        // Post-EINTR-arm rendering of the same error.
+        anyhow::anyhow!("pipelined read failed: libnfs EINTR: Command timed out"),
+    ];
+    for c in cases {
+        let msg = format!("{c:#}");
+        let err = Error::Other(c);
+        assert_eq!(
+            classify_shard_error(&err),
+            ShardErrorClass::WorkerLocal,
+            "EINTR-shaped timeout must stay retryable (WorkerLocal): {msg}",
+        );
+    }
+}
+
 /// A kernel/std-shaped timeout (`io::ErrorKind::TimedOut`) already
 /// classifies WorkerLocal via the `Error::Io` arm — pin it so the
 /// F12 guarantee holds for both shapes.
