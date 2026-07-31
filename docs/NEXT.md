@@ -2,23 +2,24 @@
 
 Living tally. Update this whenever an item lands or a decision is
 made; `docs/REVIEW_LEDGER.md` rows stay the per-finding source of
-truth. State as of 2026-07-30 (post PR #40): **43 of 45 ledger
-findings landed; 2 open** (F15, F45). What remains is those two
-design items, hardware verification (§2), and small follow-ups (§3).
+truth. State as of 2026-07-31 (post PR #43): **44 of 45 ledger
+findings landed; 1 open** (F15 — decided, awaiting the multi-pass
+mover). **No decisions remain open.** What's left: the F15
+implementation when multi-pass starts, hardware verification (§2),
+and small follow-ups (§3). Beta posture and known limitations are
+documented in `docs/BETA_NOTES.md`.
 
-## 1. Design decisions needed (blocks the remaining ledger findings)
+## 1. Remaining ledger finding
 
-| Finding | Decision to make |
+| Finding | State |
 |---|---|
-| F15 | Hardlink groups straddling batch boundaries: fold into the multi-pass design (MULTI_PASS_MOVER phases 3–8) or pre-shard by group. |
-| F45 | Coord's unused `[nfs]` config requirement (pinned in PR #22 — not a one-liner) + runtime mutex held across S3 PUT during chunk flush (perf at 10k events/s). |
+| F15 | DECIDED 2026-07-31: documented as a beta limitation (BETA_NOTES.md — link fidelity is shard-scoped; pre-shard by group for full fidelity); implementation folds into the multi-pass design (MULTI_PASS_MOVER phases 3–8) when that work starts. |
 
-The 2026-07-30 design-decision batch is DONE: both design docs
-(`docs/design/PROTECTED_FFI_DATA_PLANE.md`,
-`docs/design/COORD_TRUST_AND_FENCING.md`, merged in PR #36 with the
-owner's calls recorded) are fully executed — F12/F11/F09 in PR #39,
-F19 in PR #37, F20 in PRs #38+#40. F15 still rides the multi-pass
-design; F45 still needs its own call.
+All other decisions are closed: the 2026-07-30 batch (design docs
+PR #36; F19 PR #37; F20 PRs #38+#40; FFI F12/F11/F09 PR #39) and
+the 2026-07-31 round (F45 both halves PRs #42+#43; F20/F24 residue
+PR #43; EINTR + fenced-exit-3 PR #42; F24 log-side coalescing
+won't-do; trusted-network beta security posture in BETA_NOTES.md).
 
 ## 2. Hardware verification (needs the VAST rig; flips rows to `verified`)
 
@@ -56,28 +57,22 @@ design; F45 still needs its own call.
       migration-core; flagged independently by two sessions.
 - [ ] deny.toml: `Unicode-DFS-2016` license allowance no longer
       matches anything in the tree (pre-existing warning).
-- [ ] F20 residue (PR #40 note): non-attributed kinds
-      (`ClaimConflict*`, `VerifyFileMismatch`) can't advance the
-      client_seq HWM (no caller attribution on the envelope), so a
-      stamped tail entry of those kinds re-applies on resend unless
-      a later attributed entry covers it. Unreachable with today's
-      worker; closing it = caller attribution on the envelope
-      (small additive design call).
-- [ ] `errno_name` has no EINTR entry (PR #39 note): row-level
-      timeout failures log as `errno=4` in the failures JSONL;
-      adding it changes published failure strings — owner call.
 - [ ] DESIGN.md's "Configuration" example TOML doesn't list
       `rpc_timeout_ms` (PR #39 note); `examples/worker.toml` does.
-- [ ] F24 residue (noted in its ledger row): log-side coalescing
-      decision, worker-row eviction, trailing-edge flush (a burst's
-      last ProgressDelta is dropped from the live bus until the next
-      event; log/replay unaffected).
+- [ ] Shutdown-timing tension (PR #42 observation): the
+      orchestrator arms a 5s hard-exit watchdog when `run()`
+      returns, but the CLI's logging shutdown allows up to 10s — a
+      slow log upload on ANY exit (clean included) can be cut short
+      as exit 2. Pre-existing; align the budgets.
+- [ ] `doctor`'s early `std::process::exit(2)` paths bypass the
+      logging-stack shutdown (PR #42 observation).
+- [ ] `Snapshot.last_client_seq` and `Job.assigned_workers` retain
+      evicted worker ids by design (PR #43 note — HWM guards
+      resurrected-worker dedup); if residual growth ever matters,
+      age those entries out alongside eviction.
 - [ ] Coord: `/jobs` (or healthz-scoped snapshot) carrying an
       `as_of_seq` would make TUI bootstrap atomic and retire the
       torn-walk retry loop (see LESSONS.md).
-- [ ] Worker exit codes: a *fenced* run that shuts down cleanly still
-      exits 0 (PR #22 item A scoped the watchdog only) — decide
-      whether supervisors should see fenced ≠ clean.
 - [ ] `JobId` serde(transparent) deserialization bypasses `new()`
       validation (noted in PR #22 item D).
 - [ ] SCHEMA_CONTRACT.md wording vs code (noted in PR #24): Unknown=0
@@ -111,4 +106,9 @@ worker-event trust in two phases — allow-list + binding (PR #38),
 client_seq idempotency (PR #40); protected-FFI batch F12+F11+F09
 (PR #39, two new externs total; the F11 .so audit confirmed the
 close-while-inflight UAF is real in the linked libnfs).
+Decisions round (2026-07-31): all eight remaining calls made and
+put away — F45 both halves (PRs #42+#43), F20 HWM attribution +
+F24 trailing-edge/eviction (PR #43), EINTR + fenced-exit-3
+(PR #42), F15 beta limitation + F24 log-coalescing won't-do +
+trusted-network posture recorded in BETA_NOTES.md and the ledger.
 Process and pitfalls: `docs/LESSONS.md`.
