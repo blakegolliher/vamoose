@@ -101,6 +101,17 @@ fn parse_worker_config(text: &str) -> anyhow::Result<(wcfg::Config, Option<Strin
 /// policy, backpressure thresholds, etc. can extend the unified
 /// config or fall back to invoking `mig-worker` with a verbose TOML.
 fn build_worker_config(cfg: &Config) -> anyhow::Result<wcfg::Config> {
+    // F45a: `[nfs]` is optional at the schema level so control-plane
+    // subcommands (coord, status, …) can run without it. The worker
+    // is a data-plane consumer — no [nfs] means no copy endpoints, so
+    // fail fast with an actionable error instead of unwrapping.
+    let nfs = cfg.nfs.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "config has no [nfs] section, but `vamoose worker` requires one \
+             (src_url/dst_url/mounts/roots define the copy endpoints); \
+             add an [nfs] section to the config"
+        )
+    })?;
     let worker = cfg.worker.clone().unwrap_or_else(default_worker);
     let copy = cfg.copy.clone().unwrap_or_default();
 
@@ -125,8 +136,8 @@ fn build_worker_config(cfg: &Config) -> anyhow::Result<wcfg::Config> {
         },
         mover: wcfg::MoverCfg {
             strategy_default: "libnfs_io_uring".to_string(),
-            src_url: cfg.nfs.src_url.clone(),
-            dst_url: cfg.nfs.dst_url.clone(),
+            src_url: nfs.src_url.clone(),
+            dst_url: nfs.dst_url.clone(),
             nfs_connections: worker.concurrency.max(1) as u32,
             // F12: unified config exposes no rpc-timeout knob yet;
             // use the explicit library-matching default (60_000 ms).
@@ -275,10 +286,14 @@ mod tests {
         );
     }
 
-    /// Worker without `[nfs]` has no source/destination — must error,
-    /// and the error must point at `nfs`.
+    /// F45a (adjusted from the old `missing_nfs_section_errors_for_worker`,
+    /// which only required "nfs" somewhere in a raw parse error):
+    /// worker without `[nfs]` has no source/destination — it must
+    /// fail fast with a clear, actionable error that names the
+    /// missing `[nfs]` section AND the `worker` subcommand, not an
+    /// unwrap and not a serde parse dump.
     #[test]
-    fn missing_nfs_section_errors_for_worker() {
+    fn worker_config_without_nfs_errors_clearly() {
         let no_nfs = r#"
             [global]
             bucket = "vamoose-test"
@@ -289,8 +304,16 @@ mod tests {
         let err = parse_worker_config(no_nfs).expect_err("missing [nfs] must fail for the worker");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("nfs"),
-            "error must name the nfs section, got: {msg}"
+            msg.contains("[nfs]"),
+            "error must name the missing [nfs] section, got: {msg}"
+        );
+        assert!(
+            msg.contains("worker"),
+            "error must name the subcommand that requires the section, got: {msg}"
+        );
+        assert!(
+            msg.contains("add an [nfs] section"),
+            "error must tell the operator what to do, got: {msg}"
         );
     }
 }

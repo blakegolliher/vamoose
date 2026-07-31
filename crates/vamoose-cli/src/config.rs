@@ -18,7 +18,13 @@ use std::path::PathBuf;
 pub struct Config {
     pub global: Global,
     pub s3: S3,
-    pub nfs: Nfs,
+    /// NFS endpoints. Optional (F45a): control-plane subcommands
+    /// (`coord`, `status`, `init`, `tui`, …) never touch NFS and run
+    /// without this section. Subcommands that do need it enforce
+    /// presence themselves — `worker` fails fast with an error naming
+    /// the section, `doctor` reports its NFS checks as SKIPPED.
+    #[serde(default)]
+    pub nfs: Option<Nfs>,
     #[serde(default)]
     pub worker: Option<Worker>,
     #[serde(default)]
@@ -290,16 +296,16 @@ mod tests {
         assert!(cfg.logging.is_none(), "[logging] is optional");
     }
 
-    /// F45 pin: `[nfs]` is REQUIRED by the unified schema for every
-    /// consumer, including `vamoose coord`, which never touches NFS.
-    ///
-    /// Decision: pinned rather than fixed — making `nfs` optional is
-    /// not a one-liner (it ripples through `cmd::worker`'s adapter and
-    /// seven `cfg.nfs.*` reads in `cmd::doctor`), so F45 stays open.
-    /// If this test starts failing because `nfs` became `Option`,
-    /// delete it and close F45 with worker/doctor tests instead.
+    /// F45a (replaces the PR #22 pin
+    /// `missing_nfs_section_is_currently_an_error_even_for_coord`):
+    /// `[nfs]` is OPTIONAL at the schema level. `vamoose coord` — and
+    /// every other control-plane subcommand — parses and passes
+    /// validation with no `[nfs]` section. Subcommands that actually
+    /// need NFS enforce presence themselves: `cmd::worker` fails fast
+    /// with a clear error, `cmd::doctor` reports its NFS checks as
+    /// SKIPPED.
     #[test]
-    fn missing_nfs_section_is_currently_an_error_even_for_coord() {
+    fn coord_config_without_nfs_section_is_valid() {
         let no_nfs = r#"
             [global]
             bucket = "vamoose-test"
@@ -307,11 +313,23 @@ mod tests {
             [s3]
             endpoint = "http://127.0.0.1:9000"
         "#;
-        let err = toml::from_str::<Config>(no_nfs).expect_err("pin: [nfs] is required today");
-        assert!(
-            err.to_string().contains("nfs"),
-            "parse error must name the missing section, got: {err}",
-        );
+        let cfg: Config =
+            toml::from_str(no_nfs).expect("config without [nfs] must parse (coord needs no NFS)");
+        assert!(cfg.nfs.is_none(), "absent [nfs] must surface as None");
+        assert_eq!(cfg.global.bucket, "vamoose-test");
+    }
+
+    /// When `[nfs]` IS present it round-trips intact — the optional
+    /// wrapper must not lose the section for the consumers that need
+    /// it.
+    #[test]
+    fn present_nfs_section_round_trips() {
+        let cfg: Config = toml::from_str(MINIMAL).expect("minimal config must parse");
+        let nfs = cfg
+            .nfs
+            .expect("[nfs] present in MINIMAL must parse to Some");
+        assert_eq!(nfs.src_url, "nfs://src-filer/export");
+        assert_eq!(nfs.dst_root, "/data");
     }
 
     /// `[worker]` defaults are applied per-field when the table is
