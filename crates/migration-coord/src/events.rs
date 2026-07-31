@@ -2,10 +2,13 @@
 //!
 //! Two consumers:
 //!
-//! - The coord runtime calls [`EventLogWriter::append`] for every
-//!   event the system emits. The writer buffers events in memory per
-//!   chunk (one per active job + one cluster-wide) and flushes to S3
-//!   when either threshold is hit:
+//! - The coord runtime calls [`EventLogWriter::buffer`] for every
+//!   event the system emits (under its state lock — pure
+//!   bookkeeping), then drives the actual S3 PUTs through
+//!   `pending_flushes`/`complete_flush` *outside* that lock (F45b).
+//!   The writer buffers events in memory per chunk (one per active
+//!   job + one cluster-wide) and a chunk becomes due when either
+//!   threshold is hit:
 //!     - `max_events_per_chunk` (default 1000)
 //!     - `max_chunk_age` since the chunk's first event (default 5 min)
 //!
@@ -70,7 +73,7 @@ impl Default for EventLogConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum ChunkRoute {
+pub(crate) enum ChunkRoute {
     Cluster,
     Job(JobId),
 }
@@ -117,6 +120,54 @@ impl OpenChunk {
     }
 }
 
+/// What the runtime buffered on an [`EventLogWriter::buffer`] call.
+/// `route` + `threshold_reached` let the caller decide to flush the
+/// affected route *after* dropping whatever lock guards the writer —
+/// the F45b contract that no store PUT runs under the runtime's
+/// state mutex.
+#[derive(Debug)]
+pub(crate) struct AppendOutcome {
+    /// Key the open chunk will flush to (start-seq keyed).
+    pub(crate) key: String,
+    /// True once the route's open chunk holds
+    /// `max_events_per_chunk` events — the caller should flush it.
+    pub(crate) threshold_reached: bool,
+    pub(crate) route: ChunkRoute,
+}
+
+/// Which open chunks a [`EventLogWriter::pending_flushes`] call
+/// snapshots for flushing.
+#[derive(Debug)]
+pub(crate) enum FlushScope {
+    /// Every non-empty open chunk.
+    All,
+    /// Only chunks older than `max_chunk_age` relative to the
+    /// carried `now`.
+    Aged(DateTime<Utc>),
+    /// Only the named route (the threshold-flush path).
+    Route(ChunkRoute),
+}
+
+/// A serialized chunk snapshot ready to PUT. Produced by
+/// [`EventLogWriter::pending_flushes`] under the state lock, PUT by
+/// the caller *outside* it, then acknowledged with
+/// [`EventLogWriter::complete_flush`]. Until `complete_flush` runs
+/// the buffered envelopes stay in the writer — a failed PUT loses
+/// nothing and the next flush retries the same seqs (possibly with
+/// newer appends folded in; the key is start-seq-stable so the
+/// retried object is a superset at the same key).
+#[derive(Debug)]
+pub(crate) struct PendingFlush {
+    pub(crate) route: ChunkRoute,
+    pub(crate) key: String,
+    pub(crate) body: Vec<u8>,
+    /// Highest seq serialized into `body`. `complete_flush` drops
+    /// exactly the prefix `<= end_seq`, so envelopes appended while
+    /// the PUT was in flight survive and re-key a fresh chunk at
+    /// their own start seq — ranges never overlap.
+    pub(crate) end_seq: u64,
+}
+
 /// Append-only event log writer. Holds one in-memory open chunk per
 /// route until a threshold flush.
 ///
@@ -124,6 +175,16 @@ impl OpenChunk {
 /// for routing and chunk-age decisions. This makes the writer's tests
 /// deterministic; in production the coord runtime stamps `at =
 /// Utc::now()` at ingest time.
+///
+/// Two flush surfaces:
+///
+/// - `append`/`flush_all`/`flush_aged` — self-contained convenience
+///   API (PUT inline) for replay tooling and tests.
+/// - `buffer` + `pending_flushes` + `complete_flush` — the split
+///   API the coord runtime uses so the PUT can run outside its
+///   state mutex (F45b). The convenience methods are implemented on
+///   top of the split ones, so there is a single serialization and
+///   removal path.
 #[derive(Debug)]
 pub struct EventLogWriter {
     cfg: EventLogConfig,
@@ -138,47 +199,106 @@ impl EventLogWriter {
         }
     }
 
-    /// Append an envelope to its route's open chunk. If the chunk is
-    /// now at or above `max_events_per_chunk`, flushes it.
-    ///
-    /// Returns the key the chunk would be (or was just) written to —
-    /// useful for tests and for the runtime's logging.
-    pub async fn append(&mut self, store: &dyn CoordStore, env: EventEnvelope) -> Result<String> {
+    /// Buffer an envelope into its route's open chunk. Pure
+    /// bookkeeping — never touches the store, so it is safe to call
+    /// under the runtime's state mutex. The caller inspects
+    /// [`AppendOutcome::threshold_reached`] and flushes the route
+    /// once it has released that lock.
+    pub(crate) fn buffer(&mut self, env: EventEnvelope) -> AppendOutcome {
         let route = ChunkRoute::from_envelope(&env);
         let chunk = self
             .chunks
             .entry(route.clone())
             .or_insert_with(|| OpenChunk::new(env.seq, env.at));
         chunk.buf.push(env);
-        let key = route.chunk_key(chunk.start_seq);
-        if chunk.buf.len() >= self.cfg.max_events_per_chunk {
-            self.flush_route(store, &route).await?;
+        AppendOutcome {
+            key: route.chunk_key(chunk.start_seq),
+            threshold_reached: chunk.buf.len() >= self.cfg.max_events_per_chunk,
+            route,
         }
-        Ok(key)
+    }
+
+    /// Append an envelope to its route's open chunk. If the chunk is
+    /// now at or above `max_events_per_chunk`, flushes it.
+    ///
+    /// Returns the key the chunk would be (or was just) written to —
+    /// useful for tests and for the runtime's logging.
+    pub async fn append(&mut self, store: &dyn CoordStore, env: EventEnvelope) -> Result<String> {
+        let out = self.buffer(env);
+        if out.threshold_reached {
+            self.flush_scope(store, &FlushScope::Route(out.route))
+                .await?;
+        }
+        Ok(out.key)
+    }
+
+    /// Snapshot every open chunk selected by `scope` as a
+    /// [`PendingFlush`] (serialized body + key + covered seq range).
+    /// Read-only: the buffered envelopes stay in the writer until
+    /// the caller confirms the PUT with [`Self::complete_flush`].
+    pub(crate) fn pending_flushes(&self, scope: &FlushScope) -> Result<Vec<PendingFlush>> {
+        let mut out = Vec::new();
+        for (route, chunk) in &self.chunks {
+            if chunk.buf.is_empty() {
+                continue;
+            }
+            let selected = match scope {
+                FlushScope::All => true,
+                FlushScope::Aged(now) => *now - chunk.started_at >= self.cfg.max_chunk_age,
+                FlushScope::Route(r) => route == r,
+            };
+            if !selected {
+                continue;
+            }
+            out.push(PendingFlush {
+                route: route.clone(),
+                key: route.chunk_key(chunk.start_seq),
+                body: chunk.serialize()?,
+                end_seq: chunk.buf.last().expect("non-empty checked above").seq,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Record that a [`PendingFlush`] PUT succeeded: drop the
+    /// route's buffered prefix `<= end_seq`. Envelopes appended
+    /// while the PUT was in flight remain and re-key a fresh chunk
+    /// at their own start seq, so consecutive chunk keys cover
+    /// non-overlapping ascending ranges.
+    pub(crate) fn complete_flush(&mut self, route: &ChunkRoute, end_seq: u64) {
+        let Some(chunk) = self.chunks.get_mut(route) else {
+            return;
+        };
+        chunk.buf.retain(|e| e.seq > end_seq);
+        if chunk.buf.is_empty() {
+            self.chunks.remove(route);
+        } else {
+            let (start_seq, started_at) = (chunk.buf[0].seq, chunk.buf[0].at);
+            chunk.start_seq = start_seq;
+            chunk.started_at = started_at;
+        }
+    }
+
+    /// Convenience: snapshot + PUT + complete for `scope`, inline.
+    /// Used by the self-contained methods below; the runtime uses
+    /// the split API instead so its PUTs run outside the state lock.
+    async fn flush_scope(&mut self, store: &dyn CoordStore, scope: &FlushScope) -> Result<()> {
+        for p in self.pending_flushes(scope)? {
+            store.put(&p.key, p.body).await?;
+            self.complete_flush(&p.route, p.end_seq);
+        }
+        Ok(())
     }
 
     /// Flush every open chunk older than `max_chunk_age` relative to
     /// `now`. Empty chunks are never flushed.
     pub async fn flush_aged(&mut self, store: &dyn CoordStore, now: DateTime<Utc>) -> Result<()> {
-        let mut to_flush = Vec::new();
-        for (route, chunk) in &self.chunks {
-            if !chunk.buf.is_empty() && now - chunk.started_at >= self.cfg.max_chunk_age {
-                to_flush.push(route.clone());
-            }
-        }
-        for route in to_flush {
-            self.flush_route(store, &route).await?;
-        }
-        Ok(())
+        self.flush_scope(store, &FlushScope::Aged(now)).await
     }
 
     /// Force-flush every open chunk. Called on graceful shutdown.
     pub async fn flush_all(&mut self, store: &dyn CoordStore) -> Result<()> {
-        let routes: Vec<_> = self.chunks.keys().cloned().collect();
-        for route in routes {
-            self.flush_route(store, &route).await?;
-        }
-        Ok(())
+        self.flush_scope(store, &FlushScope::All).await
     }
 
     /// Number of events currently buffered across all open chunks.
@@ -220,20 +340,6 @@ impl EventLogWriter {
     #[cfg(test)]
     fn open_chunks(&self) -> usize {
         self.chunks.values().filter(|c| !c.buf.is_empty()).count()
-    }
-
-    async fn flush_route(&mut self, store: &dyn CoordStore, route: &ChunkRoute) -> Result<()> {
-        let chunk = match self.chunks.get_mut(route) {
-            Some(c) if !c.buf.is_empty() => c,
-            _ => return Ok(()),
-        };
-        let key = route.chunk_key(chunk.start_seq);
-        let body = chunk.serialize()?;
-        store.put(&key, body).await?;
-        // Drop the buffered events and free the slot — the next event
-        // for this route opens a fresh chunk at its own start_seq.
-        self.chunks.remove(route);
-        Ok(())
     }
 }
 

@@ -8,25 +8,43 @@
 //! ## Concurrency model
 //!
 //! A single `tokio::sync::Mutex<RuntimeInner>` serializes every
-//! mutation. The critical section is short:
+//! mutation. The critical section is short and never does store
+//! I/O for the event log:
 //!
 //! 1. Assign seq, stamp `at`.
 //! 2. Build the envelope.
 //! 3. Apply the reducer.
-//! 4. Append to the log writer (may flush; `.await` inside the
-//!    lock).
+//! 4. Buffer into the log writer (pure bookkeeping, no PUT).
 //! 5. Drop the lock.
-//! 6. `broadcast::send` to SSE subscribers (non-blocking).
+//! 6. If the route crossed `max_events_per_chunk`, flush it (see
+//!    below) — still on the ingest call path, so a failed PUT
+//!    fails the ingest exactly as before.
+//! 7. `broadcast::send` to SSE subscribers (non-blocking).
 //!
-//! The flush in step 4 is the long pole — an `S3 PUT` of an
-//! event chunk runs every 1000 events or 5 minutes. Holding the
-//! lock through that PUT keeps ingest serialized and avoids
-//! state-vs-log drift. If a future deployment finds ingest
-//! latency a problem, the flush can move to a background task
-//! consuming a bounded queue; the seq/state/log triple still
-//! stays inside the lock.
+//! ## Chunk flush (F45b): PUT outside the state lock
 //!
-//! Reads (REST handlers, SSE catch-up reads) acquire the same
+//! Chunk flushes (`flush_log`, `flush_aged`, the threshold flush
+//! in step 6) run the S3 PUT *outside* the state mutex so ingest
+//! and every read (`state()`, `job_view()`, ...) proceed while a
+//! PUT is in flight. The invariants:
+//!
+//! - **Single flusher**: a dedicated flush token (a second mutex,
+//!   held across the PUTs) admits at most one chunk PUT at a
+//!   time. A concurrent flush request parks on the token; once
+//!   the in-flight PUT completes it observes the covered seqs
+//!   gone from the buffer and flushes only what remains — two
+//!   racing flushes can never produce overlapping or
+//!   out-of-order chunk keys.
+//! - **Flush-before-ack (F03)**: `flush_log` still returns only
+//!   after every event buffered at its start is durable (or an
+//!   error) — the PUT moved off the lock, not off the request
+//!   path.
+//! - **Failure atomicity**: buffered envelopes leave the writer
+//!   only *after* their PUT succeeded. A failed PUT leaves the
+//!   buffer intact (retried by the next flush) and fails the
+//!   caller — today's ack semantics unchanged.
+//!
+//! Reads (REST handlers, SSE catch-up reads) acquire the state
 //! lock and clone what they need. Snapshot size at deployment
 //! scale (~hundreds of jobs, ~thousands of workers) keeps clone
 //! cost in microseconds; we revisit if that ever isn't true.
@@ -52,7 +70,7 @@
 //! - No background ticks — Phase 2.4.
 
 use crate::errors::{Error, Result};
-use crate::events::{EventLogConfig, EventLogWriter};
+use crate::events::{EventLogConfig, EventLogWriter, FlushScope, PendingFlush};
 use crate::lease::{self, AcquireOutcome, Identity, LeaseConfig, LeaseHandle};
 use crate::schema::{EventEnvelope, EventKind, Snapshot, SCHEMA_VERSION};
 use crate::state;
@@ -246,6 +264,12 @@ pub struct JobsPage {
 #[derive(Clone)]
 pub struct CoordRuntime {
     inner: Arc<Mutex<RuntimeInner>>,
+    /// Single-flusher token (F45b): held across event-chunk PUTs,
+    /// distinct from the state mutex so ingest and reads proceed
+    /// while a PUT is in flight. A concurrent flush request parks
+    /// here and, once the in-flight PUT completes, flushes only the
+    /// seqs still buffered — chunk keys can never overlap.
+    flush_token: Arc<Mutex<()>>,
     bus: broadcast::Sender<EventEnvelope>,
     store: Arc<dyn CoordStore>,
     clock: Arc<dyn Clock>,
@@ -286,6 +310,7 @@ impl CoordRuntime {
                 archived_jobs: Default::default(),
                 stream_caps: Default::default(),
             })),
+            flush_token: Arc::new(Mutex::new(())),
             bus,
             store,
             clock,
@@ -334,7 +359,7 @@ impl CoordRuntime {
         worker_at: Option<DateTime<Utc>>,
         client_seq: Option<u64>,
     ) -> Result<u64> {
-        let (env, broadcast) = {
+        let (env, broadcast, threshold_route) = {
             let mut guard = self.inner.lock().await;
             if guard.lease_lost {
                 return Err(Error::LeaseLost);
@@ -351,12 +376,17 @@ impl CoordRuntime {
             };
             guard.state.apply(&env);
             let broadcast = guard.stream_caps.should_broadcast(&env.kind, env.at);
-            guard
-                .writer
-                .append(self.store.as_ref(), env.clone())
-                .await?;
-            (env, broadcast)
+            // Pure bookkeeping under the lock; the PUT (if the route
+            // crossed the chunk threshold) runs below, outside it.
+            let out = guard.writer.buffer(env.clone());
+            (env, broadcast, out.threshold_reached.then_some(out.route))
         };
+        // Threshold flush — still on the ingest call path (a failed
+        // PUT fails this ingest, exactly as when the flush lived
+        // inside the lock), but no longer under the state mutex.
+        if let Some(route) = threshold_route {
+            self.flush_scope(FlushScope::Route(route)).await?;
+        }
         // Broadcast outside the lock — `send` is non-blocking; if
         // there are no subscribers it returns an error we ignore.
         let seq = env.seq;
@@ -364,6 +394,36 @@ impl CoordRuntime {
             let _ = self.bus.send(env);
         }
         Ok(seq)
+    }
+
+    /// F45b flush core: snapshot the chunks selected by `scope`
+    /// under the state lock, release it, PUT each chunk while
+    /// holding only the single-flusher token, and reacquire the
+    /// state lock briefly per chunk to record the result.
+    ///
+    /// A failed PUT returns the error with the buffer intact — the
+    /// envelopes leave the writer only on success — so the ack path
+    /// fails exactly as before and the next flush retries the same
+    /// seqs. Fenced on the lease before the snapshot and re-checked
+    /// before every PUT (the lease can drop mid-loop).
+    async fn flush_scope(&self, scope: FlushScope) -> Result<()> {
+        let _token = self.flush_token.lock().await;
+        let pending: Vec<PendingFlush> = {
+            let guard = self.inner.lock().await;
+            if guard.lease_lost {
+                return Err(Error::LeaseLost);
+            }
+            guard.writer.pending_flushes(&scope)?
+        };
+        for p in pending {
+            if self.lease_lost().await {
+                return Err(Error::LeaseLost);
+            }
+            self.store.put(&p.key, p.body).await?;
+            let mut guard = self.inner.lock().await;
+            guard.writer.complete_flush(&p.route, p.end_seq);
+        }
+        Ok(())
     }
 
     /// Per-worker `client_seq` high-water mark from reducer state
@@ -552,9 +612,10 @@ impl CoordRuntime {
     /// overwritten (ledger F22).
     ///
     /// The inner lock is held across the conditional PUTs so
-    /// concurrent audits cannot double-allocate a seq — same
-    /// pattern as `ingest`, which holds the lock through its chunk
-    /// flush.
+    /// concurrent audits cannot double-allocate a seq. Audit rows
+    /// are operator-cadence (tens per day), so this path was left
+    /// out of the F45b flush-outside-the-lock restructure — the
+    /// event-chunk paths were the hot ones.
     pub async fn record_audit(
         &self,
         token_label: impl Into<String>,
@@ -713,30 +774,27 @@ impl CoordRuntime {
 
     /// Force-flush every open event-log chunk. Called from the
     /// snapshot tick (so the snapshot reflects a clean log
-    /// boundary) and from graceful shutdown.
+    /// boundary), from graceful shutdown, and from the
+    /// flush-before-ack seam on the worker endpoints (F03) — it
+    /// returns only once every event buffered at its start is
+    /// durable, or an error. The PUT runs outside the state lock
+    /// under the single-flusher token (F45b).
     ///
     /// Fenced on the lease: once the lease is observed lost this
     /// returns [`Error::LeaseLost`] without touching the store — a
     /// deposed coord's buffered chunks could otherwise clobber the
     /// successor's (chunk keys carry no lease epoch).
     pub async fn flush_log(&self) -> Result<()> {
-        let mut guard = self.inner.lock().await;
-        if guard.lease_lost {
-            return Err(Error::LeaseLost);
-        }
-        guard.writer.flush_all(self.store.as_ref()).await
+        self.flush_scope(FlushScope::All).await
     }
 
     /// Flush only chunks aged past `max_chunk_age`. Driven by the
     /// snapshot tick at a lower cadence than `flush_log`. Fenced on
-    /// the lease like [`CoordRuntime::flush_log`].
+    /// the lease like [`CoordRuntime::flush_log`], and runs its
+    /// PUTs outside the state lock the same way.
     pub async fn flush_aged(&self) -> Result<()> {
-        let mut guard = self.inner.lock().await;
-        if guard.lease_lost {
-            return Err(Error::LeaseLost);
-        }
         let now = self.clock.now();
-        guard.writer.flush_aged(self.store.as_ref(), now).await
+        self.flush_scope(FlushScope::Aged(now)).await
     }
 
     /// Persist the current state to `state/snapshot.json`. Called
@@ -1480,6 +1538,272 @@ mod tests {
             sum, total_errors as u64,
             "bucket counts must be exact under capping",
         );
+    }
+
+    // =========================================================
+    // F45b — event-chunk flush must not hold the runtime lock
+    // across S3 PUTs (COORD_RUNTIME_BATCH item 1).
+    //
+    // Store double: PUTs under `events/` report entry on an mpsc
+    // and then park on a watch-channel gate until the test opens
+    // it — the gated cousin of `FailEventPuts`
+    // (tests/worker_endpoints.rs) and `FailArchivePuts`
+    // (tests/archive_wiring.rs). Holding a flush in flight lets
+    // the tests probe reads, ingest, and a racing second flush.
+    // =========================================================
+
+    #[derive(Debug)]
+    struct GatedEventPuts {
+        inner: Arc<MemStore>,
+        gate: tokio::sync::watch::Receiver<bool>,
+        entered_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    impl GatedEventPuts {
+        #[allow(clippy::type_complexity)]
+        fn new() -> (
+            Arc<Self>,
+            Arc<MemStore>,
+            tokio::sync::watch::Sender<bool>,
+            tokio::sync::mpsc::UnboundedReceiver<String>,
+        ) {
+            let mem = Arc::new(MemStore::new());
+            let (open_tx, open_rx) = tokio::sync::watch::channel(false);
+            let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    inner: mem.clone(),
+                    gate: open_rx,
+                    entered_tx,
+                }),
+                mem,
+                open_tx,
+                entered_rx,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CoordStore for GatedEventPuts {
+        async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            self.inner.get(key).await
+        }
+        async fn head(&self, key: &str) -> Result<Option<String>> {
+            self.inner.head(key).await
+        }
+        async fn put(&self, key: &str, body: Vec<u8>) -> Result<String> {
+            if key.starts_with("events/") {
+                let _ = self.entered_tx.send(key.to_string());
+                let mut gate = self.gate.clone();
+                while !*gate.borrow() {
+                    gate.changed()
+                        .await
+                        .map_err(|_| Error::Other(anyhow::anyhow!("gate sender dropped")))?;
+                }
+            }
+            self.inner.put(key, body).await
+        }
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            body: Vec<u8>,
+        ) -> Result<crate::store::PutOutcome> {
+            self.inner.put_if_absent(key, body).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn delete_if_match(
+            &self,
+            key: &str,
+            etag: &str,
+        ) -> Result<migration_core::claim::DeleteOutcome> {
+            self.inner.delete_if_match(key, etag).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<crate::store::ListEntry>> {
+            self.inner.list(prefix).await
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn gated_runtime() -> (
+        CoordRuntime,
+        Arc<MemStore>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (gated, mem, open, entered) = GatedEventPuts::new();
+        let store: Arc<dyn CoordStore> = gated;
+        let clock = FixedClock::new(at(0));
+        let rt = CoordRuntime::start(store, clock, me("A"), cfg_for_tests())
+            .await
+            .unwrap();
+        (rt, mem, open, entered)
+    }
+
+    /// F45b acceptance 1: a state read completes while a chunk PUT
+    /// is in flight. Red before the fix — `flush_log` held the
+    /// runtime lock across the PUT, so `state()` parked behind the
+    /// full S3 round-trip.
+    #[tokio::test]
+    async fn reads_do_not_block_on_inflight_flush() {
+        let (rt, mem, open, mut entered) = gated_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        rt.ingest(job_created("mary")).await.unwrap();
+
+        let flusher = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.flush_log().await })
+        };
+        entered
+            .recv()
+            .await
+            .expect("flush must reach the store PUT");
+
+        // The PUT is parked on the gate; reads must still complete.
+        let snap = tokio::time::timeout(std::time::Duration::from_secs(1), rt.state())
+            .await
+            .expect("state() must not block on an in-flight chunk PUT");
+        assert!(snap.jobs.contains_key(&jid("bobby")));
+        let job =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rt.job_view(&jid("mary")))
+                .await
+                .expect("job_view() must not block on an in-flight chunk PUT");
+        assert!(job.is_some());
+
+        open.send(true).unwrap();
+        flusher.await.unwrap().unwrap();
+        // Flush-before-ack intact: the awaited flush left every
+        // buffered chunk durable before returning.
+        assert_eq!(mem.list("events/bobby/").await.unwrap().len(), 1);
+        assert_eq!(mem.list("events/mary/").await.unwrap().len(), 1);
+        assert_eq!(rt.buffered_event_count().await, 0);
+    }
+
+    /// F45b acceptance 2: an ingest completes (applies to state,
+    /// buffers) while a chunk PUT is in flight, and the new event
+    /// still becomes durable afterwards. Red before the fix.
+    #[tokio::test]
+    async fn ingest_does_not_block_on_inflight_flush() {
+        let (rt, mem, open, mut entered) = gated_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+
+        let flusher = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.flush_log().await })
+        };
+        entered
+            .recv()
+            .await
+            .expect("flush must reach the store PUT");
+
+        let seq = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rt.ingest(job_created("mary")),
+        )
+        .await
+        .expect("ingest must not block on an in-flight chunk PUT")
+        .unwrap();
+        assert_eq!(seq, 2);
+        // Applied to state and buffered while the PUT is pending.
+        assert!(rt.state().await.jobs.contains_key(&jid("mary")));
+        assert!(rt.buffered_event_count().await >= 1);
+
+        open.send(true).unwrap();
+        flusher.await.unwrap().unwrap();
+        // The mid-flight ingest is not lost: the next flush lands it.
+        rt.flush_log().await.unwrap();
+        assert_eq!(mem.list("events/mary/").await.unwrap().len(), 1);
+        assert_eq!(rt.buffered_event_count().await, 0);
+    }
+
+    /// F45b acceptance 3: two flush attempts racing around one gated
+    /// PUT (with ingests landing mid-flight in the same route). The
+    /// single-flusher token serializes them; the durable chunks must
+    /// cover contiguous, non-overlapping seq ranges with every event
+    /// exactly once.
+    #[tokio::test]
+    async fn concurrent_flushes_never_overlap_chunks() {
+        let (rt, mem, open, mut entered) = gated_runtime().await;
+        let w = WorkerId::new();
+        rt.ingest(job_created("bobby")).await.unwrap(); // seq 1
+        rt.ingest(progress_delta("bobby", w, 1)).await.unwrap(); // seq 2
+        rt.ingest(progress_delta("bobby", w, 1)).await.unwrap(); // seq 3
+
+        let flush_a = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.flush_log().await })
+        };
+        entered
+            .recv()
+            .await
+            .expect("first flush must reach the PUT");
+
+        // Two more events land in the same route while the PUT for
+        // seqs 1..=3 is in flight.
+        for _ in 0..2 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                rt.ingest(progress_delta("bobby", w, 1)),
+            )
+            .await
+            .expect("ingest must not block on the in-flight PUT")
+            .unwrap();
+        }
+        // Second flusher parks on the flush token behind the first.
+        let flush_b = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.flush_log().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        open.send(true).unwrap();
+        flush_a.await.unwrap().unwrap();
+        flush_b.await.unwrap().unwrap();
+
+        // Read every durable chunk back: in-chunk seqs contiguous,
+        // cross-chunk ranges ascending, non-overlapping, contiguous,
+        // covering 1..=5 exactly once.
+        let chunks = mem.list("events/bobby/").await.unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "two flushes around the gate should leave at least two chunks: {:?}",
+            chunks.iter().map(|c| &c.key).collect::<Vec<_>>(),
+        );
+        let mut ranges = Vec::new();
+        for entry in &chunks {
+            let envs = crate::events::read_chunk(mem.as_ref(), &entry.key)
+                .await
+                .unwrap();
+            assert!(!envs.is_empty(), "empty chunk {}", entry.key);
+            let seqs: Vec<u64> = envs.iter().map(|e| e.seq).collect();
+            for pair in seqs.windows(2) {
+                assert_eq!(
+                    pair[1],
+                    pair[0] + 1,
+                    "in-chunk seqs must be contiguous in {}: {seqs:?}",
+                    entry.key,
+                );
+            }
+            ranges.push((seqs[0], *seqs.last().unwrap()));
+        }
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "chunk seq ranges must not overlap: {ranges:?}",
+            );
+            assert_eq!(
+                pair[1].0,
+                pair[0].1 + 1,
+                "chunk seq ranges must be contiguous: {ranges:?}",
+            );
+        }
+        assert_eq!(
+            (ranges[0].0, ranges.last().unwrap().1),
+            (1, 5),
+            "chunks must cover every ingested seq exactly once: {ranges:?}",
+        );
+        assert_eq!(rt.buffered_event_count().await, 0);
     }
 
     /// Sanity check: dropping the runtime does not panic even if
