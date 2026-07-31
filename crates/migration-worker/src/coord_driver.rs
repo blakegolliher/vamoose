@@ -28,9 +28,9 @@ use crate::run_control::RunControl;
 use crate::throughput::ThroughputCounter;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use migration_coord::schema::{JobId, WorkerId, WorkerState};
-use migration_coord::server::worker::HeartbeatBody;
 use migration_core::fence::Fence;
+use migration_protocol::schema::HeartbeatBody;
+use migration_protocol::schema::{JobId, WorkerId, WorkerState};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, RwLock};
@@ -440,18 +440,18 @@ impl ProgressAccum {
         job_id: JobId,
         worker_id: WorkerId,
         at: DateTime<Utc>,
-    ) -> Option<migration_coord::schema::EventEnvelope> {
+    ) -> Option<migration_protocol::schema::EventEnvelope> {
         if self.is_empty() {
             return None;
         }
-        let env = migration_coord::schema::EventEnvelope {
+        let env = migration_protocol::schema::EventEnvelope {
             seq: 0, // coord assigns
             at,
-            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            schema_version: migration_protocol::schema::SCHEMA_VERSION,
             worker_at: Some(at),
             client_seq: None,
             from_worker: None,
-            kind: migration_coord::schema::EventKind::ProgressDelta {
+            kind: migration_protocol::schema::EventKind::ProgressDelta {
                 job_id,
                 worker_id,
                 files_delta: self.files_delta,
@@ -834,7 +834,7 @@ mod tests {
             .take_envelope(jid("bobby"), wid, at(42))
             .expect("envelope");
         match env.kind {
-            migration_coord::schema::EventKind::ProgressDelta {
+            migration_protocol::schema::EventKind::ProgressDelta {
                 job_id,
                 worker_id,
                 files_delta,

@@ -4,7 +4,7 @@
 //!
 //! - REST snapshot fetch: [`get_jobs`], [`get_job`], [`get_workers`],
 //!   [`get_errors`], [`healthz`]. Each is a single round trip; the
-//!   types come from `migration_coord::server::read` so coord and
+//!   types come from `migration_protocol::schema` so coord and
 //!   client share the wire shape and cargo catches a drift at
 //!   compile time. Together these back the bootstrap/Resync-recovery
 //!   contract of COORD_PLAN §3.4 (`healthz.last_seq` is the resume
@@ -21,10 +21,10 @@
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use migration_coord::schema::EventEnvelope;
-use migration_coord::schema::Job;
-use migration_coord::server::command::{CommandAccepted, ReasonBody};
-use migration_coord::server::read::{
+use migration_protocol::schema::EventEnvelope;
+use migration_protocol::schema::Job;
+use migration_protocol::schema::{CommandAccepted, ReasonBody};
+use migration_protocol::schema::{
     HealthzResponse, ListErrorsResponse, ListEventsResponse, ListJobsResponse, ListWorkersResponse,
 };
 use reqwest::header::{HeaderMap, HeaderValue};

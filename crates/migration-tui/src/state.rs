@@ -1,7 +1,7 @@
 //! Client-side state for the TUI.
 //!
-//! The data model is the coord's own
-//! [`migration_coord::schema::Snapshot`] — we reuse its
+//! The data model is the shared protocol
+//! [`migration_protocol::schema::Snapshot`] — we reuse its
 //! [`Snapshot::apply`] reducer verbatim so the client and the server
 //! agree on the wire semantics of every event variant. The wrapper
 //! adds three things the coord itself does not need:
@@ -24,7 +24,7 @@
 
 use crate::theme::Theme;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use migration_coord::schema::{
+use migration_protocol::schema::{
     ErrorBucket, ErrorClass, EventEnvelope, EventKind, Job, JobId, Snapshot, Worker, WorkerId,
 };
 use std::collections::{HashMap, VecDeque};
@@ -887,7 +887,7 @@ impl AppState {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use migration_coord::schema::{ConfigHash, EventKind, SCHEMA_VERSION};
+    use migration_protocol::schema::{ConfigHash, EventKind, SCHEMA_VERSION};
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
@@ -1200,7 +1200,7 @@ mod tests {
         EventEnvelope {
             seq,
             at: at(secs),
-            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            schema_version: migration_protocol::schema::SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
             from_worker: None,
@@ -1437,7 +1437,7 @@ mod tests {
         EventEnvelope {
             seq,
             at: at(seq as i64),
-            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            schema_version: migration_protocol::schema::SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
             from_worker: None,
@@ -1539,7 +1539,7 @@ mod tests {
         EventEnvelope {
             seq,
             at: at(secs),
-            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            schema_version: migration_protocol::schema::SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
             from_worker: None,
@@ -1559,7 +1559,7 @@ mod tests {
         s.apply_envelope(&EventEnvelope {
             seq: 2,
             at: at(100),
-            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            schema_version: migration_protocol::schema::SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
             from_worker: None,
@@ -1570,7 +1570,7 @@ mod tests {
         s.apply_envelope(&EventEnvelope {
             seq: 3,
             at: at(200),
-            schema_version: migration_coord::schema::SCHEMA_VERSION,
+            schema_version: migration_protocol::schema::SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
             from_worker: None,

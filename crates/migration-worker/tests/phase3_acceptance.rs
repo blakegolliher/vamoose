@@ -25,11 +25,11 @@ use chrono::{TimeZone, Utc};
 use migration_coord::lease::{Identity, LeaseConfig};
 use migration_coord::runtime::test_clock::FixedClock;
 use migration_coord::runtime::{CoordRuntime, RuntimeConfig};
-use migration_coord::schema::{ConfigHash, EventKind, JobId, WorkerState};
 use migration_coord::server::auth::AuthConfig;
 use migration_coord::server::{build_router, AppState};
 use migration_coord::store::{CoordStore, MemStore};
 use migration_core::fence::Fence;
+use migration_protocol::schema::{ConfigHash, EventKind, JobId, WorkerState};
 use migration_worker::config::CoordCfg;
 use migration_worker::coord_client::ControlMode;
 use migration_worker::coord_driver::{self, DriverInputs, WorkerEventDraft};
@@ -151,7 +151,7 @@ fn driver_cfg(addr: SocketAddr) -> CoordCfg {
 
 async fn wait_for_register(
     handle: &coord_driver::CoordDriverHandle,
-) -> migration_coord::schema::WorkerId {
+) -> migration_protocol::schema::WorkerId {
     let mut wid_rx = handle.worker_id.clone();
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {

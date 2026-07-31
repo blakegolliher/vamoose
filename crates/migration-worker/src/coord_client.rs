@@ -44,8 +44,8 @@
 //! pre-D4 worker that only reads `seqs` stays correct because its
 //! unstamped entries are never deduped.
 
-use migration_coord::schema::{EventEnvelope, JobId, WorkerId};
-use migration_coord::server::worker::{
+use migration_protocol::schema::{EventEnvelope, JobId, WorkerId};
+use migration_protocol::schema::{
     EventsBatchBody, EventsBatchResponse, FenceBody, FenceResponse, HeartbeatBody,
     HeartbeatResponse, RegisterBody, RegisterResponse, WorkerEventEntry,
 };
@@ -462,8 +462,8 @@ impl CoordClient {
 }
 
 // Re-export the control mode so the orchestrator side can match on
-// `mode` without depending on migration-coord directly.
-pub use migration_coord::schema::ControlMode;
+// `mode` without depending on the coordinator implementation.
+pub use migration_protocol::schema::ControlMode;
 
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
     let status = resp.status();
@@ -484,7 +484,7 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use migration_coord::schema::{ConfigHash, EventKind, JobId, SCHEMA_VERSION};
+    use migration_protocol::schema::{ConfigHash, EventKind, JobId, SCHEMA_VERSION};
 
     fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()

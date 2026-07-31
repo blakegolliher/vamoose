@@ -18,10 +18,8 @@ path = "src/main.rs"
 [dependencies]
 migration-core  = { workspace = true }
 migration-mover = { workspace = true }
-# Schema types (EventKind, WorkerId, RegisterBody shape) shared with
-# the coord. Drift between worker wire calls and coord handlers is
-# caught at compile time by reusing the same types.
-migration-coord = { workspace = true }
+# Shared control-plane schema and worker HTTP bodies.
+migration-protocol = { workspace = true }
 
 tokio    = { workspace = true }
 tokio-util = { workspace = true }
@@ -45,6 +43,8 @@ uuid     = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+# In-process coordinator integration tests only.
+migration-coord = { workspace = true }
 # Used by the orchestrator flush_sinks tests to implement the mock
 # ClaimStore (the trait is declared with #[async_trait]).
 async-trait = { workspace = true }

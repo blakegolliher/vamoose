@@ -24,7 +24,7 @@
 //! struct is `Arc`-shaped so the heartbeat task (writer) and the
 //! orchestrator (reader) can hold cheap clones.
 
-use migration_coord::schema::ControlMode;
+use migration_protocol::schema::ControlMode;
 use std::sync::Arc;
 use tokio::sync::watch;
 

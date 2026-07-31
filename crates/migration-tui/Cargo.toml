@@ -12,10 +12,8 @@ name = "migration_tui"
 path = "src/lib.rs"
 
 [dependencies]
-# Schema types + Snapshot reducer (shared with the coord). The TUI
-# does NOT depend on the coord's HTTP server side beyond the wire
-# types — cargo only compiles what's referenced.
-migration-coord = { workspace = true }
+# Shared control-plane schema, REST bodies, and Snapshot reducer.
+migration-protocol = { workspace = true }
 
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
@@ -40,9 +38,10 @@ ratatui   = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 
 [dev-dependencies]
+# Bring up an in-process coordinator for the integration test.
+migration-coord = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-util = { workspace = true }
 
-# Bring up an in-process coord for the integration test.
 axum-server = { workspace = true }
 http        = { workspace = true }
