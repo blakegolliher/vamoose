@@ -4,7 +4,7 @@ version     = { workspace = true }
 edition     = { workspace = true }
 authors     = { workspace = true }
 license     = { workspace = true }
-description = "Control-plane coordinator: schema, S3-backed event log + snapshot + lease"
+description = "Control-plane coordinator: HTTP runtime, S3-backed event log, snapshot, and lease"
 publish     = false
 
 [features]
@@ -17,6 +17,7 @@ test-helpers = []
 
 [dependencies]
 migration-core = { workspace = true }
+migration-protocol = { workspace = true }
 
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }

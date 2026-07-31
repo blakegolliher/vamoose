@@ -77,37 +77,17 @@
 //! deposed coord fails the request instead of acking.
 
 use super::{ApiError, AppState};
-use crate::schema::{ControlMode, EventKind, JobId, WorkerCounters, WorkerId, WorkerState};
+pub use crate::schema::{
+    ControlEnvelope, EventsBatchBody, EventsBatchResponse, FenceBody, FenceResponse, HeartbeatBody,
+    HeartbeatResponse, RegisterBody, RegisterResponse, WorkerEventEntry,
+};
+use crate::schema::{EventKind, JobId, WorkerCounters, WorkerId};
 use axum::extract::{Path, State};
 use axum::Json;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
 // =============================================================================
 // POST /workers/register
 // =============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RegisterBody {
-    pub job_id: String,
-    pub host: String,
-    pub pid: u32,
-    /// Worker-process start time. Coord pairs `(host, pid, start_time)`
-    /// to detect stale registrations across restarts.
-    pub start_time: DateTime<Utc>,
-    pub version: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RegisterResponse {
-    pub worker_id: WorkerId,
-    /// WorkerIds the coord marked Disconnected as a side effect of
-    /// this register — any prior workers on `(job_id, host)` whose
-    /// `(pid, start_time)` differs from the new registration. The
-    /// caller can use this for debugging; clients ignore it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub superseded: Vec<WorkerId>,
-}
 
 pub async fn register(
     State(state): State<AppState>,
@@ -169,39 +149,6 @@ pub async fn register(
 // POST /workers/{id}/heartbeat
 // =============================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HeartbeatBody {
-    pub state: WorkerState,
-    #[serde(default)]
-    pub files_per_sec: f64,
-    #[serde(default)]
-    pub bytes_per_sec: f64,
-    #[serde(default)]
-    pub errors_per_min: f64,
-    #[serde(default)]
-    pub inflight_ops: u32,
-    #[serde(default)]
-    pub queue_depth: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ControlEnvelope {
-    pub mode: ControlMode,
-}
-
-/// Body of the heartbeat response. The worker reads `control.mode`
-/// and flips its local `RunControl` to match on every heartbeat.
-/// `last_seq` lets the worker spot a coord restart (a backwards jump
-/// is the trigger to flush its event buffer). `server_time` is
-/// echoed for clock-skew diagnostics — workers never use it for
-/// fence decisions.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HeartbeatResponse {
-    pub control: ControlEnvelope,
-    pub last_seq: u64,
-    pub server_time: DateTime<Utc>,
-}
-
 fn parse_worker_id(raw: String) -> Result<WorkerId, ApiError> {
     uuid::Uuid::parse_str(&raw)
         .map(WorkerId)
@@ -257,39 +204,6 @@ pub async fn heartbeat(
 // =============================================================================
 // POST /workers/{id}/events
 // =============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WorkerEventEntry {
-    #[serde(flatten)]
-    pub kind: EventKind,
-    #[serde(default)]
-    pub worker_at: Option<DateTime<Utc>>,
-    /// Per-worker idempotency stamp (ledger F20, D4). Absent means a
-    /// pre-upgrade worker: the entry keeps at-least-once semantics
-    /// (applied on every send). Present means the coord dedups it
-    /// against the caller's replay-durable high-water mark.
-    #[serde(default)]
-    pub client_seq: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EventsBatchBody {
-    pub events: Vec<WorkerEventEntry>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EventsBatchResponse {
-    /// Seqs assigned to the APPLIED entries, in batch order.
-    /// `seqs.len() + deduped == events.len()`. For a worker that
-    /// does not stamp `client_seq` nothing is ever deduped, so this
-    /// keeps its original shape (one seq per entry).
-    pub seqs: Vec<u64>,
-    /// Entries skipped as already-applied (`client_seq` at or below
-    /// the caller's high-water mark). The whole batch is settled
-    /// either way — the worker drops its resend buffer on any 200.
-    #[serde(default)]
-    pub deduped: u64,
-}
 
 /// Trust boundary for the worker events route (ledger F20, D2+D3 —
 /// `docs/work-items/COORD_WORKER_EVENT_TRUST.md`).
@@ -462,16 +376,6 @@ pub async fn events_batch(
 // =============================================================================
 // POST /workers/{id}/fence
 // =============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FenceBody {
-    pub reason: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FenceResponse {
-    pub seq: u64,
-}
 
 pub async fn fence(
     State(state): State<AppState>,

@@ -39,22 +39,9 @@
 use super::auth::AdminLabel;
 use super::{ApiError, AppState};
 use crate::schema::{AuditResult, EventKind, JobId};
+pub use crate::schema::{CommandAccepted, ReasonBody};
 use axum::extract::{Extension, Path, State};
 use axum::Json;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CommandAccepted {
-    pub command_id: String,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct ReasonBody {
-    /// Optional human-readable reason. Defaults to "operator" in
-    /// the audit row and the phase_history if not supplied.
-    #[serde(default)]
-    pub reason: Option<String>,
-}
 
 async fn require_job(state: &AppState, id: &JobId) -> Result<crate::schema::Job, ApiError> {
     state

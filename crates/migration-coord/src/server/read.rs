@@ -17,11 +17,14 @@
 
 use super::{ApiError, AppState};
 use crate::events::read_all_events_since;
-use crate::schema::{ErrorBucket, EventEnvelope, Job, JobId, Worker};
+pub use crate::schema::{
+    HealthzResponse, ListErrorsResponse, ListEventsParams, ListEventsResponse, ListJobsParams,
+    ListJobsResponse, ListWorkersResponse,
+};
+use crate::schema::{Job, JobId};
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use http::StatusCode;
-use serde::{Deserialize, Serialize};
 
 const DEFAULT_PAGE_LIMIT: usize = 50;
 const MAX_PAGE_LIMIT: usize = 500;
@@ -32,21 +35,6 @@ const MAX_EVENTS_LIMIT: usize = 1000;
 // =============================================================================
 // GET /jobs
 // =============================================================================
-
-#[derive(Debug, Deserialize)]
-pub struct ListJobsParams {
-    /// `JobId` from a previous response's `next_cursor` (excluded
-    /// from this page).
-    pub cursor: Option<String>,
-    /// Page size. Default 50, capped at 500.
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListJobsResponse {
-    pub jobs: Vec<Job>,
-    pub next_cursor: Option<String>,
-}
 
 pub async fn list_jobs(
     State(state): State<AppState>,
@@ -91,11 +79,6 @@ pub async fn get_job(
 // GET /jobs/{id}/workers
 // =============================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListWorkersResponse {
-    pub workers: Vec<Worker>,
-}
-
 pub async fn list_workers(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -114,11 +97,6 @@ pub async fn list_workers(
 // GET /jobs/{id}/errors
 // =============================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListErrorsResponse {
-    pub buckets: Vec<ErrorBucket>,
-}
-
 pub async fn list_errors(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -136,22 +114,6 @@ pub async fn list_errors(
 // =============================================================================
 // GET /jobs/{id}/events?since=N&limit=M
 // =============================================================================
-
-#[derive(Debug, Deserialize)]
-pub struct ListEventsParams {
-    /// Lower bound (exclusive). Default 0.
-    pub since: Option<u64>,
-    /// Max events to return. Default 200, capped at 1000.
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListEventsResponse {
-    pub events: Vec<EventEnvelope>,
-    /// Seq of the last event returned (or the original `since` if
-    /// the page was empty). Use as `since` on the next request.
-    pub next_since: u64,
-}
 
 pub async fn list_events(
     State(state): State<AppState>,
@@ -213,14 +175,6 @@ pub async fn list_all_events(
 // =============================================================================
 // GET /healthz
 // =============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HealthzResponse {
-    pub status: String,
-    pub last_seq: u64,
-    pub subscriber_count: usize,
-    pub lease_lost: bool,
-}
 
 pub async fn healthz(State(state): State<AppState>) -> (StatusCode, Json<HealthzResponse>) {
     let last_seq = state.runtime.last_seq().await;
