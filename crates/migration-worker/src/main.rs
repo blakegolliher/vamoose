@@ -46,12 +46,21 @@ async fn main() -> anyhow::Result<()> {
     // runtime drop wedges on a stale libnfs context after a long
     // SIGSTOP/SIGCONT cycle; this avoids it entirely.
     let exit_code: i32 = match &result {
-        Ok(()) => {
-            let msg: &[u8] = b"mig-worker: clean exit via libc::_exit(0)\n";
+        Ok(outcome) => {
+            // Clean → 0; fenced → 3 (dedicated code so supervisors
+            // can tell "fenced, alert/restart" from "migration
+            // complete"). Mapping pinned in orchestrator tests.
+            let code = orchestrator::exit_code_for_outcome(*outcome);
+            let msg: &[u8] = match outcome {
+                orchestrator::RunOutcome::Clean => b"mig-worker: clean exit via libc::_exit(0)\n",
+                orchestrator::RunOutcome::Fenced => {
+                    b"mig-worker: fenced run; exit via libc::_exit(3)\n"
+                }
+            };
             unsafe {
                 libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
             }
-            0
+            code
         }
         Err(e) => {
             // tracing may be down by here; eprintln directly.

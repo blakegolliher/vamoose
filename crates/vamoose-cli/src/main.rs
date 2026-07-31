@@ -105,8 +105,19 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => logging::init_fallback(filter, &log_mode),
     };
 
+    // Non-zero-but-not-error exit for the worker: a fenced run shuts
+    // down cleanly yet must exit 3 (see cmd::worker::EXIT_CODES_HELP)
+    // so supervisors can tell it from a completed migration. Carried
+    // out of the match so the logging stack still shuts down first.
+    let mut worker_exit_code: i32 = 0;
     let result = match cli.command {
-        Command::Worker(a) => cmd::worker::run(a, cli.config).await,
+        Command::Worker(a) => match cmd::worker::run(a, cli.config).await {
+            Ok(code) => {
+                worker_exit_code = code;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
         Command::Walker(a) => cmd::walker::run(a, cli.config).await,
         Command::Rewrite(a) => cmd::rewrite::run(a, cli.config).await,
         Command::Aggr(a) => cmd::aggr::run(a, cli.config).await,
@@ -121,7 +132,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = log_handle {
         handle.shutdown(Duration::from_secs(10)).await;
     }
-    result
+    result?;
+    if worker_exit_code != 0 {
+        std::process::exit(worker_exit_code);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -172,6 +187,28 @@ mod tests {
             log_mode_for(&cli.command),
             logging::LogMode::Standard
         ));
+    }
+
+    /// BETA_POLISH_BATCH Item 2: `vamoose worker --help` documents
+    /// the exit codes — in particular the dedicated fenced code 3 —
+    /// so operators wiring supervisors don't have to read source.
+    #[test]
+    fn worker_help_documents_exit_codes() {
+        let mut cmd = Cli::command();
+        let worker = cmd
+            .find_subcommand_mut("worker")
+            .expect("worker subcommand exists");
+        let help = worker.render_long_help().to_string();
+        assert!(
+            help.contains("Exit codes"),
+            "worker help must have an exit-codes section, got:\n{help}",
+        );
+        for needle in ["0", "1", "2", "3", "fenced"] {
+            assert!(
+                help.contains(needle),
+                "worker help exit-codes section must mention {needle:?}, got:\n{help}",
+            );
+        }
     }
 
     /// An unparsable `--log` filter falls back to `info` rather than

@@ -398,6 +398,10 @@ pub fn errno_name(err: i32) -> String {
     let s = match err {
         libc::EPERM => "EPERM",
         libc::ENOENT => "ENOENT",
+        // libnfs cancels RPCs that exceed the F12 per-RPC timeout
+        // with -EINTR ("Command timed out"), so timeout failures in
+        // the published JSONL carry this name, not `errno=4`.
+        libc::EINTR => "EINTR",
         libc::EIO => "EIO",
         libc::EBADF => "EBADF",
         libc::EACCES => "EACCES",
@@ -487,5 +491,15 @@ mod tests {
     #[test]
     fn errno_name_unknown() {
         assert_eq!(errno_name(9999), "errno=9999");
+    }
+
+    /// BETA_POLISH_BATCH Item 3: F12 timeout failures surface errno 4
+    /// (libnfs cancels timed-out RPCs with -EINTR). Without an EINTR
+    /// arm the published failures JSONL records the lossy numeric
+    /// fallback `errno=4` — and beta freezes that wire format.
+    #[test]
+    fn errno_4_names_eintr() {
+        assert_eq!(libc::EINTR, 4, "EINTR is errno 4 on Linux");
+        assert_eq!(errno_name(libc::EINTR), "EINTR");
     }
 }
