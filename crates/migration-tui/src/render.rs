@@ -1625,6 +1625,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
+            from_worker: None,
             kind,
         }
     }
@@ -1941,6 +1942,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
+            from_worker: None,
             kind: EventKind::ProgressDelta {
                 job_id: jid("alpha"),
                 worker_id: WorkerId::new(),

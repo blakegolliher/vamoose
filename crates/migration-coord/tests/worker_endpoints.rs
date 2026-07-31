@@ -1553,3 +1553,146 @@ async fn non_monotonic_batch_rejected() {
     let job = rt.job_view(&jid("bobby")).await.unwrap();
     assert_eq!(job.progress.files_done, 0, "nothing may have applied");
 }
+
+// =============================================================================
+// events batch — HWM attribution for stamped kinds without payload
+// attribution (F20 residue, docs/work-items/COORD_RUNTIME_BATCH.md
+// item 2).
+//
+// `EventKind::attributed_worker()` is None for ClaimConflictDetected/
+// Resolved and VerifyFileMismatch (their worker fields are conflict
+// ROLES, not caller attribution), so a stamped entry of those kinds
+// at a batch tail could not advance the per-worker high-water mark —
+// a resend after a lost 200 silently re-applied it. The envelope's
+// `from_worker` caller stamp (set by the coord from the URL id the
+// phase-1 trust boundary validated) closes that: every stamped entry
+// can advance the mark, live and across replay.
+// =============================================================================
+
+/// Item-2 acceptance 1: a batch ENDING in a stamped
+/// `ClaimConflictResolved` fully dedups on an identical resend —
+/// nothing re-applies, state and durable log identical to a single
+/// send. Red before the fix: the tail stamp could not advance the
+/// HWM and the resend double-counted `conflicts_resolved`.
+#[tokio::test]
+async fn stamped_non_attributed_tail_dedups_on_resend() {
+    let (app, rt, mem) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+    rt.flush_log().await.unwrap();
+    let seq_before = rt.last_seq().await;
+
+    let batch = serde_json::json!({ "events": [
+        stamped_delta(&wid, 5, 1),
+        with_cs(
+            entry(&EventKind::ClaimConflictResolved {
+                job_id: jid("bobby"),
+                shard_id: ShardId("s1".into()),
+                winner: wid,
+            }),
+            2,
+        ),
+    ] });
+    let (status, resp) = post_json(
+        app.clone(),
+        &format!("/workers/{wid}/events"),
+        batch.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first send must apply: {resp}");
+    assert_eq!(resp["seqs"].as_array().unwrap().len(), 2);
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(job.progress.conflicts_resolved, 1);
+    assert_eq!(job.progress.files_done, 5);
+    let durable_once = durable_since(&mem, seq_before).await;
+    assert_eq!(durable_once.len(), 2, "flush-before-ack: batch durable");
+
+    // The 200 is lost; the worker resends the identical batch.
+    let (status, resp) = post_json(app, &format!("/workers/{wid}/events"), batch).await;
+    assert_eq!(status, StatusCode::OK, "resend must succeed: {resp}");
+    assert_eq!(
+        resp["seqs"].as_array().unwrap().len(),
+        0,
+        "the stamped non-attributed tail must have advanced the HWM — \
+         nothing may re-apply on resend: {resp}",
+    );
+    assert_eq!(
+        resp["deduped"].as_u64().unwrap_or(0),
+        2,
+        "both entries must be skipped as already-applied: {resp}",
+    );
+    let job = rt.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(
+        job.progress.conflicts_resolved, 1,
+        "ClaimConflictResolved must not double-count on resend",
+    );
+    assert_eq!(job.progress.files_done, 5);
+    assert_eq!(
+        rt.last_seq().await,
+        seq_before + 2,
+        "the resend must not grow the event log",
+    );
+    let durable_twice = durable_since(&mem, seq_before).await;
+    assert_eq!(
+        durable_twice, durable_once,
+        "durable log contents must be identical to a single send",
+    );
+}
+
+/// Item-2 acceptance 2: the tail stamp survives crash + replay — the
+/// caller attribution rides the durable envelope, so a fresh runtime
+/// reconstructs the HWM and still dedups the old batch. Red before
+/// the fix.
+#[tokio::test]
+async fn replay_reconstructs_hwm_from_from_worker() {
+    let (app, rt, mem, clock) = fresh_app_with_clock().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+    rt.flush_log().await.unwrap();
+    let seq_before = rt.last_seq().await;
+
+    let batch = serde_json::json!({ "events": [
+        stamped_delta(&wid, 5, 1),
+        with_cs(
+            entry(&EventKind::ClaimConflictResolved {
+                job_id: jid("bobby"),
+                shard_id: ShardId("s1".into()),
+                winner: wid,
+            }),
+            2,
+        ),
+    ] });
+    let (status, _) = post_json(app, &format!("/workers/{wid}/events"), batch.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let durable_once = durable_since(&mem, seq_before).await;
+
+    // Coord crashes; a fresh runtime replays snapshot + log, then the
+    // worker (which never saw the lost 200) resends the old batch.
+    let rt2 = crash_restart(&mem, &clock).await;
+    let app2 = build_router(AppState::new(rt2.clone()));
+    let seq_after_replay = rt2.last_seq().await;
+
+    let (status, resp) = post_json(app2, &format!("/workers/{wid}/events"), batch).await;
+    assert_eq!(status, StatusCode::OK, "resend must succeed: {resp}");
+    assert_eq!(
+        resp["seqs"].as_array().unwrap().len(),
+        0,
+        "replay must reconstruct the HWM from the envelope's caller \
+         attribution — the stamped tail stays deduped: {resp}",
+    );
+    assert_eq!(
+        rt2.last_seq().await,
+        seq_after_replay,
+        "the deduped resend must not grow the event log after replay",
+    );
+    let job = rt2.job_view(&jid("bobby")).await.unwrap();
+    assert_eq!(
+        job.progress.conflicts_resolved, 1,
+        "conflict count must be identical to the single pre-crash send",
+    );
+    let durable_twice = durable_since(&mem, seq_before).await;
+    assert_eq!(
+        durable_twice, durable_once,
+        "durable log must be identical to the single pre-crash send",
+    );
+}

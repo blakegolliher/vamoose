@@ -372,6 +372,7 @@ async fn seed_chunks(store: &MemStore, job: &str, starts: &[u64], n_per_chunk: u
                 schema_version: SCHEMA_VERSION,
                 worker_at: None,
                 client_seq: None,
+                from_worker: None,
                 kind: EventKind::VerifyStarted { job_id: jid(job) },
             };
             w.append(store, env).await.unwrap();

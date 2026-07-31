@@ -8,25 +8,43 @@
 //! ## Concurrency model
 //!
 //! A single `tokio::sync::Mutex<RuntimeInner>` serializes every
-//! mutation. The critical section is short:
+//! mutation. The critical section is short and never does store
+//! I/O for the event log:
 //!
 //! 1. Assign seq, stamp `at`.
 //! 2. Build the envelope.
 //! 3. Apply the reducer.
-//! 4. Append to the log writer (may flush; `.await` inside the
-//!    lock).
+//! 4. Buffer into the log writer (pure bookkeeping, no PUT).
 //! 5. Drop the lock.
-//! 6. `broadcast::send` to SSE subscribers (non-blocking).
+//! 6. If the route crossed `max_events_per_chunk`, flush it (see
+//!    below) — still on the ingest call path, so a failed PUT
+//!    fails the ingest exactly as before.
+//! 7. `broadcast::send` to SSE subscribers (non-blocking).
 //!
-//! The flush in step 4 is the long pole — an `S3 PUT` of an
-//! event chunk runs every 1000 events or 5 minutes. Holding the
-//! lock through that PUT keeps ingest serialized and avoids
-//! state-vs-log drift. If a future deployment finds ingest
-//! latency a problem, the flush can move to a background task
-//! consuming a bounded queue; the seq/state/log triple still
-//! stays inside the lock.
+//! ## Chunk flush (F45b): PUT outside the state lock
 //!
-//! Reads (REST handlers, SSE catch-up reads) acquire the same
+//! Chunk flushes (`flush_log`, `flush_aged`, the threshold flush
+//! in step 6) run the S3 PUT *outside* the state mutex so ingest
+//! and every read (`state()`, `job_view()`, ...) proceed while a
+//! PUT is in flight. The invariants:
+//!
+//! - **Single flusher**: a dedicated flush token (a second mutex,
+//!   held across the PUTs) admits at most one chunk PUT at a
+//!   time. A concurrent flush request parks on the token; once
+//!   the in-flight PUT completes it observes the covered seqs
+//!   gone from the buffer and flushes only what remains — two
+//!   racing flushes can never produce overlapping or
+//!   out-of-order chunk keys.
+//! - **Flush-before-ack (F03)**: `flush_log` still returns only
+//!   after every event buffered at its start is durable (or an
+//!   error) — the PUT moved off the lock, not off the request
+//!   path.
+//! - **Failure atomicity**: buffered envelopes leave the writer
+//!   only *after* their PUT succeeded. A failed PUT leaves the
+//!   buffer intact (retried by the next flush) and fails the
+//!   caller — today's ack semantics unchanged.
+//!
+//! Reads (REST handlers, SSE catch-up reads) acquire the state
 //! lock and clone what they need. Snapshot size at deployment
 //! scale (~hundreds of jobs, ~thousands of workers) keeps clone
 //! cost in microseconds; we revisit if that ever isn't true.
@@ -52,9 +70,9 @@
 //! - No background ticks — Phase 2.4.
 
 use crate::errors::{Error, Result};
-use crate::events::{EventLogConfig, EventLogWriter};
+use crate::events::{EventLogConfig, EventLogWriter, FlushScope, PendingFlush};
 use crate::lease::{self, AcquireOutcome, Identity, LeaseConfig, LeaseHandle};
-use crate::schema::{EventEnvelope, EventKind, Snapshot, SCHEMA_VERSION};
+use crate::schema::{EventEnvelope, EventKind, Snapshot, WorkerId, SCHEMA_VERSION};
 use crate::state;
 use crate::store::CoordStore;
 use chrono::{DateTime, Utc};
@@ -131,6 +149,22 @@ impl RuntimeConfig {
 /// commands number in the tens per day, so this bound is generous.
 const MAX_AUDIT_SEQ_PROBES: u64 = 10_000;
 
+/// Snapshot-write-time eviction window for worker rows (ledger F24
+/// residue): a worker whose state is `Disconnected` and whose last
+/// activity (`last_heartbeat` — stamped by the join event and every
+/// heartbeat) is at least this old at snapshot-write time is omitted
+/// from the written snapshot, and dropped from live state once that
+/// write succeeds. `Fenced` rows are never evicted — a fence is
+/// operator-relevant until acted on. Eviction happens ONLY at
+/// snapshot write (never wall-clock pruning of live state on a
+/// tick), so replay stays deterministic: the pruning decision is
+/// embodied in the durable snapshot both sides share, and replay =
+/// pruned snapshot + events(seq > last_seq) converges with the live
+/// coord. 24 hours keeps a full operator day of disconnected rows
+/// visible for debugging while bounding live-state growth by the
+/// snapshot cadence.
+pub const WORKER_EVICT_AFTER_SECS: i64 = 24 * 60 * 60;
+
 /// Wire-cardinality caps (ledger F24, COORD_PLAN §3.3). Decides, at
 /// the ingest boundary, whether an event goes out on the SSE bus.
 /// The caps are **bus-only**: state applies every event and the
@@ -146,22 +180,35 @@ const MAX_AUDIT_SEQ_PROBES: u64 = 10_000;
 /// - Everything else streams unconditionally.
 ///
 /// `progress_last` grows with the set of (job, worker) pairs seen —
-/// the same cardinality as the workers table, which is itself
-/// unbounded today (noted in the F24 ledger row as a follow-up).
+/// the same cardinality as the workers table, which is bounded by
+/// the snapshot-write-time row eviction ([`WORKER_EVICT_AFTER_SECS`]).
+///
+/// Trailing edge (F24 residue, 3a): a suppressed `ProgressDelta` is
+/// retained per (job, worker), latest wins; the flush tick calls
+/// [`StreamCaps::take_due_trailing`] to re-broadcast retained deltas
+/// once the cap interval has passed, so a quieting burst's final
+/// values reach live subscribers. Retention is bus-only bookkeeping
+/// — the envelope was already applied and logged at ingest.
 #[derive(Debug, Default)]
 struct StreamCaps {
     progress_last:
         std::collections::HashMap<(crate::schema::JobId, crate::schema::WorkerId), DateTime<Utc>>,
+    /// Latest SUPPRESSED delta per (job, worker) — the trailing edge
+    /// the tick re-broadcasts. Cleared whenever a fresh delta for
+    /// the key broadcasts (the retained frame is then stale) and on
+    /// delivery.
+    retained_progress:
+        std::collections::HashMap<(crate::schema::JobId, crate::schema::WorkerId), EventEnvelope>,
     error_window_start: Option<DateTime<Utc>>,
     error_counts: std::collections::HashMap<crate::schema::ErrorClass, u32>,
 }
 
 impl StreamCaps {
-    /// True if `kind` may be broadcast at `now`. Mutates the cap
-    /// bookkeeping; call exactly once per ingested event, under the
-    /// runtime lock.
-    fn should_broadcast(&mut self, kind: &EventKind, now: DateTime<Utc>) -> bool {
-        match kind {
+    /// True if `env` may be broadcast at `now`. Mutates the cap
+    /// bookkeeping (including trailing-edge retention); call exactly
+    /// once per ingested event, under the runtime lock.
+    fn should_broadcast(&mut self, env: &EventEnvelope, now: DateTime<Utc>) -> bool {
+        match &env.kind {
             EventKind::ProgressDelta {
                 job_id, worker_id, ..
             } => {
@@ -169,8 +216,17 @@ impl StreamCaps {
                     chrono::Duration::milliseconds(crate::schema::PROGRESS_STREAM_MIN_INTERVAL_MS);
                 let key = (job_id.clone(), *worker_id);
                 match self.progress_last.get(&key) {
-                    Some(last) if now.signed_duration_since(*last) < min_interval => false,
+                    Some(last) if now.signed_duration_since(*last) < min_interval => {
+                        // Suppressed: retain the trailing edge so the
+                        // flush tick can deliver the burst's final
+                        // values (latest wins).
+                        self.retained_progress.insert(key, env.clone());
+                        false
+                    }
                     _ => {
+                        // A fresh broadcast supersedes any retained
+                        // older frame for this key.
+                        self.retained_progress.remove(&key);
                         self.progress_last.insert(key, now);
                         true
                     }
@@ -197,6 +253,36 @@ impl StreamCaps {
             }
             _ => true,
         }
+    }
+
+    /// Remove and return every retained trailing delta whose key has
+    /// gone at least the cap interval without a broadcast. Each
+    /// delivery counts as that key's broadcast (its `progress_last`
+    /// advances to `now`), so the tick never exceeds the 1 Hz cap.
+    fn take_due_trailing(&mut self, now: DateTime<Utc>) -> Vec<EventEnvelope> {
+        let min_interval =
+            chrono::Duration::milliseconds(crate::schema::PROGRESS_STREAM_MIN_INTERVAL_MS);
+        let due: Vec<_> = self
+            .retained_progress
+            .keys()
+            .filter(|key| match self.progress_last.get(*key) {
+                Some(last) => now.signed_duration_since(*last) >= min_interval,
+                // Unreachable (retention implies a prior broadcast),
+                // but deliver rather than leak if it ever happens.
+                None => true,
+            })
+            .cloned()
+            .collect();
+        let mut out = Vec::with_capacity(due.len());
+        for key in due {
+            if let Some(env) = self.retained_progress.remove(&key) {
+                self.progress_last.insert(key, now);
+                out.push(env);
+            }
+        }
+        // Deterministic delivery order for multi-key ticks.
+        out.sort_by_key(|e| e.seq);
+        out
     }
 }
 
@@ -246,6 +332,12 @@ pub struct JobsPage {
 #[derive(Clone)]
 pub struct CoordRuntime {
     inner: Arc<Mutex<RuntimeInner>>,
+    /// Single-flusher token (F45b): held across event-chunk PUTs,
+    /// distinct from the state mutex so ingest and reads proceed
+    /// while a PUT is in flight. A concurrent flush request parks
+    /// here and, once the in-flight PUT completes, flushes only the
+    /// seqs still buffered — chunk keys can never overlap.
+    flush_token: Arc<Mutex<()>>,
     bus: broadcast::Sender<EventEnvelope>,
     store: Arc<dyn CoordStore>,
     clock: Arc<dyn Clock>,
@@ -286,6 +378,7 @@ impl CoordRuntime {
                 archived_jobs: Default::default(),
                 stream_caps: Default::default(),
             })),
+            flush_token: Arc::new(Mutex::new(())),
             bus,
             store,
             clock,
@@ -298,7 +391,7 @@ impl CoordRuntime {
     /// subscribers (subject to the bus-only rate caps — see
     /// [`StreamCaps`]). Returns the assigned seq.
     pub async fn ingest(&self, kind: EventKind) -> Result<u64> {
-        self.ingest_inner(kind, None, None).await
+        self.ingest_inner(kind, None, None, None).await
     }
 
     /// Ingest an event whose payload was constructed by a worker
@@ -310,7 +403,7 @@ impl CoordRuntime {
         kind: EventKind,
         worker_at: DateTime<Utc>,
     ) -> Result<u64> {
-        self.ingest_inner(kind, Some(worker_at), None).await
+        self.ingest_inner(kind, Some(worker_at), None, None).await
     }
 
     /// Ingest an event submitted on the worker events route: optional
@@ -319,13 +412,22 @@ impl CoordRuntime {
     /// carried on the envelope into the durable log, so the reducer —
     /// live and on replay — maintains the per-worker high-water mark
     /// the events handler dedups against.
+    ///
+    /// `caller` is the registered worker id from the URL — already
+    /// validated by the route's trust boundary — stamped onto the
+    /// envelope as `from_worker` (F20 residue) so stamped kinds
+    /// without payload attribution can still advance the mark.
+    /// Admin/internal ingest paths ([`Self::ingest`],
+    /// [`Self::ingest_with_worker_at`]) leave it `None`.
     pub async fn ingest_worker_event(
         &self,
         kind: EventKind,
         worker_at: Option<DateTime<Utc>>,
         client_seq: Option<u64>,
+        caller: WorkerId,
     ) -> Result<u64> {
-        self.ingest_inner(kind, worker_at, client_seq).await
+        self.ingest_inner(kind, worker_at, client_seq, Some(caller))
+            .await
     }
 
     async fn ingest_inner(
@@ -333,8 +435,9 @@ impl CoordRuntime {
         kind: EventKind,
         worker_at: Option<DateTime<Utc>>,
         client_seq: Option<u64>,
+        from_worker: Option<WorkerId>,
     ) -> Result<u64> {
-        let (env, broadcast) = {
+        let (env, broadcast, threshold_route) = {
             let mut guard = self.inner.lock().await;
             if guard.lease_lost {
                 return Err(Error::LeaseLost);
@@ -347,16 +450,22 @@ impl CoordRuntime {
                 schema_version: SCHEMA_VERSION,
                 worker_at,
                 client_seq,
+                from_worker,
                 kind,
             };
             guard.state.apply(&env);
-            let broadcast = guard.stream_caps.should_broadcast(&env.kind, env.at);
-            guard
-                .writer
-                .append(self.store.as_ref(), env.clone())
-                .await?;
-            (env, broadcast)
+            let broadcast = guard.stream_caps.should_broadcast(&env, env.at);
+            // Pure bookkeeping under the lock; the PUT (if the route
+            // crossed the chunk threshold) runs below, outside it.
+            let out = guard.writer.buffer(env.clone());
+            (env, broadcast, out.threshold_reached.then_some(out.route))
         };
+        // Threshold flush — still on the ingest call path (a failed
+        // PUT fails this ingest, exactly as when the flush lived
+        // inside the lock), but no longer under the state mutex.
+        if let Some(route) = threshold_route {
+            self.flush_scope(FlushScope::Route(route)).await?;
+        }
         // Broadcast outside the lock — `send` is non-blocking; if
         // there are no subscribers it returns an error we ignore.
         let seq = env.seq;
@@ -364,6 +473,36 @@ impl CoordRuntime {
             let _ = self.bus.send(env);
         }
         Ok(seq)
+    }
+
+    /// F45b flush core: snapshot the chunks selected by `scope`
+    /// under the state lock, release it, PUT each chunk while
+    /// holding only the single-flusher token, and reacquire the
+    /// state lock briefly per chunk to record the result.
+    ///
+    /// A failed PUT returns the error with the buffer intact — the
+    /// envelopes leave the writer only on success — so the ack path
+    /// fails exactly as before and the next flush retries the same
+    /// seqs. Fenced on the lease before the snapshot and re-checked
+    /// before every PUT (the lease can drop mid-loop).
+    async fn flush_scope(&self, scope: FlushScope) -> Result<()> {
+        let _token = self.flush_token.lock().await;
+        let pending: Vec<PendingFlush> = {
+            let guard = self.inner.lock().await;
+            if guard.lease_lost {
+                return Err(Error::LeaseLost);
+            }
+            guard.writer.pending_flushes(&scope)?
+        };
+        for p in pending {
+            if self.lease_lost().await {
+                return Err(Error::LeaseLost);
+            }
+            self.store.put(&p.key, p.body).await?;
+            let mut guard = self.inner.lock().await;
+            guard.writer.complete_flush(&p.route, p.end_seq);
+        }
+        Ok(())
     }
 
     /// Per-worker `client_seq` high-water mark from reducer state
@@ -552,9 +691,10 @@ impl CoordRuntime {
     /// overwritten (ledger F22).
     ///
     /// The inner lock is held across the conditional PUTs so
-    /// concurrent audits cannot double-allocate a seq — same
-    /// pattern as `ingest`, which holds the lock through its chunk
-    /// flush.
+    /// concurrent audits cannot double-allocate a seq. Audit rows
+    /// are operator-cadence (tens per day), so this path was left
+    /// out of the F45b flush-outside-the-lock restructure — the
+    /// event-chunk paths were the hot ones.
     pub async fn record_audit(
         &self,
         token_label: impl Into<String>,
@@ -641,6 +781,32 @@ impl CoordRuntime {
         }
     }
 
+    /// Trailing-edge flush for the ProgressDelta wire cap (ledger
+    /// F24 residue, item 3a): re-broadcast the latest SUPPRESSED
+    /// delta per (job, worker) once the cap interval has passed
+    /// since that key's last broadcast, so a quieting burst's final
+    /// values reach live subscribers within ~2×
+    /// [`crate::schema::PROGRESS_STREAM_MIN_INTERVAL_MS`] (cap
+    /// interval + tick cadence) instead of hanging stale until the
+    /// next event. Bus-only: the frame is a re-broadcast of an
+    /// already-ingested, already-logged envelope — same seq, no new
+    /// event, no log write; log and replay are untouched. Driven by
+    /// the flush tick ([`crate::ticks::flush_aged_loop`]). Returns
+    /// the number of frames re-broadcast.
+    pub async fn flush_trailing_progress(&self) -> usize {
+        let now = self.clock.now();
+        let due = {
+            let mut guard = self.inner.lock().await;
+            guard.stream_caps.take_due_trailing(now)
+        };
+        let n = due.len();
+        // Send outside the lock, like every other broadcast.
+        for env in due {
+            let _ = self.bus.send(env);
+        }
+        n
+    }
+
     /// Subscribe to live events. Returns a `broadcast::Receiver`;
     /// the SSE handler typically wraps it in a stream and emits
     /// each envelope as a wire frame.
@@ -713,30 +879,27 @@ impl CoordRuntime {
 
     /// Force-flush every open event-log chunk. Called from the
     /// snapshot tick (so the snapshot reflects a clean log
-    /// boundary) and from graceful shutdown.
+    /// boundary), from graceful shutdown, and from the
+    /// flush-before-ack seam on the worker endpoints (F03) — it
+    /// returns only once every event buffered at its start is
+    /// durable, or an error. The PUT runs outside the state lock
+    /// under the single-flusher token (F45b).
     ///
     /// Fenced on the lease: once the lease is observed lost this
     /// returns [`Error::LeaseLost`] without touching the store — a
     /// deposed coord's buffered chunks could otherwise clobber the
     /// successor's (chunk keys carry no lease epoch).
     pub async fn flush_log(&self) -> Result<()> {
-        let mut guard = self.inner.lock().await;
-        if guard.lease_lost {
-            return Err(Error::LeaseLost);
-        }
-        guard.writer.flush_all(self.store.as_ref()).await
+        self.flush_scope(FlushScope::All).await
     }
 
     /// Flush only chunks aged past `max_chunk_age`. Driven by the
     /// snapshot tick at a lower cadence than `flush_log`. Fenced on
-    /// the lease like [`CoordRuntime::flush_log`].
+    /// the lease like [`CoordRuntime::flush_log`], and runs its
+    /// PUTs outside the state lock the same way.
     pub async fn flush_aged(&self) -> Result<()> {
-        let mut guard = self.inner.lock().await;
-        if guard.lease_lost {
-            return Err(Error::LeaseLost);
-        }
         let now = self.clock.now();
-        guard.writer.flush_aged(self.store.as_ref(), now).await
+        self.flush_scope(FlushScope::Aged(now)).await
     }
 
     /// Persist the current state to `state/snapshot.json`. Called
@@ -759,11 +922,31 @@ impl CoordRuntime {
             // already populated by the reducer.
             guard.state.written_at = now;
             guard.state.schema_version = SCHEMA_VERSION;
-            guard.state.clone()
+            let mut snap = guard.state.clone();
+            // Worker-row eviction (ledger F24 residue): omit rows
+            // that are Disconnected and stale — see
+            // [`WORKER_EVICT_AFTER_SECS`] for why this happens only
+            // here. Replay soundness: any event at seq <=
+            // snap.last_seq referencing an omitted row is below the
+            // replay cut; any later event either no-ops on the
+            // missing row (the reducer's get_mut arms) or is a
+            // WorkerJoined, which resurrects it identically on both
+            // sides.
+            snap.workers.retain(|_, w| !worker_evictable(w, now));
+            snap
         };
         crate::snapshot::write(self.store.as_ref(), &snap, history_keep, now).await?;
 
         let mut guard = self.inner.lock().await;
+        // Drop the same rows from live state only now that the
+        // pruned snapshot is durable — a failed write leaves live
+        // state untouched. The criteria are re-evaluated on the
+        // current rows: a worker that rejoined or changed state
+        // while the write was in flight stays live, and the event
+        // that changed it has seq > snap.last_seq, so replay
+        // re-applies it on top of the pruned snapshot and both
+        // sides converge.
+        guard.state.workers.retain(|_, w| !worker_evictable(w, now));
         for (id, job) in &snap.jobs {
             if job.phase.is_terminal() && !guard.archived_jobs.contains(id) {
                 guard.archive_eligible.insert(id.clone());
@@ -875,6 +1058,15 @@ impl std::fmt::Debug for EventTailReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventTailReader").finish_non_exhaustive()
     }
+}
+
+/// Eviction predicate for [`CoordRuntime::write_snapshot`]: only
+/// Disconnected rows past [`WORKER_EVICT_AFTER_SECS`] since their
+/// last activity qualify. Fenced (and every other) state never does.
+fn worker_evictable(w: &crate::schema::Worker, now: DateTime<Utc>) -> bool {
+    w.state == crate::schema::WorkerState::Disconnected
+        && now.signed_duration_since(w.last_heartbeat)
+            >= chrono::Duration::seconds(WORKER_EVICT_AFTER_SECS)
 }
 
 async fn acquire_with_backoff(
@@ -1004,6 +1196,24 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 5, 29, 14, 32, 0).unwrap() + Duration::seconds(secs)
     }
 
+    fn worker_joined(w: WorkerId, job: &str) -> EventKind {
+        EventKind::WorkerJoined {
+            worker_id: w,
+            job_id: jid(job),
+            host: "h".into(),
+            pid: 42,
+            start_time: at(0),
+            version: "0.6".into(),
+        }
+    }
+
+    fn worker_left(w: WorkerId) -> EventKind {
+        EventKind::WorkerLeft {
+            worker_id: w,
+            reason: "drain".into(),
+        }
+    }
+
     async fn fresh_runtime() -> (CoordRuntime, Arc<FixedClock>, Arc<MemStore>) {
         // Keep an `Arc<MemStore>` for direct test access (peeks at
         // raw keys, asserts list/get outcomes) and hand the runtime
@@ -1085,9 +1295,14 @@ mod tests {
     #[tokio::test]
     async fn restart_replays_prior_state() {
         // Run 1: ingest events, gracefully shut down (which writes
-        // a snapshot and flushes the log).
+        // a snapshot and flushes the log). Includes a worker that
+        // disconnected long ago (evicted at snapshot write, F24
+        // residue 3b) and one that disconnected recently (kept).
         let store: Arc<dyn CoordStore> = Arc::new(MemStore::new());
         let clock = FixedClock::new(at(0));
+        let w_stale = WorkerId::new();
+        let w_fresh = WorkerId::new();
+        let live_workers;
         {
             let rt = CoordRuntime::start(store.clone(), clock.clone(), me("A"), cfg_for_tests())
                 .await
@@ -1102,7 +1317,13 @@ mod tests {
             })
             .await
             .unwrap();
+            rt.ingest(worker_joined(w_stale, "bobby")).await.unwrap();
+            rt.ingest(worker_left(w_stale)).await.unwrap();
+            clock.advance(Duration::seconds(WORKER_EVICT_AFTER_SECS + 60));
+            rt.ingest(worker_joined(w_fresh, "bobby")).await.unwrap();
+            rt.ingest(worker_left(w_fresh)).await.unwrap();
             rt.shutdown(3).await.unwrap();
+            live_workers = rt.state().await.workers;
         }
 
         // Run 2: restart against the same bucket. State should
@@ -1114,10 +1335,27 @@ mod tests {
         let snap = rt2.state().await;
         assert_eq!(snap.jobs[&jid("bobby")].progress.files_done, 100);
         assert_eq!(snap.jobs[&jid("bobby")].phase, Phase::Planned);
-        assert_eq!(rt2.last_seq().await, 2);
-        // Next ingest gets seq 3.
-        let s3 = rt2.ingest(job_created("mary")).await.unwrap();
-        assert_eq!(s3, 3);
+        // 3b replay equality: the stale Disconnected row was pruned
+        // at snapshot write, the fresh one survives, and the replayed
+        // worker table converges with the live coord's post-prune
+        // state.
+        assert!(
+            !snap.workers.contains_key(&w_stale),
+            "stale Disconnected row must not survive the restart",
+        );
+        assert!(
+            snap.workers.contains_key(&w_fresh),
+            "recently Disconnected row must survive the restart",
+        );
+        assert_eq!(
+            snap.workers, live_workers,
+            "replayed worker table must converge with live post-prune state",
+        );
+        assert_eq!(rt2.last_seq().await, 6);
+        // Next ingest gets seq 7 — eviction never disturbs the seq
+        // stream.
+        let s7 = rt2.ingest(job_created("mary")).await.unwrap();
+        assert_eq!(s7, 7);
     }
 
     #[tokio::test]
@@ -1169,6 +1407,102 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snap.written_at, at(123));
+    }
+
+    // =========================================================
+    // F24 residue 3b — worker-row eviction at snapshot-write time
+    // only (COORD_RUNTIME_BATCH item 3b). Never wall-clock pruning
+    // of live state; the pruning decision is embodied in the
+    // durable snapshot, so replay = snapshot + events converges
+    // with the live coord.
+    // =========================================================
+
+    /// The snapshot writer omits rows that are Disconnected AND
+    /// stale (>= WORKER_EVICT_AFTER_SECS since last activity);
+    /// fresh Disconnected rows and Fenced rows (operator-relevant)
+    /// stay. On a successful write the live table drops the same
+    /// rows, bounding live memory by snapshot cadence.
+    #[tokio::test]
+    async fn snapshot_omits_stale_disconnected_workers() {
+        let (rt, clock, store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        let w_stale = WorkerId::new();
+        let w_fenced = WorkerId::new();
+        let w_fresh = WorkerId::new();
+        rt.ingest(worker_joined(w_stale, "bobby")).await.unwrap();
+        rt.ingest(worker_left(w_stale)).await.unwrap();
+        rt.ingest(worker_joined(w_fenced, "bobby")).await.unwrap();
+        rt.ingest(EventKind::WorkerFenced {
+            worker_id: w_fenced,
+            reason: "stuck".into(),
+        })
+        .await
+        .unwrap();
+        // Jump past the eviction window, then a recent disconnect.
+        clock.advance(Duration::seconds(WORKER_EVICT_AFTER_SECS + 1));
+        rt.ingest(worker_joined(w_fresh, "bobby")).await.unwrap();
+        rt.ingest(worker_left(w_fresh)).await.unwrap();
+
+        rt.write_snapshot(3).await.unwrap();
+
+        let snap = crate::snapshot::load(store.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !snap.workers.contains_key(&w_stale),
+            "stale Disconnected row must be omitted from the snapshot",
+        );
+        assert!(
+            snap.workers.contains_key(&w_fenced),
+            "Fenced rows are operator-relevant and must never be evicted",
+        );
+        assert!(
+            snap.workers.contains_key(&w_fresh),
+            "a fresh Disconnected row must be kept",
+        );
+        // Live state dropped the same row once the write succeeded.
+        let live = rt.state().await;
+        assert!(!live.workers.contains_key(&w_stale));
+        assert!(live.workers.contains_key(&w_fenced));
+        assert!(live.workers.contains_key(&w_fresh));
+    }
+
+    /// A WorkerJoined for an evicted id resurrects the row cleanly,
+    /// live and on replay.
+    #[tokio::test]
+    async fn worker_rejoin_after_eviction_resurrects() {
+        let (rt, clock, store) = fresh_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        let w = WorkerId::new();
+        rt.ingest(worker_joined(w, "bobby")).await.unwrap();
+        rt.ingest(worker_left(w)).await.unwrap();
+        clock.advance(Duration::seconds(WORKER_EVICT_AFTER_SECS + 1));
+        rt.write_snapshot(3).await.unwrap();
+        assert!(
+            !rt.state().await.workers.contains_key(&w),
+            "test setup: the row must be evicted at snapshot write",
+        );
+
+        // The same id reappears in the log after the eviction.
+        rt.ingest(worker_joined(w, "bobby")).await.unwrap();
+        let live = rt.state().await;
+        assert_eq!(
+            live.workers[&w].state,
+            crate::schema::WorkerState::Idle,
+            "a rejoin must resurrect the evicted row cleanly",
+        );
+
+        // Replay from the pruned snapshot + post-snapshot events
+        // converges with live.
+        rt.flush_log().await.unwrap();
+        let replayed = crate::state::replay(store.as_ref(), clock.now())
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed.state.workers, live.workers,
+            "replay must converge with live after eviction + rejoin",
+        );
     }
 
     // =========================================================
@@ -1379,6 +1713,73 @@ mod tests {
             logged_deltas, 7,
             "the cap is bus-only; the log must carry every delta",
         );
+
+        // ---- F24 residue 3a: trailing-edge flush ----
+        // A fresh burst in a new second: the first delta broadcasts,
+        // the burst's FINAL delta is suppressed. Leading-edge-only
+        // coalescing left that final value invisible to live
+        // subscribers until the next event arrived.
+        clock.advance(Duration::seconds(1));
+        rt.ingest(progress_delta("bobby", w, 100)).await.unwrap();
+        assert_eq!(drain_progress_frames(&mut sub), 1);
+        rt.ingest(progress_delta("bobby", w, 42)).await.unwrap();
+        assert_eq!(
+            drain_progress_frames(&mut sub),
+            0,
+            "the burst's final delta is suppressed by the cap",
+        );
+        let last_seq = rt.last_seq().await;
+        let writes_before = _store.write_count();
+
+        // One cap interval later the tick delivers the suppressed
+        // final VALUES — as a re-broadcast of the already-ingested
+        // envelope: same seq, no new event, no log write.
+        clock.advance(Duration::seconds(1));
+        assert_eq!(
+            rt.flush_trailing_progress().await,
+            1,
+            "the retained trailing delta must re-broadcast on the tick",
+        );
+        let env = sub
+            .try_recv()
+            .expect("the trailing frame must reach the subscriber");
+        match &env.kind {
+            EventKind::ProgressDelta { files_delta, .. } => assert_eq!(
+                *files_delta, 42,
+                "the trailing frame must carry the burst's final values",
+            ),
+            other => panic!("expected the trailing ProgressDelta, got {other:?}"),
+        }
+        assert_eq!(
+            env.seq, last_seq,
+            "a re-broadcast of the already-ingested envelope, not a new event",
+        );
+        assert_eq!(rt.last_seq().await, last_seq, "no new event may be minted");
+        assert_eq!(
+            _store.write_count(),
+            writes_before,
+            "the trailing flush is bus-only — no log write",
+        );
+
+        // Cleared after delivery: nothing re-broadcasts twice.
+        clock.advance(Duration::seconds(1));
+        assert_eq!(
+            rt.flush_trailing_progress().await,
+            0,
+            "a delivered trailing frame must not repeat",
+        );
+        // And when the final delta WAS broadcast (nothing suppressed
+        // behind it), the tick stays silent — no duplicate of a frame
+        // that was already the last broadcast one.
+        rt.ingest(progress_delta("bobby", w, 7)).await.unwrap();
+        assert_eq!(drain_progress_frames(&mut sub), 1);
+        clock.advance(Duration::seconds(2));
+        assert_eq!(
+            rt.flush_trailing_progress().await,
+            0,
+            "no trailing re-broadcast when the last frame was already broadcast",
+        );
+        assert_eq!(drain_progress_frames(&mut sub), 0);
     }
 
     /// COORD_PLAN §3.3: `WorkerHeartbeat` never streams. There is no
@@ -1480,6 +1881,272 @@ mod tests {
             sum, total_errors as u64,
             "bucket counts must be exact under capping",
         );
+    }
+
+    // =========================================================
+    // F45b — event-chunk flush must not hold the runtime lock
+    // across S3 PUTs (COORD_RUNTIME_BATCH item 1).
+    //
+    // Store double: PUTs under `events/` report entry on an mpsc
+    // and then park on a watch-channel gate until the test opens
+    // it — the gated cousin of `FailEventPuts`
+    // (tests/worker_endpoints.rs) and `FailArchivePuts`
+    // (tests/archive_wiring.rs). Holding a flush in flight lets
+    // the tests probe reads, ingest, and a racing second flush.
+    // =========================================================
+
+    #[derive(Debug)]
+    struct GatedEventPuts {
+        inner: Arc<MemStore>,
+        gate: tokio::sync::watch::Receiver<bool>,
+        entered_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    impl GatedEventPuts {
+        #[allow(clippy::type_complexity)]
+        fn new() -> (
+            Arc<Self>,
+            Arc<MemStore>,
+            tokio::sync::watch::Sender<bool>,
+            tokio::sync::mpsc::UnboundedReceiver<String>,
+        ) {
+            let mem = Arc::new(MemStore::new());
+            let (open_tx, open_rx) = tokio::sync::watch::channel(false);
+            let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    inner: mem.clone(),
+                    gate: open_rx,
+                    entered_tx,
+                }),
+                mem,
+                open_tx,
+                entered_rx,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CoordStore for GatedEventPuts {
+        async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+            self.inner.get(key).await
+        }
+        async fn head(&self, key: &str) -> Result<Option<String>> {
+            self.inner.head(key).await
+        }
+        async fn put(&self, key: &str, body: Vec<u8>) -> Result<String> {
+            if key.starts_with("events/") {
+                let _ = self.entered_tx.send(key.to_string());
+                let mut gate = self.gate.clone();
+                while !*gate.borrow() {
+                    gate.changed()
+                        .await
+                        .map_err(|_| Error::Other(anyhow::anyhow!("gate sender dropped")))?;
+                }
+            }
+            self.inner.put(key, body).await
+        }
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            body: Vec<u8>,
+        ) -> Result<crate::store::PutOutcome> {
+            self.inner.put_if_absent(key, body).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn delete_if_match(
+            &self,
+            key: &str,
+            etag: &str,
+        ) -> Result<migration_core::claim::DeleteOutcome> {
+            self.inner.delete_if_match(key, etag).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<crate::store::ListEntry>> {
+            self.inner.list(prefix).await
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn gated_runtime() -> (
+        CoordRuntime,
+        Arc<MemStore>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (gated, mem, open, entered) = GatedEventPuts::new();
+        let store: Arc<dyn CoordStore> = gated;
+        let clock = FixedClock::new(at(0));
+        let rt = CoordRuntime::start(store, clock, me("A"), cfg_for_tests())
+            .await
+            .unwrap();
+        (rt, mem, open, entered)
+    }
+
+    /// F45b acceptance 1: a state read completes while a chunk PUT
+    /// is in flight. Red before the fix — `flush_log` held the
+    /// runtime lock across the PUT, so `state()` parked behind the
+    /// full S3 round-trip.
+    #[tokio::test]
+    async fn reads_do_not_block_on_inflight_flush() {
+        let (rt, mem, open, mut entered) = gated_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+        rt.ingest(job_created("mary")).await.unwrap();
+
+        let flusher = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.flush_log().await })
+        };
+        entered
+            .recv()
+            .await
+            .expect("flush must reach the store PUT");
+
+        // The PUT is parked on the gate; reads must still complete.
+        let snap = tokio::time::timeout(std::time::Duration::from_secs(1), rt.state())
+            .await
+            .expect("state() must not block on an in-flight chunk PUT");
+        assert!(snap.jobs.contains_key(&jid("bobby")));
+        let job =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rt.job_view(&jid("mary")))
+                .await
+                .expect("job_view() must not block on an in-flight chunk PUT");
+        assert!(job.is_some());
+
+        open.send(true).unwrap();
+        flusher.await.unwrap().unwrap();
+        // Flush-before-ack intact: the awaited flush left every
+        // buffered chunk durable before returning.
+        assert_eq!(mem.list("events/bobby/").await.unwrap().len(), 1);
+        assert_eq!(mem.list("events/mary/").await.unwrap().len(), 1);
+        assert_eq!(rt.buffered_event_count().await, 0);
+    }
+
+    /// F45b acceptance 2: an ingest completes (applies to state,
+    /// buffers) while a chunk PUT is in flight, and the new event
+    /// still becomes durable afterwards. Red before the fix.
+    #[tokio::test]
+    async fn ingest_does_not_block_on_inflight_flush() {
+        let (rt, mem, open, mut entered) = gated_runtime().await;
+        rt.ingest(job_created("bobby")).await.unwrap();
+
+        let flusher = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.flush_log().await })
+        };
+        entered
+            .recv()
+            .await
+            .expect("flush must reach the store PUT");
+
+        let seq = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rt.ingest(job_created("mary")),
+        )
+        .await
+        .expect("ingest must not block on an in-flight chunk PUT")
+        .unwrap();
+        assert_eq!(seq, 2);
+        // Applied to state and buffered while the PUT is pending.
+        assert!(rt.state().await.jobs.contains_key(&jid("mary")));
+        assert!(rt.buffered_event_count().await >= 1);
+
+        open.send(true).unwrap();
+        flusher.await.unwrap().unwrap();
+        // The mid-flight ingest is not lost: the next flush lands it.
+        rt.flush_log().await.unwrap();
+        assert_eq!(mem.list("events/mary/").await.unwrap().len(), 1);
+        assert_eq!(rt.buffered_event_count().await, 0);
+    }
+
+    /// F45b acceptance 3: two flush attempts racing around one gated
+    /// PUT (with ingests landing mid-flight in the same route). The
+    /// single-flusher token serializes them; the durable chunks must
+    /// cover contiguous, non-overlapping seq ranges with every event
+    /// exactly once.
+    #[tokio::test]
+    async fn concurrent_flushes_never_overlap_chunks() {
+        let (rt, mem, open, mut entered) = gated_runtime().await;
+        let w = WorkerId::new();
+        rt.ingest(job_created("bobby")).await.unwrap(); // seq 1
+        rt.ingest(progress_delta("bobby", w, 1)).await.unwrap(); // seq 2
+        rt.ingest(progress_delta("bobby", w, 1)).await.unwrap(); // seq 3
+
+        let flush_a = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.flush_log().await })
+        };
+        entered
+            .recv()
+            .await
+            .expect("first flush must reach the PUT");
+
+        // Two more events land in the same route while the PUT for
+        // seqs 1..=3 is in flight.
+        for _ in 0..2 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                rt.ingest(progress_delta("bobby", w, 1)),
+            )
+            .await
+            .expect("ingest must not block on the in-flight PUT")
+            .unwrap();
+        }
+        // Second flusher parks on the flush token behind the first.
+        let flush_b = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.flush_log().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        open.send(true).unwrap();
+        flush_a.await.unwrap().unwrap();
+        flush_b.await.unwrap().unwrap();
+
+        // Read every durable chunk back: in-chunk seqs contiguous,
+        // cross-chunk ranges ascending, non-overlapping, contiguous,
+        // covering 1..=5 exactly once.
+        let chunks = mem.list("events/bobby/").await.unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "two flushes around the gate should leave at least two chunks: {:?}",
+            chunks.iter().map(|c| &c.key).collect::<Vec<_>>(),
+        );
+        let mut ranges = Vec::new();
+        for entry in &chunks {
+            let envs = crate::events::read_chunk(mem.as_ref(), &entry.key)
+                .await
+                .unwrap();
+            assert!(!envs.is_empty(), "empty chunk {}", entry.key);
+            let seqs: Vec<u64> = envs.iter().map(|e| e.seq).collect();
+            for pair in seqs.windows(2) {
+                assert_eq!(
+                    pair[1],
+                    pair[0] + 1,
+                    "in-chunk seqs must be contiguous in {}: {seqs:?}",
+                    entry.key,
+                );
+            }
+            ranges.push((seqs[0], *seqs.last().unwrap()));
+        }
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "chunk seq ranges must not overlap: {ranges:?}",
+            );
+            assert_eq!(
+                pair[1].0,
+                pair[0].1 + 1,
+                "chunk seq ranges must be contiguous: {ranges:?}",
+            );
+        }
+        assert_eq!(
+            (ranges[0].0, ranges.last().unwrap().1),
+            (1, 5),
+            "chunks must cover every ingested seq exactly once: {ranges:?}",
+        );
+        assert_eq!(rt.buffered_event_count().await, 0);
     }
 
     /// Sanity check: dropping the runtime does not panic even if

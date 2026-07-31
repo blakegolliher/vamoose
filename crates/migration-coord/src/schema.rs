@@ -635,6 +635,21 @@ pub struct EventEnvelope {
     /// and backward-compatible: old log chunks deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_seq: Option<u64>,
+    /// Caller attribution for events submitted on the worker events
+    /// route (F20 residue): the registered worker id from the URL,
+    /// stamped by the coord after the phase-1 trust boundary
+    /// validated it. Rides the durable stream so the reducer — live
+    /// and on replay — can advance the client_seq high-water mark
+    /// even for stamped kinds whose payload carries no caller
+    /// attribution (`ClaimConflictDetected`/`Resolved`,
+    /// `VerifyFileMismatch` — their worker fields are conflict
+    /// roles). `None` on admin/internal ingest paths and on
+    /// envelopes from older coords, for which the reducer falls back
+    /// to [`EventKind::attributed_worker`], byte-identical to the
+    /// old behavior. Additive `#[serde(default)]`, no SCHEMA_VERSION
+    /// bump — same precedent as `client_seq` (PR #40).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_worker: Option<WorkerId>,
     #[serde(flatten)]
     pub kind: EventKind,
 }
@@ -1179,6 +1194,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             worker_at: None,
             client_seq: None,
+            from_worker: None,
             kind: EventKind::JobCreated {
                 job_id: jid("bobby"),
                 name: "bobby-migration".into(),
@@ -1305,6 +1321,7 @@ mod tests {
                 schema_version: SCHEMA_VERSION,
                 worker_at: None,
                 client_seq: None,
+                from_worker: None,
                 kind,
             };
             let s = serde_json::to_string(&env).unwrap();

@@ -59,6 +59,13 @@ use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 
 /// Items the SSE wire layer renders. See module doc for semantics.
+///
+/// `Event` dwarfs the other variants (the envelope is ~200 bytes),
+/// but it is also what virtually every yielded frame is — boxing it
+/// to shrink the enum would buy nothing on `Resync`/`Keepalive`
+/// (rare) while adding an allocation per event on the hot streaming
+/// path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamFrame {
     Event(EventEnvelope),
