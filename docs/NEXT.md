@@ -17,6 +17,10 @@ clients can compile against the contract without pulling in coord's
 server/storage runtime; it does not touch the rig-sensitive claim or
 data paths.
 
+PR #46 continues that layering wave by decomposing the coordinator
+runtime into internal responsibility modules without changing its
+public API or behavior; TUI feature/view decomposition is next.
+
 ## 1. Remaining ledger finding
 
 | Finding | State |
