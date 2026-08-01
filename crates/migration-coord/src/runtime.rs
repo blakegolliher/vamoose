@@ -85,7 +85,7 @@ use tokio::sync::{broadcast, Mutex};
 
 /// Source of wall-clock `at` timestamps for events the runtime
 /// ingests. Production uses [`SystemClock`]; tests use
-/// [`FixedClock`] (the test module) to drive event timing
+/// `FixedClock` (the test module) to drive event timing
 /// deterministically.
 pub trait Clock: Send + Sync + std::fmt::Debug {
     fn now(&self) -> DateTime<Utc>;
@@ -116,11 +116,11 @@ pub struct RuntimeConfig {
     /// point — sized for "one slow subscriber falls behind a
     /// 10k-events-per-second burst for ~100ms before resync".
     pub bus_capacity: usize,
-    /// How long [`start`] backs off between failed lease-acquire
+    /// How long [`CoordRuntime::start`] backs off between failed lease-acquire
     /// attempts. Tests inject a short value; production defaults
     /// to 2s.
     pub lease_retry_interval: std::time::Duration,
-    /// Maximum attempts before [`start`] gives up. `None` means
+    /// Maximum attempts before [`CoordRuntime::start`] gives up. `None` means
     /// retry forever — the production default. Tests pin a finite
     /// cap.
     pub lease_retry_max_attempts: Option<u32>,
@@ -389,7 +389,7 @@ impl CoordRuntime {
     /// Ingest one event. Assigns the next seq, stamps `at`, applies
     /// the reducer, appends to the log, then broadcasts to SSE
     /// subscribers (subject to the bus-only rate caps — see
-    /// [`StreamCaps`]). Returns the assigned seq.
+    /// `StreamCaps`). Returns the assigned seq.
     pub async fn ingest(&self, kind: EventKind) -> Result<u64> {
         self.ingest_inner(kind, None, None, None).await
     }
@@ -588,7 +588,7 @@ impl CoordRuntime {
         })
     }
 
-    /// Compute the [`ControlMode`] the coord wants this worker to
+    /// Compute the [`ControlMode`](crate::schema::ControlMode) the coord wants this worker to
     /// observe, plus the current `last_seq` and the coord's wall
     /// clock. Used by the heartbeat handler to build the response
     /// envelope.

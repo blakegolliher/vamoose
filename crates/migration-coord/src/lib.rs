@@ -2,9 +2,8 @@
 //!
 //! Control plane for vamoose deployments. Owns:
 //!
-//! - The wire schema for jobs, workers, events, and error buckets
-//!   (`schema`). Both the HTTP/SSE API and the operator TUI consume
-//!   the same types.
+//! - A compatibility re-export of the shared control-plane wire schema
+//!   (`schema`), canonically owned by `migration-control-protocol`.
 //! - The S3 layout for coord state: lease, snapshots, append-only event
 //!   logs, audit trail, archived event logs (`layout`).
 //! - An abstraction over the storage backend (`store`) so unit tests
@@ -15,8 +14,8 @@
 //!   atomic create, `DELETE If-Match` for safe takeover after expiry.
 //! - The snapshot writer + reader (`snapshot`) with cadence policy
 //!   (1000 events OR 5 minutes, whichever first).
-//! - The event-log writer + replay routine (`events`).
-//! - An in-memory state struct + reducer (`state`).
+//! - The event-log writer (`events`) and persisted replay orchestration
+//!   (`state`) over the reducer owned by `migration-control-protocol`.
 //! - Archive-on-completion for finished jobs (`archive`).
 //!
 //! Phase 1 (this milestone) is **lib-only**: no HTTP, no worker

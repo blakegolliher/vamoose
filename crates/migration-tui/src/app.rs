@@ -30,8 +30,8 @@ use crate::render;
 use crate::state::{AppState, InputMode, Modal, Tab, View};
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use migration_coord::schema::JobId;
-use migration_coord::schema::WorkerId;
+use migration_control_protocol::schema::JobId;
+use migration_control_protocol::schema::WorkerId;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -61,7 +61,7 @@ pub enum Input {
     /// connect and Resync recovery — F26). Applied via
     /// [`AppState::replace_snapshot`] so every state mutation stays
     /// on the reducer.
-    Snapshot(Box<migration_coord::schema::Snapshot>),
+    Snapshot(Box<migration_control_protocol::schema::Snapshot>),
     /// Crossterm key event from the input task.
     Key(KeyEvent),
     /// Periodic render tick — used to advance elapsed-time labels
@@ -939,7 +939,7 @@ fn is_fatal(e: &ClientError) -> bool {
 pub async fn fetch_bootstrap_snapshot(
     client: &Client,
     now: DateTime<Utc>,
-) -> crate::client::Result<migration_coord::schema::Snapshot> {
+) -> crate::client::Result<migration_control_protocol::schema::Snapshot> {
     const CONSISTENT_ATTEMPTS: usize = 3;
     let mut cursor_seq = client.healthz().await?.last_seq;
     for attempt in 1..=CONSISTENT_ATTEMPTS {
@@ -1222,7 +1222,9 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use crossterm::event::{KeyEvent, KeyEventKind, KeyModifiers};
-    use migration_coord::schema::{ConfigHash, EventEnvelope, EventKind, SCHEMA_VERSION};
+    use migration_control_protocol::schema::{
+        ConfigHash, EventEnvelope, EventKind, SCHEMA_VERSION,
+    };
 
     fn at(s: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(s, 0).unwrap()
@@ -1884,7 +1886,7 @@ mod tests {
     // ----- Workers tab navigation + modal (Phase 5b) -----
 
     use crate::state::WorkerSort;
-    use migration_coord::schema::WorkerId as TestWorkerId;
+    use migration_control_protocol::schema::WorkerId as TestWorkerId;
 
     fn worker_joined(seq: u64, job: &str, wid: TestWorkerId, host: &str) -> EventEnvelope {
         EventEnvelope {

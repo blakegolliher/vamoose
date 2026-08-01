@@ -7,10 +7,10 @@
 
 use chrono::{TimeZone, Utc};
 use futures::StreamExt;
+use migration_control_protocol::schema::{ConfigHash, EventKind, JobId, WorkerId};
 use migration_coord::lease::{Identity, LeaseConfig};
 use migration_coord::runtime::test_clock::FixedClock;
 use migration_coord::runtime::{CoordRuntime, RuntimeConfig};
-use migration_coord::schema::{ConfigHash, EventKind, JobId, WorkerId};
 use migration_coord::server::auth::AuthConfig;
 use migration_coord::server::{build_router, AppState as ServerAppState};
 use migration_coord::store::{CoordStore, MemStore};
@@ -440,7 +440,7 @@ async fn command_methods_round_trip_through_coord() {
     let r = client.pause("alpha", Some("smoke")).await.expect("pause");
     assert!(!r.command_id.is_empty());
     let job = rt.job_view(&jid("alpha")).await.unwrap();
-    assert_eq!(job.phase, migration_coord::schema::Phase::Paused);
+    assert_eq!(job.phase, migration_control_protocol::schema::Phase::Paused);
 
     // resume.
     let r = client.resume("alpha", None).await.expect("resume");
@@ -463,7 +463,10 @@ async fn command_methods_round_trip_through_coord() {
         .expect("cancel");
     assert!(!r.command_id.is_empty());
     let job = rt.job_view(&jid("alpha")).await.unwrap();
-    assert_eq!(job.phase, migration_coord::schema::Phase::Cancelled);
+    assert_eq!(
+        job.phase,
+        migration_control_protocol::schema::Phase::Cancelled
+    );
 
     // retry-failed is audit-only today; should still 200.
     let r = client
@@ -599,7 +602,10 @@ async fn bootstrap_fetches_jobs_then_streams_from_last_seq() {
         // The archived job's state came from REST — SSE can't replay
         // it, its chunks are gone from events/.
         let alpha = s.job(&jid("alpha")).unwrap();
-        assert_eq!(alpha.phase, migration_coord::schema::Phase::Completed);
+        assert_eq!(
+            alpha.phase,
+            migration_control_protocol::schema::Phase::Completed
+        );
         assert_eq!(alpha.progress.files_done, 7);
         assert_eq!(alpha.progress.bytes_done, 2048);
         // Cursor pinned by proxy (per the work item): a stream opened
@@ -704,7 +710,7 @@ async fn resync_refetches_snapshot_and_resumes() {
         rt.ingest(EventKind::ErrorEmitted {
             job_id: jid("alpha"),
             worker_id: w,
-            class: migration_coord::schema::ErrorClass::Timeout,
+            class: migration_control_protocol::schema::ErrorClass::Timeout,
             path: format!("/p/{i}"),
             retryable: true,
             message: big.clone(),
@@ -793,7 +799,7 @@ async fn resync_refetches_snapshot_and_resumes() {
 
 /// Render one envelope the way the coord's SSE layer does:
 /// `event:` = the kind tag, `id:` = seq, `data:` = the envelope JSON.
-fn sse_frame_for(env: &migration_coord::schema::EventEnvelope) -> String {
+fn sse_frame_for(env: &migration_control_protocol::schema::EventEnvelope) -> String {
     format!(
         "event:{}\nid:{}\ndata:{}\n\n",
         env.kind.name(),

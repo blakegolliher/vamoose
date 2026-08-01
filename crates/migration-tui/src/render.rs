@@ -28,7 +28,7 @@ use crate::state::{
 };
 use crate::theme::Theme;
 use chrono::{DateTime, Utc};
-use migration_coord::schema::{
+use migration_control_protocol::schema::{
     ErrorBucket, ErrorClass, Job, JobId, Phase, Worker, WorkerId, WorkerState,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -1604,7 +1604,7 @@ mod tests {
     use super::*;
     use crate::state::AppState;
     use chrono::TimeZone;
-    use migration_coord::schema::{
+    use migration_control_protocol::schema::{
         ConfigHash, EventEnvelope, EventKind, JobId, WorkerId, SCHEMA_VERSION,
     };
     use ratatui::backend::TestBackend;

@@ -9,6 +9,14 @@ implementation when multi-pass starts, hardware verification (§2),
 and small follow-ups (§3). Beta posture and known limitations are
 documented in `docs/BETA_NOTES.md`.
 
+PR #45 is the control-plane layering extraction: it moves the
+existing REST/SSE schema and pure reducer into
+`migration-control-protocol` without changing the version-1 wire or
+runtime behavior. It comes before unified-CLI work so worker and TUI
+clients can compile against the contract without pulling in coord's
+server/storage runtime; it does not touch the rig-sensitive claim or
+data paths.
+
 ## 1. Remaining ledger finding
 
 | Finding | State |
@@ -86,6 +94,16 @@ won't-do; trusted-network beta security posture in BETA_NOTES.md).
       `Error::Other`; typed as `S3` they'd classify WorkerLocal
       without the retry wrapper's retry-everything blanket (PR #27
       scope note).
+- [ ] Control-plane compatibility shims (PR #45): remove
+      `migration_coord::schema` and the legacy `server::{worker,read,
+      command,stream}` DTO re-exports only in a separately announced
+      breaking cleanup after known downstream users import
+      `migration-control-protocol` directly.
+- [ ] Control snapshot boundary (PR #45): `Snapshot` still carries
+      inherited coord persistence/replay bookkeeping
+      (`audit_seq_today`, `audit_seq_date`, `last_client_seq`). Any
+      separation needs an explicit versioned design; do not trim these
+      fields as incidental cleanup.
 
 ## 4. Operational switches
 

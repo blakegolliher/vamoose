@@ -2,9 +2,10 @@
 //!
 //! Two surfaces, both over the same `reqwest::Client`:
 //!
-//! - REST snapshot fetch: [`get_jobs`], [`get_job`], [`get_workers`],
-//!   [`get_errors`], [`healthz`]. Each is a single round trip; the
-//!   types come from `migration_coord::server::read` so coord and
+//! - REST snapshot fetch: [`Client::get_jobs`], [`Client::get_job`],
+//!   [`Client::get_workers`], [`Client::get_errors`],
+//!   [`Client::healthz`]. Each is a single round trip; the
+//!   types come from `migration_control_protocol::schema` so coord and
 //!   client share the wire shape and cargo catches a drift at
 //!   compile time. Together these back the bootstrap/Resync-recovery
 //!   contract of COORD_PLAN §3.4 (`healthz.last_seq` is the resume
@@ -21,10 +22,10 @@
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use migration_coord::schema::EventEnvelope;
-use migration_coord::schema::Job;
-use migration_coord::server::command::{CommandAccepted, ReasonBody};
-use migration_coord::server::read::{
+use migration_control_protocol::schema::EventEnvelope;
+use migration_control_protocol::schema::Job;
+use migration_control_protocol::schema::{CommandAccepted, ReasonBody};
+use migration_control_protocol::schema::{
     HealthzResponse, ListErrorsResponse, ListEventsResponse, ListJobsResponse, ListWorkersResponse,
 };
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -315,7 +316,8 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
 ///
 /// `UnknownEvent` is the forward-compatibility escape hatch (F38): a
 /// frame whose `data:` is a valid JSON object carrying a string
-/// `kind` this build has no [`EventKind`] variant for — i.e. a
+/// `kind` this build has no
+/// [`EventKind`](migration_control_protocol::schema::EventKind) variant for — i.e. a
 /// *newer* coord talking to an older TUI. Surfacing it as an `Err`
 /// instead would tear the stream down, and because the resume cursor
 /// never advances past the frame the reconnect would replay it
@@ -331,8 +333,8 @@ pub enum SseFrame {
 
 /// Turn a `Stream<Item = Result<Bytes>>` into a `Stream<Item =
 /// Result<SseFrame>>`. Hand-rolled minimal parser — handles only the
-/// subset of SSE the coord emits, documented in
-/// `migration_coord::server::stream`.
+/// subset of SSE the coord emits, documented by the
+/// [`migration_control_protocol`] crate.
 ///
 /// Public so the integration suite can drive the exact parser path
 /// with synthetic future-coord frames the live coord cannot emit

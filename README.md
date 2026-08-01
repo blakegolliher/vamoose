@@ -48,6 +48,9 @@ no Postgres, no message broker. Adding a worker means starting a new
   observability sidecar (all subcommands are stubs today; live
   observability comes from `vamoose status` / `vamoose coord` +
   `vamoose tui`)
+- `crates/migration-control-protocol` — control-plane REST/SSE wire
+  schema and pure snapshot reducer; distinct from the S3 claim
+  protocol in `migration-core`
 - `crates/migration-coord` — HTTP/SSE control-plane daemon
   (`vamoose coord`); S3-backed event log, snapshot, single-writer
   lease

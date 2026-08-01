@@ -12,7 +12,7 @@
 //! to the caller's "default" job (selected on the list, or the
 //! job in the active Detail view).
 
-use migration_coord::schema::JobId;
+use migration_control_protocol::schema::JobId;
 
 /// One command the operator can invoke through the palette.
 ///

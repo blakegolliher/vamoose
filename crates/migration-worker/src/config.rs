@@ -110,7 +110,7 @@ pub struct MoverCfg {
     #[serde(default = "default_fixed_buf_size")]
     pub fixed_buffer_size: String,
     /// When true, route regular-file copies through the bucketed
-    /// async libnfs pool ([`AsyncBucketedFileMover`]) instead of the
+    /// async libnfs pool ([`migration_mover::AsyncBucketedFileMover`]) instead of the
     /// sync `MultiPool`. Non-regular rows (symlinks / hardlinks /
     /// dirs / empty / skip) still use the sync path. CLI override
     /// via `vamoose worker run --use-bucketed-pool`. Off by default

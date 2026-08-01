@@ -2,7 +2,7 @@
 //!
 //! Two consumers:
 //!
-//! - The coord runtime calls [`EventLogWriter::buffer`] for every
+//! - The coord runtime calls `EventLogWriter::buffer` for every
 //!   event the system emits (under its state lock — pure
 //!   bookkeeping), then drives the actual S3 PUTs through
 //!   `pending_flushes`/`complete_flush` *outside* that lock (F45b).
@@ -394,7 +394,7 @@ pub(crate) fn skip_chunks_below(keys: &[String], since: u64) -> &[String] {
 ///
 /// Seq-aware: chunk keys embed their zero-padded start seq, so per
 /// route we skip the leading chunks that cannot contain `seq > since`
-/// (see [`skip_chunks_below`]) instead of GETting the entire history.
+/// (see `skip_chunks_below`) instead of GETting the entire history.
 ///
 /// Memory: O(events-since-checkpoint). The SSE catch-up window is
 /// expected to be small (a reconnect after a brief blip); a client

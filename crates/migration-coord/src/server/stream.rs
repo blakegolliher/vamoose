@@ -14,8 +14,8 @@
 //! 2. **Live tail** — receive from the runtime's broadcast bus.
 //!    Each envelope is yielded as [`StreamFrame::Event`].
 //! 3. **Resync on lag** — if the subscriber falls past the bus
-//!    capacity, [`broadcast::Receiver::recv`] returns
-//!    [`broadcast::error::RecvError::Lagged`]; we yield
+//!    capacity, [`tokio::sync::broadcast::Receiver::recv`] returns
+//!    [`tokio::sync::broadcast::error::RecvError::Lagged`]; we yield
 //!    [`StreamFrame::Resync`] so the client refetches `/jobs`.
 //! 4. **Keepalive** — every 15s the stream yields
 //!    [`StreamFrame::Keepalive`], which renders as an SSE comment
@@ -46,7 +46,7 @@
 //!
 //! `JobFilter::All` includes every envelope (cluster + per-job).
 //! `JobFilter::Job(id)` only emits envelopes whose
-//! [`EventKind::job_id`] equals `id`. Worker lifecycle events
+//! [`EventKind::job_id`](crate::schema::EventKind::job_id) equals `id`. Worker lifecycle events
 //! without a job_id (`WorkerLeft` etc.) never appear in a per-job
 //! stream — they ride on the cluster-wide stream only.
 
@@ -215,18 +215,12 @@ pub fn sse_stream(
 // =============================================================================
 
 use super::{ApiError, AppState};
+pub use crate::schema::StreamParams;
 use axum::extract::{Query, State};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use futures::TryStreamExt;
 use http::HeaderMap;
-use serde::Deserialize;
-
-#[derive(Debug, Deserialize)]
-pub struct StreamParams {
-    /// Per-job filter. None → cluster-wide stream.
-    pub job_id: Option<String>,
-}
 
 /// GET /stream and GET /stream?job_id={id}
 ///
