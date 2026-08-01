@@ -30,8 +30,7 @@ async-stream = { workspace = true }
 reqwest = { workspace = true }
 bytes   = { workspace = true }
 
-# Rendering layer — wired in step 4b, declared here so the workspace
-# resolves them in one shot. The `event-stream` feature enables
+# Terminal rendering and input. The `event-stream` feature enables
 # crossterm::event::EventStream so the TUI loop can `select!` on
 # keyboard input alongside the SSE channel and the render tick.
 ratatui   = { workspace = true }

@@ -19,7 +19,9 @@ data paths.
 
 PR #46 continues that layering wave by decomposing the coordinator
 runtime into internal responsibility modules without changing its
-public API or behavior; TUI feature/view decomposition is next.
+public API or behavior. The TUI feature/view decomposition is now
+complete with the same public paths and behavior; unified-CLI cleanup
+remains the next layering follow-up.
 
 ## 1. Remaining ledger finding
 
