@@ -26,8 +26,9 @@
 //!
 //! Shutdown ordering: drop the non-blocking writer guard (drains the
 //! event channel into the file) → flush the file → cancel the
-//! uploader → wait with a deadline. If anything stalls, the deadline
-//! makes sure the binary exits anyway.
+//! uploader → wait with a deadline. The deadline bounds the async
+//! uploader join; the guard drain and file flush happen synchronously
+//! before that wait.
 
 use anyhow::{Context, Result};
 use file_rotate::{compression::Compression, suffix::AppendCount, ContentLimit, FileRotate};
@@ -236,7 +237,8 @@ impl LoggingHandle {
     }
 
     /// Flush pending events, finalize the active log, and drain the
-    /// uploader task. The whole sequence is bounded by `deadline`.
+    /// uploader task. `deadline` bounds only the async uploader join;
+    /// the preceding guard drain and file flush are synchronous.
     pub async fn shutdown(mut self, deadline: Duration) {
         // 1. Drop the non-blocking guard: drains the channel into the
         //    file synchronously.

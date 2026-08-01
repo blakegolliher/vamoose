@@ -7,7 +7,6 @@
 //! is only wiring.
 
 use clap::Parser;
-use std::time::Duration;
 
 mod cli;
 mod cmd;
@@ -42,9 +41,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let result = dispatch::run(cli.command, cli.config).await;
+    let shutdown_deadline = dispatch::logging_shutdown_deadline(&result);
 
     if let Some(handle) = log_handle {
-        handle.shutdown(Duration::from_secs(10)).await;
+        handle.shutdown(shutdown_deadline).await;
     }
 
     let exit_code = result?.exit_code();
