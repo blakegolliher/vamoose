@@ -1,8 +1,8 @@
 use super::*;
-use crate::state::AppState;
-use chrono::TimeZone;
+use crate::state::{AppState, Tab};
+use chrono::{DateTime, TimeZone, Utc};
 use migration_control_protocol::schema::{
-    ConfigHash, EventEnvelope, EventKind, JobId, WorkerId, SCHEMA_VERSION,
+    ConfigHash, ErrorClass, EventEnvelope, EventKind, JobId, WorkerId, SCHEMA_VERSION,
 };
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
