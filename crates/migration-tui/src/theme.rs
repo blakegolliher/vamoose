@@ -180,11 +180,11 @@ impl Theme {
 
     /// Pick a theme from the environment.
     ///
-    /// - `NO_COLOR=1` (or any non-empty value) → [`no_color`]. Per
+    /// - `NO_COLOR=1` (or any non-empty value) → [`Self::no_color`]. Per
     ///   the standard at <https://no-color.org>, presence alone is
     ///   enough; we don't parse the value.
-    /// - `VAMOOSE_THEME=light` → [`light`].
-    /// - anything else → [`dark`].
+    /// - `VAMOOSE_THEME=light` → [`Self::light`].
+    /// - anything else → [`Self::dark`].
     ///
     /// Reads via `std::env::var` so tests can drive it directly
     /// without poisoning their own env.

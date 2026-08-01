@@ -13,16 +13,16 @@
 //! 404, retryability classification.
 
 use chrono::{TimeZone, Utc};
+use migration_control_protocol::schema::HeartbeatBody;
+use migration_control_protocol::schema::{
+    ConfigHash, EventEnvelope, EventKind, JobId, WorkerState, SCHEMA_VERSION,
+};
 use migration_coord::lease::{Identity, LeaseConfig};
 use migration_coord::runtime::test_clock::FixedClock;
 use migration_coord::runtime::{CoordRuntime, RuntimeConfig};
 use migration_coord::server::auth::AuthConfig;
 use migration_coord::server::{build_router, AppState};
 use migration_coord::store::{CoordStore, MemStore};
-use migration_protocol::schema::HeartbeatBody;
-use migration_protocol::schema::{
-    ConfigHash, EventEnvelope, EventKind, JobId, WorkerState, SCHEMA_VERSION,
-};
 use migration_worker::coord_client::{CoordClient, CoordError};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -377,7 +377,7 @@ async fn unknown_job_register_returns_404() {
 async fn unknown_worker_heartbeat_returns_404() {
     let (_rt, addr, shutdown) = spawn_coord(AuthConfig::default()).await;
     let client = client_for(addr, None);
-    let bogus = migration_protocol::schema::WorkerId::new();
+    let bogus = migration_control_protocol::schema::WorkerId::new();
     let err = client
         .heartbeat(
             bogus,

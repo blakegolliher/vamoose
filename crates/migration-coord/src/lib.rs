@@ -3,7 +3,7 @@
 //! Control plane for vamoose deployments. Owns:
 //!
 //! - A compatibility re-export of the shared control-plane wire schema
-//!   (`schema`), canonically owned by `migration-protocol`.
+//!   (`schema`), canonically owned by `migration-control-protocol`.
 //! - The S3 layout for coord state: lease, snapshots, append-only event
 //!   logs, audit trail, archived event logs (`layout`).
 //! - An abstraction over the storage backend (`store`) so unit tests
@@ -15,7 +15,7 @@
 //! - The snapshot writer + reader (`snapshot`) with cadence policy
 //!   (1000 events OR 5 minutes, whichever first).
 //! - The event-log writer (`events`) and persisted replay orchestration
-//!   (`state`) over the reducer owned by `migration-protocol`.
+//!   (`state`) over the reducer owned by `migration-control-protocol`.
 //! - Archive-on-completion for finished jobs (`archive`).
 //!
 //! Phase 1 (this milestone) is **lib-only**: no HTTP, no worker

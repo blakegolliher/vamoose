@@ -27,7 +27,7 @@
 //!   Trust boundary (ledger F20, D2+D3): the URL id must belong to a
 //!   registered worker (404 `worker_not_found`, exactly like
 //!   heartbeat), and the ENTIRE batch is validated against the
-//!   [`validate_worker_event`] allow-list + identity binding before
+//!   `validate_worker_event` allow-list + identity binding before
 //!   anything is ingested — any offending entry rejects the whole
 //!   batch with 403 and nothing applied. Each surviving entry is
 //!   then ingested individually (coord assigns seq); the response

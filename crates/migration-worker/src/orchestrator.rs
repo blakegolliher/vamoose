@@ -1015,7 +1015,7 @@ pub enum RunOutcome {
 /// need to tell "fenced — alert/restart" apart from "migration
 /// complete". Codes already spoken for and left untouched: 0 = clean
 /// completion, 1 = run error (the `Err` path in `main.rs` /
-/// anyhow-from-`vamoose`), 2 = shutdown wedged ([`watchdog_exit_code`],
+/// anyhow-from-`vamoose`), 2 = shutdown wedged (`watchdog_exit_code`,
 /// also clap usage errors). Fenced therefore gets the dedicated
 /// code 3.
 pub fn exit_code_for_outcome(outcome: RunOutcome) -> i32 {

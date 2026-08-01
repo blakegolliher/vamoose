@@ -883,6 +883,11 @@ impl EventKind {
 /// inside the snapshot window rewinds the counter, and the audit
 /// writer recovers by allocating keys with `put_if_absent` and
 /// skipping past collisions (ledger F22).
+///
+/// The audit counters and `last_client_seq` are inherited coordinator
+/// persistence/replay bookkeeping. They remain here because this exact
+/// serialized snapshot is already the version-1 wire and storage contract;
+/// this extraction does not endorse them as the ideal long-term client shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     #[serde(default = "default_schema_version")]
@@ -952,7 +957,8 @@ pub struct RegisterResponse {
     pub worker_id: WorkerId,
     /// WorkerIds the coord marked Disconnected as a side effect of
     /// this register — any prior workers on `(job_id, host)` whose
-    /// `(pid, start_time)` differs from the new registration.
+    /// `(pid, start_time)` differs from the new registration. The
+    /// caller can use this for debugging; clients ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub superseded: Vec<WorkerId>,
 }
@@ -978,7 +984,12 @@ pub struct ControlEnvelope {
     pub mode: ControlMode,
 }
 
-/// Response from `POST /workers/{id}/heartbeat`.
+/// Response from `POST /workers/{id}/heartbeat`. The worker reads
+/// `control.mode` and flips its local `RunControl` to match on every
+/// heartbeat. `last_seq` lets the worker spot a coord restart (a
+/// backwards jump is the trigger to flush its event buffer).
+/// `server_time` is clock-skew diagnostics only — workers never use
+/// it for fence decisions.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
     pub control: ControlEnvelope,
@@ -993,8 +1004,9 @@ pub struct WorkerEventEntry {
     pub kind: EventKind,
     #[serde(default)]
     pub worker_at: Option<DateTime<Utc>>,
-    /// Per-worker idempotency stamp. Absent entries retain
-    /// at-least-once semantics; present entries are deduplicated
+    /// Per-worker idempotency stamp (ledger F20, D4). Absent means a
+    /// pre-upgrade worker: the entry keeps at-least-once semantics
+    /// (applied on every send). Present means the coord dedups it
     /// against the caller's replay-durable high-water mark.
     #[serde(default)]
     pub client_seq: Option<u64>,
@@ -1007,9 +1019,15 @@ pub struct EventsBatchBody {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventsBatchResponse {
-    /// Seqs assigned to applied entries, in batch order.
+    /// Seqs assigned to the APPLIED entries, in batch order.
+    /// `seqs.len() + deduped == events.len()`. For a worker that
+    /// does not stamp `client_seq` nothing is ever deduped, so this
+    /// keeps its original shape (one seq per entry). This is the
+    /// ledger F20 D4 response-shape choice.
     pub seqs: Vec<u64>,
-    /// Entries skipped as already applied.
+    /// Entries skipped as already-applied (`client_seq` at or below
+    /// the caller's high-water mark). The whole batch is settled
+    /// either way — the worker drops its resend buffer on any 200.
     #[serde(default)]
     pub deduped: u64,
 }
@@ -1024,10 +1042,20 @@ pub struct FenceResponse {
     pub seq: u64,
 }
 
+/// Query parameters for `GET /stream`.
+#[derive(Debug, Deserialize)]
+pub struct StreamParams {
+    /// Per-job filter. `None` selects the cluster-wide stream.
+    pub job_id: Option<String>,
+}
+
 /// Query parameters for paginated job reads.
 #[derive(Debug, Deserialize)]
 pub struct ListJobsParams {
+    /// `JobId` from a previous response's `next_cursor` (excluded
+    /// from this page).
     pub cursor: Option<String>,
+    /// Page size. Default 50, capped at 500.
     pub limit: Option<usize>,
 }
 
@@ -1050,15 +1078,17 @@ pub struct ListErrorsResponse {
 /// Query parameters for event-log reads.
 #[derive(Debug, Deserialize)]
 pub struct ListEventsParams {
+    /// Lower bound (exclusive). Default 0.
     pub since: Option<u64>,
+    /// Max events to return. Default 200, capped at 1000.
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListEventsResponse {
     pub events: Vec<EventEnvelope>,
-    /// Seq of the last event returned, or the request's original
-    /// `since` value when the page was empty.
+    /// Seq of the last event returned (or the original `since` if
+    /// the page was empty). Use as `since` on the next request.
     pub next_since: u64,
 }
 

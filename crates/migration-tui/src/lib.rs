@@ -9,7 +9,7 @@
 //!   so the TUI stays on the same TLS family as the rest of vamoose.
 //!
 //! - [`state`] — in-memory state derived from events. Reuses the
-//!   shared [`migration_protocol::schema::Snapshot::apply`] reducer
+//!   shared [`migration_control_protocol::schema::Snapshot::apply`] reducer
 //!   so server and client converge on the same wire semantics.
 //!   Wraps it with TUI-only state (connection status, selected job,
 //!   filter string).

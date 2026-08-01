@@ -1,7 +1,7 @@
 //! Coordinator replay orchestration over persisted snapshots and event chunks.
 //!
 //! The deterministic state transition itself is
-//! [`migration_protocol::reducer`]. This module owns the I/O required to load
+//! [`migration_control_protocol::reducer`]. This module owns the I/O required to load
 //! coordinator state, discover and merge event chunks, and feed ordered
 //! envelopes through [`crate::schema::Snapshot::apply`].
 

@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/migration-core",
-    "crates/migration-protocol",
+    "crates/migration-control-protocol",
     "crates/migration-mover",
     "crates/migration-worker",
     "crates/migration-aggr",
@@ -29,11 +29,11 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal
-migration-core  = { path = "crates/migration-core" }
-migration-protocol = { path = "crates/migration-protocol" }
-migration-mover = { path = "crates/migration-mover" }
-migration-coord = { path = "crates/migration-coord" }
-migration-tui   = { path = "crates/migration-tui" }
+migration-core             = { path = "crates/migration-core" }
+migration-control-protocol = { path = "crates/migration-control-protocol" }
+migration-mover            = { path = "crates/migration-mover" }
+migration-coord            = { path = "crates/migration-coord" }
+migration-tui              = { path = "crates/migration-tui" }
 
 # AWS / S3
 aws-sdk-s3   = "1"

@@ -28,9 +28,9 @@ use crate::run_control::RunControl;
 use crate::throughput::ThroughputCounter;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use migration_control_protocol::schema::HeartbeatBody;
+use migration_control_protocol::schema::{JobId, WorkerId, WorkerState};
 use migration_core::fence::Fence;
-use migration_protocol::schema::HeartbeatBody;
-use migration_protocol::schema::{JobId, WorkerId, WorkerState};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, RwLock};
@@ -74,7 +74,8 @@ pub struct DriverInputs {
 /// hands to the coord_driver for forwarding to the coord. The
 /// processor does NOT carry `worker_id` — it isn't known at
 /// processor-construction time (register completes asynchronously).
-/// The driver materializes the full [`EventKind`] envelope by
+/// The driver materializes the full
+/// [`EventKind`](migration_control_protocol::schema::EventKind) envelope by
 /// attaching `worker_id` and `job_id` at POST time.
 ///
 /// v1 only emits per-file progress counts (Ok / Failed / Fenced).
@@ -440,18 +441,18 @@ impl ProgressAccum {
         job_id: JobId,
         worker_id: WorkerId,
         at: DateTime<Utc>,
-    ) -> Option<migration_protocol::schema::EventEnvelope> {
+    ) -> Option<migration_control_protocol::schema::EventEnvelope> {
         if self.is_empty() {
             return None;
         }
-        let env = migration_protocol::schema::EventEnvelope {
+        let env = migration_control_protocol::schema::EventEnvelope {
             seq: 0, // coord assigns
             at,
-            schema_version: migration_protocol::schema::SCHEMA_VERSION,
+            schema_version: migration_control_protocol::schema::SCHEMA_VERSION,
             worker_at: Some(at),
             client_seq: None,
             from_worker: None,
-            kind: migration_protocol::schema::EventKind::ProgressDelta {
+            kind: migration_control_protocol::schema::EventKind::ProgressDelta {
                 job_id,
                 worker_id,
                 files_delta: self.files_delta,
@@ -834,7 +835,7 @@ mod tests {
             .take_envelope(jid("bobby"), wid, at(42))
             .expect("envelope");
         match env.kind {
-            migration_protocol::schema::EventKind::ProgressDelta {
+            migration_control_protocol::schema::EventKind::ProgressDelta {
                 job_id,
                 worker_id,
                 files_delta,

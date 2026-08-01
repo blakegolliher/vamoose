@@ -19,7 +19,7 @@ path = "src/main.rs"
 migration-core  = { workspace = true }
 migration-mover = { workspace = true }
 # Shared control-plane schema and worker HTTP bodies.
-migration-protocol = { workspace = true }
+migration-control-protocol = { workspace = true }
 
 tokio    = { workspace = true }
 tokio-util = { workspace = true }

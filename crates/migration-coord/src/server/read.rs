@@ -1,8 +1,8 @@
 //! Read-only REST handlers.
 //!
-//! All handlers take an [`AppState`](super::AppState) extractor and
+//! All handlers take an [`AppState`] extractor and
 //! return either `Json<T>` or an [`super::ApiError`]. Path
-//! parameters use axum 0.8 syntax (`{id}`) — see [`super::router`].
+//! parameters use axum 0.8 syntax (`{id}`) — see [`super::build_router`].
 //!
 //! ## Response shapes
 //!

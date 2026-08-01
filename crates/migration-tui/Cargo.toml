@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Shared control-plane schema, REST bodies, and Snapshot reducer.
-migration-protocol = { workspace = true }
+migration-control-protocol = { workspace = true }
 
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }

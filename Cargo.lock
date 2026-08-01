@@ -2418,6 +2418,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "migration-control-protocol"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "migration-coord"
 version = "0.1.0"
 dependencies = [
@@ -2433,8 +2445,8 @@ dependencies = [
  "hex",
  "http 1.4.0",
  "http-body-util",
+ "migration-control-protocol",
  "migration-core",
- "migration-protocol",
  "reqwest",
  "serde",
  "serde_json",
@@ -2497,18 +2509,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "migration-protocol"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "migration-tui"
 version = "0.1.0"
 dependencies = [
@@ -2520,8 +2520,8 @@ dependencies = [
  "crossterm",
  "futures",
  "http 1.4.0",
+ "migration-control-protocol",
  "migration-coord",
- "migration-protocol",
  "ratatui",
  "reqwest",
  "serde",
@@ -2550,10 +2550,10 @@ dependencies = [
  "hostname",
  "http 1.4.0",
  "libc",
+ "migration-control-protocol",
  "migration-coord",
  "migration-core",
  "migration-mover",
- "migration-protocol",
  "parquet",
  "reqwest",
  "serde",

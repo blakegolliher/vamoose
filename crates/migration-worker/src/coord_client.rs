@@ -1,7 +1,8 @@
 //! Worker → coord HTTP client.
 //!
-//! Wraps `reqwest` for the four worker-facing REST endpoints exposed
-//! by [`migration_coord::server::worker`]:
+//! Wraps `reqwest` for the four worker-facing REST endpoints. Their
+//! request and response contracts are owned by
+//! [`migration_control_protocol::schema`]:
 //!
 //! - `POST /workers/register`
 //! - `POST /workers/{id}/heartbeat`
@@ -44,8 +45,8 @@
 //! pre-D4 worker that only reads `seqs` stays correct because its
 //! unstamped entries are never deduped.
 
-use migration_protocol::schema::{EventEnvelope, JobId, WorkerId};
-use migration_protocol::schema::{
+use migration_control_protocol::schema::{EventEnvelope, JobId, WorkerId};
+use migration_control_protocol::schema::{
     EventsBatchBody, EventsBatchResponse, FenceBody, FenceResponse, HeartbeatBody,
     HeartbeatResponse, RegisterBody, RegisterResponse, WorkerEventEntry,
 };
@@ -463,7 +464,7 @@ impl CoordClient {
 
 // Re-export the control mode so the orchestrator side can match on
 // `mode` without depending on the coordinator implementation.
-pub use migration_protocol::schema::ControlMode;
+pub use migration_control_protocol::schema::ControlMode;
 
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
     let status = resp.status();
@@ -484,7 +485,7 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use migration_protocol::schema::{ConfigHash, EventKind, JobId, SCHEMA_VERSION};
+    use migration_control_protocol::schema::{ConfigHash, EventKind, JobId, SCHEMA_VERSION};
 
     fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()

@@ -6,6 +6,7 @@
 //! exercises the HTTP layer in isolation).
 
 use chrono::{TimeZone, Utc};
+use migration_control_protocol::schema::{ConfigHash, EventKind, JobId, WorkerState};
 use migration_coord::lease::{Identity, LeaseConfig};
 use migration_coord::runtime::test_clock::FixedClock;
 use migration_coord::runtime::{CoordRuntime, RuntimeConfig};
@@ -13,7 +14,6 @@ use migration_coord::server::auth::AuthConfig;
 use migration_coord::server::{build_router, AppState};
 use migration_coord::store::{CoordStore, MemStore};
 use migration_core::fence::Fence;
-use migration_protocol::schema::{ConfigHash, EventKind, JobId, WorkerState};
 use migration_worker::config::CoordCfg;
 use migration_worker::coord_driver::{self, DriverInputs, WorkerEventDraft};
 use migration_worker::heartbeat::ProgressState;

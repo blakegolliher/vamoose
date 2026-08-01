@@ -17,7 +17,7 @@ test-helpers = []
 
 [dependencies]
 migration-core = { workspace = true }
-migration-protocol = { workspace = true }
+migration-control-protocol = { workspace = true }
 
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
