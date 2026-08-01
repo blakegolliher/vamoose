@@ -10,14 +10,14 @@
 //! 0 clean completion, 1 run error, 2 wedged shutdown (hard-exit
 //! watchdog), 3 run ended because the worker fenced. The 0-vs-3
 //! mapping is `migration_worker::orchestrator::exit_code_for_outcome`,
-//! pinned by tests there; [`run`] returns the code and `main.rs`
-//! applies it after log shutdown.
+//! pinned by tests there; [`run`] returns the semantic outcome and
+//! the process boundary applies its code after log shutdown.
 
 use crate::config::Config;
 use anyhow::Context;
 use clap::Args as ClapArgs;
 use migration_worker::config as wcfg;
-use migration_worker::orchestrator::exit_code_for_outcome;
+use migration_worker::orchestrator::RunOutcome;
 use std::path::PathBuf;
 
 /// Exit-code contract, shown in `vamoose worker --help`. Codes 0/1/2
@@ -42,9 +42,9 @@ pub struct Args {
     pub use_bucketed_pool: bool,
 }
 
-/// Returns the process exit code for a completed run (0 clean,
-/// 3 fenced — see [`EXIT_CODES_HELP`]); `Err` keeps meaning exit 1.
-pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<i32> {
+/// Returns the semantic outcome for a completed run; `Err` keeps
+/// meaning an ordinary command failure (exit 1 at the process boundary).
+pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<RunOutcome> {
     let path = config_path.unwrap_or_else(|| PathBuf::from("vamoose.toml"));
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config from {}", path.display()))?;
@@ -70,11 +70,14 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<i32
 
     tracing::info!(host_id = %host_id, "vamoose worker starting");
     let outcome = migration_worker::orchestrator::run(worker_cfg, host_id).await?;
-    let code = exit_code_for_outcome(outcome);
-    if code != 0 {
-        tracing::warn!(?outcome, code, "worker run ended fenced; exiting non-zero");
+    if outcome == RunOutcome::Fenced {
+        tracing::warn!(
+            ?outcome,
+            code = 3,
+            "worker run ended fenced; exiting non-zero"
+        );
     }
-    Ok(code)
+    Ok(outcome)
 }
 
 /// Dual-format config parse (the seam every worker start funnels
