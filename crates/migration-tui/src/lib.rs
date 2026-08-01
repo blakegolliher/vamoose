@@ -14,10 +14,11 @@
 //!   Wraps it with TUI-only state (connection status, selected job,
 //!   filter string).
 //!
-//! - rendering (Phase 4b) — ratatui widgets. Not yet present.
+//! - [`render`] — deterministic ratatui views for the jobs list,
+//!   job details, and modal overlays.
 //!
-//! The library is composed in `vamoose tui` (Phase 4c) which owns
-//! the terminal and event loop. Headless callers can drive
+//! The [`app`] module owns the terminal and event loop used by
+//! `vamoose tui`. Headless callers can drive
 //! [`state::AppState`] directly for tests.
 
 pub mod app;

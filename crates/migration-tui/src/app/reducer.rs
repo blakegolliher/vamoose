@@ -47,7 +47,7 @@ pub enum AppAction {
     /// The coord requested a Resync (SSE bus overflow — dropped
     /// events will never be re-streamed). The reducer has flipped
     /// the banner; the caller that owns the stream must drop it,
-    /// re-bootstrap over REST, and resume ([`sse_driver`] does this
+    /// re-bootstrap over REST, and resume ([`crate::app::sse_driver`] does this
     /// itself when it forwards the frame — the main loop treats
     /// this like `Continue`).
     Resync,
