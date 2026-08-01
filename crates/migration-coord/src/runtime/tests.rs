@@ -1,7 +1,11 @@
 use super::*;
-use crate::schema::{JobId, Phase, WorkerId};
-use crate::store::MemStore;
-use chrono::{Duration, TimeZone};
+use crate::errors::{Error, Result};
+use crate::events::EventLogConfig;
+use crate::lease::{Identity, LeaseConfig};
+use crate::schema::{EventEnvelope, EventKind, JobId, Phase, WorkerId};
+use crate::store::{CoordStore, MemStore};
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use std::sync::Arc;
 use test_clock::FixedClock;
 
 fn jid(s: &str) -> JobId {

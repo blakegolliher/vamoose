@@ -1,5 +1,6 @@
-use super::*;
-use std::sync::Mutex;
+use super::Clock;
+use chrono::{DateTime, Utc};
+use std::sync::{Arc, Mutex};
 
 /// Wall-clock that returns a fixed instant; tests bump it
 /// explicitly between `ingest` calls to control event `at`
