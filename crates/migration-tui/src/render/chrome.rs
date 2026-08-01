@@ -1,3 +1,20 @@
+//! Shared top banner and bottom key-hint chrome.
+//!
+//! Jobs-list layout (the bottom row changes with view and input mode):
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │ vamoose · ● connected · 5 jobs, 1.2M files, 8.4TiB          │
+//! ├──────────────────────────────────────────────────────────────┤
+//! │ Job           Phase    Progress              Workers  Errs  │
+//! │ alpha-mig     Copying  ▓▓▓▓▓░░░░░  45%        3      0      │
+//! │ bravo-mig     Paused   ▓▓▓░░░░░░░  18%        1      4      │
+//! │ …                                                            │
+//! ├──────────────────────────────────────────────────────────────┤
+//! │ q quit  / filter  : command  ? help  s sort  ↑↓ select       │
+//! └──────────────────────────────────────────────────────────────┘
+//! ```
+
 use super::common::key_hint;
 use super::jobs::aggregate_counts;
 use crate::format::{format_bytes, format_count, format_elapsed};
