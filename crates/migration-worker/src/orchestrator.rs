@@ -64,6 +64,10 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+/// Interval between arming the watchdog on [`run`]'s successful return
+/// path and forcefully terminating a process that has not exited.
+pub const HARD_EXIT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Returns how the run ended ([`RunOutcome::Clean`] vs
 /// [`RunOutcome::Fenced`]); callers map it to the process exit code
 /// via [`exit_code_for_outcome`] so a fenced-but-clean shutdown is
@@ -969,10 +973,11 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     let watchdog_code = watchdog_exit_code(run_outcome);
     let watchdog_msg = format!(
         "watchdog: forcing process exit {watchdog_code} \
-         (shutdown took >5s; run outcome: {run_outcome:?})\n",
+         (shutdown took >{}s; run outcome: {run_outcome:?})\n",
+        HARD_EXIT_WATCHDOG_INTERVAL.as_secs(),
     );
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        std::thread::sleep(HARD_EXIT_WATCHDOG_INTERVAL);
         // Direct kernel syscalls — bypass Rust stdio (which can be
         // buffered or wedged during shutdown) and std::process::exit
         // (which runs atexit handlers that may touch the same C
@@ -2778,7 +2783,12 @@ mod flush_sinks_tests {
     /// the shutdown was not clean.
     #[test]
     fn watchdog_exit_code_never_reports_success() {
-        use super::{watchdog_exit_code, RunOutcome};
+        use super::{watchdog_exit_code, RunOutcome, HARD_EXIT_WATCHDOG_INTERVAL};
+
+        assert_eq!(
+            HARD_EXIT_WATCHDOG_INTERVAL,
+            std::time::Duration::from_secs(5)
+        );
 
         // Wedged after a clean run → 2 (was the F17 bug: _exit(0)).
         assert_eq!(watchdog_exit_code(RunOutcome::Clean), 2);

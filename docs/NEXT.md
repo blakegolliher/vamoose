@@ -20,8 +20,11 @@ data paths.
 PR #46 continues that layering wave by decomposing the coordinator
 runtime into internal responsibility modules without changing its
 public API or behavior. The TUI feature/view decomposition is now
-complete with the same public paths and behavior; unified-CLI cleanup
-remains the next layering follow-up.
+complete with the same public paths and behavior. The unified CLI now
+centralizes semantic command outcomes, logging shutdown, and final
+process status; doctor failures drain logging, and the successful-worker
+log-upload wait stays below the unchanged hard-exit watchdog. Configuration
+unification and implementation of the stub commands remain deferred.
 
 ## 1. Remaining ledger finding
 
@@ -73,13 +76,6 @@ won't-do; trusted-network beta security posture in BETA_NOTES.md).
       matches anything in the tree (pre-existing warning).
 - [ ] DESIGN.md's "Configuration" example TOML doesn't list
       `rpc_timeout_ms` (PR #39 note); `examples/worker.toml` does.
-- [ ] Shutdown-timing tension (PR #42 observation): the
-      orchestrator arms a 5s hard-exit watchdog when `run()`
-      returns, but the CLI's logging shutdown allows up to 10s — a
-      slow log upload on ANY exit (clean included) can be cut short
-      as exit 2. Pre-existing; align the budgets.
-- [ ] `doctor`'s early `std::process::exit(2)` paths bypass the
-      logging-stack shutdown (PR #42 observation).
 - [ ] `Snapshot.last_client_seq` and `Job.assigned_workers` retain
       evicted worker ids by design (PR #43 note — HWM guards
       resurrected-worker dedup); if residual growth ever matters,

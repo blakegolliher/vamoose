@@ -20,6 +20,21 @@ use std::sync::Arc;
 pub struct Args {}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum IncompleteReason {
+    ConfigurationLoad,
+    S3ClientConstruction,
+    S3Reachability,
+    ConditionalOperation,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum DoctorOutcome {
+    Healthy,
+    ChecksFailed,
+    Incomplete(IncompleteReason),
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Status {
     Pass,
     Warn,
@@ -70,7 +85,7 @@ impl Checks {
     }
 }
 
-pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
+pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<DoctorOutcome> {
     println!("vamoose doctor\n");
 
     let mut checks = Checks::new();
@@ -87,7 +102,9 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()
         Err(e) => {
             checks.record(Status::Fail, "config", format!("{e:#}"));
             print_summary(&checks);
-            std::process::exit(2);
+            return Ok(DoctorOutcome::Incomplete(
+                IncompleteReason::ConfigurationLoad,
+            ));
         }
     };
 
@@ -99,7 +116,9 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()
         Err(e) => {
             checks.record(Status::Fail, "s3 client", format!("{e:#}"));
             print_summary(&checks);
-            std::process::exit(2);
+            return Ok(DoctorOutcome::Incomplete(
+                IncompleteReason::S3ClientConstruction,
+            ));
         }
     };
     let s3: Arc<dyn ClaimStore> = s3_client.clone();
@@ -123,7 +142,7 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()
         Err(e) => {
             checks.record(Status::Fail, "s3 reach", format!("{e}"));
             print_summary(&checks);
-            std::process::exit(2);
+            return Ok(DoctorOutcome::Incomplete(IncompleteReason::S3Reachability));
         }
     }
 
@@ -146,7 +165,9 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()
                 format!("first PUT failed: {e}"),
             );
             print_summary(&checks);
-            std::process::exit(2);
+            return Ok(DoctorOutcome::Incomplete(
+                IncompleteReason::ConditionalOperation,
+            ));
         }
     };
     match s3.put_if_absent(probe, b"vamoose-doctor".to_vec()).await {
@@ -254,10 +275,11 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()
 
     print_summary(&checks);
 
-    if checks.fail > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
+    Ok(if checks.fail > 0 {
+        DoctorOutcome::ChecksFailed
+    } else {
+        DoctorOutcome::Healthy
+    })
 }
 
 async fn build_s3(cfg: &Config) -> anyhow::Result<Arc<S3Client>> {
