@@ -86,8 +86,8 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Run
 /// Try the unified vamoose schema first; if that fails, fall back to
 /// the legacy migration-worker schema. The M5 harness still emits the
 /// legacy format because it needs to set concurrency-bounding knobs
-/// ([shard].max_in_flight, [mover].nfs_connections,
-/// [batch].inflight_*) that the unified Config doesn't yet surface.
+/// (\[shard].max_in_flight, \[mover].nfs_connections,
+/// \[batch].inflight_*) that the unified Config doesn't yet surface.
 ///
 /// A subtly-invalid unified config cannot silently fall through to
 /// legacy: the legacy schema requires the `[run]`/`[shard]`/`[mover]`/
