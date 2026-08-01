@@ -3,10 +3,13 @@
 use std::path::PathBuf;
 
 use crate::cli::Command;
+use crate::cmd::doctor::DoctorOutcome;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommandOutcome {
     Success,
+    DoctorChecksFailed,
+    DoctorUnableToComplete,
     WorkerFenced,
 }
 
@@ -14,7 +17,19 @@ impl CommandOutcome {
     pub(crate) fn exit_code(self) -> u8 {
         match self {
             Self::Success => 0,
+            Self::DoctorChecksFailed => 1,
+            Self::DoctorUnableToComplete => 2,
             Self::WorkerFenced => 3,
+        }
+    }
+}
+
+impl From<DoctorOutcome> for CommandOutcome {
+    fn from(outcome: DoctorOutcome) -> Self {
+        match outcome {
+            DoctorOutcome::Healthy => Self::Success,
+            DoctorOutcome::ChecksFailed => Self::DoctorChecksFailed,
+            DoctorOutcome::Incomplete(_) => Self::DoctorUnableToComplete,
         }
     }
 }
@@ -45,7 +60,7 @@ pub(crate) async fn run(
             .map(|()| CommandOutcome::Success),
         Command::Doctor(args) => crate::cmd::doctor::run(args, config_path)
             .await
-            .map(|()| CommandOutcome::Success),
+            .map(CommandOutcome::from),
         Command::Init(args) => crate::cmd::init::run(args, config_path)
             .await
             .map(|()| CommandOutcome::Success),
@@ -64,10 +79,39 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::doctor::IncompleteReason;
 
     #[test]
     fn successful_and_fenced_worker_exit_codes_are_preserved() {
         assert_eq!(CommandOutcome::Success.exit_code(), 0);
         assert_eq!(CommandOutcome::WorkerFenced.exit_code(), 3);
+    }
+
+    #[test]
+    fn every_doctor_terminal_condition_keeps_its_exit_code() {
+        let cases = [
+            (DoctorOutcome::Healthy, 0),
+            (DoctorOutcome::ChecksFailed, 1),
+            (
+                DoctorOutcome::Incomplete(IncompleteReason::ConfigurationLoad),
+                2,
+            ),
+            (
+                DoctorOutcome::Incomplete(IncompleteReason::S3ClientConstruction),
+                2,
+            ),
+            (
+                DoctorOutcome::Incomplete(IncompleteReason::S3Reachability),
+                2,
+            ),
+            (
+                DoctorOutcome::Incomplete(IncompleteReason::ConditionalOperation),
+                2,
+            ),
+        ];
+
+        for (doctor_outcome, expected) in cases {
+            assert_eq!(CommandOutcome::from(doctor_outcome).exit_code(), expected);
+        }
     }
 }
