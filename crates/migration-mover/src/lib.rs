@@ -26,14 +26,12 @@ pub mod error;
 pub mod failure;
 pub mod file_mover;
 pub mod libnfs;
+mod mover;
 pub mod paths;
 pub mod pipelined_copy;
 pub mod reorder;
 pub mod root_mtime;
 pub mod strategy;
-pub mod uring;
-
-mod mover;
 pub use bucketed_pool::{
     bucket_for_size, AsyncNfsContextPair, BucketConfig, BucketedAsyncPool, BUCKETS,
 };

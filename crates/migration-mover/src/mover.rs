@@ -42,7 +42,6 @@ use crate::error::MoveError;
 use crate::libnfs::{ops, ContextPair, LibnfsContextPool, NfsContext};
 use crate::paths::{join_root, partial_path};
 use crate::strategy::{self, Strategy, StrategyContext};
-use crate::uring::{FixedBufferPool, UringConfig};
 use migration_core::fence::Fence;
 use migration_core::records::{DowngradeKind, FailurePhase, MigrationOptions};
 use migration_core::shard::RowView;
@@ -95,7 +94,6 @@ pub struct MoverConfig {
     /// `row.path` via [`join_root`] for every dest-side libnfs op.
     pub dest_root: String,
     pub policy: AttrPolicy,
-    pub uring: UringConfig,
     pub inflight: InflightProfile,
     /// True if the worker has CAP_CHOWN (or `require_chown_capability`
     /// is set). Controls whether `chown` EPERM is fatal or degraded
@@ -128,7 +126,6 @@ impl MoverConfig {
             source_root,
             dest_root,
             policy: AttrPolicy::from_options(opts),
-            uring: UringConfig::default(),
             inflight: InflightProfile::default(),
             require_chown: true,
             require_unchanged_size: false,
@@ -138,12 +135,11 @@ impl MoverConfig {
 }
 
 /// The mover. Holds long-lived resources: libnfs context pool, the
-/// host id and pid (used to construct `.partial` names), the buffer
-/// pool placeholder (M3.5 wires it in), the downgrade sink, the
-/// fence (consulted immediately before each commit-point op per R8),
-/// and policy. Cloning is cheap (Arc inside) and required because
-/// concurrent shard dispatch hands a clone to each spawned task.
-/// The fence is Arc-backed; all clones share the same atomic flag.
+/// host id and pid (used to construct `.partial` names), the downgrade
+/// sink, the fence (consulted immediately before each commit-point op
+/// per R8), and policy. Cloning is cheap (Arc inside) and required
+/// because concurrent shard dispatch hands a clone to each spawned
+/// task. The fence is Arc-backed; all clones share the same atomic flag.
 #[derive(Clone)]
 pub struct Mover {
     cfg: Arc<MoverConfig>,
@@ -152,7 +148,6 @@ pub struct Mover {
     pid: u32,
     downgrades: DowngradeSink,
     fence: Fence,
-    _buffers: Arc<FixedBufferPool>,
 }
 
 impl Mover {
@@ -163,7 +158,6 @@ impl Mover {
         downgrades: DowngradeSink,
         fence: Fence,
     ) -> Self {
-        let buffers = FixedBufferPool::new(cfg.uring);
         Self {
             cfg: Arc::new(cfg),
             pool,
@@ -171,7 +165,6 @@ impl Mover {
             pid: std::process::id(),
             downgrades,
             fence,
-            _buffers: buffers,
         }
     }
 
@@ -1119,7 +1112,6 @@ mod tests {
                 preserve_times: true,
                 preserve_xattr: false,
             },
-            uring: UringConfig::default(),
             inflight: InflightProfile::default(),
             require_chown: false,
             require_unchanged_size: false,

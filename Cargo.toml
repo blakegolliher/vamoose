@@ -107,9 +107,6 @@ http        = "1"
 # libnfs FFI (see migration-mover/build.rs)
 libc = "0.2"
 
-# io_uring
-io-uring = "0.6"
-
 # trait async fns over dyn
 async-trait = "0.1"
 

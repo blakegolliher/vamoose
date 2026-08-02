@@ -25,7 +25,6 @@ use migration_mover::batch::InflightProfile;
 use migration_mover::bucketed_pool::BucketedAsyncPool;
 use migration_mover::file_mover::AsyncBucketedFileMover;
 use migration_mover::libnfs::SimplePool;
-use migration_mover::uring::UringConfig;
 use migration_mover::{DowngradeSink, FileMover, Mover, MoverConfig, DEFAULT_RPC_TIMEOUT_MS};
 
 fn src_url() -> String {
@@ -143,7 +142,6 @@ async fn async_bucketed_mover_copies_regular_file_end_to_end() {
         source_root: source_root.clone(),
         dest_root: dest_root.clone(),
         policy: AttrPolicy::from_options(&MigrationOptions::default()),
-        uring: UringConfig::default(),
         inflight: InflightProfile::default(),
         require_chown: false, // running as root in the test but be defensive
         require_unchanged_size: false,
@@ -284,7 +282,6 @@ async fn hardlink_replay_is_idempotent() {
         source_root: source_root.clone(),
         dest_root: dest_root.clone(),
         policy: AttrPolicy::from_options(&MigrationOptions::default()),
-        uring: UringConfig::default(),
         inflight: InflightProfile::default(),
         require_chown: false,
         require_unchanged_size: false,
@@ -437,7 +434,6 @@ async fn symlink_replay_is_idempotent() {
         source_root: source_root.clone(),
         dest_root: dest_root.clone(),
         policy: AttrPolicy::from_options(&MigrationOptions::default()),
-        uring: UringConfig::default(),
         inflight: InflightProfile::default(),
         require_chown: false,
         require_unchanged_size: false,
