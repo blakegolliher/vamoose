@@ -24,29 +24,29 @@ pub struct Args {
 
 pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
+    let storage = cfg.storage();
     let bucket = match args.bucket {
         Some(b) => b
             .strip_prefix("s3://")
             .map(|s| s.trim_end_matches('/').to_string())
             .unwrap_or(b),
-        None => cfg.global.bucket.clone(),
+        None => storage.bucket.clone(),
     };
-    if bucket != cfg.global.bucket {
+    if bucket != storage.bucket {
         anyhow::bail!(
             "bucket arg ({bucket}) does not match config bucket ({}); \
              pass the same bucket or omit the arg",
-            cfg.global.bucket
+            storage.bucket
         );
     }
 
-    let verify_tls = !cfg.s3.no_verify_ssl.unwrap_or(false);
     let s3 = Arc::new(
         S3Client::from_config(
-            &cfg.s3.endpoint,
-            &cfg.s3.region,
+            &storage.endpoint,
+            &storage.region,
             &bucket,
-            cfg.s3.profile.as_deref(),
-            verify_tls,
+            storage.profile.as_deref(),
+            storage.verify_tls,
         )
         .await?,
     );

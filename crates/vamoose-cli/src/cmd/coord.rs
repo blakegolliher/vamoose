@@ -77,7 +77,7 @@ pub struct Args {
 pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
     // 1. Config + S3 client.
     let cfg = Config::load(config_path)?;
-    let s3 = build_s3(&cfg).await?;
+    let s3 = build_s3(cfg.storage()).await?;
     let store: Arc<dyn CoordStore> = Arc::new(S3Store::new(s3));
 
     // 2. Auth. F21: dev mode (no tokens, no cluster secret) must not
@@ -202,14 +202,13 @@ async fn finish_shutdown(runtime: &CoordRuntime, history_keep: usize) -> anyhow:
     }
 }
 
-async fn build_s3(cfg: &Config) -> anyhow::Result<S3Client> {
-    let verify_tls = !cfg.s3.no_verify_ssl.unwrap_or(false);
+async fn build_s3(storage: &crate::config::StorageSettings) -> anyhow::Result<S3Client> {
     let client = S3Client::from_config(
-        &cfg.s3.endpoint,
-        &cfg.s3.region,
-        &cfg.global.bucket,
-        cfg.s3.profile.as_deref(),
-        verify_tls,
+        &storage.endpoint,
+        &storage.region,
+        &storage.bucket,
+        storage.profile.as_deref(),
+        storage.verify_tls,
     )
     .await?;
     Ok(client)

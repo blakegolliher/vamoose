@@ -45,7 +45,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Logging, S3};
+use crate::config::{Logging, StorageSettings};
 
 type SharedRotator = Arc<Mutex<FileRotate<AppendCount>>>;
 
@@ -81,16 +81,15 @@ struct UploaderTask {
 /// opens the mode's rotating log file (if any), and — Standard mode
 /// only — spawns the config-gated S3 uploader task.
 ///
-/// `s3_cfg` and `bucket` are only consulted when the uploader
-/// actually spawns; otherwise they're ignored.
+/// `storage` is only consulted when the uploader actually spawns;
+/// otherwise it is ignored.
 pub fn init(
     filter: EnvFilter,
     logging: &Logging,
-    s3_cfg: &S3,
-    bucket: &str,
+    storage: &StorageSettings,
     mode: &LogMode,
 ) -> Result<LoggingHandle> {
-    let (dispatch, handle) = build(filter, logging, s3_cfg, bucket, mode, std::io::stderr)?;
+    let (dispatch, handle) = build(filter, logging, Some(storage), mode, std::io::stderr)?;
     tracing::dispatcher::set_global_default(dispatch)
         .map_err(|e| anyhow::anyhow!("install tracing subscriber: {e}"))?;
     Ok(handle)
@@ -113,20 +112,11 @@ pub fn init_fallback(filter: EnvFilter, mode: &LogMode) -> Option<LoggingHandle>
             None
         }
         LogMode::TuiQuiet { .. } => {
-            // The S3 stub is never consulted: TuiQuiet cannot spawn
-            // the uploader. Failure to open --log-file degrades to
-            // no subscriber at all — for the TUI, silence beats a
-            // corrupted alternate screen.
-            let s3 = S3 {
-                endpoint: String::new(),
-                region: "us-east-1".into(),
-                profile: None,
-                access_key: None,
-                secret_key: None,
-                no_verify_ssl: None,
-            };
+            // TuiQuiet cannot spawn the uploader. Failure to open
+            // --log-file degrades to no subscriber at all — for the
+            // TUI, silence beats a corrupted alternate screen.
             let (dispatch, handle) =
-                build(filter, &Logging::default(), &s3, "", mode, std::io::stderr).ok()?;
+                build(filter, &Logging::default(), None, mode, std::io::stderr).ok()?;
             tracing::dispatcher::set_global_default(dispatch).ok()?;
             Some(handle)
         }
@@ -141,8 +131,7 @@ pub fn init_fallback(filter: EnvFilter, mode: &LogMode) -> Option<LoggingHandle>
 fn build<W>(
     filter: EnvFilter,
     logging: &Logging,
-    s3_cfg: &S3,
-    bucket: &str,
+    storage: Option<&StorageSettings>,
     mode: &LogMode,
     stderr_writer: W,
 ) -> Result<(tracing::Dispatch, LoggingHandle)>
@@ -212,7 +201,10 @@ where
     // TUI must never spawn it no matter what the config says (F39) —
     // the machinery itself stays intact for Standard mode.
     let uploader = match mode {
-        LogMode::Standard if logging.s3_upload => Some(spawn_uploader(logging, s3_cfg, bucket)?),
+        LogMode::Standard if logging.s3_upload => Some(spawn_uploader(
+            logging,
+            storage.expect("standard logging initialization requires storage settings"),
+        )?),
         _ => None,
     };
 
@@ -312,7 +304,7 @@ impl<'a> MakeWriter<'a> for NbMaker {
 
 // ---------- uploader ---------------------------------------------------
 
-fn spawn_uploader(logging: &Logging, s3_cfg: &S3, bucket: &str) -> Result<UploaderTask> {
+fn spawn_uploader(logging: &Logging, storage: &StorageSettings) -> Result<UploaderTask> {
     let cancel = CancellationToken::new();
     let cancel_child = cancel.clone();
 
@@ -335,11 +327,11 @@ fn spawn_uploader(logging: &Logging, s3_cfg: &S3, bucket: &str) -> Result<Upload
     // client. Building a second client here (the orchestrator builds
     // its own at orchestrator::run) is intentional: the uploader runs
     // for every subcommand, not just `worker`.
-    let endpoint = s3_cfg.endpoint.clone();
-    let region = s3_cfg.region.clone();
-    let profile = s3_cfg.profile.clone();
-    let verify_tls = !s3_cfg.no_verify_ssl.unwrap_or(false);
-    let bucket = bucket.to_string();
+    let endpoint = storage.endpoint.clone();
+    let region = storage.region.clone();
+    let profile = storage.profile.clone();
+    let verify_tls = storage.verify_tls;
+    let bucket = storage.bucket.clone();
     let poll = Duration::from_secs(logging.poll_secs.max(1));
 
     let handle = tokio::spawn(async move {
@@ -520,7 +512,7 @@ fn parse_size(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Logging, S3};
+    use crate::config::{Logging, StorageSettings};
     use std::sync::{Arc, Mutex};
 
     /// Injectable stderr seam: captures everything the subscriber's
@@ -551,14 +543,13 @@ mod tests {
         }
     }
 
-    fn s3_stub() -> S3 {
-        S3 {
+    fn storage_stub() -> StorageSettings {
+        StorageSettings {
+            bucket: "bucket".into(),
             endpoint: "http://127.0.0.1:1".into(),
             region: "us-east-1".into(),
             profile: None,
-            access_key: None,
-            secret_key: None,
-            no_verify_ssl: None,
+            verify_tls: true,
         }
     }
 
@@ -584,8 +575,7 @@ mod tests {
         let (dispatch, _handle) = build(
             EnvFilter::new("info"),
             &Logging::default(),
-            &s3_stub(),
-            "bucket",
+            None,
             &LogMode::TuiQuiet { log_file: None },
             stderr.clone(),
         )
@@ -610,8 +600,7 @@ mod tests {
         let (dispatch, handle) = build(
             EnvFilter::new("info"),
             &logging_at(dir.path(), false),
-            &s3_stub(),
-            "bucket",
+            None,
             &LogMode::TuiQuiet {
                 log_file: Some(log_path.clone()),
             },
@@ -642,8 +631,7 @@ mod tests {
         let (_dispatch, handle) = build(
             EnvFilter::new("info"),
             &logging_at(dir.path(), true),
-            &s3_stub(),
-            "bucket",
+            Some(&storage_stub()),
             &LogMode::TuiQuiet {
                 log_file: Some(dir.path().join("tui.log")),
             },
@@ -666,8 +654,7 @@ mod tests {
         let (dispatch, handle) = build(
             EnvFilter::new("info"),
             &logging,
-            &s3_stub(),
-            "bucket",
+            Some(&storage_stub()),
             &LogMode::Standard,
             stderr.clone(),
         )

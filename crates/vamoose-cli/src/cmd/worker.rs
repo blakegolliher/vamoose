@@ -1,22 +1,18 @@
-//! `vamoose worker` — wraps the existing `migration-worker`
-//! orchestrator. The unified `Config` is mapped field-by-field onto
-//! `migration_worker::config::Config`; fields the unified TOML omits
-//! are filled with defaults (mostly delegated to the existing
-//! `serde(default)` handlers).
+//! `vamoose worker` — loads the composition configuration, applies
+//! CLI overrides, and invokes the existing worker orchestrator.
 //!
 //! # Exit codes
 //!
 //! See [`EXIT_CODES_HELP`] (rendered in `vamoose worker --help`):
 //! 0 clean completion, 1 run error, 2 wedged shutdown (hard-exit
 //! watchdog), 3 run ended because the worker fenced. The 0-vs-3
-//! mapping is `migration_worker::orchestrator::exit_code_for_outcome`,
-//! pinned by tests there; [`run`] returns the semantic outcome and
-//! the process boundary applies its code after log shutdown.
+//! mapping is `migration_worker::orchestrator::exit_code_for_outcome`;
+//! [`run`] returns the semantic outcome and the process boundary
+//! applies its code after log shutdown.
 
 use crate::config::Config;
 use anyhow::Context;
 use clap::Args as ClapArgs;
-use migration_worker::config as wcfg;
 use migration_worker::orchestrator::{exit_code_for_outcome, RunOutcome};
 use std::path::PathBuf;
 
@@ -45,22 +41,15 @@ pub struct Args {
 /// Returns the semantic outcome for a completed run; `Err` keeps
 /// meaning an ordinary command failure (exit 1 at the process boundary).
 pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<RunOutcome> {
-    let path = config_path.unwrap_or_else(|| PathBuf::from("vamoose.toml"));
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading config from {}", path.display()))?;
-
-    let (mut worker_cfg, host_id_from_cfg) = parse_worker_config(&text)
+    let (config, path) = Config::load_with_path(config_path)?;
+    let (mut worker_cfg, host_id_from_cfg) = config
+        .into_worker_config()
         .with_context(|| format!("loading config at {}", path.display()))?;
 
-    // CLI override always wins over the config-file value (which
-    // defaults to false anyway). Passing the flag on a config that
-    // also sets `[mover].use_bucketed_pool = true` is redundant but
-    // not an error.
-    if args.use_bucketed_pool {
-        worker_cfg.mover.use_bucketed_pool = true;
-    }
+    worker_cfg.mover.use_bucketed_pool =
+        effective_bucketed_pool(worker_cfg.mover.use_bucketed_pool, args.use_bucketed_pool);
 
-    let host_id = args.id.or(host_id_from_cfg).unwrap_or_else(|| {
+    let host_id = selected_host_id(args.id, host_id_from_cfg).unwrap_or_else(|| {
         let host = hostname::get()
             .ok()
             .and_then(|s| s.into_string().ok())
@@ -81,269 +70,35 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Run
     Ok(outcome)
 }
 
-/// Dual-format config parse (the seam every worker start funnels
-/// through — F31 pins its behavior with tests below).
-///
-/// Try the unified vamoose schema first; if that fails, fall back to
-/// the legacy migration-worker schema. The M5 harness still emits the
-/// legacy format because it needs to set concurrency-bounding knobs
-/// (\[shard].max_in_flight, \[mover].nfs_connections,
-/// \[batch].inflight_*) that the unified Config doesn't yet surface.
-///
-/// A subtly-invalid unified config cannot silently fall through to
-/// legacy: the legacy schema requires the `[run]`/`[shard]`/`[mover]`/
-/// `[batch]` tables a unified file doesn't have, so both parses fail
-/// and the error reports both messages (pinned by
-/// `subtly_invalid_unified_does_not_silently_fall_through`).
-///
-/// Returns the worker config plus the config-carried host id (if any).
-fn parse_worker_config(text: &str) -> anyhow::Result<(wcfg::Config, Option<String>)> {
-    match toml::from_str::<Config>(text) {
-        Ok(unified) => {
-            tracing::debug!("config: unified format detected");
-            let cfg_host = unified.worker.as_ref().and_then(|w| w.host_id.clone());
-            Ok((build_worker_config(&unified)?, cfg_host))
-        }
-        Err(unified_err) => match toml::from_str::<wcfg::Config>(text) {
-            Ok(legacy) => {
-                tracing::debug!("config: legacy worker format detected");
-                let cfg_host = legacy.worker.host_id.clone();
-                Ok((legacy, cfg_host))
-            }
-            Err(legacy_err) => {
-                anyhow::bail!(
-                    "config parse failed in both formats:\n  \
-                     unified: {}\n  \
-                     legacy:  {}",
-                    unified_err,
-                    legacy_err
-                );
-            }
-        },
-    }
+fn effective_bucketed_pool(configured: bool, cli_flag: bool) -> bool {
+    configured || cli_flag
 }
 
-/// Adapter: unified `Config` → existing `migration_worker::config::Config`.
-///
-/// The fields the unified config exposes are passed through directly.
-/// Everything else gets sensible production defaults — operators who
-/// need fine-grained tuning of the inflight profile, server-side-copy
-/// policy, backpressure thresholds, etc. can extend the unified
-/// config or fall back to invoking `mig-worker` with a verbose TOML.
-fn build_worker_config(cfg: &Config) -> anyhow::Result<wcfg::Config> {
-    // F45a: `[nfs]` is optional at the schema level so control-plane
-    // subcommands (coord, status, …) can run without it. The worker
-    // is a data-plane consumer — no [nfs] means no copy endpoints, so
-    // fail fast with an actionable error instead of unwrapping.
-    let nfs = cfg.nfs.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config has no [nfs] section, but `vamoose worker` requires one \
-             (src_url/dst_url/mounts/roots define the copy endpoints); \
-             add an [nfs] section to the config"
-        )
-    })?;
-    let worker = cfg.worker.clone().unwrap_or_else(default_worker);
-    let copy = cfg.copy.clone().unwrap_or_default();
-
-    let no_verify = cfg.s3.no_verify_ssl.unwrap_or(false);
-
-    Ok(wcfg::Config {
-        run: wcfg::RunCfg {
-            bucket: cfg.global.bucket.clone(),
-            endpoint: cfg.s3.endpoint.clone(),
-            region: cfg.s3.region.clone(),
-            profile: cfg.s3.profile.clone(),
-            verify_tls: !no_verify,
-        },
-        worker: wcfg::WorkerCfg {
-            host_id: worker.host_id.clone(),
-            heartbeat_sec: worker.heartbeat_sec,
-            lease_timeout_sec: worker.lease_timeout_sec,
-        },
-        shard: wcfg::ShardCfg {
-            local_scratch: worker.local_scratch.clone(),
-            max_in_flight: 1,
-        },
-        mover: wcfg::MoverCfg {
-            strategy_default: "libnfs_io_uring".to_string(),
-            src_url: nfs.src_url.clone(),
-            dst_url: nfs.dst_url.clone(),
-            nfs_connections: worker.concurrency.max(1) as u32,
-            // F12: unified config exposes no rpc-timeout knob yet;
-            // use the explicit library-matching default (60_000 ms).
-            rpc_timeout_ms: migration_mover::DEFAULT_RPC_TIMEOUT_MS,
-            pipeline_depth: 8,
-            io_uring_queue_depth: 256,
-            fixed_buffer_count: 256,
-            fixed_buffer_size: "1 MiB".to_string(),
-            use_bucketed_pool: false,
-        },
-        batch: wcfg::BatchCfg {
-            bytes_budget: worker.bytes_budget.clone(),
-            files_budget: 100_000,
-            inflight_small: 256,
-            inflight_medium: 16,
-            inflight_large: 4,
-            large_stripe_size: "4 MiB".to_string(),
-            large_stripe_depth: 32,
-        },
-        copy: wcfg::CopyCfg {
-            preserve_owner: copy.preserve_owner,
-            preserve_mode: copy.preserve_mode,
-            preserve_times: copy.preserve_times,
-            preserve_xattr: copy.preserve_xattr,
-            server_side_copy: copy
-                .server_side_copy
-                .clone()
-                .unwrap_or_else(|| "off".to_string()),
-            require_chown_capability: true,
-            require_unchanged_size: false,
-        },
-        backpressure: wcfg::BackpressureCfg {
-            failure_pct_window_sec: 60,
-            failure_pct_threshold: 5.0,
-            throughput_floor_mb_s: 100,
-        },
-        // Coord wiring is not exposed in the unified vamoose.toml
-        // yet (Phase 3.5). Operators opt in via `mig-worker` with a
-        // worker.toml `[coord]` block until the unified config grows
-        // a [coord] section of its own.
-        coord: None,
-    })
+fn selected_host_id(cli: Option<String>, configured: Option<String>) -> Option<String> {
+    cli.or(configured)
 }
-
-fn default_worker() -> crate::config::Worker {
-    crate::config::Worker {
-        host_id: None,
-        heartbeat_sec: 30,
-        lease_timeout_sec: 180,
-        concurrency: 16,
-        local_scratch: PathBuf::from("/tmp/vamoose-scratch"),
-        bytes_budget: "8 GiB".to_string(),
-    }
-}
-
-// =============================================================================
-// F31: tests over the dual-format config seam
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The 6-field starter config from the `config.rs` module doc.
-    const MINIMAL_UNIFIED: &str = r#"
-        [global]
-        bucket = "vamoose-test"
-
-        [s3]
-        endpoint = "http://127.0.0.1:9000"
-
-        [nfs]
-        src_url   = "nfs://src-filer/export"
-        dst_url   = "nfs://dst-filer/export"
-        src_mount = "/mnt/src"
-        dst_mount = "/mnt/dst"
-        src_root  = "/data"
-        dst_root  = "/data"
-    "#;
-
-    /// Minimal legacy migration-worker TOML (what the M5 harness
-    /// emits): required tables present, everything else defaulted.
-    const MINIMAL_LEGACY: &str = r#"
-        [run]
-        bucket   = "vamoose-test"
-        endpoint = "http://127.0.0.1:9000"
-        region   = "us-east-1"
-
-        [worker]
-
-        [shard]
-        local_scratch = "/tmp/vamoose-scratch"
-
-        [mover]
-        src_url = "nfs://src-filer/export"
-        dst_url = "nfs://dst-filer/export"
-
-        [batch]
-        bytes_budget = "8 GiB"
-
-        [copy]
-
-        [backpressure]
-    "#;
-
     #[test]
-    fn minimal_unified_config_parses() {
-        let (cfg, host) = parse_worker_config(MINIMAL_UNIFIED).expect("minimal unified must parse");
-        assert_eq!(cfg.run.bucket, "vamoose-test");
-        assert_eq!(cfg.mover.src_url, "nfs://src-filer/export");
-        // Adapter defaults applied for fields the unified TOML omits.
-        assert_eq!(cfg.mover.nfs_connections, 16);
-        assert_eq!(cfg.batch.bytes_budget, "8 GiB");
-        assert!(host.is_none(), "no [worker].host_id configured");
+    fn bucketed_pool_flag_only_enables_the_setting() {
+        assert!(!effective_bucketed_pool(false, false));
+        assert!(effective_bucketed_pool(false, true));
+        assert!(effective_bucketed_pool(true, false));
+        assert!(effective_bucketed_pool(true, true));
     }
 
     #[test]
-    fn legacy_worker_toml_falls_back() {
-        let (cfg, host) = parse_worker_config(MINIMAL_LEGACY).expect("legacy format must parse");
-        assert_eq!(cfg.run.bucket, "vamoose-test");
+    fn cli_host_id_takes_precedence_over_configuration() {
         assert_eq!(
-            cfg.shard.local_scratch,
-            PathBuf::from("/tmp/vamoose-scratch")
+            selected_host_id(Some("cli-host".into()), Some("config-host".into())).as_deref(),
+            Some("cli-host")
         );
-        assert!(host.is_none());
-    }
-
-    /// A unified config with a subtle mistake (wrong type on a
-    /// `[worker]` field) must NOT silently fall through to a legacy
-    /// run — it fails, and the error carries BOTH parse messages so
-    /// the operator sees the real unified problem. (Structurally a
-    /// unified file can't parse as legacy — legacy requires `[run]` /
-    /// `[shard]` / `[mover]` / `[batch]` — this test pins that.)
-    #[test]
-    fn subtly_invalid_unified_does_not_silently_fall_through() {
-        let broken = format!("{MINIMAL_UNIFIED}\n[worker]\nheartbeat_sec = \"not-a-number\"\n");
-        let err = parse_worker_config(&broken).expect_err("must not run with a mistyped config");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("unified:") && msg.contains("legacy:"),
-            "error must report both format failures, got: {msg}",
-        );
-        assert!(
-            msg.contains("heartbeat_sec"),
-            "the real (unified) mistake must be visible, got: {msg}",
-        );
-    }
-
-    /// F45a (adjusted from the old `missing_nfs_section_errors_for_worker`,
-    /// which only required "nfs" somewhere in a raw parse error):
-    /// worker without `[nfs]` has no source/destination — it must
-    /// fail fast with a clear, actionable error that names the
-    /// missing `[nfs]` section AND the `worker` subcommand, not an
-    /// unwrap and not a serde parse dump.
-    #[test]
-    fn worker_config_without_nfs_errors_clearly() {
-        let no_nfs = r#"
-            [global]
-            bucket = "vamoose-test"
-
-            [s3]
-            endpoint = "http://127.0.0.1:9000"
-        "#;
-        let err = parse_worker_config(no_nfs).expect_err("missing [nfs] must fail for the worker");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("[nfs]"),
-            "error must name the missing [nfs] section, got: {msg}"
-        );
-        assert!(
-            msg.contains("worker"),
-            "error must name the subcommand that requires the section, got: {msg}"
-        );
-        assert!(
-            msg.contains("add an [nfs] section"),
-            "error must tell the operator what to do, got: {msg}"
+        assert_eq!(
+            selected_host_id(None, Some("config-host".into())).as_deref(),
+            Some("config-host")
         );
     }
 }

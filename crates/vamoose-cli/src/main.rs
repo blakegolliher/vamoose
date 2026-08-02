@@ -19,24 +19,23 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     let filter = cli::build_filter(cli.log.as_deref());
 
-    // Load config first so logging::init can read [logging] / [s3] /
-    // [global].bucket. If the config is missing or invalid, fall back
-    // to a mode-appropriate minimal subscriber so the operator sees
-    // the load error through the normal error path (F39: the TUI's
-    // fallback must stay off stderr too — the alternate screen is
-    // corrupted by any fmt line).
+    // Load config first so logging can use the source format's explicit
+    // policy and normalized storage settings. Missing or invalid input
+    // falls back to a mode-appropriate minimal subscriber so the
+    // operator sees the load error through the normal error path (F39:
+    // the TUI's fallback must stay off stderr too — the alternate
+    // screen is corrupted by any fmt line).
     let log_mode = cli::log_mode_for(&cli.command);
     let log_handle = match config::Config::load(cli.config.clone()) {
-        Ok(cfg) => {
-            let logging_cfg = cfg.logging.clone().unwrap_or_default();
-            Some(logging::init(
+        Ok(cfg) => match cfg.logging_policy() {
+            config::LoggingPolicy::MinimalFallback => logging::init_fallback(filter, &log_mode),
+            config::LoggingPolicy::Standard(logging_cfg) => Some(logging::init(
                 filter,
                 &logging_cfg,
-                &cfg.s3,
-                &cfg.global.bucket,
+                cfg.storage(),
                 &log_mode,
-            )?)
-        }
+            )?),
+        },
         Err(_) => logging::init_fallback(filter, &log_mode),
     };
 
