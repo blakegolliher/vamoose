@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use crate::cli::Command;
 use crate::cmd::doctor::DoctorOutcome;
+use migration_worker::orchestrator::{exit_code_for_outcome, RunOutcome};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommandOutcome {
     Success,
     DoctorChecksFailed,
     DoctorUnableToComplete,
-    WorkerFenced,
+    WorkerCompleted(RunOutcome),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,18 +38,14 @@ impl CommandCompletion {
         }
     }
 
-    fn completed_worker(outcome: migration_worker::orchestrator::RunOutcome) -> Self {
-        let outcome = match outcome {
-            migration_worker::orchestrator::RunOutcome::Clean => CommandOutcome::Success,
-            migration_worker::orchestrator::RunOutcome::Fenced => CommandOutcome::WorkerFenced,
-        };
+    fn completed_worker(outcome: RunOutcome) -> Self {
         Self {
-            outcome,
+            outcome: CommandOutcome::WorkerCompleted(outcome),
             logging: LoggingShutdownPolicy::WorkerWatchdogArmed,
         }
     }
 
-    pub(crate) fn exit_code(self) -> u8 {
+    pub(crate) fn exit_code(self) -> i32 {
         self.outcome.exit_code()
     }
 }
@@ -72,12 +69,12 @@ pub(crate) fn logging_shutdown_deadline(result: &anyhow::Result<CommandCompletio
 }
 
 impl CommandOutcome {
-    pub(crate) fn exit_code(self) -> u8 {
+    pub(crate) fn exit_code(self) -> i32 {
         match self {
             Self::Success => 0,
             Self::DoctorChecksFailed => 1,
             Self::DoctorUnableToComplete => 2,
-            Self::WorkerFenced => 3,
+            Self::WorkerCompleted(outcome) => exit_code_for_outcome(outcome),
         }
     }
 }
@@ -138,13 +135,17 @@ mod tests {
     use crate::cmd::doctor::IncompleteReason;
 
     #[test]
-    fn successful_and_fenced_worker_exit_codes_are_preserved() {
-        let clean =
-            CommandCompletion::completed_worker(migration_worker::orchestrator::RunOutcome::Clean);
-        let fenced =
-            CommandCompletion::completed_worker(migration_worker::orchestrator::RunOutcome::Fenced);
-        assert_eq!(clean.exit_code(), 0);
-        assert_eq!(fenced.exit_code(), 3);
+    fn worker_completion_uses_the_worker_owned_exit_code_mapping() {
+        for outcome in [
+            migration_worker::orchestrator::RunOutcome::Clean,
+            migration_worker::orchestrator::RunOutcome::Fenced,
+        ] {
+            let completion = CommandCompletion::completed_worker(outcome);
+            assert_eq!(
+                completion.exit_code(),
+                migration_worker::orchestrator::exit_code_for_outcome(outcome)
+            );
+        }
     }
 
     #[test]

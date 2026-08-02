@@ -28,14 +28,14 @@ pub struct Args {
 
 pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let cfg = Config::load(config_path)?;
-    let verify_tls = !cfg.s3.no_verify_ssl.unwrap_or(false);
+    let storage = cfg.storage();
     let s3 = Arc::new(
         S3Client::from_config(
-            &cfg.s3.endpoint,
-            &cfg.s3.region,
-            &cfg.global.bucket,
-            cfg.s3.profile.as_deref(),
-            verify_tls,
+            &storage.endpoint,
+            &storage.region,
+            &storage.bucket,
+            storage.profile.as_deref(),
+            storage.verify_tls,
         )
         .await?,
     );

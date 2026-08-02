@@ -1,5 +1,7 @@
-# Example mig-worker config. See DESIGN.md "Configuration" for full
-# semantics. Values shown are starting points; tune in M6.
+# Canonical worker and unified-vamoose configuration. This same file
+# works with `mig-worker` and every configuration-consuming `vamoose`
+# subcommand. See DESIGN.md "Configuration" for full semantics.
+# Values shown are starting points; tune in M6.
 
 [run]
 bucket     = "vamoose"

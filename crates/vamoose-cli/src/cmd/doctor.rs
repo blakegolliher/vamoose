@@ -111,7 +111,7 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Do
     let _ = cfg_path; // resolved path retained for context; not re-used
 
     // Build S3 client.
-    let s3_client = match build_s3(&cfg).await {
+    let s3_client = match build_s3(cfg.storage()).await {
         Ok(c) => c,
         Err(e) => {
             checks.record(Status::Fail, "s3 client", format!("{e:#}"));
@@ -131,12 +131,12 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Do
             checks.record(
                 Status::Pass,
                 "s3 reach",
-                format!("LIST s3://{}/ → 200", cfg.global.bucket),
+                format!("LIST s3://{}/ → 200", cfg.storage().bucket),
             );
             checks.record(
                 Status::Pass,
                 "s3 bucket",
-                format!("{} exists", cfg.global.bucket),
+                format!("{} exists", cfg.storage().bucket),
             );
         }
         Err(e) => {
@@ -268,7 +268,7 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Do
     }
 
     // 7-11. NFS checks (or explicit SKIPs when `[nfs]` is absent).
-    run_nfs_checks(&mut checks, cfg.nfs.as_ref());
+    run_nfs_checks(&mut checks, cfg.nfs());
 
     // 12. Walker binary on PATH (or at the configured path).
     check_walker(&mut checks, &cfg);
@@ -282,14 +282,13 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Do
     })
 }
 
-async fn build_s3(cfg: &Config) -> anyhow::Result<Arc<S3Client>> {
-    let verify_tls = !cfg.s3.no_verify_ssl.unwrap_or(false);
+async fn build_s3(storage: &crate::config::StorageSettings) -> anyhow::Result<Arc<S3Client>> {
     let client = S3Client::from_config(
-        &cfg.s3.endpoint,
-        &cfg.s3.region,
-        &cfg.global.bucket,
-        cfg.s3.profile.as_deref(),
-        verify_tls,
+        &storage.endpoint,
+        &storage.region,
+        &storage.bucket,
+        storage.profile.as_deref(),
+        storage.verify_tls,
     )
     .await?;
     Ok(Arc::new(client))
@@ -406,7 +405,7 @@ fn check_mount(checks: &mut Checks, label: &str, mount: &str, writable: bool) {
 }
 
 fn check_walker(checks: &mut Checks, cfg: &Config) {
-    let configured = cfg.walker.as_ref().and_then(|w| w.binary_path.clone());
+    let configured = cfg.walker().and_then(|w| w.binary_path.clone());
     if let Some(path) = configured {
         if path.is_file() {
             checks.record(Status::Pass, "walker binary", format!("{}", path.display()));

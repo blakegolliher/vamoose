@@ -366,6 +366,41 @@ mod tests {
         assert!(cfg.coord.is_none());
     }
 
+    #[test]
+    fn canonical_config_with_cli_only_sections_still_parses_for_mig_worker() {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/worker.toml");
+        let mut text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        text.push_str(
+            r#"
+
+                [nfs]
+                src_url = "nfs://src/export"
+                dst_url = "nfs://dst/export"
+                src_mount = "/mnt/src"
+                dst_mount = "/mnt/dst"
+                src_root = "/source"
+                dst_root = "/destination"
+
+                [walker]
+                threads = 8
+
+                [aggr]
+                refresh_interval_sec = 3
+
+                [logging]
+                path = "/tmp/vamoose.log"
+                s3_upload = false
+            "#,
+        );
+
+        let cfg: Config = toml::from_str(&text)
+            .expect("mig-worker must continue ignoring unified-CLI-only tables");
+        assert_eq!(cfg.run.bucket, "vamoose");
+        assert_eq!(cfg.mover.rpc_timeout_ms, 60_000);
+    }
+
     /// F12: `[mover] rpc_timeout_ms` defaults to 60_000 ms when the
     /// key is omitted — existing operator TOMLs upgrade to an
     /// explicit-and-configurable version of the timeout libnfs was

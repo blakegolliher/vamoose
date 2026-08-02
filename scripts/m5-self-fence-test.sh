@@ -58,9 +58,9 @@ Optional env:
                        only if target/release is missing.
   MIG_WALKER_REWRITE   Path to mig-walker-rewrite (default: cargo run --release).
   VAMOOSE_BIN          Path to unified vamoose binary (default: target/release/vamoose).
-                       Invoked as 'vamoose worker --config <path>'. The worker
-                       subcommand auto-detects unified vs. legacy worker TOML
-                       formats; this harness emits the legacy format.
+                       Invoked as 'vamoose worker --config <path>'. This harness
+                       emits the canonical [run] worker configuration, which is
+                       also accepted by every config-consuming vamoose command.
   AWS_S3_FLAGS         Extra args for aws s3 / aws s3api (e.g. --no-verify-ssl).
 
 Host requirements:
