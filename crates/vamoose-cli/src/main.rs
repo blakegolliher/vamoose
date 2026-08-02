@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
 
     let exit_code = result?.exit_code();
     if exit_code != 0 {
-        std::process::exit(exit_code.into());
+        std::process::exit(exit_code);
     }
     Ok(())
 }

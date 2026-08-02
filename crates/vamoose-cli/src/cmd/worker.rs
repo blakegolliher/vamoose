@@ -17,7 +17,7 @@ use crate::config::Config;
 use anyhow::Context;
 use clap::Args as ClapArgs;
 use migration_worker::config as wcfg;
-use migration_worker::orchestrator::RunOutcome;
+use migration_worker::orchestrator::{exit_code_for_outcome, RunOutcome};
 use std::path::PathBuf;
 
 /// Exit-code contract, shown in `vamoose worker --help`. Codes 0/1/2
@@ -70,10 +70,11 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Run
 
     tracing::info!(host_id = %host_id, "vamoose worker starting");
     let outcome = migration_worker::orchestrator::run(worker_cfg, host_id).await?;
-    if outcome == RunOutcome::Fenced {
+    let exit_code = exit_code_for_outcome(outcome);
+    if exit_code != 0 {
         tracing::warn!(
             ?outcome,
-            code = 3,
+            code = exit_code,
             "worker run ended fenced; exiting non-zero"
         );
     }
