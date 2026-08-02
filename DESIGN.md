@@ -661,8 +661,10 @@ standalone `mig-worker` and every configuration-consuming `vamoose`
 subcommand. Control-plane commands need only `[run]`; starting a worker
 also requires the worker-specific sections shown below. The older
 `[global]`/`[s3]` vamoose shape remains accepted as a compatibility
-input. CLI-only `[nfs]`, `[walker]`, `[aggr]`, and `[logging]` sections
-may be added when those checks or policies are needed.
+input. The compatibility shape does not carry `[coord]`; use canonical
+input for coord-connected workers. CLI-only `[nfs]`, `[walker]`,
+`[aggr]`, and `[logging]` sections may be added when those checks or
+policies are needed.
 
 ```toml
 [run]
