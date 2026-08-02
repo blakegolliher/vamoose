@@ -656,14 +656,24 @@ shard). VAST S3 sees almost no load.
 
 ## Configuration
 
+`examples/worker.toml` is the canonical configuration for both the
+standalone `mig-worker` and every configuration-consuming `vamoose`
+subcommand. Control-plane commands need only `[run]`; starting a worker
+also requires the worker-specific sections shown below. The older
+`[global]`/`[s3]` vamoose shape remains accepted as a compatibility
+input. CLI-only `[nfs]`, `[walker]`, `[aggr]`, and `[logging]` sections
+may be added when those checks or policies are needed.
+
 ```toml
 [run]
 bucket   = "migration-run-2026-05-02"
 endpoint = "https://vast-s3.example.com"
 region   = "us-east-1"
+profile  = "migration-operator"
+verify_tls = true
 
 [worker]
-host_id           = "auto"
+# host_id         = "worker-07"  # auto-generated if omitted
 heartbeat_sec     = 30
 lease_timeout_sec = 180          # 3 min, 6× heartbeat
 
@@ -676,6 +686,7 @@ strategy_default     = "libnfs_io_uring"  # or "nfs42_copy", "kernel_cfr"
 src_url              = "nfs://src/export"
 dst_url              = "nfs://dst/export"
 nfs_connections      = 16
+rpc_timeout_ms       = 60000
 pipeline_depth       = 8
 io_uring_queue_depth = 256
 fixed_buffer_count   = 256
@@ -691,11 +702,13 @@ large_stripe_size  = "4 MiB"
 large_stripe_depth = 32
 
 [copy]
-preserve_owner = true
-preserve_mode  = true
-preserve_times = true
-preserve_xattr = true              # honored when walker emits xattr_blob; no-op until then
-server_side_copy = "auto"          # auto | force | off
+preserve_owner           = true
+preserve_mode            = true
+preserve_times           = true
+preserve_xattr           = true   # honored when walker emits xattr_blob; no-op until then
+server_side_copy         = "off"  # NFSv3 baseline
+require_chown_capability = true
+require_unchanged_size   = false
 
 [backpressure]
 failure_pct_window_sec = 60

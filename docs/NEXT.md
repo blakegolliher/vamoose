@@ -23,8 +23,11 @@ public API or behavior. The TUI feature/view decomposition is now
 complete with the same public paths and behavior. The unified CLI now
 centralizes semantic command outcomes, logging shutdown, and final
 process status; doctor failures drain logging, and the successful-worker
-log-upload wait stays below the unchanged hard-exit watchdog. Configuration
-unification and implementation of the stub commands remain deferred.
+log-upload wait stays below the unchanged hard-exit watchdog. The existing
+worker `[run]` format is now the canonical unified-CLI configuration, with
+the older `[global]`/`[s3]` shape retained as a compatibility input. Mover
+scaffolding cleanup is the next architectural follow-up; implementation of
+the stub commands remains deferred.
 
 ## 1. Remaining ledger finding
 
@@ -74,8 +77,6 @@ won't-do; trusted-network beta security posture in BETA_NOTES.md).
       migration-core; flagged independently by two sessions.
 - [ ] deny.toml: `Unicode-DFS-2016` license allowance no longer
       matches anything in the tree (pre-existing warning).
-- [ ] DESIGN.md's "Configuration" example TOML doesn't list
-      `rpc_timeout_ms` (PR #39 note); `examples/worker.toml` does.
 - [ ] `Snapshot.last_client_seq` and `Job.assigned_workers` retain
       evicted worker ids by design (PR #43 note — HWM guards
       resurrected-worker dedup); if residual growth ever matters,

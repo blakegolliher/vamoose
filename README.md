@@ -92,8 +92,10 @@ end-to-end cookbook. At a high level:
    the canonical shards — `scripts/manual-verify.sh` shows the exact
    steps.)
 4. Copy `examples/worker.toml` per migration host and edit the
-   source / destination / S3 stanzas. **Do not** reuse a config whose
-   source path overlaps its destination path.
+   source / destination / S3 stanzas. This is the canonical config
+   for `vamoose worker`, `status`, `init`, `coord`, and `doctor`, as
+   well as the standalone `mig-worker`. **Do not** reuse a config
+   whose source path overlaps its destination path.
 5. Launch `vamoose worker --config <path>` on each migration host.
 6. Monitor progress. Pick the surface that fits:
    - **One-shot or watch loop** — `vamoose status` (reads the S3
