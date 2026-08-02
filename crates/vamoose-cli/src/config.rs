@@ -444,17 +444,24 @@ fn canonical_worker_config(input: CanonicalWorkerInput) -> Result<(wcfg::Config,
         );
     }
 
-    let worker = input.worker.expect("checked above");
+    let worker = input.worker.context("missing [worker] after validation")?;
+    let shard = input.shard.context("missing [shard] after validation")?;
+    let mover = input.mover.context("missing [mover] after validation")?;
+    let batch = input.batch.context("missing [batch] after validation")?;
+    let copy = input.copy.context("missing [copy] after validation")?;
+    let backpressure = input
+        .backpressure
+        .context("missing [backpressure] after validation")?;
     let host_id = worker.host_id.clone();
     Ok((
         wcfg::Config {
             run: input.run,
             worker,
-            shard: input.shard.expect("checked above"),
-            mover: input.mover.expect("checked above"),
-            batch: input.batch.expect("checked above"),
-            copy: input.copy.expect("checked above"),
-            backpressure: input.backpressure.expect("checked above"),
+            shard,
+            mover,
+            batch,
+            copy,
+            backpressure,
             coord: input.coord,
         },
         host_id,

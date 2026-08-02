@@ -201,10 +201,12 @@ where
     // TUI must never spawn it no matter what the config says (F39) —
     // the machinery itself stays intact for Standard mode.
     let uploader = match mode {
-        LogMode::Standard if logging.s3_upload => Some(spawn_uploader(
-            logging,
-            storage.expect("standard logging initialization requires storage settings"),
-        )?),
+        LogMode::Standard if logging.s3_upload => {
+            let storage = storage.ok_or_else(|| {
+                anyhow::anyhow!("standard logging initialization requires storage settings")
+            })?;
+            Some(spawn_uploader(logging, storage)?)
+        }
         _ => None,
     };
 
