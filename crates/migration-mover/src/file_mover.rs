@@ -384,9 +384,6 @@ impl FileMover for AsyncBucketedFileMover {
         // is only the regular-file fast path; everything else falls
         // back to the wrapped sync impl.
         let strat_ctx = StrategyContext {
-            server_side_copy_policy: self.cfg.server_side_copy,
-            same_server_v42: self.cfg.same_server_v42,
-            server_side_copy_min_bytes: self.cfg.server_side_copy_min_bytes,
             already_copied_inode: false,
         };
         let strategy = strategy::pick(row, &strat_ctx);

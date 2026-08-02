@@ -210,7 +210,6 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
         manifest.dest.url.clone(),
         manifest.source.root.clone(),
         manifest.dest.root.clone(),
-        false, // same_server_v42 detection lands in M4
         &opts,
     );
     mover_cfg.require_chown = require_chown && cap_chown;

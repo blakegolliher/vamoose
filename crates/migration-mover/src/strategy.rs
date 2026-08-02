@@ -1,26 +1,20 @@
 //! Per-file strategy selection.
 //!
-//! Decided per-file from `(file_type, size, src_url, dst_url, server
-//! capabilities)`. See DESIGN.md "Strategy selection per file".
-//!
-//! Strategy::ServerSideCopy uses NFSv4.2 COPY op. Not selected because
-//! the system targets NFSv3 as the protocol baseline. Keep the variant
-//! for future NFSv4.2 support; do not remove from the enum.
+//! Decided per-file from the row kind, size, and hardlink state. Regular
+//! non-empty files use the libnfs data path; special rows use their existing
+//! metadata-only or skip paths.
 
-use migration_core::records::ServerSideCopy;
 use migration_core::schema::FileTypeTag;
 use migration_core::shard::RowView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
-    /// Same NFSv4.2 server on both sides; use COPY op.
-    ServerSideCopy,
-    /// libnfs READ + libnfs WRITE via io_uring fixed buffers. Default
-    /// for everything not handled by a special case.
+    /// Regular-file libnfs READ/WRITE.
+    ///
+    /// The historical variant name is retained because it appears in mover
+    /// outcomes and debug logging. The active sync and bucketed async paths do
+    /// not use io_uring fixed buffers.
     LibnfsIoUring,
-    /// Kernel `copy_file_range`, only when both sides are kernel-mounted
-    /// and the operator opted in. Not a default.
-    KernelCopyFileRange,
     /// Symlink — `READLINK` (or use cached `symlink_target`) → `SYMLINK`
     /// on dest. No data path.
     Symlink,
@@ -39,13 +33,6 @@ pub enum Strategy {
 
 #[derive(Debug, Clone, Copy)]
 pub struct StrategyContext {
-    pub server_side_copy_policy: ServerSideCopy,
-    /// True if the destination NFS server is the same machine/cluster
-    /// as the source and supports NFSv4.2 COPY.
-    pub same_server_v42: bool,
-    /// Threshold below which server-side COPY is *not* worth it (the
-    /// per-op overhead exceeds the data transfer savings).
-    pub server_side_copy_min_bytes: u64,
     /// Set of inodes already copied in this shard, for hardlink
     /// resolution. Caller maintains this; we just consult it.
     pub already_copied_inode: bool,
@@ -68,13 +55,6 @@ pub fn pick(row: &RowView, ctx: &StrategyContext) -> Strategy {
         return Strategy::Empty;
     }
 
-    // NFSv3 baseline: never select Strategy::ServerSideCopy. The
-    // policy/`same_server_v42` inputs are ignored for selection.
-    // See module docs and BUGFIX_PLAN.md "Fix 4". When NFSv4.2
-    // support returns, restore the auto/force gate here.
-    let _ = (ctx.server_side_copy_policy, ctx.same_server_v42);
-    let _ = ServerSideCopy::Auto;
-
     Strategy::LibnfsIoUring
 }
 
@@ -83,12 +63,9 @@ mod tests {
     use super::*;
     use migration_core::schema::FileTypeTag;
 
-    fn ctx(policy: ServerSideCopy, same_server_v42: bool) -> StrategyContext {
+    fn ctx(already_copied_inode: bool) -> StrategyContext {
         StrategyContext {
-            server_side_copy_policy: policy,
-            same_server_v42,
-            server_side_copy_min_bytes: 64 * 1024,
-            already_copied_inode: false,
+            already_copied_inode,
         }
     }
 
@@ -113,64 +90,49 @@ mod tests {
         }
     }
 
-    /// NFSv3 baseline regression: no input combination causes
-    /// `pick` to return `ServerSideCopy`. If NFSv4.2 support is
-    /// reintroduced, this test should be relaxed deliberately —
-    /// see BUGFIX_PLAN.md "Fix 4".
-    #[test]
-    fn strategy_pick_never_returns_server_side_copy() {
-        let cases = [
-            (ServerSideCopy::Auto, false),
-            (ServerSideCopy::Auto, true),
-            (ServerSideCopy::Force, false),
-            (ServerSideCopy::Force, true),
-            (ServerSideCopy::Off, false),
-            (ServerSideCopy::Off, true),
-        ];
-        for (policy, same) in cases {
-            let c = ctx(policy, same);
-            for size in [1u64, 1024, 1 << 20, 1 << 30] {
-                let r = row(size, FileTypeTag::Regular);
-                assert_ne!(
-                    pick(&r, &c),
-                    Strategy::ServerSideCopy,
-                    "policy={policy:?} same_server_v42={same} size={size}",
-                );
-            }
-        }
-    }
-
     #[test]
     fn empty_files_pick_empty() {
         let r = row(0, FileTypeTag::Regular);
-        assert_eq!(pick(&r, &ctx(ServerSideCopy::Off, false)), Strategy::Empty);
+        assert_eq!(pick(&r, &ctx(false)), Strategy::Empty);
     }
 
     #[test]
     fn symlinks_pick_symlink() {
         let r = row(0, FileTypeTag::Symlink);
-        assert_eq!(
-            pick(&r, &ctx(ServerSideCopy::Off, false)),
-            Strategy::Symlink
-        );
+        assert_eq!(pick(&r, &ctx(false)), Strategy::Symlink);
     }
 
     #[test]
     fn dirs_pick_dir_attrs() {
         let r = row(0, FileTypeTag::Dir);
-        assert_eq!(
-            pick(&r, &ctx(ServerSideCopy::Off, false)),
-            Strategy::DirAttrs
-        );
+        assert_eq!(pick(&r, &ctx(false)), Strategy::DirAttrs);
     }
 
     #[test]
     fn regular_files_pick_libnfs() {
         let r = row(1 << 20, FileTypeTag::Regular);
-        assert_eq!(
-            pick(&r, &ctx(ServerSideCopy::Auto, true)),
-            Strategy::LibnfsIoUring,
-            "auto + same_server_v42=true must still pick LibnfsIoUring under NFSv3 baseline",
-        );
+        assert_eq!(pick(&r, &ctx(false)), Strategy::LibnfsIoUring);
+    }
+
+    #[test]
+    fn copied_inodes_pick_hardlink() {
+        let mut r = row(1 << 20, FileTypeTag::Regular);
+        r.inode = Some(42);
+        assert_eq!(pick(&r, &ctx(true)), Strategy::HardlinkExisting);
+        assert_eq!(pick(&r, &ctx(false)), Strategy::LibnfsIoUring);
+    }
+
+    #[test]
+    fn non_data_rows_pick_skip() {
+        for file_type in [
+            FileTypeTag::Unknown,
+            FileTypeTag::Fifo,
+            FileTypeTag::Socket,
+            FileTypeTag::BlockDev,
+            FileTypeTag::CharDev,
+        ] {
+            let r = row(4096, file_type);
+            assert_eq!(pick(&r, &ctx(false)), Strategy::Skip);
+        }
     }
 }

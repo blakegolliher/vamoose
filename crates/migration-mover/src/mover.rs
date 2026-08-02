@@ -44,7 +44,7 @@ use crate::paths::{join_root, partial_path};
 use crate::strategy::{self, Strategy, StrategyContext};
 use crate::uring::{FixedBufferPool, UringConfig};
 use migration_core::fence::Fence;
-use migration_core::records::{DowngradeKind, FailurePhase, MigrationOptions, ServerSideCopy};
+use migration_core::records::{DowngradeKind, FailurePhase, MigrationOptions};
 use migration_core::shard::RowView;
 use std::sync::Arc;
 
@@ -94,15 +94,7 @@ pub struct MoverConfig {
     /// `endpoint.root` from the manifest's `dest` block. Joined with
     /// `row.path` via [`join_root`] for every dest-side libnfs op.
     pub dest_root: String,
-    /// **Currently unused.** Strategy selection in this build never
-    /// returns `Strategy::ServerSideCopy` because the system targets
-    /// NFSv3 as the protocol baseline; see `strategy.rs`. Kept on the
-    /// struct for forward compatibility — when an NFSv4.2 fast path
-    /// is reintroduced it will read this flag again.
-    pub same_server_v42: bool,
     pub policy: AttrPolicy,
-    pub server_side_copy: ServerSideCopy,
-    pub server_side_copy_min_bytes: u64,
     pub uring: UringConfig,
     pub inflight: InflightProfile,
     /// True if the worker has CAP_CHOWN (or `require_chown_capability`
@@ -128,7 +120,6 @@ impl MoverConfig {
         dest_url: String,
         source_root: String,
         dest_root: String,
-        same_server_v42: bool,
         opts: &MigrationOptions,
     ) -> Self {
         Self {
@@ -136,10 +127,7 @@ impl MoverConfig {
             dest_url,
             source_root,
             dest_root,
-            same_server_v42,
             policy: AttrPolicy::from_options(opts),
-            server_side_copy: opts.server_side_copy,
-            server_side_copy_min_bytes: 64 * 1024,
             uring: UringConfig::default(),
             inflight: InflightProfile::default(),
             require_chown: true,
@@ -204,9 +192,6 @@ impl Mover {
     /// those (the shard processor's per-group logic is the authority).
     pub async fn move_one(&self, row: &RowView) -> MoveOutcome {
         let strat_ctx = StrategyContext {
-            server_side_copy_policy: self.cfg.server_side_copy,
-            same_server_v42: self.cfg.same_server_v42,
-            server_side_copy_min_bytes: self.cfg.server_side_copy_min_bytes,
             already_copied_inode: false,
         };
         let strategy = strategy::pick(row, &strat_ctx);
@@ -298,9 +283,7 @@ impl Mover {
         strategy: Strategy,
     ) -> Result<u64, MoveError> {
         match strategy {
-            Strategy::ServerSideCopy => self.do_server_side_copy(pair, row).map(|()| 0),
             Strategy::LibnfsIoUring => self.do_libnfs_copy(pair, row),
-            Strategy::KernelCopyFileRange => self.do_kernel_cfr(pair, row).map(|()| 0),
             Strategy::Symlink => self.do_symlink(pair, row).map(|()| 0),
             Strategy::HardlinkExisting => Err(MoveError::new(FailurePhase::Hardlink, "EINVAL")),
             Strategy::Empty => self.do_empty(pair, row).map(|()| 0),
@@ -389,21 +372,6 @@ impl Mover {
         } else {
             Err(MoveError::new(FailurePhase::Fenced, "FENCE_TRIPPED"))
         }
-    }
-
-    /// **M4** — NFSv4.2 server-side COPY. Stubbed.
-    fn do_server_side_copy(
-        &self,
-        _pair: &mut ContextPair,
-        _row: &RowView,
-    ) -> Result<(), MoveError> {
-        Err(MoveError::new(FailurePhase::ServerSideCopy, "ENOSYS"))
-    }
-
-    /// **Escape hatch** — kernel `copy_file_range` over already-mounted
-    /// kernel NFS. Stubbed.
-    fn do_kernel_cfr(&self, _pair: &mut ContextPair, _row: &RowView) -> Result<(), MoveError> {
-        Err(MoveError::new(FailurePhase::Write, "ENOSYS"))
     }
 
     /// Symlink — preserve `target` byte-for-byte from the index column
@@ -1145,15 +1113,12 @@ mod tests {
             dest_url: "nfs://srcB/exp".to_string(),
             source_root: "/".to_string(),
             dest_root: "/".to_string(),
-            same_server_v42: false,
             policy: AttrPolicy {
                 preserve_mode: true,
                 preserve_owner: true,
                 preserve_times: true,
                 preserve_xattr: false,
             },
-            server_side_copy: ServerSideCopy::Off,
-            server_side_copy_min_bytes: 0,
             uring: UringConfig::default(),
             inflight: InflightProfile::default(),
             require_chown: false,
@@ -1179,7 +1144,6 @@ mod tests {
             "nfs://dst/exp".into(),
             "/".into(),
             "/".into(),
-            false,
             &MigrationOptions::default(),
         );
         assert_eq!(cfg.rpc_timeout_ms, crate::libnfs::DEFAULT_RPC_TIMEOUT_MS);
