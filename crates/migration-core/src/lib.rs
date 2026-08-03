@@ -14,7 +14,7 @@
 //!
 //! Anything that both the worker and aggregator need to agree on lives
 //! here. The mover (`migration-mover`) depends on this crate but adds
-//! its own libnfs + io_uring machinery.
+//! its own libnfs data-plane implementation.
 
 // `Error::S3(aws_sdk_s3::Error)` carries a ~168-byte variant that
 // recent clippy (1.92+) flags as `result_large_err` everywhere `Result<T>`

@@ -52,9 +52,9 @@ use std::sync::Arc;
 /// what `nfs_symlink` produces.
 const SYMLINK_DEFAULT_MODE: u32 = 0o0777;
 
-/// Streaming buffer size for the libnfs READ→WRITE path. Per-task
-/// allocation is a few microseconds; keeping this simple while M3 is
-/// new (true fixed-buffer registration is M3.5+ — see `M3_NOTES.md`).
+/// Streaming buffer size for the sync libnfs READ→WRITE path. Per-task
+/// allocation is negligible beside the libnfs network round trips, so the
+/// active path deliberately uses a plain buffer.
 const STREAM_BUF_SIZE: usize = 1 << 20; // 1 MiB
 
 /// Outcome of attempting to move one file.
@@ -81,6 +81,9 @@ pub struct MoveOutcome {
     pub result: Result<(), MoveError>,
 }
 
+/// Internal configuration consumed by the two implemented libnfs movers.
+/// Historical operator fields remain accepted by `migration-worker` for TOML
+/// compatibility but are not projected into this executable configuration.
 #[derive(Clone)]
 pub struct MoverConfig {
     pub source_url: String,

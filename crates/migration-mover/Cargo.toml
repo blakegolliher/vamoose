@@ -4,7 +4,7 @@ version     = { workspace = true }
 edition     = { workspace = true }
 authors     = { workspace = true }
 license     = { workspace = true }
-description = "Wire-rate file mover: libnfs (user-space NFS) + io_uring, with NFSv4.2 server-side COPY fast path"
+description = "NFSv3 file mover with sync and bucketed async libnfs data paths"
 publish     = false
 links       = "nfs"   # tells cargo this crate links libnfs
 

@@ -153,8 +153,10 @@ NFS COMMIT, R4 completion/heartbeat TOCTOU).
   the binary to `bail!` like `vamoose aggr` does. Nothing cleans
   orphaned `.partial` files today.
 - **xattr support** — mover has dead code awaiting walker capture.
-- **M3.5 (real io_uring)** — deferred; `uring.rs` still has a
-  `todo!()` landmine in `FixedBufferPool::acquire`.
+- **True io_uring integration** — deferred and intentionally unscaffolded.
+  The obsolete fixed-buffer placeholder and unused crate dependency were
+  removed on 2026-08-02; any future implementation starts with a measured
+  design rather than a dormant runtime hook.
 - **libnfs vendoring / bindgen** — long-term FFI determinism.
 
 ---

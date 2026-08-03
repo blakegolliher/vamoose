@@ -77,14 +77,18 @@ fn one() -> u32 {
     1
 }
 
-// Most of MoverCfg's fields are M3.5+ stubs (`pipeline_depth`,
-// `io_uring_queue_depth`, `fixed_buffer_*`) or NFSv3-baseline holdouts
-// (`strategy_default`, `src_url`, `dst_url`); the orchestrator reads
-// the manifest's URLs instead. Keep the schema published — operators
-// have these in their TOMLs — and silence dead_code at the struct level.
+// The canonical operator schema retains historical strategy/tuning fields.
+// They continue to deserialize and project losslessly, but do not select or
+// tune an executable path today. The orchestrator reads source/destination
+// URLs from the manifest and uses nfs_connections, rpc_timeout_ms, and
+// use_bucketed_pool. Keep the compatibility surface intact and silence
+// dead_code at the struct level.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct MoverCfg {
+    /// Compatibility name for the regular-file libnfs strategy. Parsed and
+    /// retained, but strategy selection is fixed to the implemented libnfs
+    /// path.
     #[serde(default = "default_strategy")]
     pub strategy_default: String,
     pub src_url: String,
@@ -101,12 +105,18 @@ pub struct MoverCfg {
     /// retryable/worker-local, never shard corruption.
     #[serde(default = "default_rpc_timeout_ms")]
     pub rpc_timeout_ms: u32,
+    /// Compatibility-reserved; does not tune the current sync or bucketed
+    /// libnfs implementation.
     #[serde(default = "default_pipeline_depth")]
     pub pipeline_depth: u32,
+    /// Compatibility-reserved for a possible future io_uring design; no
+    /// io_uring implementation is present.
     #[serde(default = "default_io_uring_qd")]
     pub io_uring_queue_depth: u32,
+    /// Compatibility-reserved for a possible future fixed-buffer design.
     #[serde(default = "default_fixed_buf_count")]
     pub fixed_buffer_count: u32,
+    /// Compatibility-reserved for a possible future fixed-buffer design.
     #[serde(default = "default_fixed_buf_size")]
     pub fixed_buffer_size: String,
     /// When true, route regular-file copies through the bucketed
@@ -185,6 +195,8 @@ pub struct CopyCfg {
     pub preserve_times: bool,
     #[serde(default = "t")]
     pub preserve_xattr: bool,
+    /// Compatibility-reserved NFSv4.2 policy. The NFSv3 mover never selects
+    /// server-side COPY.
     #[serde(default = "default_ssc")]
     pub server_side_copy: String,
     /// True (default): refuse to start if `preserve_owner` is on but
@@ -206,8 +218,6 @@ fn t() -> bool {
 fn default_false() -> bool {
     false
 }
-// NFSv3 baseline: server-side COPY is never selected. See
-// BUGFIX_PLAN.md "Fix 4". The field stays for forward compatibility.
 fn default_ssc() -> String {
     "off".into()
 }
