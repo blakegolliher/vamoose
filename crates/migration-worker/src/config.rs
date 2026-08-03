@@ -360,6 +360,12 @@ mod tests {
         );
         assert_eq!(cfg.run.profile.as_deref(), Some("var204"));
         assert!(!cfg.run.verify_tls);
+        assert_eq!(cfg.mover.strategy_default, "libnfs_io_uring");
+        assert_eq!(cfg.mover.pipeline_depth, 8);
+        assert_eq!(cfg.mover.io_uring_queue_depth, 256);
+        assert_eq!(cfg.mover.fixed_buffer_count, 256);
+        assert_eq!(cfg.mover.fixed_buffer_size, "1 MiB");
+        assert_eq!(cfg.copy.server_side_copy, "off");
         // The example does not declare [coord] today, so the optional
         // field defaults to None. Existing operator configs must
         // continue to parse without edits.

@@ -115,6 +115,11 @@ mod tests {
     }
 
     #[test]
+    fn regular_strategy_keeps_compatibility_debug_label() {
+        assert_eq!(format!("{:?}", Strategy::LibnfsIoUring), "LibnfsIoUring");
+    }
+
+    #[test]
     fn copied_inodes_pick_hardlink() {
         let mut r = row(1 << 20, FileTypeTag::Regular);
         r.inode = Some(42);
