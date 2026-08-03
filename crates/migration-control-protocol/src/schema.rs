@@ -365,9 +365,8 @@ pub struct RateCaps {
     pub bytes_per_sec_per_worker: Option<u64>,
 }
 
-/// Immutable job configuration. Written to `jobs/{job_id}/config.json`
-/// at creation and never mutated. `claim_version` defaults to `2`
-/// (today's protocol); `1` is rejected.
+/// Immutable job configuration carried in the control-plane snapshot.
+/// `claim_version` defaults to `2` (today's claim protocol).
 ///
 /// Free-form fields (`exclusions`, the four caps structs) are kept
 /// explicit rather than a `serde_json::Value` blob so the wire shape
@@ -405,9 +404,8 @@ fn default_verify_mode() -> VerifyMode {
     VerifyMode::Stat
 }
 
-/// Hex-encoded config hash. Computed at job creation from a
-/// deterministic JSON encoding of `JobConfig` (Phase 1 stub: the
-/// reducer will fill this in; the type just carries the value).
+/// Hex-encoded hash of the job configuration, supplied by the job creator and
+/// carried unchanged by the reducer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ConfigHash(pub String);

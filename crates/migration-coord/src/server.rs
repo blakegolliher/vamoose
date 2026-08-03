@@ -8,12 +8,12 @@
 //!   `GET /jobs/{id}/events?since=...`.
 //! - **Command** (`server::command`): `POST /jobs/{id}/pause`,
 //!   `/resume`, `/cancel`, `/drain`, `/retry-failed`. Each writes an
-//!   audit line and emits the corresponding event; workers honor the
-//!   command in Phase 3.
+//!   audit line; lifecycle commands emit durable events that workers
+//!   observe through heartbeat control. `retry-failed` is audit-only.
 //! - **Worker** (`server::worker`): `POST /workers/register`,
 //!   `/workers/{id}/heartbeat`, `/workers/{id}/events` (batched),
-//!   `/workers/{id}/fence`. Worker integration lands in Phase 3 —
-//!   endpoints exist so the contract can be exercised by tests.
+//!   `/workers/{id}/fence`. Current workers use these endpoints when
+//!   their `[coord]` section is configured.
 //! - **Stream** (`server::stream`): `GET /stream` and
 //!   `GET /stream?job_id={id}`. SSE with `Last-Event-ID` resume and
 //!   15s keepalive pings.
@@ -28,9 +28,9 @@
 //!   One value per deployment, env-loaded.
 //! - `GET /healthz` is exempt from auth.
 //!
-//! Phase 2 implementation lands in subsequent commits — this module
-//! holds the skeleton + documentation so the crate keeps compiling
-//! as each piece arrives.
+//! In dev mode both authentication middleware layers allow requests, but the
+//! CLI refuses a non-loopback dev-mode bind without an explicit unsafe
+//! override.
 
 pub mod auth;
 pub mod command;

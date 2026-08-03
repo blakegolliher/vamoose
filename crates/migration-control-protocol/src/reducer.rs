@@ -18,7 +18,7 @@
 //! same ordered envelopes to the same snapshot produces the same
 //! state.
 //!
-//! ## What the reducer covers in Phase 1
+//! ## Covered transitions
 //!
 //! - Job lifecycle: created, phase changes, paused/resumed/cancelled/
 //!   completed/failed (each updates phase + appends to phase_history).
@@ -30,10 +30,9 @@
 //! - Claim conflict count: ClaimConflictResolved bumps the per-job
 //!   counter.
 //!
-//! Verify events are routed but produce no aggregate state change in
-//! Phase 1 beyond Phase transitions. Phase 5 (TUI verify tab) will
-//! grow more nuanced derived state from them; that's intentionally
-//! deferred.
+//! Verify start/completion events transition job phase. Individual mismatch
+//! events remain stream-visible but do not mutate aggregate snapshot state;
+//! clients may maintain their own bounded mismatch history.
 
 use crate::schema::{
     ErrorBucket, ErrorClass, EventEnvelope, EventKind, Job, JobConfig, JobId, Phase,
@@ -43,11 +42,8 @@ use crate::schema::{
 use chrono::{DateTime, Utc};
 
 impl Snapshot {
-    /// Apply an event envelope. Pure on `(state, env)`; the reducer
-    /// only reads `env.kind` (and the seq it's about to install).
-    /// Caller updates `self.last_seq` to `env.seq` after — keeping
-    /// that bookkeeping out of the match keeps the reducer easier to
-    /// audit.
+    /// Apply an event envelope. Pure on `(state, env)`; the reducer reads the
+    /// event kind and records `env.seq` as `last_seq` after the transition.
     pub fn apply(&mut self, env: &EventEnvelope) {
         // Per-worker client_seq high-water mark (ledger F20, D4).
         // Runs in the reducer — not the ingest handler — so replay
@@ -78,14 +74,9 @@ impl Snapshot {
                 owner,
                 config_hash,
             } => {
-                // Synthesizing JobConfig from event fields is the
-                // event-creator's responsibility for now; the event
-                // carries no config payload (it's referenced by hash).
-                // For replay we install a minimal Job with the config
-                // we already have on disk if available. Phase 1 reads
-                // jobs/{id}/config.json on demand from the REST
-                // handlers (Phase 2); the in-memory Job carries a
-                // sentinel config that the REST handler refreshes.
+                // JobCreated carries the endpoints and config hash, not the
+                // full JobConfig. The reducer therefore installs the stable
+                // protocol defaults around those endpoints.
                 self.jobs.insert(
                     job_id.clone(),
                     Job {
@@ -96,11 +87,8 @@ impl Snapshot {
                         owner: owner.clone(),
                         created_at: env.at,
                         config_hash: config_hash.clone(),
-                        // Sentinel: Phase 2 REST overlays this from
-                        // jobs/{id}/config.json. Fields the replay
-                        // reducer touches (phase, progress, etc.)
-                        // are not on JobConfig, so the sentinel is
-                        // safe to carry through replay.
+                        // The full configuration is not an event payload, so
+                        // replay deterministically reconstructs this value.
                         config: sentinel_config(source, dest),
                         phase: Phase::Planned,
                         phase_history: Vec::new(),
@@ -333,8 +321,7 @@ impl Snapshot {
             }
 
             EventKind::VerifyFileMismatch { .. } => {
-                // Streams to SSE but no aggregate state change in
-                // Phase 1.
+                // Streams to SSE but does not change aggregate snapshot state.
             }
         }
 

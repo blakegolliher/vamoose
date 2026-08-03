@@ -17,13 +17,13 @@
 //! - The event-log writer (`events`) and persisted replay orchestration
 //!   (`state`) over the reducer owned by `migration-control-protocol`.
 //! - Archive-on-completion for finished jobs (`archive`).
+//! - The REST/SSE server, authentication, and TLS listener (`server`).
+//! - The decomposed runtime façade and background lifecycle (`runtime`,
+//!   `ticks`).
 //!
-//! Phase 1 (this milestone) is **lib-only**: no HTTP, no worker
-//! integration. The `vamoose coord` subcommand and the REST/SSE
-//! surface land in Phase 2; worker reporting in Phase 3.
-//!
-//! See `docs/COORD_PLAN.md` for the full phase plan, conflict notes,
-//! and acceptance gates.
+//! Worker reporting and operator commands are implemented through the shared
+//! control protocol. See `docs/CONTROL_PLANE.md` for the current ownership and
+//! runtime invariants; `docs/COORD_PLAN.md` is the historical delivery plan.
 
 // migration-core re-exports an aws-sdk-s3 error variant that recent
 // clippy flags as large in `Result<T>`. Boxing every Result through the

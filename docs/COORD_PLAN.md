@@ -1,9 +1,11 @@
 # vamoose Coordinator + TUI — 6-Phase Build Plan
 
-> **Status: delivered.** All six phases shipped and merged to `main`
-> (PR #7, 2026-05-30). This document remains the design record for
-> the coord daemon, the TUI, and the supply-chain CI wiring; the
-> forward-looking phrasing below is historical.
+> **Historical delivery plan.** All six phases landed. The sequencing,
+> alternatives, and forward-looking language below are preserved as the record
+> of how the control plane was delivered; they are not the current architecture
+> specification. See [CONTROL_PLANE.md](CONTROL_PLANE.md) for the as-built
+> reference. Current source, tests, and correctness documents take precedence
+> wherever implementation details differ.
 
 This document is the working plan for `vamoose coord` (control plane) and
 `vamoose tui` (operator UI). It is paired with the build prompt; this is the
@@ -11,9 +13,10 @@ internal-engineering view that records decisions, conflicts with existing
 code, sequencing, and acceptance gates. Web dashboard is out of scope here.
 
 Companion docs:
-- `DESIGN.md` — overall vamoose architecture (the worker side)
-- `docs/CLAIM_PROTOCOL.md` — v2 conditional-PUT primitives (lease reuses these)
-- `docs/CORRECTNESS_RULES.md` — R-rules the coord must not break
+- [DESIGN.md](../DESIGN.md) — current overall vamoose architecture
+- [CONTROL_PLANE.md](CONTROL_PLANE.md) — current as-built control-plane reference
+- [CLAIM_PROTOCOL.md](CLAIM_PROTOCOL.md) — v2 conditional-PUT primitives (lease reuses these)
+- [CORRECTNESS_RULES.md](CORRECTNESS_RULES.md) — R-rules the coord must not break
 
 Licensing: workspace already declares AGPL-3.0-only. New source files
 follow the existing convention — module-level `//!` doc comment, license
