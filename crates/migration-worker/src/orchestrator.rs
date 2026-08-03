@@ -1,14 +1,12 @@
-//! Worker orchestrator — top-level loop for the M1 worker.
+//! Worker orchestrator — top-level migration lifecycle.
 //!
 //! Sequence:
 //!
 //! 1. Load manifest, verify format version.
-//! 2. Build the mover (no-op data path in M1) and a shared
-//!    `ProgressState`.
-//! 3. Spawn the heartbeat task.
-//! 4. Reconcile any self-owned claims left behind by a previous run
-//!    (logged, not resumed in M1 — see DESIGN.md "Future work:
-//!    resume-after-restart").
+//! 2. Reject source/destination overlap, build the configured libnfs mover,
+//!    and initialize shared progress/fence state.
+//! 3. Spawn the S3 heartbeat and optional coordinator driver.
+//! 4. Reconcile self-owned claims left behind by a previous run.
 //! 5. Loop:
 //!    a. Scan `shards/` for a claimable shard (free or stale-leased).
 //!    b. Acquire via `If-None-Match: *`, or v2-reclaim if stale.
@@ -239,7 +237,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     // The async path additionally mounts a BucketedAsyncPool (six
     // contexts: src+dst × small/medium/large) and wraps a sync Mover
     // for the non-regular-file fallback rows (symlinks / hardlinks /
-    // dirs / empty / skip) per Phase 2 Decision #3.
+    // dirs / empty / skip).
     let mover: Arc<dyn FileMover> = if cfg.mover.use_bucketed_pool {
         let async_pool = Arc::new(
             BucketedAsyncPool::new(
@@ -453,7 +451,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
             }
         }
 
-        // Backpressure gate per DESIGN.md "Backpressure": if the last
+        // Backpressure gate per DESIGN.md "Batching and backpressure": if the last
         // shard ended in poor shape, don't pile onto a struggling
         // dest. Sleep one heartbeat interval and re-check — until the
         // cooldown elapses, at which point exactly ONE probe shard is

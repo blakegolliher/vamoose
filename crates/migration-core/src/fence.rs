@@ -1,7 +1,7 @@
 //! Self-fencing.
 //!
 //! The single most important correctness primitive in the worker. See
-//! DESIGN.md "Self-fencing" — the goal is to prevent dual-writer
+//! DESIGN.md "S3 claim protocol and worker lifecycle" — the goal is to prevent dual-writer
 //! corruption when this worker has been declared dead by the rest of
 //! the fleet but is itself still alive and copying.
 //!

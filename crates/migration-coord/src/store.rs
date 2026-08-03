@@ -102,8 +102,8 @@ impl CoordStore for S3Store {
     async fn head(&self, key: &str) -> Result<Option<String>> {
         // ClaimStore::head_object returns (etag, body). We only want
         // the etag here; the body cost is one extra round-trip's worth
-        // of bytes the SDK already paid for. Phase 1 is fine with
-        // that; tighten later if it shows up in profiles.
+        // of bytes the SDK already paid for. Tighten this only if it
+        // shows up in production profiles.
         match <S3Client as ClaimStore>::head_object(&self.inner, key).await? {
             Some((etag, _body)) => Ok(Some(etag)),
             None => Ok(None),

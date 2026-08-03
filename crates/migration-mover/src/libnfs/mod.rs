@@ -23,17 +23,15 @@
 //!
 //! ## Why libnfs (user-space)
 //!
-//! See DESIGN.md "Why libnfs (user-space) instead of a kernel NFS
-//! mount". Short version: predictable per-connection concurrency, no
-//! kernel mount tuning, same code path as the scanner that built the
-//! index.
+//! See DESIGN.md "Mover behavior". The current data plane uses libnfs
+//! directly, without a kernel NFS mount.
 //!
 //! ## Concurrency model
 //!
-//! libnfs contexts are **not** thread-safe. The mover keeps a pool of
-//! contexts (one per fiber/task) and pipelines requests within each
-//! context up to `pipeline_depth`. M2 has a single pre-mounted pair
-//! held behind a mutex; M3 reshapes the pool to N pairs.
+//! libnfs contexts are **not** thread-safe. The sync mover lends one
+//! source/destination pair per blocking task from `MultiPool`; the async mover
+//! gives each context to one service task and issues work through its request
+//! channel.
 
 #![allow(non_camel_case_types, dead_code)]
 

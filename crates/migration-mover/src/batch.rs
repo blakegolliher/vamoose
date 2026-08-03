@@ -11,7 +11,7 @@
 //! (where you want huge counts to amortize syscall overhead) and 1GB
 //! files (where you want few-file batches to bound memory).
 //!
-//! See DESIGN.md "Byte-budgeted micro-batches".
+//! See DESIGN.md "Batching and backpressure".
 
 use migration_core::shard::RowView;
 use std::sync::Arc;
@@ -64,7 +64,7 @@ impl Batch {
 }
 
 /// Adaptive in-flight concurrency by file-size class. See DESIGN.md
-/// "Byte-budgeted micro-batches".
+/// "Batching and backpressure".
 #[derive(Debug, Clone, Copy)]
 pub struct InflightProfile {
     pub small: usize,  // files < 1 MiB

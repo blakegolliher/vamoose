@@ -292,12 +292,12 @@ impl Mover {
     /// the index. Ensures the dir exists first (mkdir-on-demand may
     /// not have created it if no child file landed in it). Caller
     /// (the shard processor) MUST schedule this strategy after all
-    /// non-dir rows in the same shard are committed, otherwise file
+    /// non-dir rows in the same micro-batch are committed, otherwise file
     /// commits inside the dir will restamp its mtime.
     ///
-    /// Cross-shard caveat: if a child file's row lands in a later
-    /// shard than its parent dir's row, that child's commit will
-    /// still restamp the parent's mtime. Documented in M3_NOTES.md.
+    /// Cross-batch caveat: if a child file's row lands in a later batch or
+    /// shard than its parent dir's row, that child's commit will still restamp
+    /// the parent's mtime. Documented in M3_NOTES.md.
     fn do_dir_attrs(&self, pair: &mut ContextPair, row: &RowView) -> Result<(), MoveError> {
         let dst = self.dst_path(row);
         ops::mkdir_p(pair.dst(), &dst)?;
@@ -583,7 +583,7 @@ impl Mover {
 
         // F09: whole-file NFS COMMIT before the write fh closes and
         // before the rename below — the streaming loop's WRITEs are
-        // UNSTABLE (see DESIGN.md "Durability model"), and the rename
+        // UNSTABLE (see DESIGN.md "Mover behavior"), and the rename
         // must never publish bytes the server hasn't acknowledged as
         // stable. Mirrors the async path's `dst.fsync` in
         // `pipelined_copy`. Skipped when the copy already failed —

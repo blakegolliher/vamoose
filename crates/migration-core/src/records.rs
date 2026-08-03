@@ -66,6 +66,8 @@ pub struct MigrationOptions {
     pub preserve_times: bool,
     /// Honored when the walker emits `xattr_blob`. No-op until then.
     pub preserve_xattr: bool,
+    /// Compatibility-reserved policy field. The current NFSv3 mover does not
+    /// select a server-side COPY strategy.
     pub server_side_copy: ServerSideCopy,
 }
 
@@ -95,10 +97,9 @@ pub enum ServerSideCopy {
 
 /// The contents of `shards/<shard>.parquet.claim`.
 ///
-/// Authoritative ownership comes from the S3 object's etag — this body
-/// is informational. `epoch` increments on each heartbeat; if a reader
-/// sees an unchanged epoch over multiple heartbeat intervals, the owner
-/// is assumed dead.
+/// Authoritative ownership comes from the S3 object's etag — this body is
+/// informational. `epoch` identifies the acquisition generation and advances
+/// on reclaim; a holder never rewrites the claim during heartbeat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRecord {
     pub host: String,
@@ -188,8 +189,11 @@ pub struct BatchRecord {
 /// for figuring out where wall-clock went.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StrategyCounts {
+    /// Compatibility-reserved wire counter; no server-side COPY path exists.
     pub server_side_copy: u64,
+    /// Historical wire name for regular-file libnfs copies.
     pub libnfs_io_uring: u64,
+    /// Compatibility-reserved wire counter; no kernel-CFR path exists.
     pub kernel_cfr: u64,
     pub symlink: u64,
     pub hardlink: u64,
@@ -225,6 +229,7 @@ pub enum FailurePhase {
     Rename,
     Symlink,
     Hardlink,
+    /// Compatibility-reserved serialized phase; no current mover path emits it.
     ServerSideCopy,
     /// R8: the fence tripped between the shard processor's last
     /// between-row check and the mover's commit-point op (rename / link

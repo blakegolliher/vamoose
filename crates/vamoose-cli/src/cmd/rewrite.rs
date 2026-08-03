@@ -1,7 +1,5 @@
-//! `vamoose rewrite` (stub) — will eventually call into the
-//! `mig-walker-rewrite` library to convert legacy walker parquet
-//! into the canonical schema. For now invoke that crate's binary
-//! directly.
+//! `vamoose rewrite` is a safe stub. Invoke the `mig-walker-rewrite` binary
+//! directly to convert legacy walker Parquet into the canonical schema.
 //!
 //! The shim accepts either the walker output root (auto-descends
 //! into `scans/<scan_id>/`) or a specific scan subdirectory.

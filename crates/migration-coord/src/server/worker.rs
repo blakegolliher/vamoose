@@ -1,8 +1,7 @@
 //! Worker-facing REST endpoints.
 //!
-//! These sit behind the cluster-secret auth in Phase 2.8. Until then
-//! they are reachable directly — the integration tests exercise the
-//! handlers in that mode.
+//! These sit behind cluster-secret authentication. In explicit dev mode the
+//! auth middleware allows requests and integration tests exercise that path.
 //!
 //! - **POST /workers/register** — bootstrap. Body: `{job_id, host,
 //!   pid, start_time, version}`. Coord mints a fresh `WorkerId`,
@@ -19,7 +18,7 @@
 //!   ingested (heartbeats deliberately stay out of the event log
 //!   per the build prompt). Response: `{control: {mode}, last_seq,
 //!   server_time}`. The worker reads `control.mode` and flips its
-//!   local `RunControl` on every heartbeat (Phase 3.5). 404 if
+//!   local `RunControl` on every heartbeat. 404 if
 //!   `worker_id` is unknown.
 //!
 //! - **POST /workers/{id}/events** — batched event submission.

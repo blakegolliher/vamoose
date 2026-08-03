@@ -1,10 +1,10 @@
 //! `vamoose` — unified CLI binary.
 //!
-//! Composes the existing crates (`migration-core`, `migration-mover`,
-//! `migration-worker`, `migration-aggr`) into a single binary with
-//! subcommand dispatch. The protocol, schema, claim logic, and
-//! orchestrator are all owned by the underlying crates; this binary
-//! is only wiring.
+//! Composes the worker, coordinator, TUI, and data-plane crates into a single
+//! command surface. This binary owns process-level argument parsing, command
+//! dispatch, configuration composition, logging startup/shutdown, and final
+//! exit status. Protocols, schemas, claim logic, copy execution, coordinator
+//! runtime behavior, and TUI behavior remain owned by their underlying crates.
 
 use clap::Parser;
 

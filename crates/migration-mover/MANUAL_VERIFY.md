@@ -138,7 +138,7 @@ follow-up task before M3 (`mig-aggr clean-partials`).
 ## Crash durability (F09) — rig drill, not a test claim
 
 Both copy paths issue UNSTABLE WRITEs followed by one whole-file NFS
-COMMIT before the commit-point rename (DESIGN.md "Durability model").
+COMMIT before the commit-point rename (DESIGN.md "Mover behavior").
 No automated test can verify what the *server* does with a COMMIT —
 proving it requires a kill-the-server drill: power-fail (or force a
 failover of) the destination filer mid-run, bring it back, and re-run

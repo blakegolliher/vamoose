@@ -1,5 +1,10 @@
 # Design: coord lease fencing (F19) and worker trust boundary (F20)
 
+> **Historical decision record.** D1–D5 were implemented and the findings are
+> landed. The problem statements and proposed sequencing below preserve the
+> pre-implementation analysis. See [../CONTROL_PLANE.md](../CONTROL_PLANE.md)
+> for the current architecture and source paths.
+
 Status: DECIDED 2026-07-30 — every recommendation accepted by the
 project owner. D1: Option A, delete-then-create refresh. D2–D5:
 full bundle — strict EventKind allow-list + worker-id binding as
@@ -16,8 +21,9 @@ F24 bus caps, F21 auth defaults.
 Binding rule: **no `PUT If-Match` anywhere** — var204 does not
 enforce it (silently overwrites, returns 200).
 
-Decision points for the project owner are marked **D1–D6**. Each has
-a recommendation; none is implemented until called.
+Decision points for the project owner are marked **D1–D6**. Their original
+recommendations are retained below; D1–D5 have since landed and D6 remains out
+of scope.
 
 ---
 
@@ -38,7 +44,7 @@ etag) → A's unconditional PUT lands on top, overwriting B's fresh
 lease with A's stale body. **A's refresh returns Ok and A keeps
 operating as a believed owner.** The F02 write gate never trips,
 because the gate's only input is refresh returning `LeaseLost`
-(`ticks.rs:113-117` → `runtime.rs:679-681`). Both coords now ingest,
+(`ticks.rs` → `runtime/lifecycle.rs`). Both coords now ingest,
 assign colliding event seqs, and flush chunks to identical keys
 (chunk keys carry no lease epoch — the residual F02 documented at
 `COORD_LEASE_FENCE_WRITES.md:20-23`).
@@ -138,7 +144,7 @@ existing `refresh_after_takeover_returns_lease_lost` stays green.
   handler `?`-propagates mid-loop (`worker.rs:257-269`); a failure at
   entry k leaves 0..k applied with no rollback and no record.
 - F24 caps do not help here: they rate-limit the outbound bus only
-  (`runtime.rs:135-146`); every ingested event still hits state, log,
+  (`runtime/ingest.rs`); every ingested event still hits state, log,
   and snapshot.
 
 Fact that makes this cheap to fix now: the production worker emits

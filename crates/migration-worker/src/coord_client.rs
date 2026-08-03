@@ -30,10 +30,8 @@
 //!   to 1s on the first successful HTTP exchange after a series of
 //!   failures.
 //!
-//! The driver that ties these together (event channel → buffer →
-//! HTTP batches; heartbeat ticks; reconnect loop) lands in a later
-//! Phase 3 step alongside the orchestrator wire-up. This module
-//! provides the pieces.
+//! `coord_driver` ties these pieces together: event channel to buffer and HTTP
+//! batches, heartbeat ticks, reconnect/backoff, and run-control updates.
 //!
 //! ## Batch response contract (F20 D4)
 //!

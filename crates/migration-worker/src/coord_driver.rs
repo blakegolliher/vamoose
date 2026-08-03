@@ -13,13 +13,10 @@
 //!    schedule between attempts; the heartbeat interval resumes
 //!    after the first success.
 //!
-//! 3. Honors the `CancellationToken` on shutdown — both during
-//!    register-backoff sleeps and between heartbeats.
-//!
-//! Step 4a deliberately does NOT plumb the outbound event channel
-//! or the fence POST — those land in step 4b. The driver still
-//! gives the orchestrator everything it needs to gate the claim loop
-//! on coord-driven `Pause`/`Drain`/`Cancel`.
+//! 3. Drains coalesced worker progress events to the coordinator and reports a
+//!    local self-fence through the worker fence endpoint.
+//! 4. Honors the `CancellationToken` during registration, heartbeat, event
+//!    draining, and shutdown.
 
 use crate::config::CoordCfg;
 use crate::coord_client::{Backoff, CoordClient};
@@ -38,8 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Handle returned by [`spawn`]. The orchestrator clones the
 /// `RunControl` once and gates its claim loop on it; the
-/// `worker_id_rx` is mostly for diagnostics and step 4b (event
-/// emission needs the worker id).
+/// `worker_id` exposes successful registration for diagnostics and tests.
 pub struct CoordDriverHandle {
     pub run_control: RunControl,
     pub worker_id: watch::Receiver<Option<WorkerId>>,
@@ -640,10 +636,9 @@ async fn sample_heartbeat(inputs: &DriverInputs, run_control: &RunControl) -> He
     // Sample the rolling throughput on every tick — same 60s window
     // the legacy S3 progress writer uses, for shape parity.
     let bytes_per_sec = inputs.throughput.sample_mb_s(60) * 1024.0 * 1024.0;
-    // files_per_sec and errors_per_min derivation needs a rolling
-    // window we don't maintain on the worker side today. Phase 3.5
-    // surfaces that; for now report 0 and let the coord show the
-    // counters that DO flow through the event log instead.
+    // files_per_sec and errors_per_min derivation needs a rolling window we do
+    // not maintain on the worker side. Report 0 and let the coord show the
+    // counters that do flow through the event log instead.
     HeartbeatBody {
         state,
         files_per_sec: 0.0,

@@ -18,23 +18,19 @@
 //!    failed ingest/flush must never leave one behind.
 //! 5. Returns `{ command_id }`.
 //!
-//! Workers don't observe these commands directly in Phase 2. The
-//! pause/resume/cancel/drain semantics are realized by the worker
-//! polling its per-job state via heartbeat (Phase 3).
+//! Workers observe pause/resume/cancel state through the control mode returned
+//! by heartbeat. Version 1 encodes drain as `JobPaused { reason: "drain" }`, so
+//! the worker observes the same pause mode rather than a distinct drain mode.
 //!
 //! `retry-failed` is currently a no-op event-wise — there is no
 //! `JobRetryFailed` kind in the schema. We record the audit line and
-//! return the command_id; Phase 3 wires the actual retry queue. The
-//! audit row alone is enough to satisfy the build prompt's "command
-//! issued via REST shows up in `audit/`" acceptance gate.
+//! return the command_id. No retry event or worker queue is implemented yet.
 //!
 //! ## Token labels
 //!
-//! Until the auth middleware (Phase 2.8) lands, every command uses
-//! the literal label `"anonymous"`. The audit row carries that
-//! placeholder so post-merge log inspection identifies which
-//! requests landed under un-authenticated mode (a dev-mode
-//! disclaimer the operator can grep for).
+//! Authenticated requests carry the configured admin-token label. Dev-mode
+//! requests use the explicit `"dev-mode"` label so the audit trail identifies
+//! their unauthenticated origin.
 
 use super::auth::AdminLabel;
 use super::{ApiError, AppState};
@@ -182,9 +178,9 @@ pub async fn cancel(
 //
 // Drain is "stop accepting new work, finish in-flight, then pause".
 // At the coord level it's a JobPaused event tagged with reason
-// "drain" so the worker side (Phase 3) can tell the two apart by the
-// reason field. There's no separate JobDrained variant — distinct
-// reason in the audit + phase_history is sufficient.
+// "drain" so the audit and phase history preserve the operator's intent.
+// There's no separate JobDrained variant, and heartbeat currently maps the
+// paused phase to ControlMode::Pause.
 
 pub async fn drain(
     State(state): State<AppState>,
@@ -217,9 +213,8 @@ pub async fn retry_failed(
 ) -> Result<Json<CommandAccepted>, ApiError> {
     let id = parse_id(id)?;
     require_job(&state, &id).await?;
-    // No event for retry-failed in the Phase 2 schema. Record the
-    // audit row and return — the Phase 3 worker integration wires
-    // the retry queue itself.
+    // No event or worker retry queue exists for retry-failed. Record the audit
+    // row and return; the accepted response is audit-only in version 1.
     let target = format!("jobs/{id}");
     let command_id = state
         .runtime

@@ -1,849 +1,333 @@
-# Distributed NFS File Migration System — Design (v2)
+# Vamoose as-built architecture
 
-> **Freshness note (2026-07-03).** The claim-protocol sections below
-> were rewritten to the shipped v2 delete-then-create protocol;
-> `docs/CLAIM_PROTOCOL.md` remains the authoritative as-built
-> reference — where this doc disagrees with it, CLAIM_PROTOCOL.md
-> wins. Still-stale caveats:
-> - Workspace: the crate list below predates `migration-coord`,
->   `migration-tui`, `mig-walker-rewrite`, and `vamoose-cli` (the
->   operator plane) — see `README.md`.
-> - M4 (NFSv4.2 server-side COPY) is cancelled; `strategy::pick`
->   never selects it. M2/M3/M5 are verified complete.
-> - io_uring is still deferred (M3.5); the data plane is async libnfs.
-> - `mig-aggr` subcommands (incl. `clean-partials`) are stubs.
+This document describes the system implemented in this repository. Current
+source and tests take precedence if this overview drifts; detailed contracts
+are linked rather than repeated here. Milestone notes, work-item prompts, and
+the delivered coordinator plan are historical records, not current
+specifications.
 
-## Goal
+Vamoose migrates an immutable, sharded file index from one NFS export to
+another. Workers use S3 for shard ownership and durable progress. A separate,
+optional control plane supplies live operator state and commands without
+becoming part of the data-plane ownership protocol.
 
-Migrate large numbers of files between POSIX/NFS shares at **wire rate**,
-using a fleet of worker hosts that coordinate through a parquet-based file
-index served from VAST S3. Workers join and leave dynamically; no central
-coordinator.
+## Responsibilities
 
-Wire rate means: the bottleneck is the source NFS server's request rate or
-the destination NFS server's ingest rate, **not** anything the mover does.
-Every design choice below is in service of that.
+The implementation separates four concerns:
 
----
+- **Data plane:** `migration-core`, `migration-mover`, and
+  `migration-worker` read immutable Parquet shards, acquire S3 claims, and copy
+  filesystem objects through libnfs.
+- **Claim coordination:** the S3 objects owned by `migration-core` arbitrate
+  shard ownership. This path has no required coordinator service or database.
+- **Operator control plane:** `migration-control-protocol`,
+  `migration-coord`, and `migration-tui` provide an optional REST/SSE view,
+  commands, durable event history, and a terminal UI. They do not replace S3
+  claims.
+- **Observability and operations:** worker progress/failure/downgrade objects,
+  coordinator snapshots/events/audit records, unified-CLI logging, and the
+  limited `migration-aggr` utility expose different views of the same run.
 
-## Changes from v1
+At a high level:
 
-This doc replaces v1. Major changes, all in service of throughput and
-correctness:
+```text
+ nfs-walker             S3 run bucket                     worker fleet
+     |          manifest + immutable parquet shards            |
+     +--------> index/ and manifest.json ---------------------->|
+                        shard claims, progress, records <------>|
+                                                                 |
+ source NFS <---------------- libnfs copy --------------------> dest NFS
 
-- **Shard-level claiming via S3 conditional PUT** (was: row-range claims
-  with optimistic conflict resolution). Eliminates the race-resolution code
-  path entirely. Drops claim traffic by ~1000×.
-- **Workers download their assigned parquet shard once** to local tmpfs and
-  mmap it; no per-batch S3 parquet reads on the data path.
-- **Byte-budgeted micro-batches inside a shard** (was: 1000-row fixed
-  batches). Wire-rate-correct for both 1KB and 1GB files.
-- **Self-fencing on heartbeat failure** to prevent dual-writer corruption
-  when a worker is partitioned but still copying.
-- **Tighter heartbeat/lease ratio**: 30s heartbeat / 3min lease (was 30s /
-  15min). Faster recovery from dead workers at wire rate.
-- **Custom io_uring data mover** built on the **same libnfs user-space
-  driver used by `nfs-walker`** for both read and write paths. Bypasses the
-  kernel NFS client. Preserves all POSIX attributes recorded in the index.
-- **NFSv4.2 server-side COPY** as a fast path when source and dest share a
-  server.
-- **Path/attribute encoding fixed**: paths are byte arrays, materialized
-  `row_id` column in parquet, JSON records use base64 for any non-UTF-8.
-- **Per-file failure log** separate from claim records.
-- **xattr support deferred**: schema reserves `xattr_blob`, mover apply
-  path is wired up but inactive (NULL column) until `nfs-walker` adds
-  xattr capture. See Future work.
-
----
-
-## High-level architecture
-
-```
-   ┌─────────────────────────────────┐
-   │  nfs-walker scan                │   (pre-existing, libnfs-based)
-   │   → sharded Parquet, direct     │   scans/<scan_id>/part-rNN-SSSSS.parquet
-   └─────────────┬───────────────────┘
-                 │  upload (one-shot, immutable)
-                 ▼
-   ┌──────────────────────────────────────────────┐
-   │  VAST S3 bucket: migration-run-<id>/         │
-   │  ├── manifest.json                           │
-   │  ├── index/                                  │
-   │  │   ├── part-0000.parquet                   │
-   │  │   ├── part-0001.parquet                   │
-   │  │   └── ...                                 │
-   │  ├── shards/                                 │
-   │  │   ├── part-0000.parquet.claim   (atomic)  │
-   │  │   └── ...                                 │
-   │  ├── progress/                               │
-   │  │   └── host-<id>.json                      │
-   │  ├── batches/                                │
-   │  │   └── host-<id>.jsonl       (audit trail) │
-   │  └── failures/                               │
-   │      └── host-<id>.jsonl       (per-file)    │
-   └──────────────────────────────────────────────┘
-             ▲                    ▲
-             │                    │
-   ┌─────────┴────────┐  ┌────────┴─────────┐
-   │ Worker host A    │  │ Worker host B …N │   1–100 hosts
-   │ (Rust)           │  │ (Rust)           │   add/remove anytime
-   │  - claim shard   │  │                  │
-   │  - mmap parquet  │  │                  │
-   │  - io_uring +    │  │                  │
-   │    libnfs mover  │  │                  │
-   └────────┬─────────┘  └────────┬─────────┘
-            │                     │
-            ▼                     ▼
-       ┌─────────────────────────────────┐
-       │ Source NFS  (libnfs READ)       │
-       │ Dest NFS    (libnfs WRITE)      │
-       │ — or NFSv4.2 server-side COPY — │
-       └─────────────────────────────────┘
+                         optional operator plane
+ worker HTTP reporting ---> vamoose coord <--- REST/SSE ---> vamoose tui
+                                  |
+                          S3 event/snapshot/audit state
 ```
 
----
+## Crate ownership and dependencies
 
-## Components
-
-### 1. Index (input, immutable)
-
-Pre-built by `nfs-walker` (existing, libnfs-based), writing sharded
-Parquet directly. Output layout is
-`scans/<scan_id>/part-rNN-SSSSS.parquet` + a `metadata.json`. Sharded
-into ~hundreds of parquet files, ~GB each, ~5–6 B rows total.
-
-**Required schema** (columns the mover relies on):
-
-| Column | Type | Notes |
-|---|---|---|
-| `row_id` | UINT64 | **Materialized at write time**. `(shard_idx << 40) \| row_in_shard`. Never derived at read time — predicate pushdown can reorder rows. |
-| `path` | BYTE_ARRAY | Raw bytes, no UTF-8 logical type. POSIX paths can contain arbitrary non-UTF-8 bytes; storing as bytes preserves them losslessly. |
-| `size` | UINT64 | Used for byte-budgeted batching. |
-| `mtime_sec` / `mtime_nsec` | INT64 / INT32 | For `utimensat` after copy. |
-| `atime_sec` / `atime_nsec` | INT64 / INT32 | Optional preservation. |
-| `mode` | UINT32 | POSIX mode bits including type. |
-| `uid` / `gid` | UINT32 | For `chown` (worker must run as root or have CAP_CHOWN). |
-| `nlink` | UINT32 | Hardlink detection (see Hardlinks below). |
-| `inode` | UINT64 | Hardlink grouping key. |
-| `xattr_blob` | BYTE_ARRAY (nullable) | Serialized name→value xattrs, format documented in `migration-core`. **Walker support deferred** (see Future work); column is reserved in the schema and emitted as NULL until the walker side lands. |
-| `symlink_target` | BYTE_ARRAY (nullable) | Set iff `S_ISLNK(mode)`; raw bytes. |
-| `file_type` | UINT8 | Regular / dir / symlink / fifo / socket / block / char. Filters out non-data entries quickly. |
-
-The walker may not currently emit all of these; v1 of the mover can ignore
-columns the walker doesn't produce, but the design assumes they're added
-over time.
-
-### 2. Manifest
-
-Single immutable `manifest.json`, written once at upload:
-
-```json
-{
-  "run_id": "2026-05-02T10:00:00Z-jobname",
-  "created_utc": "2026-05-02T10:00:00Z",
-  "shards": [
-    { "key": "index/part-0000.parquet", "rows": 12345678, "bytes": 2147483648, "etag": "..." },
-    { "key": "index/part-0001.parquet", "rows": 12345678, "bytes": 2147483648, "etag": "..." }
-  ],
-  "total_rows": 5500000000,
-  "source": { "kind": "nfs", "url": "nfs://src-server/export", "root": "/" },
-  "dest":   { "kind": "nfs", "url": "nfs://dst-server/export", "root": "/" },
-  "options": {
-    "preserve_owner": true,
-    "preserve_mode":  true,
-    "preserve_times": true,
-    "preserve_xattr": true,
-    "server_side_copy": "auto"
-  }
-}
-```
-
-ETags let workers detect a swapped manifest. Source/dest URLs are explicit;
-the mover uses libnfs against these directly.
-
-### 3. Claims (shard-level, atomic)
-
-One claim object per shard:
-
-```
-shards/part-0042.parquet.claim
-```
-
-Contents:
-
-```json
-{ "host": "worker-07", "claimed_utc": "2026-05-02T10:14:22Z", "epoch": 3 }
-```
-
-**The protocol is v2 delete-then-create.** Four atoms, all arbitrated
-by S3 conditional requests — there is **no `PUT If-Match` anywhere**
-(a conditional overwrite cannot distinguish "I still own this" from
-"someone else's claim happens to be here"); ownership is proven by
-holding the etag of an object this worker created. See
-`docs/CLAIM_PROTOCOL.md` ("The four atoms", "State machine") for the
-authoritative as-built spec; summary:
-
-- **try_acquire** — `PUT If-None-Match: *`. Success = ownership (the
-  returned etag is the ownership token); `412` = someone else owns it.
-  No race-resolution code in the worker; the S3 server is the arbiter.
-- **refresh (heartbeat)** — `HEAD` the claim and compare etags. **No
-  write**: the claim object and its etag stay stable for the whole
-  ownership window. Etag differs or object gone → the claim was lost →
-  self-fence (see below).
-- **reclaim** — after `LEASE_TIMEOUT`, a worker that judges the claim
-  stale does `DELETE If-Match: <stale-etag>` then
-  `PUT If-None-Match: *` with a bumped `epoch`. The delete only
-  succeeds against the exact stale generation; the create only
-  succeeds if nobody else got there first. Staleness is judged from
-  `claimed_utc` age **plus** a progress-liveness cross-check and a
-  fresh-claim grace window (see §4 and CLAIM_PROTOCOL.md "Worker
-  lifecycle") so a healthy owner is never stolen from.
-- **complete / fail** — `DELETE If-Match: <held-etag>` then
-  `PUT If-None-Match: *` of an **immutable terminal marker**
-  (`Completed` / `Failed`). Terminal states are never overwritten.
-  `fail` is reserved for shard-fatal errors (corrupt parquet — errors
-  that would recur for any worker); worker-local errors instead
-  release the claim (plain `DELETE If-Match`) and skip the shard so a
-  healthy peer can take it.
-
-### 4. Progress (per-host, observability only)
-
-```
-progress/host-<id>.json
-```
-
-```json
-{
-  "host": "worker-07",
-  "started_utc":   "2026-05-02T10:00:00Z",
-  "heartbeat_utc": "2026-05-02T10:42:11Z",
-  "current_shard": "part-0042.parquet",
-  "shard_rows_total": 12345678,
-  "shard_rows_done":  4521000,
-  "shard_bytes_done": 4398046511104,
-  "files_ok":     4520837,
-  "files_failed":      163,
-  "throughput_mb_s_1m": 22150.4
-}
-```
-
-Updated every 30s. Aggregator reads these. Since v2, progress records
-are **also a reclaim input**: the record carries the writer's
-`held_etag` and `heartbeat_sec`, and a worker judging another's claim
-stale cross-checks the owner's progress heartbeat before reclaiming
-(fresh claims get a `2 × heartbeat_sec` grace window). Progress is
-still not required for the owner's own correctness — a missing or
-stale progress record can delay a reclaim, never corrupt one. See
-CLAIM_PROTOCOL.md "Worker lifecycle".
-
-### 5. Batch audit trail (per-host, append-only)
-
-```
-batches/host-<id>.jsonl
-```
-
-One record per micro-batch completed (see Mover below). For post-run
-forensics — which batches took how long, which contained failures.
-Optional; can be turned off at scale.
-
-### 6. Per-file failures
-
-```
-failures/host-<id>/<shard-stem>-e<epoch>.jsonl
-```
-
-One **immutable object per sink flush** (shard stem + claim epoch make
-the key unique and replay-safe; written with `If-None-Match: *`, never
-overwritten — S3 has no append, and a fixed per-host key would lose
-every earlier shard's records on each flush). Consumers list the
-`failures/host-<id>/` prefix and concatenate. One line per failed file
-with full context for retry:
-
-```json
-{
-  "row_id": 17592186049321,
-  "shard":  "part-0042.parquet",
-  "path_b64": "L2RhdGEvc3R1ZmYvxIDigKzigJzigKjigJk=",
-  "error": "ENOSPC",
-  "phase": "write",
-  "ts": "2026-05-02T10:55:33Z"
-}
-```
-
-`path_b64` because POSIX paths aren't guaranteed UTF-8. A separate retry
-run reads `failures/*.jsonl`, builds a synthetic single-shard parquet, and
-re-runs against it.
-
-### 7. Aggregator (Rust, read-only sidecar)
-
-Same as v1: separate Rust binary, reads `progress/`, `shards/`, and
-optionally `batches/` and `failures/`. Three modes: TUI, JSON summary,
-Prometheus exporter. Workers don't depend on it.
-
----
-
-## Mover (the wire-rate part)
-
-This is where throughput lives or dies. The mover is a per-worker subsystem
-that, given a parquet shard and the file rows in it, copies files from
-source to dest as fast as the underlying servers allow.
-
-### Architecture
-
-```
-   ┌──────────────────────────────────────────────────────────┐
-   │                       Worker process                     │
-   │                                                          │
-   │  parquet shard (mmap'd local tmpfs)                      │
-   │           │                                              │
-   │           ▼                                              │
-   │   batch builder ── byte-budgeted, file-type-aware ──┐    │
-   │                                                     ▼    │
-   │   ┌───────────────────────────────────────────────────┐  │
-   │   │   work pool: tokio tasks over file rows           │  │
-   │   │                                                   │  │
-   │   │   for each row:                                   │  │
-   │   │     classify(file_type, size) → strategy          │  │
-   │   │       ↓                                           │  │
-   │   │     ┌──────────────────────────────────────────┐  │  │
-   │   │     │ strategy A: NFSv4.2 server-side COPY     │  │  │
-   │   │     │   (when same server src+dst)             │  │  │
-   │   │     │                                          │  │  │
-   │   │     │ strategy B: libnfs READ → libnfs WRITE   │  │  │
-   │   │     │   driven by io_uring fixed buffers       │  │  │
-   │   │     │   (default)                              │  │  │
-   │   │     │                                          │  │  │
-   │   │     │ strategy C: kernel copy_file_range       │  │  │
-   │   │     │   (only for ad-hoc kernel-mounted dirs)  │  │  │
-   │   │     └──────────────────────────────────────────┘  │  │
-   │   └───────────────────────────────────────────────────┘  │
-   │                                                          │
-   │  attribute applier: chown / chmod / utimensat / xattr    │
-   │  (post-data, batched per-file)                           │
-   │                                                          │
-   └──────────────────────────────────────────────────────────┘
-```
-
-### Why libnfs (user-space) instead of a kernel NFS mount
-
-`nfs-walker` already speaks libnfs directly and gets ~340K entries/sec
-against a 34-cnode VAST cluster. The same machinery is the right answer for
-the mover for the same reasons:
-
-- **No kernel mount tuning required.** No fighting with `nconnect`,
-  `actimeo`, `nocto`, kernel page cache pressure, dirty page writeback
-  storms, or `vm.dirty_*` parameters.
-- **Predictable concurrency.** Per-worker, per-connection pipeline depth is
-  a config parameter, not a kernel side-effect.
-- **Same code path as the scanner.** Reusing the libnfs wrapper from
-  `nfs-walker` means the mover sees the filesystem the same way the
-  walker did when it built the index — same inode resolution, same
-  symlink semantics, same xattr handling.
-- **Direct RDMA path possible later** without rebuilding the kernel
-  module story.
-
-### Why io_uring on top of libnfs
-
-libnfs is single-threaded per connection. To saturate a 200GbE link with
-1KB files (millions of IOPS) you need:
-
-- Many libnfs connections (the walker uses up to 1024 walker threads).
-- Each connection issuing many in-flight RPCs.
-
-io_uring provides:
-
-- A zero-syscall submission/completion path for the per-RPC work the
-  worker does outside libnfs (file-local buffer alloc, attribute syscalls
-  on local tmpfs, batch flushes).
-- Fixed-buffer registration: pre-allocate N MB of buffers, register them
-  once, hand them to libnfs READ/WRITE without per-op alloc/free.
-- Batched submission of attribute ops (`fchownat`, `fchmodat`,
-  `utimensat`, `setxattr`) at end-of-file.
-
-The combined model: libnfs handles the NFS protocol; io_uring handles
-everything else. Walker hits ~340K op/s with this pattern; the mover
-should land in the same neighborhood for small-file workloads.
-
-### Strategy selection per file
-
-Decided per-file based on `(file_type, size, src_url, dst_url)`:
-
-| Condition | Strategy |
+| Crate | Owns |
 |---|---|
-| `src` and `dst` are the same NFSv4.2 server, file is regular, size > 64KB | **NFSv4.2 server-side COPY** (`COPY` op). Wire rate = server's internal rate. Mover does almost no data-plane work. |
-| Symlink | `READLINK` (or use cached `symlink_target` from index) → `SYMLINK` on dest. No data path. |
-| Hardlink (nlink > 1, inode seen before in this shard) | `LINK` on dest, no data copy. |
-| Empty file (size == 0) | `CREATE` only. |
-| Otherwise | **libnfs READ → libnfs WRITE via io_uring fixed buffers**. |
+| `migration-core` | Run manifest and record formats, Parquet schema/reader, S3 run layout and client, claim protocol, fencing primitives |
+| `migration-mover` | NFSv3/libnfs copy execution, file-kind selection, POSIX attribute application, partial-file commit, sync and bucketed-async paths |
+| `migration-worker` | Configuration for the worker runtime, claim/reclaim lifecycle, heartbeat and self-fencing, shard processing, backpressure, optional coordinator client |
+| `migration-control-protocol` | Versioned control-plane wire types, REST/SSE bodies, snapshots, events, commands, validation, and the pure `Snapshot::apply` reducer |
+| `migration-coord` | Coordinator store, S3 layout, event chunks, snapshots, replay, audit, lease, archival, HTTP/SSE, authentication, and runtime lifecycle |
+| `migration-tui` | REST bootstrap, SSE reconnect/resume, client-side state and histories, input handling, terminal lifecycle, and deterministic ratatui views |
+| `migration-aggr` | The standalone `mig-aggr` binary; only `clean-partials` is implemented |
+| `mig-walker-rewrite` | Temporary conversion from the walker repository's legacy Parquet output to the canonical schema |
+| `vamoose-cli` | The `vamoose` process boundary: CLI parsing/dispatch, configuration composition, logging startup/shutdown, and final exit status |
 
-Strategy C (`copy_file_range` over kernel mounts) is **not** the default
-but is supported as an escape hatch for environments where libnfs can't be
-used (e.g. NFSv3-only with no Kerberos requirement and the operator has
-already mounted both sides).
+The important control-plane boundary is:
 
-### Byte-budgeted micro-batches
+```text
+ migration-control-protocol ---> migration-worker
+             |                 --> migration-coord
+             +-------------------> migration-tui
 
-Within a shard, the worker walks rows in `row_id` order and accumulates a
-micro-batch up to:
-
-- `BATCH_BYTES = 8 GiB` of source data, OR
-- `BATCH_FILES = 100_000` rows, OR
-- end of shard.
-
-Whichever hits first. This matters:
-
-- **1KB files**: a 100K-row batch is 100MB of source data — fits comfortably
-  in fixed buffers, gives io_uring enough work to amortize submission cost.
-- **1GB files**: a 8-file batch is 8GiB; mover streams them with bounded
-  in-flight count.
-
-Per-batch in-flight concurrency is also adaptive:
-
-- For files < 1 MB: up to **256 concurrent files** in flight (IOPS bound).
-- For files 1 MB – 1 GB: up to **16 concurrent files** (bandwidth bound).
-- For files > 1 GB: up to **4 concurrent files**, each split into striped
-  reads of `STRIPE_SIZE = 4 MiB` × `STRIPE_DEPTH = 32` (bandwidth bound,
-  large per-file readahead).
-
-These numbers are starting points; the worker should expose them as config
-and we'll tune in M6.
-
-### Attribute preservation
-
-After data is written, attributes are applied **once per file** to avoid
-multiple round-trips:
-
-1. `WRITE` last data block.
-2. `SETATTR` with mode + uid/gid + atime/mtime in a single call (NFSv4
-   batches these).
-3. If `xattr_blob` non-null, issue `SETXATTR` per name/value pair. **In v1
-   this branch is dead code** — the walker doesn't emit xattrs yet, so
-   `xattr_blob` is always NULL. The mover code path is wired up so xattr
-   support lights up automatically once the walker side lands.
-
-For NFSv3 servers, `SETATTR` doesn't carry uid/gid/mode in one call as
-cleanly; mover falls back to a sequence but submits them via io_uring
-chained ops to keep the syscall overhead low.
-
-`utimensat` happens last so that a successful copy is always reflected in
-the dest file's mtime matching the source.
-
-### Atomic destination writes
-
-Files are written to a temp name in the dest directory:
-
-```
-.<basename>.<host>.<pid>.partial
+ migration-core ---> migration-mover ---> migration-worker
+        +--------------------------------> migration-coord
 ```
 
-On success, atomic `RENAME` to the final name. On failure, the partial
-file remains (cleaned up by a separate `mig-aggr clean-partials` mode).
-This guarantees: a reader on the dest never sees a half-written file.
+Arrows point from a dependency to its consumer.
 
-### Durability model (F09)
+`migration-worker` and `migration-tui` depend directly on the protocol crate;
+neither has a normal dependency on `migration-coord`. The TUI also has no
+normal dependency on `migration-core` or the AWS SDK. In-process integration
+tests may use `migration-coord` as a dev-dependency. See
+[the control-plane reference](docs/CONTROL_PLANE.md) for the runtime boundary
+and durability invariants.
 
-Data WRITEs on both copy paths are issued UNSTABLE — NFSv3 lets the
-server acknowledge them from volatile buffers (the linked libnfs sets
-`stable = UNSTABLE` unless the fh was opened `O_SYNC`; see
-`lib/nfs_v3.c:nfs3_fill_WRITE3args`). Durability comes from one
-whole-file COMMIT issued after the write loop, before the write fh is
-closed and before the `.partial → final` rename publishes the file,
-on BOTH paths:
+## Immutable migration input
 
-- **bucketed-async**: `pipelined_copy` drains the write pipeline,
-  then `dst.fsync(dst_fh)` (`nfs_fsync_async` → COMMIT3 with
-  `offset = 0, count = 0`, i.e. whole-file).
-- **sync**: `do_libnfs_copy` calls `ops::fsync(dst_ctx, dst_fh)`
-  (sync `nfs_fsync`, the same whole-file COMMIT3) after
-  `stream_copy`, before `close_fh`/rename.
+An external `nfs-walker` scan produces sharded Parquet. Until the walker emits
+the canonical schema directly, `mig-walker-rewrite` converts its output. The
+canonical column and metadata contract is mirrored with the walker repository
+in [SCHEMA_CONTRACT.md](SCHEMA_CONTRACT.md).
 
-So the commit-point rename never publishes bytes the server has not
-acknowledged as stable. A COMMIT failure fails the row through the
-normal `MoveError` path (phase `write`, error tag `COMMIT:<errno>` —
-distinguishable in the failure log without widening the published
-`FailurePhase` schema).
+Each run bucket contains an immutable `manifest.json` and immutable objects
+under `index/`. The manifest identifies the format version, run, source and
+destination endpoints (including logical roots), copy options, shard keys,
+row/byte counts, and each uploaded shard's ETag. A worker:
 
-NFSv3 metadata operations (CREATE, MKDIR, RENAME, LINK, SYMLINK,
-SETATTR) are protocol-synchronous — the server must reach stable
-storage before replying — so they need no COMMIT bracket; empty-file,
-symlink, hardlink, and dir-attr rows carry no unstable data.
+1. loads the manifest and rejects an unsupported format version;
+2. rejects overlapping source and destination endpoints before any write;
+3. downloads a claimed shard to local scratch;
+4. verifies the downloaded object's ETag against the manifest; and
+5. mmaps the local Parquet shard and consumes canonical rows in materialized
+   `row_id` order.
 
-Historical note: before F09 the sync path issued no COMMIT at all.
-On VAST that gap was mitigated (not licensed) by the cluster's
-NVRAM-backed write path, which makes UNSTABLE writes effectively
-stable on ack; against a server without that property, a crash of
-the destination filer after rename-but-before-flush could have
-published a file whose tail was never durable. The async path has
-issued the COMMIT since it shipped.
+The manifest and index are input truth, not mutable work queues. Claims,
+progress, failures, downgrades, and coordinator state live under disjoint S3
+prefixes.
 
-### Hardlinks
+## S3 claim protocol and worker lifecycle
 
-Hardlink groups are detected by `inode` collisions within the index. The
-walker reports `inode` and `nlink`; the mover:
+The detailed as-built ownership protocol is
+[docs/CLAIM_PROTOCOL.md](docs/CLAIM_PROTOCOL.md). Its essential properties are:
 
-1. On first occurrence of an inode, copies the file normally and remembers
-   `(inode → dest_path)` in a per-shard map.
-2. On subsequent occurrences, issues NFS `LINK` from the remembered
-   `dest_path` to the new path.
+- acquisition is `PUT If-None-Match: *`;
+- a held claim's ETag is the ownership token and remains stable;
+- heartbeat refresh is a read/compare, not a rewrite;
+- reclaim and terminalization use conditional delete followed by conditional
+  create; and
+- a worker that cannot prove ownership trips its shared fence before another
+  commit.
 
-Cross-shard hardlinks are out of scope for v1 — they fall back to a full
-copy and lose hardlink identity. (Real fix: pre-process the index to put
-all rows of a hardlink group into the same shard.)
+The worker scans the manifest's shards, skips immutable terminal claims,
+acquires available work, and reclaims only after the lease and progress-
+liveness policy permit it. It writes per-host heartbeat/progress records while
+processing. Shard-fatal data errors can produce an immutable failed marker;
+worker-local failures release work so a peer can retry it. Successful
+processing terminates the claim as completed.
 
----
+Claim execution is deliberately at-least-once around crash windows. File
+publication is designed to make a replay safe: regular files publish with an
+atomic rename, while hardlink and symlink replay accepts an existing target
+only after verifying it matches the already-committed result. The fence is
+checked at commit points. See [docs/CORRECTNESS_RULES.md](docs/CORRECTNESS_RULES.md)
+for the cross-cutting rules.
 
-## Worker lifecycle
+When `[coord]` is configured, a background worker client registers, sends
+heartbeats and buffered events, and consumes the coordinator's control mode.
+Client sequence high-water marks make current-worker event retries converge.
+Without `[coord]`, the same worker continues in S3-only mode; claim correctness
+does not depend on the optional service.
 
-1. **Startup**
-   - Read `manifest.json`, verify ETags of shards.
-   - Generate stable `host-id` (configured, or hostname+random suffix).
-   - Reconcile own state: read `shards/*.claim` looking for any owned by
-     this `host-id`. If found, the worker resumes them (epoch bump).
-   - Open libnfs handles to source and dest URLs.
+## Mover behavior
 
-2. **Claim a shard**
-   - List `shards/`, identify a parquet shard with no live claim.
-     "Live" = `(now - claimed_utc) < LEASE_TIMEOUT`, cross-checked
-     against the owner's progress heartbeat, with a fresh-claim grace
-     window (CLAIM_PROTOCOL.md "Worker lifecycle").
-   - Free shard: `try_acquire` (`PUT If-None-Match: *`). Stale claim:
-     `reclaim` (`DELETE If-Match: <stale-etag>` then
-     `PUT If-None-Match: *`, epoch bumped).
-   - On 412 / lost race, back off with jitter and pick another shard.
-   - On success, download `index/<shard>.parquet` to local tmpfs
-     (etag-verified against the manifest), mmap.
+Vamoose's protocol baseline is NFSv3 over dynamically linked libnfs. There is
+no custom io_uring mover, NFSv4.2 server-side COPY, or kernel
+`copy_file_range` execution path.
 
-3. **Process shard**
-   - Walk rows in `row_id` order, building byte-budgeted micro-batches.
-   - For each micro-batch, run the mover (strategy selection per row).
-   - On every 30s tick: `refresh` the claim (a `HEAD` + etag compare —
-     no write), update `progress/`, append batch audit if enabled.
-   - If refresh observes a different etag or a missing object, the
-     claim is lost: **stop all in-flight copies, drop libnfs handles
-     for in-flight files, exit this shard.** This is the self-fence.
-     (One suppression: if the loss coincides with this worker's own
-     just-finished clean completion — the held-claim cell no longer
-     matches the tick's snapshot — it is not a fence.)
+### Regular files
 
-4. **Complete shard**
-   - When all rows in the shard are processed, `complete`:
-     `DELETE If-Match: <held-etag>` then `PUT If-None-Match: *` of the
-     immutable `Completed` marker.
-   - Delete local mmap'd parquet.
-   - Loop to step 2. (Shard-fatal processing errors take the same
-     shape via `fail`; worker-local errors release the claim and skip
-     the shard instead.)
+Two regular-file implementations exist:
 
-5. **Exit**
-   - When no claimable shards remain (every claim is `completed` or live
-     and recent), the worker exits cleanly.
+1. **Synchronous MultiPool path (default).** A long-lived `MultiPool` owns
+   source/destination libnfs context pairs. Each file runs on Tokio's blocking
+   pool and streams libnfs READ to WRITE through a 1 MiB buffer. Concurrency is
+   across files.
+2. **Bucketed asynchronous path (opt-in).** `[mover]
+   use_bucketed_pool = true` or `vamoose worker --use-bucketed-pool` selects
+   source/destination async context pairs for small, medium, and large files.
+   Regular-file data uses the bounded pipelined copy implementation. Special
+   rows still delegate to the synchronous mover.
 
----
+The public outcome label `Strategy::LibnfsIoUring` is a retained compatibility
+name for regular-file libnfs work; it does not describe an io_uring
+implementation.
 
-## Self-fencing (correctness)
+For both regular-file paths, the destination is a hidden sibling named
+`.<base>.<host>.<pid>.partial`. Data is made stable with a whole-file NFS
+COMMIT (`fsync` in the libnfs API) before publication. Owner, mode, and times
+are applied in the order `chown -> chmod -> utimes`; owner precedes mode so
+NFSv3 kill-priv behavior cannot strip freshly applied setuid/setgid bits. The
+fence is checked immediately before the atomic rename publishes the final
+path. A commit failure or fence trip leaves the partial unrenamed.
 
-The dual-writer scenario is the one bug that can corrupt user data, so it
-gets explicit treatment.
+The bucketed path brackets a copy with source metadata and records a torn-copy
+downgrade if the source changed while the file was copied. The default sync
+path does not currently perform that bracket.
 
-**Invariant**: at any instant, the worker writing to dest paths derived
-from rows in shard X must hold a valid claim on X.
+### Other rows and metadata
 
-**Mechanism**:
-- The mover's batch loop checks an atomic "claim_valid" flag before issuing
-  each new file copy.
-- The heartbeat task sets `claim_valid = false` on any of:
-  - `HEAD` observes a different etag or a missing claim object (lost
-    claim) — **except** when the loss matches this worker's own clean
-    completion in flight (the held-claim cell no longer matches the
-    tick's snapshot; re-checked under the cell lock — a clean
-    completion must not fence the worker).
-  - Transient refresh errors past the retry budget
-    (`floor(lease / heartbeat)` consecutive failures; the counter
-    resets on any success).
-  - Local clock jump > `LEASE_TIMEOUT/2` (wall vs monotonic).
-- When `claim_valid = false`, the mover:
-  - Cancels in-flight tasks (`tokio::select!` on a cancellation token).
-  - **Does not** issue further `RENAME` ops. (Partial-file cleanup is
-    the planned `mig-aggr clean-partials` — still a stub; see the
-    freshness note.)
-  - Exits the shard. The worker may try to claim a new shard.
+- Empty regular files use create, attributes, fence check, and rename without
+  a data loop.
+- Symlinks preserve raw target bytes. NFSv3 limitations in link metadata are
+  recorded as downgrades. Replay compares an existing destination target.
+- Hardlink candidates are grouped by `(fsid, inode)` when possible and copied
+  sequentially within a micro-batch: the first member is copied, then later
+  members link to its final path. Missing `fsid` falls back to inode-only
+  grouping with a downgrade. Fidelity across batch or shard boundaries is a
+  known limitation.
+- Directory attributes are applied deepest-first after non-directory rows in
+  the same batch. Later work in another batch or shard can restamp a parent
+  directory's mtime.
+- FIFOs, sockets, and device rows are skipped by the mover.
 
-This is why writes go to `.partial` and only `RENAME` makes them visible:
-the rename is the commit point, and we don't commit without a valid claim.
+Failures and fidelity downgrades are separate immutable JSONL objects keyed by
+host, shard, and claim epoch. A failed row does not inflate bytes-moved
+accounting; a committed early-EOF or torn copy remains visible as a downgrade.
 
----
+### Batching and backpressure
 
-## Conflict resolution
+Rows are accumulated in materialized order until either the configured byte
+budget, file budget, or shard end closes a micro-batch. Per-size inflight
+limits bound concurrent file work inside it. After each completed shard, the
+worker evaluates its failure percentage and measured throughput. An unhealthy
+result stops ordinary new claims; after a cooldown, one probe claim is allowed.
+A healthy probe reopens the gate, while another unhealthy result extends the
+cooldown up to its cap.
 
-There isn't any. S3 conditional PUT serializes claims at the storage layer.
-Two workers issuing `If-None-Match: *` against the same key: one gets 200,
-the other gets 412. No timestamps, no host-id tiebreakers, no clock
-assumptions.
+## Optional control plane
 
----
+`migration-control-protocol` is the canonical control-plane contract. Version
+1 snapshot and event shapes, serde behavior, identifiers, commands, request/
+response bodies, and the deterministic reducer live there. It has no
+dependency on `migration-core`, the coordinator, Tokio, Axum, or an AWS SDK.
 
-## Dynamic membership
+`migration-coord` owns everything stateful around that contract: single-writer
+lease acquisition and refresh, persisted event chunks, snapshots, replay,
+audit allocation, terminal-job archival, HTTP/SSE, authentication, and runtime
+ticks. It re-exports the protocol schema at `migration_coord::schema` for
+source compatibility. It never owns or mutates worker shard claims.
 
-- **Add a host**: it starts, follows the lifecycle. Claims whatever's free.
-- **Remove gracefully**: worker drains current shard, marks claim
-  `completed`, exits.
-- **Crash**: claim goes stale (progress heartbeat stops). After
-  `LEASE_TIMEOUT` (3 min), another worker reclaims (delete-then-create,
-  epoch bumped). Crashed worker, if it comes back, HEADs a claim whose
-  etag is no longer its own and self-fences.
+`migration-tui` bootstraps from REST, then follows SSE with resume and resync
+handling. It uses the protocol reducer directly so server replay and client
+state share transition semantics. Live broadcast caps reduce display traffic;
+the coordinator's reducer and durable event log still see every accepted
+event. See [docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md) for the module map and
+concurrency/durability details.
 
----
-
-## Failure modes
-
-| Failure | Detection | Recovery |
-|---|---|---|
-| Worker crashes mid-shard | Heartbeat stale > 3 min | Another worker reclaims (`DELETE If-Match` + `PUT If-None-Match`, epoch bumped). |
-| Worker partitioned from S3 | Heartbeat refresh fails | Worker self-fences before any other host reclaims. |
-| Source NFS slow / cnode pinning | Throughput metric drops | Surfaced in `progress/`; operator can rebalance shards or add hosts. |
-| Source NFS file gone at copy time | Per-file ENOENT | Logged to `failures/`; batch continues. |
-| Dest NFS full | Per-file ENOSPC | Logged; worker pauses claims (backpressure gate). |
-| Dest NFS partial write | io_uring error | `.partial` file remains; not renamed; logged. |
-| Two workers race for shard | S3 conditional PUT | One gets 412 and picks another shard. |
-| Parquet shard corrupt | Parquet decode error | Worker `fail`s the claim (immutable `Failed` marker via delete-then-create), picks another shard. Worker-local errors (stale binary, scratch I/O) release-and-skip instead. |
-| NFSv4.2 COPY unsupported on path | Server returns NOTSUPP | Mover falls back to READ/WRITE for that file. |
-| Aggregator down | N/A | Workers don't care; observability degraded only. |
-| Manifest swapped underneath us | ETag mismatch on shard re-fetch | Worker logs and exits this run. |
-
----
-
-## Backpressure
-
-If the worker's recent failure rate exceeds a threshold (e.g. >5% in the
-last 60s) **or** sustained throughput drops below a floor, the worker:
-
-- Stops claiming new shards (does not abandon current).
-- Continues current shard at reduced concurrency.
-- Publishes a structured `degraded:<reason>` status to `progress/`.
-
-Degradation recovers via **cooldown probes** rather than trapping the
-worker forever (inputs only update when a shard completes, and degraded
-blocks claiming — so an exit path is required): after a cooldown
-(5 min initially) the gate admits exactly one probe claim
-(status `degraded:<reason>:probe-pending` → `:probing`); a healthy
-outcome clears degradation, an unhealthy one re-degrades with the
-cooldown doubled (capped at 30 min).
-
-Avoids the failure mode where all 100 hosts pile onto a degraded dest and
-generate 100× ENOSPC events.
-
----
-
-## Read patterns on VAST S3 (revised)
-
-| Object | Frequency per host | Size | Notes |
-|---|---|---|---|
-| `manifest.json` | Once at startup | KB | Cached. |
-| `index/part-NNNN.parquet` | Once per shard | GB | **Downloaded fully to local tmpfs**; not range-read on the data path. |
-| `shards/*.claim` (LIST) | Every claim attempt + every 30s | KB | LIST returns small set. |
-| `shards/<own>.claim` (HEAD) | Every 30s heartbeat | — | Etag compare only; no write on the heartbeat path. |
-| `shards/<own>.claim` (PUT/DELETE) | Acquire/reclaim/complete/fail only | <1 KB | Conditional delete-then-create. |
-| `progress/host-<self>.json` (PUT) | Every 30s | KB | Overwrite (single writer). |
-| `batches/host-<self>.jsonl` (PUT) | Per micro-batch | KB | Single-writer key. |
-| `failures/host-<self>/<stem>-e<epoch>.jsonl` (PUT) | Per sink flush | KB | Immutable per-flush object (`If-None-Match: *`); list the prefix to consume. |
-
-At 100 hosts, claim/heartbeat traffic is ~3.3 PUT/s and ~3.3 LIST/s
-**globally**. Shard parquet downloads are the only bulk traffic and happen
-~once per worker per ~10 min (assuming wire-rate processing of a few-GB
-shard). VAST S3 sees almost no load.
-
----
+No production CLI or REST route currently creates/imports a control-plane job.
+A fresh coordinator starts with an empty job registry, and worker registration
+requires the configured job to exist. The runtime, replay, command, worker, and
+TUI paths are implemented and tested once `JobCreated` state is present; an
+operator provisioning workflow is deferred.
 
 ## Configuration
 
-`examples/worker.toml` is the canonical configuration for both the
-standalone `mig-worker` and every configuration-consuming `vamoose`
-subcommand. Control-plane commands need only `[run]`; starting a worker
-also requires the worker-specific sections shown below. The older
-`[global]`/`[s3]` vamoose shape remains accepted as a compatibility
-input. The compatibility shape does not carry `[coord]`; use canonical
-input for coord-connected workers. CLI-only `[nfs]`, `[walker]`,
-`[aggr]`, and `[logging]` sections may be added when those checks or
-policies are needed.
+The canonical operator input is the existing worker-shaped TOML:
 
 ```toml
-[run]
-bucket   = "migration-run-2026-05-02"
-endpoint = "https://vast-s3.example.com"
-region   = "us-east-1"
-profile  = "migration-operator"
-verify_tls = true
-
+[run]          # bucket, endpoint, region, profile, verify_tls
 [worker]
-# host_id         = "worker-07"  # auto-generated if omitted
-heartbeat_sec     = 30
-lease_timeout_sec = 180          # 3 min, 6× heartbeat
-
 [shard]
-local_scratch  = "/var/lib/mig/scratch"  # tmpfs preferred
-max_in_flight  = 1                       # # of shards concurrently in this worker
-
 [mover]
-strategy_default     = "libnfs_io_uring"  # or "nfs42_copy", "kernel_cfr"
-src_url              = "nfs://src/export"
-dst_url              = "nfs://dst/export"
-nfs_connections      = 16
-rpc_timeout_ms       = 60000
-pipeline_depth       = 8
-io_uring_queue_depth = 256
-fixed_buffer_count   = 256
-fixed_buffer_size    = "1 MiB"
-
 [batch]
-bytes_budget       = "8 GiB"
-files_budget       = 100_000
-inflight_small     = 256          # files < 1 MiB
-inflight_medium    = 16           # 1 MiB – 1 GiB
-inflight_large     = 4            # > 1 GiB
-large_stripe_size  = "4 MiB"
-large_stripe_depth = 32
-
 [copy]
-preserve_owner           = true
-preserve_mode            = true
-preserve_times           = true
-preserve_xattr           = true   # honored when walker emits xattr_blob; no-op until then
-server_side_copy         = "off"  # NFSv3 baseline
-require_chown_capability = true
-require_unchanged_size   = false
-
 [backpressure]
-failure_pct_window_sec = 60
-failure_pct_threshold  = 5.0
-throughput_floor_mb_s  = 100
+[coord]        # optional worker-to-coordinator connection
 ```
 
----
+The full shape and defaults are demonstrated by
+[examples/worker.toml](examples/worker.toml). The same file is accepted by
+standalone `mig-worker` and by every configuration-consuming `vamoose`
+subcommand. Control-only commands need only `[run]`; `vamoose worker` also
+requires the worker-specific sections. Unified-CLI-only `[nfs]`, `[walker]`,
+`[aggr]`, and `[logging]` sections are optional additions, and standalone
+`mig-worker` ignores them through Serde's normal unknown-field behavior.
 
-## Open questions (smaller, real)
+The older `[global]` plus `[s3]` vamoose shape remains a compatibility input.
+The CLI normalizes either format to bucket, endpoint, region, profile, and
+`verify_tls`, rejects a file that mixes the two format roots, and does not
+fall through to another parser after a malformed input. Compatibility worker
+projection retains its established defaults and requires `[nfs]`.
 
-1. **Hardlink groups across shards**: do we accept the v1 limitation, or
-   add an "index post-processor" step that re-shards by inode-group?
-2. **NFSv4.2 COPY testing**: validate against VAST's NFSv4.2 implementation
-   for both the same-server and cross-server cases. May not be supported
-   on all surfaces.
-3. **Worker count vs source cluster size**: from the walker measurements,
-   the source NFS cluster has a per-client throughput ceiling. With 100
-   workers the aggregate exceeds any single client, but if all 100 hammer
-   one cnode, we'll re-create the pinning issue. Worth thinking about
-   shard-to-cnode affinity in the index build (out of scope for v1, worth
-   noting).
+Historical mover fields such as `strategy_default`, `pipeline_depth`,
+`io_uring_queue_depth`, `fixed_buffer_count`, `fixed_buffer_size`, and
+`server_side_copy` remain accepted so operator files do not break. They do not
+select or tune an unimplemented strategy. `use_bucketed_pool` and
+`rpc_timeout_ms` are active mover settings.
 
----
+Logging policy also preserves the source format's behavior: canonical input
+without `[logging]` uses the minimal fallback subscriber; compatibility input
+without it uses the established standard defaults; explicit `[logging]` works
+with either. The TUI remains quiet on stderr and does not start the S3 log
+uploader. The `vamoose` process boundary owns command dispatch, orderly
+logging shutdown, and final exit status.
 
-## Resolved
+## Command and aggregation status
 
-- **VAST S3 conditional PUT**: confirmed. `If-None-Match: *` and
-  `If-Match: <etag>` both work per RFC 9110. The claim protocol can rely
-  on them.
+The unified CLI currently implements `worker`, `status`, `doctor`, `init`,
+`coord`, and `tui`. Its `walker`, `rewrite`, `aggr`, and end-to-end `run`
+subcommands retain their command-line shapes but fail safely with actionable
+messages. Operators invoke `nfs-walker` and `mig-walker-rewrite` directly for
+index preparation.
 
----
+The standalone `mig-aggr` binary is not a complete observability sidecar.
+`clean-partials` is implemented: it scans a locally mounted destination for
+mover-shaped partial files, defaults to dry-run, requires `--delete` to
+remove them, and gates deletion on claim liveness unless `--force` is given.
+`watch`, `summary`, `metrics`, `inspect`, and `verify` return explicit
+unimplemented errors rather than panicking. Current live observability comes
+from `vamoose status` or the optional coordinator and TUI.
 
-## Future work (deferred but designed-for)
+The control surface also has two deliberate version-1 limits: `drain` is
+encoded as a paused job with reason `drain`, so the worker currently observes
+pause rather than a distinct drain mode; `retry-failed` records an accepted
+audit command but has no retry event or worker queue behind it.
 
-- **xattr capture in `nfs-walker`**. The mover schema reserves
-  `xattr_blob` and the apply path is wired up (currently dead code
-  because the column is always NULL). When walker xattr support lands:
-  - Walker reads xattrs during scan (`GETXATTR` / `LISTXATTR` over libnfs).
-  - Serialization format for `xattr_blob` to be defined in
-    `migration-core` — proposed: length-prefixed `(name_len, name,
-    value_len, value)` tuples, repeated. Spec it before walker
-    implementation so both sides agree.
-  - Decide on filtering rules — e.g. skip `system.*` namespaces, preserve
-    `user.*` and `security.*` (the latter requires CAP_SYS_ADMIN on dest).
-  - No mover changes required when this lights up; existing branch
-    activates as soon as non-NULL `xattr_blob` values appear.
-- **Cross-shard hardlink consolidation** (see open question 1).
-- **Shard-to-cnode affinity hints** in the manifest, so workers can be
-  pinned to source cnodes that own their shards' data.
-- **Resume-after-restart** of partially-completed shards. v1 restarts a
-  shard from the beginning if a worker died mid-shard. Mid-shard checkpoints
-  (every N micro-batches) would let reclaim resume from the last committed
-  row, at the cost of more S3 writes.
+## Current limitations and deferred work
 
----
+The authoritative current list is [docs/NEXT.md](docs/NEXT.md), with operator
+impact summarized in [docs/BETA_NOTES.md](docs/BETA_NOTES.md). Important
+boundaries include:
 
-## Tech stack
+- several libnfs and reclaim guarantees still require the recorded VAST
+  hardware verification pass;
+- hardlink fidelity and directory-attribute ordering are batch/shard scoped;
+- multi-pass migration and cross-boundary hardlink reconciliation are not
+  implemented;
+- walker/rewrite/run composition and most aggregation commands remain stubs;
+- walker-side xattr capture is not yet available;
+- the S3 data-plane layout represents one run at the bucket root;
+- archive restore, scoped control-plane credentials, and an atomic coordinator
+  snapshot boundary for TUI bootstrap are deferred;
+- fresh-deployment control-plane job provisioning is not implemented;
+- distinct drain execution and retry-failed queueing are not implemented; and
+- compatibility configuration and control-plane re-exports remain until a
+  separately approved breaking cleanup.
 
-- **Language**: Rust.
-- **Workspace**:
-  ```
-  migration/
-  ├── crates/
-  │   ├── migration-core/   # types, S3 client, parquet reader, claim protocol
-  │   ├── migration-mover/  # libnfs + io_uring data path
-  │   ├── migration-worker/ # binary: orchestration + mover
-  │   └── migration-aggr/   # binary: read-only sidecar
-  ```
-- **Crates**:
-  - `aws-sdk-s3` (Apache-2.0).
-  - `arrow` + `parquet` v54 (Apache-2.0).
-  - `tokio` (MIT).
-  - `io-uring` crate or `tokio-uring` (MIT).
-  - `libnfs` via FFI — same approach as `nfs-walker` (LGPL-2.1-or-later;
-    see Attribution below).
-  - `serde`, `serde_json`, `clap`, `tracing`, `ratatui` (MIT or dual MIT/Apache-2.0).
-  - `crossbeam-channel`, `crossbeam-deque` (MIT/Apache-2.0) — same
-    primitives as `nfs-walker` for the work-stealing pool.
+No dormant executable scaffolding is retained for io_uring, NFSv4.2 COPY, or
+kernel `copy_file_range`. A future strategy effort must begin with a measured,
+reviewed implementation rather than treating those names as existing support.
 
----
+## Documentation map
 
-## Milestones
+- [docs/CLAIM_PROTOCOL.md](docs/CLAIM_PROTOCOL.md): detailed S3 claim protocol
+- [docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md): control-plane architecture and invariants
+- [docs/CORRECTNESS_RULES.md](docs/CORRECTNESS_RULES.md): cross-cutting correctness rules
+- [SCHEMA_CONTRACT.md](SCHEMA_CONTRACT.md): mirrored Parquet schema contract
+- [docs/BETA_NOTES.md](docs/BETA_NOTES.md): operator limitations and security posture
+- [docs/NEXT.md](docs/NEXT.md): remaining work
+- [docs/COORD_PLAN.md](docs/COORD_PLAN.md): historical coordinator delivery plan
 
-1. **M1 — Skeleton.** Single worker, claims a shard via S3 conditional
-   PUT, mmaps parquet, walks rows, logs (no-op mover). Aggregator reads
-   `progress/`.
-2. **M2 — Mover v1: libnfs READ/WRITE.** No io_uring yet. Single-file
-   copies with attribute preservation. Validate end-to-end correctness
-   against a small dataset and verify SHA-256 match source/dest.
-3. **M3 — io_uring + fixed buffers + adaptive concurrency.** Performance
-   pass: byte-budgeted batches, in-flight concurrency by size class.
-   Bench against `nfs-walker`'s measured ceiling.
-4. **M4 — NFSv4.2 server-side COPY fast path.** Detect server support,
-   route eligible files. Bench delta vs M3.
-5. **M5 — Multi-host + self-fencing test.** 3 workers; kill -9 mid-batch;
-   verify reclaim + self-fence + no dual-writer corruption (audit dest
-   tree against source).
-6. **M6 — Scale test.** 100 workers on the production-class target. Tune
-   batch budgets, concurrency, connection counts. Goal: aggregate
-   throughput within 90% of source-cluster ceiling.
-7. **M7 — Hardlink + symlink end-to-end (xattr deferred).** Validate
-   POSIX attribute fidelity (mode, uid/gid, atime/mtime, hardlinks,
-   symlinks) via a `mig-aggr verify` mode that diffs src and dst tree
-   metadata. xattr verification gated on walker support landing.
+## Toolchain and licensing
 
----
-
-## Attribution / licensing notes
-
-This design is original. When implementing:
-
-- **`libnfs` is LGPL-2.1-or-later.** This is the most important attribution
-  consideration in the project. LGPL allows use from non-LGPL code via
-  dynamic linking. The `nfs-walker` precedent (which links libnfs via FFI
-  through a build script + `pkg-config`) is what we'll follow. Required:
-  - Distribute the libnfs source or a written offer for it with any
-    binary distribution.
-  - Preserve libnfs's copyright and license notices.
-  - If the mover ever statically links libnfs, that triggers stronger
-    obligations; avoid static linking.
-- **`nfs-walker` is MIT.** Reusing its libnfs FFI wrappers requires
-  preserving its copyright and license notice in any derived files.
-  Easiest path: vendor the wrapper code into `migration-core` with the
-  original MIT header intact.
-- **`aws-sdk-s3`, `arrow`, `parquet`** are Apache-2.0 — preserve `LICENSE`
-  and `NOTICE`, mark any modified files.
-- **`tokio`, `serde`, `clap`, `tracing`, `crossbeam-*`, `ratatui`,
-  `io-uring`** are MIT (or dual MIT/Apache-2.0) — preserve copyright
-  notices.
-- **`gxhash`** (used in `nfs-walker` for checksums; if reused for
-  end-to-end verify) — verify license before pulling in.
-
-A `THIRD_PARTY_LICENSES.md` file at the workspace root, regenerated by
-`cargo about` on every build, is the right pattern for keeping this
-honest.
+The workspace MSRV is Rust 1.91.1 and the edition is 2021. The mover
+dynamically links libnfs; static linking is not supported by the repository's
+licensing policy. Workspace code is AGPL-3.0-only. See
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the generated dependency
+inventory.

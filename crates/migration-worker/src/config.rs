@@ -123,8 +123,7 @@ pub struct MoverCfg {
     /// async libnfs pool ([`migration_mover::AsyncBucketedFileMover`]) instead of the
     /// sync `MultiPool`. Non-regular rows (symlinks / hardlinks /
     /// dirs / empty / skip) still use the sync path. CLI override
-    /// via `vamoose worker run --use-bucketed-pool`. Off by default
-    /// during the Phase 2 rollout.
+    /// via `vamoose worker --use-bucketed-pool`. Off by default.
     #[serde(default)]
     pub use_bucketed_pool: bool,
 }

@@ -1,4 +1,4 @@
-//! Coord runtime — the long-running data plane.
+//! Coord runtime — the long-running control-plane state engine.
 //!
 //! Owns the lease handle, the in-memory state ([`Snapshot`]), the
 //! monotonic seq counter, the [`EventLogWriter`], and a tokio
@@ -59,7 +59,7 @@
 //! ## Lease ownership
 //!
 //! The runtime *owns* the lease handle. Lease refresh and
-//! takeover-on-loss live in [`crate::ticks`] (Phase 2.4). The
+//! refresh cadence and shutdown-on-loss live in [`crate::ticks`]. The
 //! runtime exposes `lease_lost()` so the ticks task can signal
 //! shutdown when refresh sees [`crate::Error::LeaseLost`].
 //!

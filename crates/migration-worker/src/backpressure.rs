@@ -1,6 +1,6 @@
 //! Backpressure gate.
 //!
-//! Per DESIGN.md "Backpressure": when the worker's recent failure
+//! Per DESIGN.md "Batching and backpressure": when the worker's recent failure
 //! rate exceeds a threshold OR sustained throughput drops below a
 //! floor, stop claiming new shards. The current shard finishes; new
 //! claims wait. The orchestrator checks `degraded()` before each scan

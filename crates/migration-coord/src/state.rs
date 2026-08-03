@@ -65,8 +65,8 @@ async fn discover_chunks_by_route(
 /// chunk under `events/`, merge by seq, and fold envelopes with `seq
 /// > snapshot.last_seq` through the protocol reducer.
 ///
-/// Memory footprint: O(events-since-snapshot). For Phase 1 that is
-/// acceptable (snapshots cap at 1000 events or 5 minutes apart). If
+/// Memory footprint: O(events-since-snapshot). The production snapshot
+/// cadence caps this at 1000 events or 5 minutes of normal operation. If
 /// a future deployment needs streaming replay, this is the function
 /// to revisit.
 pub async fn replay(store: &dyn CoordStore, now: DateTime<Utc>) -> Result<ReplayResult> {
@@ -113,7 +113,7 @@ pub async fn replay(store: &dyn CoordStore, now: DateTime<Utc>) -> Result<Replay
 // =============================================================================
 
 /// Read every event for a job from the log, in seq order, with seq
-/// strictly greater than `since`. Used by the (Phase 2) REST endpoint
+/// strictly greater than `since`. Used by the REST endpoint
 /// `GET /jobs/{id}/events?since=...` and by tests that need to assert
 /// the per-job log contents.
 pub async fn read_job_events(

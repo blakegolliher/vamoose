@@ -1,7 +1,7 @@
 //! Snapshot writer + loader.
 //!
 //! The lease holder writes `state/snapshot.json` from its in-memory
-//! state on cadence (the policy lives in the runtime, Phase 2). Each
+//! state on cadence (the policy lives in the runtime ticks). Each
 //! write also drops a timestamped copy under
 //! `state/snapshot-<ts>.json`; the loader prunes that history to the
 //! newest N copies.

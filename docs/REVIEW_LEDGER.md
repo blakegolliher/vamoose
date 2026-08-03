@@ -34,8 +34,9 @@ changes need a hardware verification note before `verified`.
 ## Findings — 2026-07-01 four-track review
 
 Tracks: claim protocol vs spec; worker+mover; coord+TUI+CLI;
-docs+tests+CI. Full narrative context is in `docs/HANDOFF.md`
-"Known issues".
+docs+tests+CI. Full narrative context is preserved in
+[`docs/baselines/2026-07-01-review-handoff.md`](baselines/2026-07-01-review-handoff.md)
+under "Known issues".
 
 ### Critical
 
@@ -60,7 +61,7 @@ docs+tests+CI. Full narrative context is in `docs/HANDOFF.md`
 | F12 | mover    | No I/O deadline anywhere on the data plane (no `nfs_set_timeout`); hung server wedges shards forever while heartbeats look healthy. | [PROTECTED_FFI_BATCH.md](work-items/PROTECTED_FFI_BATCH.md) | landed | Decision (D3): `nfs_set_timeout` bound, non-optional at every context creation, `[mover] rpc_timeout_ms` default 60_000 (`0` = library default); timeouts classify retryable WorkerLocal. Merged in PR #39. Hardware bounded-timeout smoke pending rig. |
 | F13 | worker   | Every `process()` error marks the claim `Failed` (terminal), incl. worker-local errors; a stale binary can poison shards fleet-wide. | [WORKER_ERROR_CLASSIFICATION.md](work-items/WORKER_ERROR_CLASSIFICATION.md) | landed | merged in PR #18. F42 is the transient-retry follow-up. |
 | F14 | worker   | Backpressure `degraded` is a one-way trap: inputs only update after a shard completes, but degraded blocks claiming shards. | [WORKER_BACKPRESSURE_RECOVERY.md](work-items/WORKER_BACKPRESSURE_RECOVERY.md) | landed | merged in PR #19. |
-| F15 | worker   | Hardlink groups + dir-attr ordering are batch-scoped, not shard-scoped: groups straddling a batch boundary lose nlink fidelity silently. | — | open | Decision (2026-07-31): documented as a beta limitation (docs/BETA_NOTES.md — link fidelity is shard-scoped; pre-shard by group for full fidelity); proper fix folds into the multi-pass design when that work starts. Pre-shard-now and standalone-link-pass rejected. |
+| F15 | worker   | Hardlink groups + dir-attr ordering are batch-scoped, not shard-scoped: groups straddling a batch boundary lose nlink fidelity silently. | — | open | Decision (2026-07-31): documented as a beta limitation (docs/BETA_NOTES.md — link fidelity is micro-batch-scoped); proper fix folds into the multi-pass design when that work starts. Pre-shard-now and standalone-link-pass rejected. |
 | F16 | worker   | R4 TOCTOU: heartbeat snapshots held claim, `complete()` races it, stale HEAD → spurious self-fence on a clean completion. | [PROTOCOL_TEST_PACK.md](work-items/PROTOCOL_TEST_PACK.md) | landed | merged in PR #20 (suppression fix + regression pair). |
 | F17 | worker   | Shutdown watchdog forces `_exit(0)` on wedged shutdown — supervisors see success for fenced/failed runs. | [HARDENING_BATCH_1.md](work-items/HARDENING_BATCH_1.md) | landed | merged in PR #22 item A: wedged shutdown exits 2. Possible follow-up: fenced-but-clean runs still exit 0. |
 | F18 | coord    | SSE catch-up reads only flushed chunks; events in the writer buffer at subscribe time are silently missed (doc claims "gaps impossible"). | [COORD_EVENT_ACK_DURABILITY.md](work-items/COORD_EVENT_ACK_DURABILITY.md) | landed | Same root as F03. merged in PR #17. |

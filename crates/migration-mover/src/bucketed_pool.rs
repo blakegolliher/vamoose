@@ -1,4 +1,4 @@
-//! Bucketed async libnfs pool for the multi-pass converging mover.
+//! Bucketed async libnfs pool for the opt-in regular-file mover.
 //!
 //! Builds three `AsyncNfsContext` pairs — one per file-size bucket —
 //! with per-bucket `rsize` / `wsize` tuned to the bucket's workload.
@@ -17,10 +17,10 @@
 //!
 //! ## What does NOT live here
 //!
-//! - Per-file pipelined copy: `pipelined_copy.rs` (Phase 2).
+//! - Per-file pipelined copy: `pipelined_copy.rs`.
 //! - Inflight concurrency budgets across files: `batch.rs::InflightLimiter`.
-//! - Mover integration: `mover.rs` (Phase 2 wires this behind
-//!   `--use-bucketed-pool`).
+//! - Mover integration and sync fallback: `file_mover.rs`, selected by
+//!   `[mover] use_bucketed_pool` or `--use-bucketed-pool`.
 //!
 //! ## Deltas vs the work-item sketch
 //!

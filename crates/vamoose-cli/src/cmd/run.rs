@@ -1,8 +1,6 @@
-//! `vamoose run` (stub) — will eventually orchestrate the
-//! end-to-end pipeline: walker → rewrite → S3 upload → spawn
-//! N workers → wait for completion. For now operators script the
-//! pipeline by chaining nfs-walker, mig-walker-rewrite, aws s3 cp,
-//! and `vamoose worker` themselves; see scripts/manual-verify.sh.
+//! `vamoose run` is a safe stub. Operators currently script the end-to-end
+//! pipeline by chaining nfs-walker, mig-walker-rewrite, S3 upload, and
+//! `vamoose worker`; see scripts/manual-verify.sh.
 
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
