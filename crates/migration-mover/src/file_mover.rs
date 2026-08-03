@@ -91,7 +91,7 @@ impl CopyDisposition {
 /// [`DowngradeKind::TornCopy`] carrying the pre/post
 /// `(size, mtime_sec, ctime_sec)` stat-bracket triples; a clean
 /// result is a plain commit. No I/O, no side effects — the caller
-/// ([`AsyncBucketedFileMover::copy_regular`]) emits the record,
+/// (`AsyncBucketedFileMover::copy_regular`) emits the record,
 /// bumps counters, and warns.
 pub fn classify_copy(result: &FileCopyResult, row: &RowView) -> CopyDisposition {
     if !result.torn {

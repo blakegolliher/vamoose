@@ -13,7 +13,7 @@
 //!   / large).
 //! - [`AsyncNfsContextPair`] — one (src, dst) pair of mounted contexts.
 //! - [`BucketedAsyncPool`] — owns all three pairs; routes
-//!   [`pair_for_size`] selection by file size.
+//!   [`BucketedAsyncPool::pair_for_size`] selection by file size.
 //!
 //! ## What does NOT live here
 //!
@@ -154,7 +154,7 @@ impl BucketedAsyncPool {
 
     /// Borrow the (src, dst) pair for a given bucket name. Mostly for
     /// tests and observability; production code goes through
-    /// [`pair_for_size`].
+    /// [`Self::pair_for_size`].
     pub fn pair_by_name(&self, name: &str) -> Option<&AsyncNfsContextPair> {
         match name {
             "large" => Some(&self.large),
