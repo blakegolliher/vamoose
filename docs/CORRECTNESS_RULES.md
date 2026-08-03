@@ -12,7 +12,7 @@ an explicit design change.
   `PUT If-None-Match: *` for first-time claim and
   `DELETE If-Match: <etag>` for ownership transfer; both are honored
   by VAST S3 and most S3-compatible stores. See
-  `docs/work-items/CLAIM_PROTOCOL_V2_DELETE_THEN_CREATE.md`.
+  [CLAIM_PROTOCOL.md](CLAIM_PROTOCOL.md).
 
 - **Self-fence before commit.** The mover must check
   `fence.is_valid()` before issuing `RENAME` (the commit point). If
@@ -186,11 +186,16 @@ the perf binary dropping below the recorded baseline by more than
 
 ## Authoritative source-of-truth files
 
-- `SCHEMA_CONTRACT.md` — column names, types, null semantics, path
-  encoding, fsid grouping, parquet KV footer keys, downgrade
-  semantics, version policy.
-- `DESIGN.md` — architecture (claim protocol, fence, mover
-  strategies, milestone scope). If code disagrees with it, the
-  design wins unless the design has been explicitly updated.
-- `THIRD_PARTY_LICENSES.md` — keep accurate when adding deps.
-  libnfs is **LGPL-2.1-or-later, dynamic-linked only**.
+Current Rust source and tests are the executable truth; manifests define the
+dependency graph. Bring current documentation forward when it drifts rather
+than implementing an older plan implicitly.
+
+- `SCHEMA_CONTRACT.md` — mirrored column names, types, null semantics, path
+  encoding, fsid grouping, Parquet KV footer keys, downgrade semantics, and
+  version policy. Coordinate edits with the `nfs-walker` repository.
+- `DESIGN.md` — concise current system architecture.
+- `docs/CONTROL_PLANE.md` — current control-plane ownership and runtime
+  invariants.
+- `docs/CLAIM_PROTOCOL.md` — current S3 claim protocol.
+- `THIRD_PARTY_LICENSES.md` — generated dependency inventory. libnfs is
+  **LGPL-2.1-or-later, dynamic-linked only**.

@@ -1,7 +1,5 @@
-//! `vamoose aggr` (stub) — will eventually run the mig-aggr TUI
-//! / metrics exporter / verify subcommands inline. For now invoke
-//! the standalone `mig-aggr` binary directly. `vamoose status`
-//! covers the read-only one-shot use case.
+//! `vamoose aggr` is a safe stub. Invoke standalone `mig-aggr` for
+//! `clean-partials`; `vamoose status` covers the read-only status use case.
 
 use clap::Args as ClapArgs;
 use std::path::PathBuf;

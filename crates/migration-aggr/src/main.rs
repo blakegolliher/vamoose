@@ -1,4 +1,4 @@
-//! `mig-aggr` — read-only observability sidecar.
+//! `mig-aggr` — migration maintenance and observability CLI.
 //!
 //! Implemented subcommand:
 //!   - `clean-partials`   : lease-aware sweep of orphaned `.partial`
@@ -22,7 +22,7 @@ mod verify;
 #[derive(Debug, Parser)]
 #[command(name = "mig-aggr", version)]
 struct Cli {
-    /// S3 endpoint URL (e.g. https://vast-s3.example.com).
+    /// S3 endpoint URL (e.g. <https://vast-s3.example.com>).
     #[arg(long, env = "MIG_S3_ENDPOINT")]
     endpoint: String,
 

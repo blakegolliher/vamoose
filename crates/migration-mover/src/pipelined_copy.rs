@@ -18,16 +18,16 @@
 //!
 //! ## What this module deliberately does NOT do
 //!
-//! - **Open / close fhs.** Caller opens with the appropriate stability
-//!   (`Flags::wronly_sync()` for cutover, plain `Flags::wronly()` for
-//!   bulk) and closes after the fence check / rename. Stability is an
+//! - **Open / close fhs.** The caller owns both handles and closes them after
+//!   this copy returns, before attribute application and the fence-gated
+//!   rename. Stability is an
 //!   open-time choice on the linked libnfs (`pwrite` has no per-call
 //!   stability flag — see `LIBNFS_ASYNC_FORK.md` closing note).
 //! - **Rename / commit.** The atomic `.partial → final` rename is the
 //!   sole commit point and stays in the caller, gated on
-//!   `Fence::check_pre_rename()`. The fence check must sit between
-//!   `pipelined_copy().await?` and `rename().await` with no other
-//!   work in between. R8 from `CORRECTNESS_RULES.md`.
+//!   the caller's fence check. Attribute work and handle cleanup may follow
+//!   `pipelined_copy`, but the final fence check and `rename` must remain
+//!   adjacent. R8 from `CORRECTNESS_RULES.md`.
 //! - **Torn-read remediation.** Torn reads are recorded in
 //!   `FileCopyResult::torn`; the caller (`file_mover::classify_copy`,
 //!   consumed by `copy_regular`) still commits the file and emits a
@@ -47,9 +47,8 @@ use futures::FutureExt;
 use migration_core::records::FailurePhase;
 use xxhash_rust::xxh3::Xxh3;
 
-/// Outcome of one `pipelined_copy` invocation. Caller folds this into
-/// its per-file record (per-host partial manifest writer in Phase 3,
-/// `MoveOutcome` once the `FileMover` trait lands in Phase 2 T2).
+/// Outcome of one `pipelined_copy` invocation. `AsyncBucketedFileMover` folds
+/// this into the row's `MoveOutcome` and downgrade records.
 #[derive(Debug, Clone)]
 pub struct FileCopyResult {
     /// `xxh3_128` of the bytes that actually transited the pipeline.

@@ -214,7 +214,7 @@ pub trait ClaimStore: Send + Sync {
     /// Unconditional GET. Returns `(body, etag)` or `None` if absent.
     /// Retained for back-compat with non-claim readers (manifest,
     /// shard parquet download). New v2 code paths should prefer
-    /// [`head_object`].
+    /// [`Self::head_object`].
     async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>>;
 
     /// LIST objects under a prefix.

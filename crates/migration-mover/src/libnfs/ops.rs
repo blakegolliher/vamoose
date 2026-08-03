@@ -420,9 +420,9 @@ mod tests {
     #[test]
     fn phase_mapping_documented() {
         // This test is intentionally just an assertion that the phase
-        // labels we hardwire above match the design table. If you
-        // change a phase below, update DESIGN.md "R6. Error → phase
-        // mapping" too.
+        // labels we hardwire above match the failure-record contract. If you
+        // change a phase below, update operator-facing failure documentation
+        // and sink-parser tests too.
         let cases: &[(&str, FailurePhase)] = &[
             ("open_read", FailurePhase::Open),
             ("create_write", FailurePhase::Write),

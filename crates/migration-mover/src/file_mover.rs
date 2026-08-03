@@ -10,8 +10,8 @@
 //!   symlinks / hardlinks / dirs / empty files / skip-everything-else
 //!   rows.
 //!
-//! The worker holds `Arc<dyn FileMover>`; the `--use-bucketed-pool`
-//! CLI flag (Phase 2 T3) picks which impl is constructed at startup.
+//! The worker holds `Arc<dyn FileMover>`; configuration or the
+//! `--use-bucketed-pool` CLI override picks the implementation at startup.
 //!
 //! ## R8 placement
 //!
@@ -22,7 +22,7 @@
 //! 1. `pipelined_copy(...)` — durabilizes bytes via whole-file fsync.
 //! 2. close src + dst fhs (post-fsync cleanup; bytes are durable).
 //! 3. `apply_async_attrs(...)` — chown / chmod / utimes on `.partial`.
-//! 4. `fence.check_pre_rename()` — R8 gate.
+//! 4. `check_fence()` — R8 gate.
 //! 5. `dst.rename(.partial, final)` — atomic commit point.
 //!
 //! Steps 1–3 may take seconds (large file + fsync + per-RPC attrs);
@@ -120,9 +120,8 @@ pub trait FileMover: Send + Sync {
     /// from row, execute, return outcome.
     async fn move_one(&self, row: &RowView) -> MoveOutcome;
 
-    /// Hardlink an already-copied dest path to `link_target`. Per
-    /// Phase 2 Decision #3 the async pool does not handle this path —
-    /// it always delegates to the wrapped sync mover.
+    /// Hardlink an already-copied dest path to `link_target`. The async pool
+    /// does not handle this path; it delegates to the wrapped sync mover.
     async fn move_hardlink(&self, row: &RowView, link_target: &[u8]) -> MoveOutcome;
 
     /// Borrow the downgrade sink for the shard processor's
@@ -144,9 +143,8 @@ impl FileMover for Mover {
 }
 
 /// Routes regular-file rows through the bucketed async pool +
-/// [`pipelined_copy`]. Everything else delegates to a wrapped sync
-/// [`Mover`] (Phase 2 Decision #3 — async pipe handles regular files
-/// only). The two impls share the same downgrade sink and the same
+/// [`pipelined_copy`]. Everything else delegates to a wrapped sync [`Mover`];
+/// the async pipe handles regular files only. The two impls share the same
 /// fence so the worker observes one unified observability surface
 /// regardless of which path a row took.
 pub struct AsyncBucketedFileMover {

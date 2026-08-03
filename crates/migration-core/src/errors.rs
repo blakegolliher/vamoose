@@ -19,7 +19,7 @@ pub enum Error {
 
     /// The worker has lost its claim and must self-fence. Triggered by
     /// 412 on heartbeat, sustained 5xx past retry budget, or local
-    /// clock skew. See DESIGN.md "Self-fencing".
+    /// clock skew. See DESIGN.md "S3 claim protocol and worker lifecycle".
     #[error("claim invalidated; worker must self-fence: {0}")]
     ClaimInvalidated(String),
 
@@ -41,8 +41,8 @@ pub enum Error {
     #[error("corrupt row {row_id}: {reason}")]
     CorruptRow { row_id: u64, reason: String },
 
-    /// Parquet shard could not be read or decoded. Corresponds to
-    /// "Parquet shard corrupt" in DESIGN.md failure modes.
+    /// Parquet shard could not be read or decoded. The worker classifies this
+    /// separately from a worker-local storage or transport failure.
     #[error("shard {shard} corrupt: {source}")]
     ShardCorrupt {
         shard: String,

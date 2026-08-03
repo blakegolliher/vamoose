@@ -9,7 +9,7 @@ delete-then-create), see
 `docs/work-items/CLAIM_PROTOCOL_V2_DELETE_THEN_CREATE.md`.
 
 For the architectural picture this protocol fits inside, see
-`DESIGN.md` "Claims" and "Self-fencing".
+`DESIGN.md` "S3 claim protocol and worker lifecycle".
 
 ---
 
@@ -316,11 +316,12 @@ content / atomic rename argument (see below).
   tree is frozen for the duration of the run. If a file changes
   bytes between A's read and B's read of the same row, the two
   workers' renames will commit different content. Out of scope for
-  v1; flagged in DESIGN.md "Future work".
+  v1; tracked in `docs/NEXT.md`.
 
-- **Cross-shard hardlink consolidation.** Hardlink groups are
-  preserved within a shard but not across shards. See SCHEMA_CONTRACT.md
-  and DESIGN.md "Hardlinks".
+- **Cross-batch and cross-shard hardlink consolidation.** Hardlink groups are
+  preserved only within the current micro-batch. Members split across batches
+  or shards are copied independently. See SCHEMA_CONTRACT.md and DESIGN.md
+  "Other rows and metadata".
 
 ---
 
@@ -448,4 +449,4 @@ SIGSTOP fast.
 - `crates/migration-core/src/fence.rs` — fence primitive
 - `docs/work-items/CLAIM_PROTOCOL_V2_DELETE_THEN_CREATE.md` — v2 design rationale
 - `docs/work-items/M5_SELF_FENCE.md` — M5 verification harness assertions
-- `DESIGN.md` "Claims" and "Self-fencing" — architectural overview
+- `DESIGN.md` "S3 claim protocol and worker lifecycle" — architectural overview
