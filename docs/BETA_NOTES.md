@@ -7,12 +7,11 @@ posture (2026-07-31) — not an unknown. Source of truth for status:
 
 ## Known limitations
 
-- **Hardlink fidelity is shard-scoped (F15).** Hardlink groups whose
-  members land in different shards are migrated as independent files
-  — `nlink` fidelity across shards is not preserved, silently. If
-  full link fidelity matters for a dataset, pre-shard the source so
-  groups stay within one shard. The complete fix arrives with the
-  multi-pass mover design.
+- **Hardlink fidelity is micro-batch-scoped (F15).** The shard processor
+  groups `(fsid, inode)` members only within the current byte/file-budgeted
+  batch. Members split across batches or shards are migrated as independent
+  files, so `nlink` fidelity is not preserved across those boundaries. The
+  complete fix belongs in the multi-pass mover design.
 - **Pre-upgrade workers keep at-least-once event semantics.** Event
   idempotency (exactly-once effective delivery to the coord) engages
   only for workers that stamp `client_seq` (all current builds).
@@ -24,6 +23,14 @@ posture (2026-07-31) — not an unknown. Source of truth for status:
   ErrorEmitted at 10/class/sec; a quieting burst's final value
   arrives within ~2 s via the trailing-edge flush. The durable event
   log always carries everything — accounting and replay are exact.
+- **Two coordinator commands are compatibility placeholders.** `drain`
+  currently records a paused control mode, and `retry-failed` records an audit
+  entry without queuing worker retries. Both fail safely, but neither provides
+  the richer behavior implied by its name yet.
+- **Fresh control-plane job provisioning is absent.** The coordinator starts
+  with an empty job registry and exposes no production job-create/import route;
+  worker registration rejects an unknown job. The implemented control paths
+  operate after `JobCreated` state has been seeded by replay or a test harness.
 
 ## Security posture (trusted-network beta)
 
@@ -53,7 +60,7 @@ Run vamoose on a trusted network for beta. Concretely:
 - **Durability**: file data is COMMITted (whole-file NFS COMMIT)
   before the rename publishes it, on both copy paths; every data-
   plane RPC carries a deadline (`[mover] rpc_timeout_ms`, default
-  60 s, `0` = libnfs default). See DESIGN.md "Durability model".
+  60 s, `0` = libnfs default). See DESIGN.md "Mover behavior".
 - **`mig-aggr clean-partials`** is dry-run by default; deletion
   requires `--delete` and is gated on claim liveness using the
   protocol-default 180 s lease window. If your fleet configures
@@ -65,8 +72,9 @@ Run vamoose on a trusted network for beta. Concretely:
 
 ## Verification status
 
-All 44 landed findings are CI-green; rows marked `landed` (not yet
-`verified`) await the hardware pass on a VAST rig — the checklist
-lives in `docs/NEXT.md` §2 (reclaim drill, pipelined smoke, replay
-smokes, bounded timeout, drain, fsync readback, 4755, crash drill).
-Run it before broad beta exposure.
+Automated checks cover the landed findings. F15 remains open with its
+micro-batch limitation accepted for beta. Rows marked `landed` rather than
+`verified` still await the applicable VAST-rig pass; the checklist lives in
+`docs/NEXT.md` §2 (reclaim drill, pipelined smoke, replay smokes, bounded
+timeout, drain, fsync readback, 4755, crash drill). Run it before broad beta
+exposure.

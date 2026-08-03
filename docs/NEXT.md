@@ -1,137 +1,135 @@
 # What's next
 
-Living tally. Update this whenever an item lands or a decision is
-made; `docs/REVIEW_LEDGER.md` rows stay the per-finding source of
-truth. State as of 2026-08-02: **44 of 45 ledger
-findings landed; 1 open** (F15 — decided, awaiting the multi-pass
-mover). **No decisions remain open.** What's left: the F15
-implementation when multi-pass starts, hardware verification (§2),
-and small follow-ups (§3). Beta posture and known limitations are
-documented in `docs/BETA_NOTES.md`.
+This is the living list of remaining work. The architecture-maintainability
+sequence is complete: control-protocol extraction, coordinator runtime
+decomposition, TUI feature/view decomposition, unified CLI lifecycle,
+canonical configuration composition, obsolete mover-scaffolding removal, and
+the as-built documentation reconciliation have landed.
 
-PR #45 is the control-plane layering extraction: it moves the
-existing REST/SSE schema and pure reducer into
-`migration-control-protocol` without changing the version-1 wire or
-runtime behavior. It comes before unified-CLI work so worker and TUI
-clients can compile against the contract without pulling in coord's
-server/storage runtime; it does not touch the rig-sensitive claim or
-data paths.
+Future work should be selected from this document and current evidence rather
+than from another predetermined cleanup sequence. The review ledger remains the
+finding-by-finding disposition record; beta/operator impact lives in
+[BETA_NOTES.md](BETA_NOTES.md).
 
-PR #46 continues that layering wave by decomposing the coordinator
-runtime into internal responsibility modules without changing its
-public API or behavior. The TUI feature/view decomposition is now
-complete with the same public paths and behavior. The unified CLI now
-centralizes semantic command outcomes, logging shutdown, and final
-process status; doctor failures drain logging, and the successful-worker
-log-upload wait stays below the unchanged hard-exit watchdog. The existing
-worker `[run]` format is now the canonical unified-CLI configuration, with
-the older `[global]`/`[s3]` shape retained as a compatibility input. Mover
-scaffolding cleanup is complete: the implemented sync and bucketed async
-libnfs paths remain, while unused io_uring, server-side COPY, and kernel CFR
-execution scaffolding is gone. The final documentation rewrite is the next
-architectural follow-up; implementation of the stub commands remains deferred.
-
-## 1. Remaining ledger finding
+## 1. Open review-ledger work
 
 | Finding | State |
 |---|---|
-| F15 | DECIDED 2026-07-31: documented as a beta limitation (BETA_NOTES.md — link fidelity is shard-scoped; pre-shard by group for full fidelity); implementation folds into the multi-pass design (MULTI_PASS_MOVER phases 3–8) when that work starts. |
+| F15 | Open, with the limitation accepted for beta: hardlink grouping and directory-attribute ordering are micro-batch scoped. The durable fix belongs in a reviewed multi-pass design; it is not a small one-pass patch. |
 
-All other decisions are closed: the 2026-07-30 batch (design docs
-PR #36; F19 PR #37; F20 PRs #38+#40; FFI F12/F11/F09 PR #39) and
-the 2026-07-31 round (F45 both halves PRs #42+#43; F20/F24 residue
-PR #43; EINTR + fenced-exit-3 PR #42; F24 log-side coalescing
-won't-do; trusted-network beta security posture in BETA_NOTES.md).
+All other ledger findings are landed or otherwise decided. A `landed` row that
+requires hardware evidence is not `verified` until the relevant exercise below
+passes.
 
-## 2. Hardware verification (needs the VAST rig; flips rows to `verified`)
+## 2. Hardware-backed validation
 
-- [ ] F01/F30 — `scripts/fast-reclaim-drill.sh`: kill -9 → reclaim
-      latency grows by ≤ one grace window; no theft cascade.
-- [ ] F06/F07 — `pipelined_copy_smoke` (`#[ignore]`d) re-run.
-- [ ] F10 — `hardlink_replay_is_idempotent` (PR #30) and
-      `symlink_replay_is_idempotent` (PR #34) in
-      `file_mover_smoke.rs` (`#[ignore]`d): replayed rows succeed;
-      hardlinks share an inode (`nlink == 2`), symlink readlink
-      byte-equals the intended target.
-- [ ] F08 — MANUAL_VERIFY.md check [5]: migrate a `4755` root-owned
-      file; destination `stat` must show `4755`.
-- [ ] F12 — `libnfs_async_integration.rs` bounded-timeout case
-      (`#[ignore]`d, PR #39): mount vs blackholed address fails
-      within ~2× `rpc_timeout_ms` instead of hanging.
-- [ ] F11 — `error_path_leaves_context_usable_after_drain`
-      (`#[ignore]`d, PR #39): forced write failure with reads in
-      flight; context stays usable.
-- [ ] F09 — `sync_write_fsync_commit_readback` in
-      `file_mover_smoke.rs` (`#[ignore]`d, PR #39); plus the
-      MANUAL_VERIFY.md crash-drill note (kill the server mid-run) —
-      rig exercise, not a test.
+These checks require the VAST/libnfs rig and remain enabled or documented for
+that environment:
 
-## 3. Small follow-ups (codeable now, none urgent)
+- [ ] F01/F30 — run `scripts/fast-reclaim-drill.sh`; reclaim latency must stay
+      within the documented progress-liveness grace rather than falling back to
+      the full lease, with no live-claim theft cascade.
+- [ ] F06/F07 — rerun the ignored `pipelined_copy_smoke` tests.
+- [ ] F10 — run ignored hardlink and symlink replay-idempotency cases in
+      `file_mover_smoke.rs`; verify link identity/target bytes on the server.
+- [ ] F08 — migrate a root-owned `4755` file and confirm the destination mode
+      remains `4755`.
+- [ ] F12 — run the ignored bounded-timeout case in
+      `libnfs_async_integration.rs` against a black-holed address.
+- [ ] F11 — run `error_path_leaves_context_usable_after_drain` against the
+      linked libnfs implementation.
+- [ ] F09 — run `sync_write_fsync_commit_readback` and the documented
+      server-crash drill in `crates/migration-mover/MANUAL_VERIFY.md`.
 
-- [ ] `clean-partials` `--lease-timeout-sec` override: the liveness
-      gate uses the protocol default (180s), so deployments with a
-      longer configured `worker.lease_timeout_sec` could pass the
-      gate while a worker still holds a claim (documented in
-      `clean_partials.rs`; PR #31 note).
-- [ ] `records.rs` `ClaimRecord.epoch` doc comment says "increments
-      on each heartbeat" — stale v1 wording; v2 owners never rewrite
-      a held claim (claim.rs header). Docs-only sweep in
-      migration-core; flagged independently by two sessions.
-- [ ] deny.toml: `Unicode-DFS-2016` license allowance no longer
-      matches anything in the tree (pre-existing warning).
-- [ ] `Snapshot.last_client_seq` and `Job.assigned_workers` retain
-      evicted worker ids by design (PR #43 note — HWM guards
-      resurrected-worker dedup); if residual growth ever matters,
-      age those entries out alongside eviction.
-- [ ] Coord: `/jobs` (or healthz-scoped snapshot) carrying an
-      `as_of_seq` would make TUI bootstrap atomic and retire the
-      torn-walk retry loop (see LESSONS.md).
-- [ ] `JobId` serde(transparent) deserialization bypasses `new()`
-      validation (noted in PR #22 item D).
-- [ ] SCHEMA_CONTRACT.md wording vs code (noted in PR #24): Unknown=0
-      file type raises `CorruptRow` (contract says `ShardCorrupt`);
-      contract's "required" table lists 14 columns, code enforces the
-      5 non-nullable ones. Align the prose.
-- [ ] Classifier bridge test in migration-worker driving
-      reader-produced drift errors through `classify_shard_error`
-      directly (PR #24 deviation note — fence has lifted).
-- [ ] s3.rs: `get`/`list`/`head_object` errors still typed
-      `Error::Other`; typed as `S3` they'd classify WorkerLocal
-      without the retry wrapper's retry-everything blanket (PR #27
-      scope note).
-- [ ] Control-plane compatibility shims (PR #45): remove
-      `migration_coord::schema` and the legacy `server::{worker,read,
-      command,stream}` DTO re-exports only in a separately announced
-      breaking cleanup after known downstream users import
-      `migration-control-protocol` directly.
-- [ ] Control snapshot boundary (PR #45): `Snapshot` still carries
-      inherited coord persistence/replay bookkeeping
-      (`audit_seq_today`, `audit_seq_date`, `last_client_seq`). Any
-      separation needs an explicit versioned design; do not trim these
-      fields as incidental cleanup.
+Do not mark these verified from unit tests alone. The detailed FFI invocation
+and pass criteria are in [CORRECTNESS_RULES.md](CORRECTNESS_RULES.md).
 
-## 4. Operational switches
+## 3. Functional work not yet implemented
 
-- [ ] Set the `NFS_WALKER_REPO` repository variable (e.g.
-      `blakegolliher/nfs-walker`, plus `NFS_WALKER_TOKEN` secret if
-      private) to activate the cross-repo SCHEMA_CONTRACT drift job.
+- **Multi-pass migration:** design and implement later passes, including F15
+  cross-batch/cross-shard hardlink fidelity and directory/root metadata
+  convergence. Do not revive removed mover strategies as placeholders.
+- **Aggregation and observability:** standalone `mig-aggr` implements only
+  `clean-partials`. `watch`, `summary`, `metrics`, `inspect`, and `verify`
+  return safe unimplemented errors; `vamoose aggr` is also a stub.
+- **Unified pipeline composition:** `vamoose walker`, `rewrite`, and `run`
+  retain CLI shapes but are not implemented. Operators currently invoke
+  `nfs-walker`, `mig-walker-rewrite`, upload tooling, and workers explicitly.
+- **Walker schema completion:** coordinate the walker repository's canonical
+  output and xattr capture before deleting `mig-walker-rewrite` or claiming
+  xattr fidelity.
+- **Multiple runs per bucket:** the worker layout still places one run at the
+  bucket root. A `run_prefix` or equivalent requires a deliberate layout and
+  compatibility design.
+- **Archived control history restore:** the coordinator writes
+  `archivelogs/`, but replay does not restore from it and no restore command is
+  implemented.
+- **Control-plane job provisioning:** the coordinator exposes no production
+  job-create/import command or route. A fresh runtime has an empty job registry,
+  and worker registration rejects unknown jobs; define a supported way to seed
+  the control job and its immutable configuration.
 
-## Done (for orientation)
+## 4. Focused follow-ups
 
-Rounds 1–2 of the review ledger: F01–F08, F13/F14, F16–F18,
-F21–F35, F37–F44 — landed via PRs #11–#28; ledger sweep in PR #29.
-Quick-calls round (2026-07-13): F36 landed in PR #31
-(`clean-partials` real + stubs bail); F10 landed across PR #30
-(hardlink half) and PR #34 (symlink half).
-Design-decision batch (2026-07-30): design docs decided + merged
-(PR #36); F19 delete-then-create lease refresh (PR #37); F20
-worker-event trust in two phases — allow-list + binding (PR #38),
-client_seq idempotency (PR #40); protected-FFI batch F12+F11+F09
-(PR #39, two new externs total; the F11 .so audit confirmed the
-close-while-inflight UAF is real in the linked libnfs).
-Decisions round (2026-07-31): all eight remaining calls made and
-put away — F45 both halves (PRs #42+#43), F20 HWM attribution +
-F24 trailing-edge/eviction (PR #43), EINTR + fenced-exit-3
-(PR #42), F15 beta limitation + F24 log-coalescing won't-do +
-trusted-network posture recorded in BETA_NOTES.md and the ledger.
-Process and pitfalls: `docs/LESSONS.md`.
+- Add a `clean-partials --lease-timeout-sec` override. Its liveness gate uses
+  the protocol default (180 seconds), so operators with longer configured
+  worker leases must currently wait out that lease or use `--force`
+  deliberately.
+- Add a coordinator snapshot/read boundary such as `as_of_seq` so the TUI can
+  replace its bounded torn-walk bootstrap retry with a server-defined atomic
+  boundary.
+- Decide whether to age `Snapshot.last_client_seq` and
+  `Job.assigned_workers` entries alongside disconnected worker eviction if
+  their residual growth becomes operationally relevant.
+- Close the `JobId` deserialization validation gap: transparent Serde input
+  currently bypasses `JobId::new` validation.
+- Add a classifier bridge test that drives reader-produced schema drift errors
+  through `migration-worker::classify_shard_error`.
+- Revisit `migration-core::s3` typing for `get`/`list`/`head_object` errors;
+  they remain generic `Other` errors beneath retry policy.
+- Remove the control-plane compatibility surfaces only through a separately
+  announced breaking change after downstream users migrate to
+  `migration-control-protocol`. This includes `migration_coord::schema` and
+  legacy server DTO re-exports.
+- Separate coordinator persistence bookkeeping from the version-1 control
+  snapshot only through an explicit versioned design. Do not trim
+  `audit_seq_today`, `audit_seq_date`, or `last_client_seq` as incidental
+  cleanup.
+- Remove the unused `Unicode-DFS-2016` allowance from `deny.toml` in a focused
+  supply-chain cleanup after rechecking the dependency tree.
+
+## 5. Cross-repository schema contract
+
+`SCHEMA_CONTRACT.md` is mirrored with `nfs-walker` and must not be edited in
+only this repository. Two wording corrections remain queued for a coordinated,
+byte-identical update:
+
+- file type `Unknown = 0` currently produces `CorruptRow`, while the contract
+  calls that outcome `ShardCorrupt`; and
+- the contract's required-column table lists the full canonical shape, while
+  the current reader enforces the five non-nullable columns and handles other
+  canonical columns according to their null/default semantics.
+
+Set the `NFS_WALKER_REPO` repository variable (and `NFS_WALKER_TOKEN` when the
+target is private) to enable the cross-repository drift check.
+
+## Completed architecture sequence
+
+- Shared control-plane types and reducer live in
+  `migration-control-protocol`; worker and TUI no longer compile against the
+  coordinator runtime in their production graphs.
+- Coordinator runtime and TUI application/state/rendering are decomposed into
+  responsibility modules without changing their public façades.
+- The unified CLI owns dispatch, logging teardown, and final process status;
+  doctor and worker shutdown lifecycle defects are fixed.
+- The worker `[run]` format is canonical across the unified CLI, with
+  `[global]`/`[s3]` retained as a compatibility input.
+- Only the implemented synchronous and bucketed-async libnfs paths remain
+  executable; unused io_uring, server-side COPY, and kernel-CFR scaffolding is
+  gone while operator TOML compatibility remains.
+- Current architecture, control-plane, handoff, README, and next-work docs now
+  describe the as-built system; historical plans and review records remain
+  identifiable as history.
+
+Process lessons from the completed review campaign remain in
+[LESSONS.md](LESSONS.md).
