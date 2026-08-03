@@ -14,7 +14,7 @@
 //!   cargo build -p migration-mover --tests
 //!   sudo -E target/debug/deps/libnfs_ffi_smoke-*  --ignored --nocapture
 //!
-//! **Vendored from `nfs-walker`** (https://github.com/blakegolliher/nfs-walker, MIT)
+//! **Vendored from `nfs-walker`** (<https://github.com/blakegolliher/nfs-walker>, MIT)
 //! and extended for the mover's WRITE / SETATTR / RENAME / LINK /
 //! SYMLINK / READLINK / UTIMES / MKDIR ops.
 //!

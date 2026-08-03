@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use migration_core::fence::Fence;
-use migration_core::records::{MigrationOptions, ServerSideCopy};
+use migration_core::records::MigrationOptions;
 use migration_core::schema::FileTypeTag;
 use migration_core::shard::RowView;
 use migration_mover::attrs::AttrPolicy;
@@ -25,7 +25,6 @@ use migration_mover::batch::InflightProfile;
 use migration_mover::bucketed_pool::BucketedAsyncPool;
 use migration_mover::file_mover::AsyncBucketedFileMover;
 use migration_mover::libnfs::SimplePool;
-use migration_mover::uring::UringConfig;
 use migration_mover::{DowngradeSink, FileMover, Mover, MoverConfig, DEFAULT_RPC_TIMEOUT_MS};
 
 fn src_url() -> String {
@@ -142,11 +141,7 @@ async fn async_bucketed_mover_copies_regular_file_end_to_end() {
         dest_url: dst_url_s.clone(),
         source_root: source_root.clone(),
         dest_root: dest_root.clone(),
-        same_server_v42: false,
         policy: AttrPolicy::from_options(&MigrationOptions::default()),
-        server_side_copy: ServerSideCopy::Off,
-        server_side_copy_min_bytes: 64 * 1024,
-        uring: UringConfig::default(),
         inflight: InflightProfile::default(),
         require_chown: false, // running as root in the test but be defensive
         require_unchanged_size: false,
@@ -286,11 +281,7 @@ async fn hardlink_replay_is_idempotent() {
         dest_url: dst_url_s.clone(),
         source_root: source_root.clone(),
         dest_root: dest_root.clone(),
-        same_server_v42: false,
         policy: AttrPolicy::from_options(&MigrationOptions::default()),
-        server_side_copy: ServerSideCopy::Off,
-        server_side_copy_min_bytes: 64 * 1024,
-        uring: UringConfig::default(),
         inflight: InflightProfile::default(),
         require_chown: false,
         require_unchanged_size: false,
@@ -442,11 +433,7 @@ async fn symlink_replay_is_idempotent() {
         dest_url: dst_url_s.clone(),
         source_root: source_root.clone(),
         dest_root: dest_root.clone(),
-        same_server_v42: false,
         policy: AttrPolicy::from_options(&MigrationOptions::default()),
-        server_side_copy: ServerSideCopy::Off,
-        server_side_copy_min_bytes: 64 * 1024,
-        uring: UringConfig::default(),
         inflight: InflightProfile::default(),
         require_chown: false,
         require_unchanged_size: false,

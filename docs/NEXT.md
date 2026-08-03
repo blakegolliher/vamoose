@@ -2,7 +2,7 @@
 
 Living tally. Update this whenever an item lands or a decision is
 made; `docs/REVIEW_LEDGER.md` rows stay the per-finding source of
-truth. State as of 2026-07-31 (post PR #43): **44 of 45 ledger
+truth. State as of 2026-08-02: **44 of 45 ledger
 findings landed; 1 open** (F15 — decided, awaiting the multi-pass
 mover). **No decisions remain open.** What's left: the F15
 implementation when multi-pass starts, hardware verification (§2),
@@ -26,8 +26,10 @@ process status; doctor failures drain logging, and the successful-worker
 log-upload wait stays below the unchanged hard-exit watchdog. The existing
 worker `[run]` format is now the canonical unified-CLI configuration, with
 the older `[global]`/`[s3]` shape retained as a compatibility input. Mover
-scaffolding cleanup is the next architectural follow-up; implementation of
-the stub commands remains deferred.
+scaffolding cleanup is complete: the implemented sync and bucketed async
+libnfs paths remain, while unused io_uring, server-side COPY, and kernel CFR
+execution scaffolding is gone. The final documentation rewrite is the next
+architectural follow-up; implementation of the stub commands remains deferred.
 
 ## 1. Remaining ledger finding
 

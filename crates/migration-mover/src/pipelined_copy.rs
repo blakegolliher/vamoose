@@ -115,7 +115,7 @@ type WriteFuture<'a> = BoxFuture<'a, Result<(), NfsError>>;
 /// dirty fh can free it while a WRITE reply is still outstanding —
 /// a use-after-free window (audited in the F11 commit message).
 /// This is enforced by construction: the whole copy body lives in
-/// [`copy_pipeline_body`], and this wrapper is the only caller — its
+/// `copy_pipeline_body`, and this wrapper is the only caller — its
 /// single `Err` arm is the one exit that can carry an error out,
 /// and it drains both pipelines first. With F12's per-RPC timeout,
 /// the drain wait is bounded.

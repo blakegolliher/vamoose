@@ -646,6 +646,12 @@ mod tests {
             .into_worker_config()
             .expect("worker example must project");
         assert_eq!(worker.mover.rpc_timeout_ms, 60_000);
+        assert_eq!(worker.mover.strategy_default, "libnfs_io_uring");
+        assert_eq!(worker.mover.pipeline_depth, 8);
+        assert_eq!(worker.mover.io_uring_queue_depth, 256);
+        assert_eq!(worker.mover.fixed_buffer_count, 256);
+        assert_eq!(worker.mover.fixed_buffer_size, "1 MiB");
+        assert_eq!(worker.copy.server_side_copy, "off");
         assert_eq!(worker.batch.inflight_small, 256);
     }
 

@@ -91,7 +91,7 @@ impl CopyDisposition {
 /// [`DowngradeKind::TornCopy`] carrying the pre/post
 /// `(size, mtime_sec, ctime_sec)` stat-bracket triples; a clean
 /// result is a plain commit. No I/O, no side effects — the caller
-/// ([`AsyncBucketedFileMover::copy_regular`]) emits the record,
+/// (`AsyncBucketedFileMover::copy_regular`) emits the record,
 /// bumps counters, and warns.
 pub fn classify_copy(result: &FileCopyResult, row: &RowView) -> CopyDisposition {
     if !result.torn {
@@ -383,14 +383,8 @@ impl FileMover for AsyncBucketedFileMover {
         // Strategy selection mirrors the sync mover. The async path
         // is only the regular-file fast path; everything else falls
         // back to the wrapped sync impl.
-        let strat_ctx = StrategyContext {
-            server_side_copy_policy: self.cfg.server_side_copy,
-            same_server_v42: self.cfg.same_server_v42,
-            server_side_copy_min_bytes: self.cfg.server_side_copy_min_bytes,
-            already_copied_inode: false,
-        };
-        let strategy = strategy::pick(row, &strat_ctx);
-        if strategy != Strategy::LibnfsIoUring {
+        let strategy = strategy_for_move_one(row);
+        if !uses_bucketed_async_path(strategy) {
             return self.sync.move_one(row).await;
         }
 
@@ -416,6 +410,19 @@ impl FileMover for AsyncBucketedFileMover {
     fn downgrade_sink(&self) -> &DowngradeSink {
         &self.downgrades
     }
+}
+
+fn strategy_for_move_one(row: &RowView) -> Strategy {
+    strategy::pick(
+        row,
+        &StrategyContext {
+            already_copied_inode: false,
+        },
+    )
+}
+
+fn uses_bucketed_async_path(strategy: Strategy) -> bool {
+    strategy == Strategy::LibnfsIoUring
 }
 
 /// Async `mkdir -p` for the parent dir of `file_path`. Mirrors
@@ -514,6 +521,10 @@ mod tests {
     }
 
     fn test_row(row_id: u64, path: &[u8], size: u64) -> RowView {
+        test_row_with_type(row_id, path, size, FileTypeTag::Regular)
+    }
+
+    fn test_row_with_type(row_id: u64, path: &[u8], size: u64, file_type: FileTypeTag) -> RowView {
         RowView {
             row_id,
             path: path.to_vec(),
@@ -530,7 +541,32 @@ mod tests {
             fsid: None,
             xattr_blob: None,
             symlink_target: None,
-            file_type: FileTypeTag::Regular,
+            file_type,
+        }
+    }
+
+    #[test]
+    fn bucketed_async_route_is_regular_nonempty_only() {
+        let cases = [
+            (FileTypeTag::Regular, 1, true),
+            (FileTypeTag::Regular, 0, false),
+            (FileTypeTag::Symlink, 1, false),
+            (FileTypeTag::Dir, 1, false),
+            (FileTypeTag::Fifo, 1, false),
+            (FileTypeTag::Socket, 1, false),
+            (FileTypeTag::BlockDev, 1, false),
+            (FileTypeTag::CharDev, 1, false),
+            (FileTypeTag::Unknown, 1, false),
+        ];
+
+        for (file_type, size, expected) in cases {
+            let row = test_row_with_type(1, b"/route", size, file_type);
+            let strategy = strategy_for_move_one(&row);
+            assert_eq!(
+                uses_bucketed_async_path(strategy),
+                expected,
+                "file_type={file_type:?} size={size} strategy={strategy:?}",
+            );
         }
     }
 

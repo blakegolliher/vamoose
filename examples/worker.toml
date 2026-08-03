@@ -20,7 +20,7 @@ local_scratch  = "/var/lib/mig/scratch"   # tmpfs strongly preferred
 max_in_flight  = 1                         # shards concurrently in this worker
 
 [mover]
-strategy_default     = "libnfs_io_uring"   # libnfs_io_uring | nfs42_copy | kernel_cfr
+strategy_default     = "libnfs_io_uring"   # compatibility name retained; regular files use libnfs
 src_url              = "nfs://src-server/source-export"
 dst_url              = "nfs://dst-server/dest-export"
 # Source and destination MUST be distinct exports OR distinct roots
@@ -33,6 +33,8 @@ nfs_connections      = 16
 # libnfs built-in default untouched (nfs_set_timeout is not called).
 # Default: 60000 — matches libnfs's implicit 60 s, now explicit.
 rpc_timeout_ms       = 60000
+# Compatibility-reserved fields. They remain accepted with the same defaults
+# but do not tune the current sync or bucketed async libnfs paths.
 pipeline_depth       = 8
 io_uring_queue_depth = 256
 fixed_buffer_count   = 256
@@ -52,9 +54,7 @@ preserve_owner            = true
 preserve_mode             = true
 preserve_times            = true
 preserve_xattr            = true   # honored when walker emits xattr_blob; no-op until then
-server_side_copy          = "off"  # NFSv3 baseline; NFSv4.2 COPY not used.
-                                    # Field is informational under NFSv3 — strategy
-                                    # selection never picks server-side COPY regardless.
+server_side_copy          = "off"  # compatibility-reserved; NFSv4.2 COPY is not implemented.
 require_chown_capability  = true   # default; refuse to start if preserve_owner=true
                                     # but the worker doesn't hold CAP_CHOWN.
                                     # Set false to downgrade chown EPERM to a per-file

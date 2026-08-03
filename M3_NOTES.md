@@ -100,6 +100,12 @@ honest reasons:
   trip. Keep as `_buffers: Arc<FixedBufferPool>` placeholder so M3.5
   can wire it in without changing the mover surface.
 
+  **Follow-up (2026-08-02):** after confirming that no executable path ever
+  consumed the placeholder, the mover cleanup removed `_buffers`, the fake
+  fixed-buffer API, and the unused `io-uring` dependency. The paragraph above
+  records the original M3 decision; a future io_uring effort must begin with a
+  new measured design rather than rely on dormant scaffolding.
+
 - **Striped reads for large files.** Within a single libnfs context,
   one file copy is one synchronous loop. To pipeline N reads against
   one file you need libnfs's *async* API (`nfs_pread_async` +

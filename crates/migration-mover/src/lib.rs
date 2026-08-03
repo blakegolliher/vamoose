@@ -4,18 +4,19 @@
 //! decides which strategy applies and copies the file from source to
 //! destination, preserving POSIX attributes.
 //!
-//! Three strategies, picked per-file:
+//! Regular files have two implemented libnfs paths:
 //!
-//! 1. **NFSv4.2 server-side COPY** when source and destination are the
-//!    same NFSv4.2 server. The mover does almost no data-plane work.
-//!    *Wired up in M4.*
-//! 2. **libnfs READ → libnfs WRITE driven by io_uring fixed buffers**
-//!    (default). M2 implements the libnfs side single-threaded with a
-//!    plain 1 MiB buffer; io_uring lands in M3.
-//! 3. **Kernel `copy_file_range`** as an escape hatch for environments
-//!    where libnfs can't be used. *Stubbed.*
+//! 1. **Sync libnfs READ → WRITE** through [`MultiPool`], run on Tokio's
+//!    blocking pool.
+//! 2. **Bucketed async libnfs** through [`AsyncBucketedFileMover`] and the
+//!    pipelined copy implementation, enabled explicitly by worker config or
+//!    CLI override.
 //!
-//! See DESIGN.md "Mover" and the M2 working spec.
+//! Symlinks, hardlinks, empty files, directory attributes, and skipped rows
+//! retain their dedicated paths. NFSv4.2 server-side COPY, kernel
+//! `copy_file_range`, and true io_uring integration are not implemented.
+//! [`strategy::Strategy::LibnfsIoUring`] remains the compatibility name used
+//! in mover outcomes for regular-file libnfs copies.
 
 pub mod attr_plan;
 pub mod attrs;
@@ -26,14 +27,12 @@ pub mod error;
 pub mod failure;
 pub mod file_mover;
 pub mod libnfs;
+mod mover;
 pub mod paths;
 pub mod pipelined_copy;
 pub mod reorder;
 pub mod root_mtime;
 pub mod strategy;
-pub mod uring;
-
-mod mover;
 pub use bucketed_pool::{
     bucket_for_size, AsyncNfsContextPair, BucketConfig, BucketedAsyncPool, BUCKETS,
 };
