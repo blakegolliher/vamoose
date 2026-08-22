@@ -159,6 +159,15 @@ pub struct Mover {
     /// budget on small-file trees (measured ~7 EEXIST round-trips per
     /// file on a depth-8 tree).
     dirs_known: Arc<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>>,
+    /// Single-flight guards per directory currently being created.
+    /// Without this the cache misses under fan-out: every file of a
+    /// directory is already in flight before the first `mkdir_p`
+    /// finishes and populates `dirs_known`, so all of them re-probe the
+    /// ancestor chain (measured: ~7 EEXIST round-trips per file even
+    /// with the plain cache). Losers of the race block on the winner's
+    /// per-dir mutex (blocking-pool threads, so parking is fine) and
+    /// then hit the cache.
+    dir_locks: Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<std::sync::Mutex<()>>>>>,
 }
 
 impl Mover {
@@ -177,6 +186,7 @@ impl Mover {
             downgrades,
             fence,
             dirs_known: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            dir_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -200,16 +210,34 @@ impl Mover {
         if self.dirs_known.lock().unwrap().contains(path) {
             return Ok(());
         }
+        // Single-flight: exactly one task per directory runs the real
+        // mkdir chain; concurrent requesters park on the per-dir mutex
+        // and re-check the cache once the winner finishes.
+        let dir_lock = {
+            let mut locks = self.dir_locks.lock().unwrap();
+            Arc::clone(
+                locks
+                    .entry(path.to_vec())
+                    .or_insert_with(|| Arc::new(std::sync::Mutex::new(()))),
+            )
+        };
+        let _flight = dir_lock.lock().unwrap();
+        if self.dirs_known.lock().unwrap().contains(path) {
+            return Ok(());
+        }
         ops::mkdir_p(ctx, path)?;
-        let mut known = self.dirs_known.lock().unwrap();
-        let mut end = path.len();
-        loop {
-            known.insert(path[..end].to_vec());
-            match path[..end].iter().rposition(|&b| b == b'/') {
-                Some(i) if i > 0 => end = i,
-                _ => break,
+        {
+            let mut known = self.dirs_known.lock().unwrap();
+            let mut end = path.len();
+            loop {
+                known.insert(path[..end].to_vec());
+                match path[..end].iter().rposition(|&b| b == b'/') {
+                    Some(i) if i > 0 => end = i,
+                    _ => break,
+                }
             }
         }
+        self.dir_locks.lock().unwrap().remove(path);
         Ok(())
     }
 
