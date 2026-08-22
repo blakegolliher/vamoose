@@ -371,7 +371,7 @@ impl Mover {
     fn do_dir_attrs(&self, pair: &mut ContextPair, row: &RowView) -> Result<(), MoveError> {
         let dst = self.dst_path(row);
         self.ensure_dir(pair.dst(), &dst)?;
-        self.apply_attrs(pair.dst(), &dst, row)?;
+        self.apply_attrs(pair.dst(), &dst, row, None)?;
         Ok(())
     }
 
@@ -604,7 +604,7 @@ impl Mover {
         let fh = ops::create_write(pair.dst(), &dst_partial, 0o600)?;
         ops::close_fh(pair.dst(), fh, FailurePhase::Write)?;
 
-        self.apply_attrs(pair.dst(), &dst_partial, row)?;
+        self.apply_attrs(pair.dst(), &dst_partial, row, None)?;
         // R8: see do_libnfs_copy — fence check immediately before rename.
         self.check_fence()?;
         tracing::debug!(
@@ -666,11 +666,21 @@ impl Mover {
             Err(_) => Ok(()),
         };
 
+        // Apply chown/chmod through the still-open write fh (saves two
+        // full-path LOOKUP walks per file); skipped if the copy or
+        // COMMIT already failed — the row fails anyway below. utimes
+        // runs path-based inside the same plan.
+        let attrs = match (&result, &commit) {
+            (Ok(_), Ok(())) => self.apply_attrs(pair.dst(), &dst_partial, row, Some(&dst_fh)),
+            _ => Ok(()),
+        };
+
         let close_src = ops::close_fh(pair.src(), src_fh, FailurePhase::Read);
         let close_dst = ops::close_fh(pair.dst(), dst_fh, FailurePhase::Write);
 
         let written = result?;
         commit?;
+        attrs?;
         close_src?;
         close_dst?;
 
@@ -691,7 +701,7 @@ impl Mover {
                 .record(row.row_id, &row.path, DowngradeKind::EarlyEof);
         }
 
-        self.apply_attrs(pair.dst(), &dst_partial, row)?;
+        // Attributes were applied above through the open fh, before close.
         // R8: last-ditch fence check immediately before the commit-point
         // rename. The shard processor only checks between rows; without
         // this guard, every row already inside spawn_blocking at fence
@@ -726,6 +736,7 @@ impl Mover {
         ctx: &mut NfsContext,
         dst_partial: &[u8],
         row: &RowView,
+        fh: Option<&ops::NfsFh>,
     ) -> Result<(), MoveError> {
         let policy = self.cfg.policy;
 
@@ -747,6 +758,7 @@ impl Mover {
             ctx,
             dst_partial,
             row,
+            fh,
             downgrades: &self.downgrades,
             require_chown: self.cfg.require_chown,
         };
@@ -762,6 +774,13 @@ struct SyncAttrExec<'a> {
     ctx: &'a mut NfsContext,
     dst_partial: &'a [u8],
     row: &'a RowView,
+    /// When the caller still holds the write fh, chown/chmod go
+    /// through it (`nfs_fchown`/`nfs_fchmod`) instead of the path
+    /// variants — every path-based libnfs op re-walks the full path
+    /// with one LOOKUP per component (measured: LOOKUPs were 88% of
+    /// all RPCs on a depth-8 tree). utimes has no fh variant in this
+    /// libnfs FFI surface and stays path-based.
+    fh: Option<&'a ops::NfsFh>,
     downgrades: &'a DowngradeSink,
     require_chown: bool,
 }
@@ -770,7 +789,11 @@ impl AttrExec for SyncAttrExec<'_> {
     type Err = MoveError;
 
     fn chown(&mut self, uid: u32, gid: u32) -> Result<ChownOutcome, MoveError> {
-        match ops::chown(self.ctx, self.dst_partial, uid, gid) {
+        let result = match self.fh {
+            Some(fh) => ops::fchown(self.ctx, fh, uid, gid),
+            None => ops::chown(self.ctx, self.dst_partial, uid, gid),
+        };
+        match result {
             Ok(()) => Ok(ChownOutcome::Applied),
             Err(e) if e.error == "EPERM" && !self.require_chown => {
                 tracing::debug!(uid, gid, "chown EPERM in degraded mode; skipping");
@@ -783,7 +806,10 @@ impl AttrExec for SyncAttrExec<'_> {
     }
 
     fn chmod(&mut self, mode: u32) -> Result<(), MoveError> {
-        ops::chmod(self.ctx, self.dst_partial, mode)
+        match self.fh {
+            Some(fh) => ops::fchmod(self.ctx, fh, mode),
+            None => ops::chmod(self.ctx, self.dst_partial, mode),
+        }
     }
 
     fn utimes(&mut self, atime: (i64, i32), mtime: (i64, i32)) -> Result<(), MoveError> {

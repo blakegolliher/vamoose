@@ -183,6 +183,26 @@ pub fn chown(ctx: &mut NfsContext, path: &[u8], uid: u32, gid: u32) -> Result<()
     Ok(())
 }
 
+/// fh-based chown. Preferred over the path variant while the write fh
+/// is still open: libnfs path ops re-walk every path component with a
+/// LOOKUP per call, which dominates the RPC budget on deep trees.
+pub fn fchown(ctx: &mut NfsContext, fh: &NfsFh, uid: u32, gid: u32) -> Result<(), MoveError> {
+    let rc = unsafe { super::nfs_fchown(ctx.raw(), fh.raw(), uid as c_int, gid as c_int) };
+    if rc < 0 {
+        return Err(err_from_rc(ctx, rc, FailurePhase::Setattr));
+    }
+    Ok(())
+}
+
+/// fh-based chmod. Same LOOKUP-avoidance rationale as [`fchown`].
+pub fn fchmod(ctx: &mut NfsContext, fh: &NfsFh, mode: u32) -> Result<(), MoveError> {
+    let rc = unsafe { super::nfs_fchmod(ctx.raw(), fh.raw(), mode as c_int) };
+    if rc < 0 {
+        return Err(err_from_rc(ctx, rc, FailurePhase::Setattr));
+    }
+    Ok(())
+}
+
 /// Set atime + mtime. Sub-second precision is microseconds (the M2
 /// FFI uses `nfs_utimes`); nanosecond columns are truncated.
 pub fn utimes(
