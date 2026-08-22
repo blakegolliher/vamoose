@@ -195,27 +195,67 @@ impl ShardProcessor {
             }
         }
 
-        // ---- Phase 2: dirs, deepest-first, sequential ----------------
+        // ---- Phase 2: dirs, deepest-first, level-parallel ------------
         //
-        // Sequential because applying attrs to a child dir is fast
-        // enough that concurrency isn't worth it, and serializing keeps
-        // the deepest-first invariant trivially intact (a parallel
-        // run could mkdir an empty child dir after the parent's setattr,
-        // restamping the parent).
+        // Deepest-first is the invariant that keeps dir mtimes honest: a
+        // parent's setattr must come after every deeper mkdir that could
+        // restamp it. Fully sequential processing preserved that but
+        // serializes ~5 ms metadata RPCs per dir, which dominates
+        // dir-dense batches. Instead: group dirs into depth levels and
+        // run each level concurrently with a barrier between levels.
+        // Within one level no dir is an ancestor of another, and all
+        // deeper levels (the only possible restampers) are fully
+        // committed before a shallower level's setattr runs — the same
+        // guarantee the sequential loop gave.
         if !dirs.is_empty() {
             sort_deepest_first(&mut dirs);
+            let mut levels: Vec<Vec<RowView>> = Vec::new();
+            let mut level_depth: Option<usize> = None;
             for row in dirs {
+                let d = row.path.iter().filter(|&&b| b == b'/').count();
+                if level_depth != Some(d) {
+                    levels.push(Vec::new());
+                    level_depth = Some(d);
+                }
+                levels.last_mut().expect("just pushed").push(row);
+            }
+
+            for level in levels {
                 if !self.fence.is_valid() {
                     break;
                 }
-                let _permit = self.inflight.acquire(row.size).await;
-                // Fence may have tripped while waiting for the inflight
-                // permit; recheck before launching the mover op.
-                if !self.fence.is_valid() {
-                    break;
+                let mut joins: JoinSet<Vec<(RowView, MoveOutcome)>> = JoinSet::new();
+                for row in level {
+                    let mover = Arc::clone(&self.mover);
+                    let inflight = self.inflight.clone();
+                    let fence = self.fence.clone();
+                    joins.spawn(async move {
+                        if !fence.is_valid() {
+                            return Vec::new();
+                        }
+                        let _permit = inflight.acquire(row.size).await;
+                        // Fence may have tripped while waiting for the
+                        // inflight permit; recheck before the mover op.
+                        if !fence.is_valid() {
+                            return Vec::new();
+                        }
+                        let mo = mover.move_one(&row).await;
+                        vec![(row, mo)]
+                    });
                 }
-                let mo = self.mover.move_one(&row).await;
-                self.record(&row, mo, outcome);
+                while let Some(joined) = joins.join_next().await {
+                    match joined {
+                        Ok(results) => {
+                            for (row, mo) in results {
+                                self.record(&row, mo, outcome);
+                            }
+                        }
+                        Err(e) => {
+                            outcome.files_failed += 1;
+                            tracing::error!(error = ?e, "dir task join failed");
+                        }
+                    }
+                }
             }
         }
 

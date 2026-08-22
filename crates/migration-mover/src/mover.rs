@@ -151,6 +151,14 @@ pub struct Mover {
     pid: u32,
     downgrades: DowngradeSink,
     fence: Fence,
+    /// Destination directories confirmed present, shared across all
+    /// blocking copies. Entries are only added after a successful
+    /// `mkdir_p`, and nothing removes destination directories during a
+    /// run, so a hit can never mask a missing directory. Guards the
+    /// per-file ancestor mkdir probes, which otherwise dominate the RPC
+    /// budget on small-file trees (measured ~7 EEXIST round-trips per
+    /// file on a depth-8 tree).
+    dirs_known: Arc<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>>,
 }
 
 impl Mover {
@@ -168,7 +176,41 @@ impl Mover {
             pid: std::process::id(),
             downgrades,
             fence,
+            dirs_known: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Cached `mkdir -p` of `file_path`'s parent (see `dirs_known`).
+    fn ensure_parent_dir(&self, ctx: &mut NfsContext, file_path: &[u8]) -> Result<(), MoveError> {
+        let last_slash = match file_path.iter().rposition(|&b| b == b'/') {
+            Some(0) | None => return Ok(()), // root or no parent; root always exists
+            Some(i) => i,
+        };
+        let parent = &file_path[..last_slash];
+        if parent.is_empty() {
+            return Ok(());
+        }
+        self.ensure_dir(ctx, parent)
+    }
+
+    /// Cached `mkdir -p <path>`. On a miss, performs the real chain and
+    /// then records `path` plus every ancestor, so sibling subtrees skip
+    /// the shared prefix entirely.
+    fn ensure_dir(&self, ctx: &mut NfsContext, path: &[u8]) -> Result<(), MoveError> {
+        if self.dirs_known.lock().unwrap().contains(path) {
+            return Ok(());
+        }
+        ops::mkdir_p(ctx, path)?;
+        let mut known = self.dirs_known.lock().unwrap();
+        let mut end = path.len();
+        loop {
+            known.insert(path[..end].to_vec());
+            match path[..end].iter().rposition(|&b| b == b'/') {
+                Some(i) if i > 0 => end = i,
+                _ => break,
+            }
+        }
+        Ok(())
     }
 
     /// Borrow the downgrade sink. Used by the orchestrator to drain
@@ -300,7 +342,7 @@ impl Mover {
     /// the parent's mtime. Documented in M3_NOTES.md.
     fn do_dir_attrs(&self, pair: &mut ContextPair, row: &RowView) -> Result<(), MoveError> {
         let dst = self.dst_path(row);
-        ops::mkdir_p(pair.dst(), &dst)?;
+        self.ensure_dir(pair.dst(), &dst)?;
         self.apply_attrs(pair.dst(), &dst, row)?;
         Ok(())
     }
@@ -401,7 +443,7 @@ impl Mover {
             None => ops::readlink(pair.src(), &src)?,
         };
 
-        if let Err(e) = ops::mkdir_p_for_file(pair.dst(), &dst) {
+        if let Err(e) = self.ensure_parent_dir(pair.dst(), &dst) {
             return Err(MoveError::new(FailurePhase::Symlink, e.error));
         }
         // R8: symlink IS the commit point for symlink rows — there is
@@ -498,7 +540,7 @@ impl Mover {
         let target_abs = join_root(self.cfg.dest_root.as_bytes(), target);
         let linkpath_abs = join_root(self.cfg.dest_root.as_bytes(), linkpath);
 
-        if let Err(e) = ops::mkdir_p_for_file(pair.dst(), &linkpath_abs) {
+        if let Err(e) = self.ensure_parent_dir(pair.dst(), &linkpath_abs) {
             return Err(MoveError::new(FailurePhase::Hardlink, e.error));
         }
         // R8: link IS the commit point for hardlink rows — there is no
@@ -529,7 +571,7 @@ impl Mover {
         let dst_partial = partial_path(&dst, &self.host_id, self.pid)?;
         self.check_self_target(&src, &dst, &dst_partial)?;
 
-        ops::mkdir_p_for_file(pair.dst(), &dst)?;
+        self.ensure_parent_dir(pair.dst(), &dst)?;
 
         let fh = ops::create_write(pair.dst(), &dst_partial, 0o600)?;
         ops::close_fh(pair.dst(), fh, FailurePhase::Write)?;
@@ -568,7 +610,7 @@ impl Mover {
         let dst_partial = partial_path(&dst, &self.host_id, self.pid)?;
         self.check_self_target(&src, &dst, &dst_partial)?;
 
-        ops::mkdir_p_for_file(pair.dst(), &dst)?;
+        self.ensure_parent_dir(pair.dst(), &dst)?;
 
         let src_fh = ops::open_read(pair.src(), &src)?;
         let dst_fh = match ops::create_write(pair.dst(), &dst_partial, 0o600) {
