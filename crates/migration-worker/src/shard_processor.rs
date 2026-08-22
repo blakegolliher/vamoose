@@ -62,6 +62,13 @@ pub struct ShardProcessor {
     pub inflight: InflightLimiter,
     pub failures: FailureSink,
     pub throughput: ThroughputCounter,
+    /// Directory rows seen in this shard, kept for the shard-end
+    /// attr re-stamp: every file CREATE bumps its parent dir's mtime,
+    /// so per-batch dir stamping is undone by later batches. One
+    /// idempotent DirAttrs replay after the last batch makes dir
+    /// mtimes correct at shard scope (cross-shard children remain the
+    /// documented caveat).
+    pub dir_restamp: Vec<RowView>,
     /// Set true the first time we see an `inode`-bearing row with no
     /// `fsid`; gates the one-shot WARN + `FsidUngrouped` downgrade.
     pub fsid_fallback_warned: bool,
@@ -80,6 +87,7 @@ impl ShardProcessor {
 
         // Per-shard state reset.
         self.fsid_fallback_warned = false;
+        self.dir_restamp.clear();
 
         let mut current = Batch::default();
         let mut outcome = ProcessOutcome {
@@ -110,6 +118,56 @@ impl ShardProcessor {
         if !self.fence.is_valid() {
             return Ok(outcome.with_fenced(true));
         }
+
+        // ---- Shard-end dir attr re-stamp -----------------------------
+        // Replays DirAttrs for every dir row now that no more file
+        // CREATEs in this shard can bump parent mtimes. Idempotent; no
+        // ordering requirement (SETATTR on a child dir does not touch
+        // its parent). Failures count normally.
+        if !self.dir_restamp.is_empty() {
+            tracing::info!(
+                dirs = self.dir_restamp.len(),
+                "shard-end directory attr re-stamp",
+            );
+            let rows = std::mem::take(&mut self.dir_restamp);
+            let mut joins: JoinSet<Vec<(RowView, MoveOutcome)>> = JoinSet::new();
+            for row in rows {
+                let mover = Arc::clone(&self.mover);
+                let inflight = self.inflight.clone();
+                let fence = self.fence.clone();
+                joins.spawn(async move {
+                    if !fence.is_valid() {
+                        return Vec::new();
+                    }
+                    let _permit = inflight.acquire(row.size).await;
+                    if !fence.is_valid() {
+                        return Vec::new();
+                    }
+                    let mo = mover.move_one(&row).await;
+                    vec![(row, mo)]
+                });
+            }
+            while let Some(joined) = joins.join_next().await {
+                match joined {
+                    Ok(results) => {
+                        for (row, mo) in results {
+                            // Only surface restamp *failures*; successes were
+                            // already counted when the row ran in its batch.
+                            if mo.result.is_err() {
+                                self.record(&row, mo, &mut outcome);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        outcome.files_failed += 1;
+                        tracing::error!(error = ?e, "dir restamp task join failed");
+                    }
+                }
+            }
+            if !self.fence.is_valid() {
+                return Ok(outcome.with_fenced(true));
+            }
+        }
         Ok(outcome)
     }
 
@@ -132,6 +190,7 @@ impl ShardProcessor {
         let mut dirs: Vec<RowView> = Vec::new();
         for row in batch.rows {
             if row.file_type == FileTypeTag::Dir {
+                self.dir_restamp.push(row.clone());
                 dirs.push(row);
                 continue;
             }

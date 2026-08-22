@@ -513,6 +513,7 @@ fn compatibility_worker_config(
                 fixed_buffer_count: 256,
                 fixed_buffer_size: "1 MiB".to_string(),
                 use_bucketed_pool: false,
+                use_raw_fh: false,
             },
             batch: wcfg::BatchCfg {
                 bytes_budget: worker.bytes_budget,

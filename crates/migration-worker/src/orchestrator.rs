@@ -222,6 +222,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     );
     mover_cfg.require_chown = require_chown && cap_chown;
     mover_cfg.require_unchanged_size = cfg.copy.require_unchanged_size;
+    mover_cfg.use_raw_fh = cfg.mover.use_raw_fh;
     // F12: [mover] rpc_timeout_ms flows config → MoverConfig →
     // MountOpts (both pools read it from here / from cfg.mover).
     mover_cfg.rpc_timeout_ms = cfg.mover.rpc_timeout_ms;
@@ -750,6 +751,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
         // limiter/sinks/throughput so all shards report into one
         // throughput counter and one failure log per host.
         let mut processor = ShardProcessor {
+            dir_restamp: Vec::new(),
             mover: Arc::clone(&mover),
             fence: fence.clone(),
             budget,

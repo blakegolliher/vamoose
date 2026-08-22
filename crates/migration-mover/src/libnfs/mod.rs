@@ -40,6 +40,7 @@ use std::os::raw::{c_char, c_int, c_void};
 
 pub mod asyncio;
 pub mod ops;
+pub mod raw;
 pub mod pool;
 
 pub use pool::{ContextPair, LibnfsContextPool, MultiPool, SimplePool};

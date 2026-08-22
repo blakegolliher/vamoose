@@ -484,22 +484,6 @@ fn uses_bucketed_async_path(strategy: Strategy) -> bool {
     strategy == Strategy::LibnfsIoUring
 }
 
-/// Async `mkdir -p` for the parent dir of `file_path`. Mirrors
-/// `crate::libnfs::ops::mkdir_p_for_file` (sync) — walk the path,
-/// mkdir each component, ignore `EEXIST`.
-async fn async_mkdir_p_for_file(dst: &AsyncNfsContext, file_path: &[u8]) -> Result<(), MoveError> {
-    let last_slash = match file_path.iter().rposition(|&b| b == b'/') {
-        Some(0) => return Ok(()), // file is at root; root exists
-        Some(i) => i,
-        None => return Ok(()),
-    };
-    let parent = &file_path[..last_slash];
-    if parent.is_empty() {
-        return Ok(());
-    }
-    async_mkdir_p(dst, parent).await
-}
-
 async fn async_mkdir_p(dst: &AsyncNfsContext, path: &[u8]) -> Result<(), MoveError> {
     if path.is_empty() {
         return Ok(());

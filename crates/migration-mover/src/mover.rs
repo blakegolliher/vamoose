@@ -35,10 +35,11 @@
 //! 6. rename `.partial` → final — **commit point**
 
 use crate::attr_plan::{self, AttrExec, ChownOutcome};
-use crate::attrs::AttrPolicy;
+use crate::attrs::{self, AttrPolicy};
 use crate::batch::InflightProfile;
 use crate::downgrade::DowngradeSink;
 use crate::error::MoveError;
+use crate::libnfs::raw::{self, RawSattr};
 use crate::libnfs::{ops, ContextPair, LibnfsContextPool, NfsContext};
 use crate::paths::{join_root, partial_path};
 use crate::strategy::{self, Strategy, StrategyContext};
@@ -107,6 +108,13 @@ pub struct MoverConfig {
     /// `SCHEMA_CONTRACT.md` "Size semantics". Default false: source
     /// truth wins over walker's stale `size`.
     pub require_unchanged_size: bool,
+    /// Route regular-file copies through the raw NFSv3 filehandle
+    /// path ([`crate::libnfs::raw`]): cached parent-dir filehandles,
+    /// attrs stamped at CREATE, FILE_SYNC single-chunk writes, one
+    /// SETATTR for times. ~6 RPCs per small file vs ~60-80 on the
+    /// path-based API. Regular files only; other row types keep the
+    /// path-based ops.
+    pub use_raw_fh: bool,
     /// F12: per-RPC timeout in milliseconds, applied to every libnfs
     /// context (sync pools and the bucketed async pool) at creation.
     /// `0` = leave the libnfs built-in default untouched. Seeded to
@@ -132,6 +140,7 @@ impl MoverConfig {
             inflight: InflightProfile::default(),
             require_chown: true,
             require_unchanged_size: false,
+            use_raw_fh: false,
             rpc_timeout_ms: crate::libnfs::DEFAULT_RPC_TIMEOUT_MS,
         }
     }
@@ -168,6 +177,21 @@ pub struct Mover {
     /// per-dir mutex (blocking-pool threads, so parking is fine) and
     /// then hit the cache.
     dir_locks: Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<std::sync::Mutex<()>>>>>,
+    /// Raw-FH path (see [`crate::libnfs::raw`]): directory filehandles
+    /// resolved once and shared across every context — NFSv3 fhs are
+    /// server-scoped, not connection-scoped. Separate caches per side
+    /// because source and destination are different exports.
+    src_dir_fhs: Arc<FhCache>,
+    dst_dir_fhs: Arc<FhCache>,
+}
+
+/// Path → directory-filehandle cache with per-path single-flight, so a
+/// burst of files landing in one new directory costs one LOOKUP/MKDIR
+/// chain, not one per in-flight file.
+#[derive(Default)]
+struct FhCache {
+    map: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<Vec<u8>>>>,
+    locks: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<std::sync::Mutex<()>>>>,
 }
 
 impl Mover {
@@ -187,7 +211,73 @@ impl Mover {
             fence,
             dirs_known: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             dir_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            src_dir_fhs: Arc::new(FhCache::default()),
+            dst_dir_fhs: Arc::new(FhCache::default()),
         }
+    }
+
+    /// Resolve `dir_path`'s filehandle, walking component-by-component
+    /// from the export root with every prefix cached. With
+    /// `create_missing`, absent components are MKDIRed (0755 stand-in
+    /// mode; the dir-attrs pass overwrites, same contract as
+    /// `ops::mkdir_p`). Concurrent resolvers of the same prefix
+    /// single-flight on a per-prefix mutex.
+    fn resolve_dir_fh(
+        &self,
+        ctx: &mut NfsContext,
+        cache: &FhCache,
+        dir_path: &[u8],
+        create_missing: bool,
+    ) -> Result<Arc<Vec<u8>>, raw::RawError> {
+        if dir_path.is_empty() || dir_path == b"/" {
+            return Ok(Arc::new(raw::root_fh(ctx)?));
+        }
+        if let Some(fh) = cache.map.lock().unwrap().get(dir_path) {
+            return Ok(Arc::clone(fh));
+        }
+        let mut cur: Arc<Vec<u8>> = Arc::new(raw::root_fh(ctx)?);
+        let mut acc: Vec<u8> = Vec::with_capacity(dir_path.len());
+        for comp in dir_path.split(|&b| b == b'/') {
+            if comp.is_empty() {
+                continue;
+            }
+            acc.push(b'/');
+            acc.extend_from_slice(comp);
+            if let Some(fh) = cache.map.lock().unwrap().get(acc.as_slice()) {
+                cur = Arc::clone(fh);
+                continue;
+            }
+            let flight = {
+                let mut locks = cache.locks.lock().unwrap();
+                Arc::clone(
+                    locks
+                        .entry(acc.clone())
+                        .or_insert_with(|| Arc::new(std::sync::Mutex::new(()))),
+                )
+            };
+            let _g = flight.lock().unwrap();
+            if let Some(fh) = cache.map.lock().unwrap().get(acc.as_slice()) {
+                cur = Arc::clone(fh);
+                continue;
+            }
+            let fh = match raw::lookup(ctx, &cur, comp) {
+                Ok(fh) => fh,
+                Err(e) if e.tag == "ENOENT" && create_missing => {
+                    match raw::mkdir(ctx, &cur, comp, 0o755) {
+                        Ok(fh) => fh,
+                        // Lost a cross-host race; the dir exists now.
+                        Err(e2) if e2.tag == "EEXIST" => raw::lookup(ctx, &cur, comp)?,
+                        Err(e2) => return Err(e2),
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            let fh = Arc::new(fh);
+            cache.map.lock().unwrap().insert(acc.clone(), Arc::clone(&fh));
+            cache.locks.lock().unwrap().remove(acc.as_slice());
+            cur = fh;
+        }
+        Ok(cur)
     }
 
     /// Cached `mkdir -p` of `file_path`'s parent (see `dirs_known`).
@@ -632,7 +722,147 @@ impl Mover {
     /// (`pipelined_copy` + `file_mover::classify_copy`) is the one
     /// that detects and records tears; see
     /// docs/work-items/MOVER_TORN_COPY_SURFACE.md (F05).
+    /// Raw-FH copy path. Same commit contract as `do_libnfs_copy`
+    /// (write `.partial`, durable before publish, attrs before rename,
+    /// R8 fence check immediately before RENAME) with the RPC budget
+    /// collapsed: LOOKUP(src) + READs + CREATE(attrs) + WRITEs +
+    /// SETATTR(times) + RENAME. Single-chunk files write FILE_SYNC and
+    /// skip COMMIT; multi-chunk files write UNSTABLE then COMMIT.
+    fn do_raw_copy(&self, pair: &mut ContextPair, row: &RowView) -> Result<u64, MoveError> {
+        const CHUNK: u64 = 1 << 20; // 1 MiB per READ/WRITE
+
+        let src = self.src_path(row);
+        let dst = self.dst_path(row);
+        let dst_partial = partial_path(&dst, &self.host_id, self.pid)?;
+        self.check_self_target(&src, &dst, &dst_partial)?;
+
+        let (src_parent, src_name) = split_parent_name(&src)
+            .ok_or_else(|| MoveError::new(FailurePhase::Open, "EINVAL"))?;
+        let (dst_parent, dst_name) = split_parent_name(&dst)
+            .ok_or_else(|| MoveError::new(FailurePhase::Open, "EINVAL"))?;
+        let (_, partial_name) = split_parent_name(&dst_partial)
+            .ok_or_else(|| MoveError::new(FailurePhase::Open, "EINVAL"))?;
+
+        let src_dir = self
+            .resolve_dir_fh(pair.src(), &self.src_dir_fhs, src_parent, false)
+            .map_err(|e| raw_move_err(e, FailurePhase::Open))?;
+        let dst_dir = self
+            .resolve_dir_fh(pair.dst(), &self.dst_dir_fhs, dst_parent, true)
+            .map_err(|e| raw_move_err(e, FailurePhase::Write))?;
+
+        let src_fh = raw::lookup(pair.src(), &src_dir, src_name)
+            .map_err(|e| raw_move_err(e, FailurePhase::Open))?;
+
+        // Same null-attribute downgrades the path-based flow records.
+        let policy = self.cfg.policy;
+        if policy.preserve_owner && (row.uid.is_none() || row.gid.is_none()) {
+            self.downgrades
+                .record(row.row_id, &row.path, DowngradeKind::NullOwner);
+        }
+        if policy.preserve_times && row.mtime_sec.is_none() {
+            self.downgrades
+                .record(row.row_id, &row.path, DowngradeKind::NullMtime);
+        }
+        if policy.preserve_times && row.mtime_sec.is_some() && row.atime_sec.is_none() {
+            self.downgrades
+                .record(row.row_id, &row.path, DowngradeKind::NullAtime);
+        }
+
+        // mode/uid/gid stamped atomically at CREATE — no chown/chmod
+        // ops, and no kill-priv ordering concern (nothing is changed
+        // after the mode is set). size=0 truncates a stale `.partial`.
+        let a = attrs::build(row, policy);
+        let create_attrs = RawSattr {
+            mode: a.mode.map(|m| m & 0o7777),
+            uid: a.uid,
+            gid: a.gid,
+            size: Some(0),
+            atime: None,
+            mtime: None,
+        };
+        let dst_fh = raw::create(pair.dst(), &dst_dir, partial_name, &create_attrs)
+            .map_err(|e| raw_move_err(e, FailurePhase::Open))?;
+
+        let single_chunk = row.size <= CHUNK;
+        let mut off: u64 = 0;
+        loop {
+            let (data, eof) = raw::read(pair.src(), &src_fh, off, CHUNK as u32)
+                .map_err(|e| raw_move_err(e, FailurePhase::Read))?;
+            if !data.is_empty() {
+                let mut sent = 0usize;
+                while sent < data.len() {
+                    let n = raw::write(
+                        pair.dst(),
+                        &dst_fh,
+                        off + sent as u64,
+                        &data[sent..],
+                        single_chunk,
+                    )
+                    .map_err(|e| raw_move_err(e, FailurePhase::Write))?;
+                    if n == 0 {
+                        return Err(MoveError::new(FailurePhase::Write, "EIO"));
+                    }
+                    sent += n as usize;
+                }
+                off += data.len() as u64;
+            }
+            if eof || data.is_empty() {
+                break;
+            }
+        }
+        let written = off;
+
+        if !single_chunk {
+            // F09: durable before publish. FILE_SYNC writes already
+            // are; UNSTABLE streams need the whole-file COMMIT.
+            raw::commit(pair.dst(), &dst_fh).map_err(|e| {
+                let mut me = raw_move_err(e, FailurePhase::Write);
+                me.error = format!("COMMIT:{}", me.error);
+                me
+            })?;
+        }
+
+        if self.cfg.require_unchanged_size && written != row.size {
+            return Err(MoveError::new(FailurePhase::Open, "SIZE_CHANGED"));
+        }
+        if written < row.size {
+            self.downgrades
+                .record(row.row_id, &row.path, DowngradeKind::EarlyEof);
+        }
+
+        // Times last (WRITE bumped mtime), one SETATTR for both.
+        if let Some((msec, mnsec)) = a.mtime {
+            let (asec, ansec) = a.atime.unwrap_or((msec, mnsec));
+            raw::setattr(
+                pair.dst(),
+                &dst_fh,
+                &RawSattr {
+                    atime: Some((asec, ansec.max(0) as u32)),
+                    mtime: Some((msec, mnsec.max(0) as u32)),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| raw_move_err(e, FailurePhase::Setattr))?;
+        }
+
+        // R8: fence check immediately before the commit-point rename.
+        self.check_fence()?;
+        tracing::debug!(
+            dest = %String::from_utf8_lossy(&dst),
+            host = %self.host_id,
+            pid = self.pid,
+            row_id = row.row_id,
+            "commit: rename .partial → final (raw-fh)",
+        );
+        raw::rename(pair.dst(), &dst_dir, partial_name, dst_name)
+            .map_err(|e| raw_move_err(e, FailurePhase::Rename))?;
+        Ok(written)
+    }
+
     fn do_libnfs_copy(&self, pair: &mut ContextPair, row: &RowView) -> Result<u64, MoveError> {
+        if self.cfg.use_raw_fh {
+            return self.do_raw_copy(pair, row);
+        }
         let src = self.src_path(row);
         let dst = self.dst_path(row);
         let dst_partial = partial_path(&dst, &self.host_id, self.pid)?;
@@ -822,6 +1052,24 @@ impl AttrExec for SyncAttrExec<'_> {
             mtime.1,
         )
     }
+}
+
+/// Convert a raw-op error into a `MoveError`, logging the transport
+/// detail at debug (the tag alone feeds failure records).
+fn raw_move_err(e: raw::RawError, phase: FailurePhase) -> MoveError {
+    tracing::debug!(detail = %e.detail, "raw nfs op failed");
+    MoveError::new(phase, e.tag)
+}
+
+/// Split an absolute byte path into (parent, basename). Returns None
+/// for the root or a path without a slash.
+fn split_parent_name(p: &[u8]) -> Option<(&[u8], &[u8])> {
+    let i = p.iter().rposition(|&b| b == b'/')?;
+    let name = &p[i + 1..];
+    if name.is_empty() {
+        return None;
+    }
+    Some((if i == 0 { b"/" } else { &p[..i] }, name))
 }
 
 /// Return the parent directory portion of an absolute byte path,
@@ -1214,6 +1462,7 @@ mod tests {
             inflight: InflightProfile::default(),
             require_chown: false,
             require_unchanged_size: false,
+            use_raw_fh: false,
             rpc_timeout_ms: crate::libnfs::DEFAULT_RPC_TIMEOUT_MS,
         };
         Mover::new(
