@@ -57,6 +57,11 @@ type HardlinkKey = (Option<u64>, u64);
 
 pub struct ShardProcessor {
     pub mover: Arc<dyn FileMover>,
+    /// Live per-row counters published by the heartbeat between batch
+    /// commits (see `heartbeat::LivePending`). Reset by the
+    /// orchestrator when it merges shard-end totals into
+    /// `ProgressState`.
+    pub live: Arc<crate::heartbeat::LivePending>,
     pub fence: Fence,
     pub budget: BatchBudget,
     pub inflight: InflightLimiter,
@@ -347,6 +352,23 @@ impl ShardProcessor {
     }
 
     fn record(&mut self, row: &RowView, mo: MoveOutcome, outcome: &mut ProcessOutcome) {
+        // Live counters first — same classification as record_outcome.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.live.rows_done.fetch_add(1, Relaxed);
+            match (&mo.result, mo.strategy) {
+                (Ok(()), _) => {
+                    self.live.files_ok.fetch_add(1, Relaxed);
+                    self.live.bytes_moved.fetch_add(mo.bytes_moved, Relaxed);
+                }
+                (Err(e), _) if matches!(e.phase, migration_core::records::FailurePhase::Fenced) => {
+                    self.live.files_fenced.fetch_add(1, Relaxed);
+                }
+                (Err(_), _) => {
+                    self.live.files_failed.fetch_add(1, Relaxed);
+                }
+            }
+        }
         record_outcome(
             &row.path,
             mo,

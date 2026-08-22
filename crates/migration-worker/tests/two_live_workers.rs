@@ -97,6 +97,7 @@ fn spawn_worker(
         let current = Arc::new(Mutex::new(None::<HeldClaim>));
         let progress = Arc::new(RwLock::new(ProgressState::new()));
         let hb = HeartbeatTask {
+            live: std::sync::Arc::new(migration_worker::heartbeat::LivePending::default()),
             store: store.clone() as Arc<dyn ClaimStore>,
             fence: fence.clone(),
             host_id: host_id.clone(),

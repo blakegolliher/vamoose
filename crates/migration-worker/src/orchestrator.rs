@@ -240,6 +240,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
 
     // ---- 4. Shared progress + heartbeat ----------------------------
     let progress = Arc::new(RwLock::new(ProgressState::new()));
+    let live = Arc::new(crate::heartbeat::LivePending::default());
     let current = Arc::new(Mutex::new(None::<HeldClaim>));
     let fence = Fence::new();
 
@@ -335,6 +336,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     };
 
     let hb = HeartbeatTask {
+        live: Arc::clone(&live),
         store: s3.clone() as Arc<dyn ClaimStore>,
         fence: fence.clone(),
         host_id: host_id.clone(),
@@ -698,6 +700,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
             p.shard_bytes_done = 0;
             p.status = "active".into();
         }
+        live.reset();
 
         // Download the parquet shard to scratch and verify its etag
         // against the manifest (F40). F42: neither failure may take
@@ -752,6 +755,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
         // throughput counter and one failure log per host.
         let mut processor = ShardProcessor {
             dir_restamp: Vec::new(),
+            live: Arc::clone(&live),
             mover: Arc::clone(&mover),
             fence: fence.clone(),
             budget,
@@ -799,6 +803,10 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
         };
 
         // Push final per-shard counters into the shared progress.
+        // Reset the live pending set FIRST: a heartbeat tick landing
+        // between reset and merge briefly under-counts; the reverse
+        // order would double-count.
+        live.reset();
         {
             let mut p = progress.write().await;
             p.shard_rows_total = outcome.rows_total;
