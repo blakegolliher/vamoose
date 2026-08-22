@@ -786,7 +786,15 @@ impl Mover {
         let single_chunk = row.size <= CHUNK;
         let mut off: u64 = 0;
         loop {
-            let (data, eof) = raw::read(pair.src(), &src_fh, off, CHUNK as u32)
+            // Size the request to the row hint (min 4 KiB, capped at
+            // CHUNK). A flat 1 MiB request forced a zeroed 1 MiB
+            // buffer allocation per file — above glibc's mmap
+            // threshold, so every tiny file paid mmap/munmap and the
+            // process-wide mmap_sem serialized 500 blocking threads
+            // (measured: 87% of wall time in futex). If the file is
+            // larger than the hint, the loop simply issues more reads.
+            let want = (row.size.saturating_sub(off)).clamp(4096, CHUNK) as u32;
+            let (data, eof) = raw::read(pair.src(), &src_fh, off, want)
                 .map_err(|e| raw_move_err(e, FailurePhase::Read))?;
             if !data.is_empty() {
                 let mut sent = 0usize;
