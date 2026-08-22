@@ -146,6 +146,16 @@ impl ShardProcessor {
             }
         }
 
+        // Interleave singletons round-robin across parent directories.
+        // Row order is directory-clustered (walker DFS), so the
+        // in-flight window otherwise targets only a handful of parent
+        // dirs at a time — and the NFS server serializes creates
+        // within one parent (measured ~185 creates/s/dir on VAST).
+        // Spreading the window across parents turns the per-dir
+        // ceiling into a non-factor. Deterministic: first-seen parent
+        // order, original row order within each parent.
+        let singletons = interleave_by_parent(singletons);
+
         // ---- Phase 1: dispatch non-dir work concurrently -------------
         let mut joins: JoinSet<Vec<(RowView, MoveOutcome)>> = JoinSet::new();
 
@@ -438,6 +448,36 @@ pub(crate) fn hardlink_key(row: &RowView) -> Option<HardlinkKey> {
 ///
 /// "Depth" here is just the count of `/` separators. Stable so
 /// equal-depth paths keep their input order.
+/// Round-robin rows across their parent directories: one row from each
+/// parent in first-seen order, repeating until all queues drain. See
+/// the call site in `run_batch` for why (per-directory create
+/// serialization on the NFS server).
+pub(crate) fn interleave_by_parent(rows: Vec<RowView>) -> Vec<RowView> {
+    let total = rows.len();
+    let mut queues: Vec<std::collections::VecDeque<RowView>> = Vec::new();
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+    for row in rows {
+        let parent = match row.path.iter().rposition(|&b| b == b'/') {
+            Some(i) => row.path[..i].to_vec(),
+            None => Vec::new(),
+        };
+        let qi = *index.entry(parent).or_insert_with(|| {
+            queues.push(std::collections::VecDeque::new());
+            queues.len() - 1
+        });
+        queues[qi].push_back(row);
+    }
+    let mut out = Vec::with_capacity(total);
+    while out.len() < total {
+        for q in queues.iter_mut() {
+            if let Some(row) = q.pop_front() {
+                out.push(row);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn sort_deepest_first(dirs: &mut [RowView]) {
     dirs.sort_by(|a, b| {
         let da = a.path.iter().filter(|&&b| b == b'/').count();
