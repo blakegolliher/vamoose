@@ -114,14 +114,22 @@ pub struct AsyncNfsContextPair {
 pub struct BucketedAsyncPool {
     large: AsyncNfsContextPair,
     medium: AsyncNfsContextPair,
-    small: AsyncNfsContextPair,
+    /// N pairs, checked out round-robin. One pair per bucket was the
+    /// original design; on small-file trees a single connection pair
+    /// becomes the whole worker's throughput (every in-flight file
+    /// multiplexes one socket and serializes on its context lock —
+    /// measured ~350 files/s regardless of `inflight_small`). Small
+    /// files are RPC-latency-bound, so they scale with connection
+    /// count; large/medium are bandwidth-bound and keep one pair.
+    small: Vec<AsyncNfsContextPair>,
+    small_rr: std::sync::atomic::AtomicUsize,
 }
 
 impl BucketedAsyncPool {
-    /// Mount all six contexts (src+dst × small/medium/large)
-    /// concurrently. Returns once every mount has completed.
+    /// Mount `2 + 2 + 2 * small_pairs` contexts. Returns once every
+    /// mount has completed.
     ///
-    /// `rpc_timeout_ms` (F12): per-RPC timeout applied to all six
+    /// `rpc_timeout_ms` (F12): per-RPC timeout applied to all
     /// contexts at creation; `0` = leave the libnfs default. See
     /// [`crate::libnfs::DEFAULT_RPC_TIMEOUT_MS`].
     ///
@@ -129,17 +137,32 @@ impl BucketedAsyncPool {
     /// already-mounted contexts wind down through `AsyncNfsContext`'s
     /// own Drop (which signals the service task to shut down). No
     /// extra cleanup is needed at this layer.
-    pub async fn new(src_url: &str, dst_url: &str, rpc_timeout_ms: u32) -> Result<Self, NfsError> {
-        let (large, medium, small) = tokio::try_join!(
+    pub async fn new(
+        src_url: &str,
+        dst_url: &str,
+        rpc_timeout_ms: u32,
+        small_pairs: usize,
+    ) -> Result<Self, NfsError> {
+        let small_pairs = small_pairs.max(1);
+        let (large, medium) = tokio::try_join!(
             mount_pair(src_url, dst_url, BUCKETS[0], rpc_timeout_ms),
             mount_pair(src_url, dst_url, BUCKETS[1], rpc_timeout_ms),
-            mount_pair(src_url, dst_url, BUCKETS[2], rpc_timeout_ms),
         )?;
+        let small = futures::future::try_join_all(
+            (0..small_pairs).map(|_| mount_pair(src_url, dst_url, BUCKETS[2], rpc_timeout_ms)),
+        )
+        .await?;
         Ok(Self {
             large,
             medium,
             small,
+            small_rr: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Number of small-bucket pairs mounted (for startup logging).
+    pub fn small_pairs(&self) -> usize {
+        self.small.len()
     }
 
     /// Return the (src ctx, dst ctx, bucket config) for the bucket
@@ -159,7 +182,7 @@ impl BucketedAsyncPool {
         match name {
             "large" => Some(&self.large),
             "medium" => Some(&self.medium),
-            "small" => Some(&self.small),
+            "small" => self.small.first(),
             _ => None,
         }
     }
@@ -168,7 +191,13 @@ impl BucketedAsyncPool {
         match cfg.name {
             "large" => &self.large,
             "medium" => &self.medium,
-            "small" => &self.small,
+            "small" => {
+                let idx = self
+                    .small_rr
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % self.small.len();
+                &self.small[idx]
+            }
             other => unreachable!(
                 "bucket_for_size returned unknown bucket name {other:?}; \
                  BUCKETS and pair_for_bucket are out of sync",

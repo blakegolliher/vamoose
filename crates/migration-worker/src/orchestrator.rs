@@ -184,7 +184,17 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     // ---- 3. Mount libnfs pool + build mover -----------------------
     // M3: pre-mount cfg.mover.nfs_connections context pairs so
     // concurrent shard dispatch has distinct contexts to draw from.
+    // In bucketed-async mode the sync pool only serves fallback rows
+    // (symlink/hardlink/dir/empty), so cap it — every context pair
+    // costs two reserved ports (libnfs as root binds ports < 1024;
+    // ~111 pairs is the observed per-host ceiling) and the async pool
+    // needs that headroom for its small-bucket pairs.
     let pool_size = cfg.mover.nfs_connections.max(1) as usize;
+    let pool_size = if cfg.mover.use_bucketed_pool {
+        pool_size.min(16)
+    } else {
+        pool_size
+    };
     let pool: Arc<dyn LibnfsContextPool> = MultiPool::build(
         &manifest.source.url,
         &manifest.dest.url,
@@ -244,13 +254,15 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
                 &manifest.source.url,
                 &manifest.dest.url,
                 mover_cfg.rpc_timeout_ms,
+                cfg.mover.nfs_connections.max(1) as usize,
             )
             .await?,
         );
         tracing::info!(
             src = %manifest.source.url,
             dst = %manifest.dest.url,
-            "bucketed async libnfs pool mounted (6 contexts)",
+            small_pairs = async_pool.small_pairs(),
+            "bucketed async libnfs pool mounted",
         );
         let sync_mover = Mover::new(
             mover_cfg.clone(),

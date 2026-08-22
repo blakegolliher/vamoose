@@ -155,6 +155,18 @@ pub struct AsyncBucketedFileMover {
     host_id: Arc<str>,
     pid: u32,
     downgrades: DowngradeSink,
+    /// Destination directories confirmed present + per-dir single-flight
+    /// guards. Same rationale as `Mover::dirs_known` on the sync path:
+    /// without both pieces every in-flight file of a directory re-probes
+    /// the full ancestor mkdir chain (~7 EEXIST round-trips per file on
+    /// a depth-8 tree). Entries are only added after a successful
+    /// mkdir chain and nothing removes destination dirs during a run.
+    dirs_known: Arc<tokio::sync::Mutex<std::collections::HashSet<Vec<u8>>>>,
+    dir_locks: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<Vec<u8>, Arc<tokio::sync::Mutex<()>>>,
+        >,
+    >,
 }
 
 impl AsyncBucketedFileMover {
@@ -179,7 +191,56 @@ impl AsyncBucketedFileMover {
             host_id: host_id.into(),
             pid: std::process::id(),
             downgrades,
+            dirs_known: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            dir_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Cached, single-flight `mkdir -p` of `file_path`'s parent. See
+    /// the `dirs_known` field docs and the sync twin
+    /// `Mover::ensure_parent_dir`.
+    async fn ensure_parent_dir(
+        &self,
+        ctx: &AsyncNfsContext,
+        file_path: &[u8],
+    ) -> Result<(), MoveError> {
+        let last_slash = match file_path.iter().rposition(|&b| b == b'/') {
+            Some(0) | None => return Ok(()), // root or no parent; root exists
+            Some(i) => i,
+        };
+        let parent = &file_path[..last_slash];
+        if parent.is_empty() {
+            return Ok(());
+        }
+        if self.dirs_known.lock().await.contains(parent) {
+            return Ok(());
+        }
+        let dir_lock = {
+            let mut locks = self.dir_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(parent.to_vec())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _flight = dir_lock.lock().await;
+        if self.dirs_known.lock().await.contains(parent) {
+            return Ok(());
+        }
+        async_mkdir_p(ctx, parent).await?;
+        {
+            let mut known = self.dirs_known.lock().await;
+            let mut end = parent.len();
+            loop {
+                known.insert(parent[..end].to_vec());
+                match parent[..end].iter().rposition(|&b| b == b'/') {
+                    Some(i) if i > 0 => end = i,
+                    _ => break,
+                }
+            }
+        }
+        self.dir_locks.lock().await.remove(parent);
+        Ok(())
     }
 
     /// R8 gate. Same contract as `Mover::check_fence`.
@@ -218,10 +279,10 @@ impl AsyncBucketedFileMover {
 
         let (src_ctx, dst_ctx, cfg) = self.pool.pair_for_size(row.size);
 
-        // Ensure the dst parent dir exists. mkdir -p style; ignore
-        // EEXIST per component. Uses the bucket's dst ctx — any
-        // bucket's dst ctx would resolve to the same NFS server view.
-        async_mkdir_p_for_file(dst_ctx, &dst).await?;
+        // Ensure the dst parent dir exists (cached + single-flight).
+        // Uses the bucket's dst ctx — any bucket's dst ctx would
+        // resolve to the same NFS server view.
+        self.ensure_parent_dir(dst_ctx, &dst).await?;
 
         let src_fh = src_ctx
             .open(&src, Flags::rdonly())
