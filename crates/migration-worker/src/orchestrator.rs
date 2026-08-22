@@ -1374,18 +1374,33 @@ pub async fn scan_shards(
                         all_terminal = false;
                         let age = now.signed_duration_since(record.claimed_utc.0);
                         let stale_by_lease = age.to_std().map(|d| d > lease).unwrap_or(false);
-                        // Cross-check the per-host progress file. Lets
-                        // a peer reclaim within ~2× the owner's
-                        // heartbeat_sec when the owner has stopped
-                        // heartbeating, instead of waiting the full
-                        // lease window. See
-                        // docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md.
+                        // Progress-liveness cross-check — AUTHORITATIVE
+                        // for Active claims. `claimed_utc` is written
+                        // once at acquire and never advances (refresh
+                        // is HEAD-and-compare), so `stale_by_lease` is
+                        // true for EVERY shard held longer than the
+                        // lease window; on its own it is not evidence
+                        // of a dead owner. Acting on it alone stole a
+                        // live, heartbeating owner's shard on the
+                        // 2026-08-22 600M rig run (dual-writer window
+                        // closed only by the owner's self-fence).
+                        //
+                        // The per-host progress file is the real
+                        // heartbeat: a fresh, matching-`held_etag`
+                        // record VETOES reclaim regardless of claim
+                        // age; a stale/absent/mismatched one makes the
+                        // shard reclaimable within ~2× the owner's
+                        // heartbeat_sec (see
+                        // docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md).
+                        // `stale_by_lease` survives only as the
+                        // conservative fallback when the progress
+                        // object cannot be read at all.
                         //
                         // Only fetch when we'd act on the result — and
                         // dedupe by host within a single pass so M
                         // active shards owned by N hosts cost at most
                         // N progress GETs.
-                        let stale_by_progress = if next.is_none() && !skipped && !stale_by_lease {
+                        let stale = if next.is_none() && !skipped {
                             let fetch = match progress_cache.get(&record.host).cloned() {
                                 Some(cached) => cached,
                                 None => {
@@ -1423,12 +1438,15 @@ pub async fn scan_shards(
                                     heartbeat_sec,
                                     now,
                                 ),
-                                ProgressFetch::Error => false,
+                                // Progress unreadable: fall back to the
+                                // lease window as the only (coarse)
+                                // dead-owner signal.
+                                ProgressFetch::Error => stale_by_lease,
                             }
                         } else {
                             false
                         };
-                        if (stale_by_lease || stale_by_progress) && next.is_none() && !skipped {
+                        if stale && next.is_none() && !skipped {
                             next = Some(ClaimTarget::Stale {
                                 shard: shard_filename.clone(),
                                 stale_etag: e.etag.clone(),
