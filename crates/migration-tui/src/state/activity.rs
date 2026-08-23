@@ -124,24 +124,25 @@ pub(super) const MAX_WINDOW_SECS: i64 = 5 * 60;
 /// per-tick payload.
 #[derive(Debug, Clone, Default)]
 pub struct ProgressDeltaHistory {
-    /// Bounded ring of `(wall_clock, bytes_delta)`. Sorted oldest-
-    /// first so pruning is a single `pop_front` per stale entry.
-    samples: VecDeque<(DateTime<Utc>, u64)>,
+    /// Bounded ring of `(wall_clock, bytes_delta, files_delta)`.
+    /// Sorted oldest-first so pruning is a single `pop_front` per
+    /// stale entry.
+    samples: VecDeque<(DateTime<Utc>, u64, u64)>,
 }
 
 impl ProgressDeltaHistory {
     /// Record one ProgressDelta. Prunes anything older than the
     /// longest window the TUI maintains.
-    pub fn push(&mut self, at: DateTime<Utc>, bytes_delta: u64) {
+    pub fn push(&mut self, at: DateTime<Utc>, bytes_delta: u64, files_delta: u64) {
         let cutoff = at - ChronoDuration::seconds(MAX_WINDOW_SECS);
-        while let Some(&(t, _)) = self.samples.front() {
+        while let Some(&(t, _, _)) = self.samples.front() {
             if t < cutoff {
                 self.samples.pop_front();
             } else {
                 break;
             }
         }
-        self.samples.push_back((at, bytes_delta));
+        self.samples.push_back((at, bytes_delta, files_delta));
     }
 
     /// Bytes-per-second over the most recent `window_secs`. Returns
@@ -155,11 +156,25 @@ impl ProgressDeltaHistory {
         let total: u64 = self
             .samples
             .iter()
-            .filter(|(t, _)| *t >= cutoff)
-            .map(|(_, b)| *b)
+            .filter(|(t, _, _)| *t >= cutoff)
+            .map(|(_, b, _)| *b)
             .sum();
         total as f64 / window_secs as f64
     }
+
+    /// Files-per-second over the most recent `window_secs`. Same
+    /// window semantics as [`Self::bytes_per_sec`].
+    pub fn files_per_sec(&self, window_secs: i64, now: DateTime<Utc>) -> f64 {
+        let cutoff = now - ChronoDuration::seconds(window_secs);
+        let total: u64 = self
+            .samples
+            .iter()
+            .filter(|(t, _, _)| *t >= cutoff)
+            .map(|(_, _, f)| *f)
+            .sum();
+        total as f64 / window_secs as f64
+    }
+
 
     /// Sample count (mostly for tests and diagnostics).
     pub fn len(&self) -> usize {

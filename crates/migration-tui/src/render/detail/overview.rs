@@ -55,6 +55,16 @@ pub(super) fn render_overview_tab(
     let bps1 = state.job_bytes_per_sec(&job.id, 1, now).unwrap_or(0.0);
     let bps60 = state.job_bytes_per_sec(&job.id, 60, now).unwrap_or(0.0);
     let bps300 = state.job_bytes_per_sec(&job.id, 300, now).unwrap_or(0.0);
+    let fps1 = state.job_files_per_sec(&job.id, 1, now);
+    let fps60 = state.job_files_per_sec(&job.id, 60, now);
+    let fps300 = state.job_files_per_sec(&job.id, 300, now);
+    // Files/s first: metadata-heavy migrations move millions of tiny
+    // files, where bytes/s reads as noise (measured 59-byte average
+    // files on the 600M rig run).
+    lines.push(kv_line(
+        "Files/s",
+        format!("1s {fps1:.0}   1m {fps60:.0}   5m {fps300:.0}"),
+    ));
     lines.push(kv_line(
         "Throughput",
         format!(

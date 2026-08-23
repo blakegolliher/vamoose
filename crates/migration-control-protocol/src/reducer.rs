@@ -73,6 +73,8 @@ impl Snapshot {
                 dest,
                 owner,
                 config_hash,
+                total_files,
+                total_bytes,
             } => {
                 // JobCreated carries the endpoints and config hash, not the
                 // full JobConfig. The reducer therefore installs the stable
@@ -92,7 +94,11 @@ impl Snapshot {
                         config: sentinel_config(source, dest),
                         phase: Phase::Planned,
                         phase_history: Vec::new(),
-                        progress: Progress::default(),
+                        progress: Progress {
+                            files_total: *total_files,
+                            bytes_total: *total_bytes,
+                            ..Progress::default()
+                        },
                         throughput: Default::default(),
                         eta: Default::default(),
                         health: Default::default(),
@@ -235,10 +241,20 @@ impl Snapshot {
                 bytes_delta,
                 errors_delta,
             } => {
-                if let Some(j) = self.jobs.get_mut(job_id) {
+                let was_planned = if let Some(j) = self.jobs.get_mut(job_id) {
                     j.progress.files_done = j.progress.files_done.saturating_add(*files_delta);
                     j.progress.bytes_done = j.progress.bytes_done.saturating_add(*bytes_delta);
                     j.progress.errors_total = j.progress.errors_total.saturating_add(*errors_delta);
+                    j.phase == Phase::Planned
+                } else {
+                    false
+                };
+                // A job with work flowing is not "Planned" — derive
+                // Copying on the first delta. Deterministic on replay
+                // (same events, same transition), and legal per the
+                // F25 guard (Planned -> Copying skips forward).
+                if was_planned {
+                    transition_phase(self, job_id, Phase::Copying, "first progress delta", env.at);
                 }
             }
 
@@ -437,6 +453,8 @@ mod tests {
                 dest: "nfs://dst".into(),
                 owner: "blake".into(),
                 config_hash: ConfigHash("deadbeef".into()),
+                total_files: 0,
+                total_bytes: 0,
             },
         )
     }

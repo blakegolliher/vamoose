@@ -29,6 +29,8 @@ fn job_created(seq: u64, job: &str) -> EventEnvelope {
             dest: "nfs://dst".into(),
             owner: "test".into(),
             config_hash: ConfigHash("ab".into()),
+            total_files: 0,
+            total_bytes: 0,
         },
     }
 }
@@ -334,9 +336,9 @@ fn prog_at(seq: u64, secs: i64, job: &str, bytes: u64) -> EventEnvelope {
 #[test]
 fn history_push_then_bytes_per_sec_sums_within_window() {
     let mut h = ProgressDeltaHistory::default();
-    h.push(at(0), 1000);
-    h.push(at(1), 2000);
-    h.push(at(2), 3000);
+    h.push(at(0), 1000, 0);
+    h.push(at(1), 2000, 0);
+    h.push(at(2), 3000, 0);
     // 6000 bytes over the last 10 seconds → 600 B/s.
     assert!((h.bytes_per_sec(10, at(10)) - 600.0).abs() < 0.0001);
     // Inclusive window: at now=at(2), the 2-second window is
@@ -354,9 +356,9 @@ fn history_push_then_bytes_per_sec_sums_within_window() {
 fn history_prunes_entries_older_than_max_window() {
     let mut h = ProgressDeltaHistory::default();
     // First entry far in the past.
-    h.push(at(0), 100);
+    h.push(at(0), 100, 0);
     // Push enough later that the first is dropped.
-    h.push(at(MAX_WINDOW_SECS + 1), 200);
+    h.push(at(MAX_WINDOW_SECS + 1), 200, 0);
     assert_eq!(h.len(), 1, "history pruned to 1 entry");
     // Only the surviving entry contributes to the window.
     assert!((h.bytes_per_sec(10, at(MAX_WINDOW_SECS + 1)) - 20.0).abs() < 0.0001);
@@ -372,7 +374,7 @@ fn history_empty_window_yields_zero() {
 #[test]
 fn history_window_secs_zero_or_negative_yields_zero() {
     let mut h = ProgressDeltaHistory::default();
-    h.push(at(0), 1000);
+    h.push(at(0), 1000, 0);
     assert_eq!(h.bytes_per_sec(0, at(0)), 0.0);
     assert_eq!(h.bytes_per_sec(-5, at(0)), 0.0);
 }

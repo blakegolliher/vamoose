@@ -673,6 +673,13 @@ pub enum EventKind {
         dest: String,
         owner: String,
         config_hash: ConfigHash,
+        /// Planned totals for progress display (0 = unknown). Added
+        /// for seeded jobs whose manifest is known at creation;
+        /// serde-defaulted so historical logs replay unchanged.
+        #[serde(default)]
+        total_files: u64,
+        #[serde(default)]
+        total_bytes: u64,
     },
     JobPhaseChanged {
         job_id: JobId,
@@ -1384,6 +1391,8 @@ mod tests {
                 dest: "nfs://dst".into(),
                 owner: "blake".into(),
                 config_hash: ConfigHash("deadbeef".into()),
+                total_files: 0,
+                total_bytes: 0,
             },
         };
         let s = serde_json::to_string(&env).unwrap();
@@ -1406,6 +1415,8 @@ mod tests {
                 dest: "d".into(),
                 owner: "o".into(),
                 config_hash: ConfigHash("ab".into()),
+                total_files: 0,
+                total_bytes: 0,
             },
             EventKind::JobPhaseChanged {
                 job_id: job.clone(),

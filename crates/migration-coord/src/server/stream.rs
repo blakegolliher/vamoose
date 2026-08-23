@@ -340,6 +340,8 @@ mod tests {
             dest: "d".into(),
             owner: "test".into(),
             config_hash: crate::schema::ConfigHash("ab".into()),
+            total_files: 0,
+            total_bytes: 0,
         }
     }
 

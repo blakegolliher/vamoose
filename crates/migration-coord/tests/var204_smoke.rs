@@ -335,6 +335,8 @@ async fn replay_snapshot_plus_log_round_trip() {
                 dest: "nfs://dst".into(),
                 owner: "test".into(),
                 config_hash: migration_coord::schema::ConfigHash("ab".into()),
+                total_files: 0,
+                total_bytes: 0,
             },
         },
         EventEnvelope {

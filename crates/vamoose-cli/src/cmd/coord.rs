@@ -93,6 +93,15 @@ pub struct Args {
     /// `dest` field recorded on the seeded job (display only).
     #[arg(long, default_value = "nfs://unspecified")]
     pub seed_dest: String,
+
+    /// Planned total files for the seeded job (drives percent/ETA in
+    /// the TUI; 0 = unknown). Typically the manifest's `total_rows`.
+    #[arg(long, default_value_t = 0)]
+    pub seed_total_files: u64,
+
+    /// Planned total bytes for the seeded job (0 = unknown).
+    #[arg(long, default_value_t = 0)]
+    pub seed_total_bytes: u64,
 }
 
 pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -158,6 +167,8 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
                     dest: args.seed_dest.clone(),
                     owner: whoami_owner(),
                     config_hash: migration_coord::schema::ConfigHash("seeded-via-cli".into()),
+                    total_files: args.seed_total_files,
+                    total_bytes: args.seed_total_bytes,
                 })
                 .await?;
             tracing::info!(job = %job_id, seq, "seeded job into registry");
@@ -333,6 +344,8 @@ mod tests {
             dest: "nfs://dst".into(),
             owner: "test".into(),
             config_hash: ConfigHash("ab".into()),
+            total_files: 0,
+            total_bytes: 0,
         }
     }
 

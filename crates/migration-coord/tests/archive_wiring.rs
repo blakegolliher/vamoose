@@ -93,6 +93,8 @@ fn job_created(job: &str) -> EventKind {
         dest: "nfs://dst".into(),
         owner: "test".into(),
         config_hash: ConfigHash("ab".into()),
+        total_files: 0,
+        total_bytes: 0,
     }
 }
 

@@ -69,6 +69,8 @@ fn job_created(j: &str) -> EventKind {
         dest: "nfs://dst".into(),
         owner: "test".into(),
         config_hash: ConfigHash("deadbeef".into()),
+        total_files: 0,
+        total_bytes: 0,
     }
 }
 
@@ -227,7 +229,9 @@ async fn get_job_returns_full_job_view() {
     assert_eq!(body["id"], "bobby");
     assert_eq!(body["progress"]["files_done"], 10);
     assert_eq!(body["progress"]["bytes_done"], 1024);
-    assert_eq!(body["phase"], "Planned");
+    // The fixture ingested a ProgressDelta, so the reducer derives
+    // Copying (auto phase transition on first delta).
+    assert_eq!(body["phase"], "Copying");
 }
 
 // =============================================================================
