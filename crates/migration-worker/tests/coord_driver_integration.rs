@@ -122,6 +122,7 @@ fn driver_cfg(addr: SocketAddr) -> CoordCfg {
 fn fresh_inputs(fence: Fence, fence_rx: Option<mpsc::Receiver<String>>) -> DriverInputs {
     DriverInputs {
         progress: Arc::new(RwLock::new(ProgressState::new())),
+        live: std::sync::Arc::new(migration_worker::heartbeat::LivePending::default()),
         throughput: ThroughputCounter::new(),
         fence,
         fence_rx,
@@ -135,6 +136,7 @@ fn fresh_inputs_with_events(
 ) -> DriverInputs {
     DriverInputs {
         progress: Arc::new(RwLock::new(ProgressState::new())),
+        live: std::sync::Arc::new(migration_worker::heartbeat::LivePending::default()),
         throughput: ThroughputCounter::new(),
         fence,
         fence_rx: None,

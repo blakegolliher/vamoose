@@ -56,16 +56,26 @@ impl StreamCaps {
                 let key = (job_id.clone(), *worker_id);
                 match self.progress_last.get(&key) {
                     Some(last) if now.signed_duration_since(*last) < min_interval => {
-                        // Suppressed: retain the trailing edge so the
-                        // flush tick can deliver the burst's final
-                        // values (latest wins).
-                        self.retained_progress.insert(key, env.clone());
+                        // Suppressed: COALESCE into the retained frame
+                        // (sum the deltas, keep the newest envelope
+                        // shell). Latest-wins retention dropped the
+                        // in-between counts from the wire, so every
+                        // client-derived rate under-reported — the
+                        // 600M-rig TUI read ~60% of the true files/s.
+                        match self.retained_progress.get_mut(&key) {
+                            Some(retained) => merge_progress_delta(retained, env),
+                            None => {
+                                self.retained_progress.insert(key, env.clone());
+                            }
+                        }
                         false
                     }
                     _ => {
-                        // A fresh broadcast supersedes any retained
-                        // older frame for this key.
-                        self.retained_progress.remove(&key);
+                        // Fresh broadcast. Any retained (suppressed)
+                        // sums stay retained — their counts have not
+                        // reached subscribers yet; the flush tick
+                        // delivers them. Removing them here silently
+                        // dropped their counts.
                         self.progress_last.insert(key, now);
                         true
                     }
@@ -105,9 +115,13 @@ impl StreamCaps {
             .retained_progress
             .keys()
             .filter(|key| match self.progress_last.get(*key) {
+                // Deliver once the key has gone a cap interval
+                // without a broadcast — retained sums must drain even
+                // under a constant event flow, otherwise they
+                // accumulate for the whole run and land as one giant
+                // correction at the end. Delivery itself counts as a
+                // broadcast, so the wire stays paced at ~1 Hz per key.
                 Some(last) => now.signed_duration_since(*last) >= min_interval,
-                // Unreachable (retention implies a prior broadcast),
-                // but deliver rather than leak if it ever happens.
                 None => true,
             })
             .cloned()
@@ -123,6 +137,50 @@ impl StreamCaps {
         out.sort_by_key(|e| e.seq);
         out
     }
+}
+
+/// Fold `newer`'s ProgressDelta counts into `retained` (also a
+/// ProgressDelta for the same (job, worker)), keeping `newer`'s
+/// envelope identity (seq / at / client_seq) so resume cursors stay
+/// monotonic. The merged frame then represents the SUM of every
+/// suppressed event up to its seq — a client folding it reaches the
+/// same totals as one that saw each original.
+fn merge_progress_delta(retained: &mut EventEnvelope, newer: &EventEnvelope) {
+    let (
+        EventKind::ProgressDelta {
+            files_delta: rf,
+            bytes_delta: rb,
+            errors_delta: re,
+            ..
+        },
+        EventKind::ProgressDelta {
+            files_delta: nf,
+            bytes_delta: nb,
+            errors_delta: ne,
+            ..
+        },
+    ) = (&retained.kind, &newer.kind)
+    else {
+        return;
+    };
+    let (sf, sb, se) = (
+        rf.saturating_add(*nf),
+        rb.saturating_add(*nb),
+        re.saturating_add(*ne),
+    );
+    let mut merged = newer.clone();
+    if let EventKind::ProgressDelta {
+        files_delta,
+        bytes_delta,
+        errors_delta,
+        ..
+    } = &mut merged.kind
+    {
+        *files_delta = sf;
+        *bytes_delta = sb;
+        *errors_delta = se;
+    }
+    *retained = merged;
 }
 
 impl CoordRuntime {
