@@ -429,7 +429,20 @@ async fn seed_job_from_manifest(
         };
         if let Some(job) = job {
             match seed_once(&runtime, &job, &spec, manifest.as_ref()).await {
-                Ok(()) => return,
+                // Seeded with manifest facts (or none are coming): done.
+                Ok(()) if manifest.is_some() || spec.explicit_job.is_none() => return,
+                // Explicit id seeded before the manifest exists: keep
+                // polling so its totals land via JobTotalsSet later.
+                Ok(()) => {
+                    if !announced_wait {
+                        announced_wait = true;
+                        tracing::info!(
+                            job,
+                            "coord: job seeded without a manifest; will install totals when \
+                             manifest.json appears",
+                        );
+                    }
+                }
                 Err(e) => tracing::warn!(job, error = %e, "coord: seeding failed; retrying"),
             }
         } else if !announced_wait {
@@ -502,8 +515,33 @@ async fn seed_once(
 ) -> anyhow::Result<()> {
     let job_id = migration_coord::schema::JobId::new(job.to_string())
         .map_err(|e| anyhow::anyhow!("seed job id {job:?}: {e}"))?;
-    if runtime.job_view(&job_id).await.is_some() {
-        tracing::info!(job = %job_id, "seed job already present (replayed); skipping");
+    if let Some(existing) = runtime.job_view(&job_id).await {
+        // Totals learned late — the usual case when the job was seeded
+        // (explicit id) before the manifest existed: install them now
+        // so the TUI gains percent/ETA without recreating the job.
+        let (total_files, total_bytes) = match seed_event(job_id.clone(), spec, manifest) {
+            migration_coord::schema::EventKind::JobCreated {
+                total_files,
+                total_bytes,
+                ..
+            } => (total_files, total_bytes),
+            _ => unreachable!("seed_event builds JobCreated"),
+        };
+        let known = total_files != 0 || total_bytes != 0;
+        let differs = existing.progress.files_total != total_files
+            || existing.progress.bytes_total != total_bytes;
+        if known && differs {
+            let seq = runtime
+                .ingest(migration_coord::schema::EventKind::JobTotalsSet {
+                    job_id: job_id.clone(),
+                    total_files,
+                    total_bytes,
+                })
+                .await?;
+            tracing::info!(job = %job_id, seq, total_files, total_bytes, "installed job totals");
+        } else {
+            tracing::info!(job = %job_id, "seed job already present (replayed); skipping");
+        }
         return Ok(());
     }
     let seq = runtime
@@ -717,6 +755,28 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// An explicit id seeded before the manifest exists gains the
+    /// manifest's totals later through JobTotalsSet, without a second
+    /// JobCreated.
+    #[tokio::test]
+    async fn seed_once_installs_late_totals_from_the_manifest() {
+        let (rt, _store) = fresh_runtime().await;
+        let mut early = spec(Some("run-2026"));
+        early.total_files = 0;
+        early.total_bytes = 0;
+        seed_once(&rt, "run-2026", &early, None).await.unwrap();
+        let id = JobId::new("run-2026").unwrap();
+        assert_eq!(rt.job_view(&id).await.unwrap().progress.files_total, 0);
+        let m = manifest();
+        seed_once(&rt, "run-2026", &early, Some(&m)).await.unwrap();
+        let job = rt.job_view(&id).await.unwrap();
+        assert_eq!(job.progress.files_total, 15);
+        assert_eq!(job.progress.bytes_total, 150);
+        let seq = rt.last_seq().await;
+        seed_once(&rt, "run-2026", &early, Some(&m)).await.unwrap();
+        assert_eq!(rt.last_seq().await, seq, "matching totals append nothing");
     }
 
     /// Seeding is idempotent and takes its id from the manifest when

@@ -107,6 +107,17 @@ impl Snapshot {
                 );
             }
 
+            EventKind::JobTotalsSet {
+                job_id,
+                total_files,
+                total_bytes,
+            } => {
+                if let Some(j) = self.jobs.get_mut(job_id) {
+                    j.progress.files_total = *total_files;
+                    j.progress.bytes_total = *total_bytes;
+                }
+            }
+
             EventKind::JobPhaseChanged {
                 job_id,
                 from: _,
