@@ -153,8 +153,23 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
     if let Some(job) = &args.seed_job {
         let job_id = migration_coord::schema::JobId::new(job.clone())
             .map_err(|e| anyhow::anyhow!("--seed-job: {e}"))?;
-        if runtime.job_view(&job_id).await.is_some() {
-            tracing::info!(job = %job_id, "seed job already present (replayed); skipping");
+        if let Some(existing) = runtime.job_view(&job_id).await {
+            tracing::info!(job = %job_id, "seed job already present (replayed); skipping create");
+            // Totals learned late (e.g. index built after the job was
+            // first seeded): install them now via JobTotalsSet.
+            if (args.seed_total_files != 0 || args.seed_total_bytes != 0)
+                && (existing.progress.files_total != args.seed_total_files
+                    || existing.progress.bytes_total != args.seed_total_bytes)
+            {
+                let seq = runtime
+                    .ingest(migration_coord::schema::EventKind::JobTotalsSet {
+                        job_id: job_id.clone(),
+                        total_files: args.seed_total_files,
+                        total_bytes: args.seed_total_bytes,
+                    })
+                    .await?;
+                tracing::info!(job = %job_id, seq, "installed job totals");
+            }
         } else {
             let seq = runtime
                 .ingest(migration_coord::schema::EventKind::JobCreated {

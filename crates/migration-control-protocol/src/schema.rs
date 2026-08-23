@@ -681,6 +681,15 @@ pub enum EventKind {
         #[serde(default)]
         total_bytes: u64,
     },
+    /// Install or correct a job's planned totals after creation —
+    /// the normal case: totals become known when a scan or index
+    /// build finishes, which is after JobCreated. Operator-nature;
+    /// rejected on the worker events route.
+    JobTotalsSet {
+        job_id: JobId,
+        total_files: u64,
+        total_bytes: u64,
+    },
     JobPhaseChanged {
         job_id: JobId,
         from: Phase,
@@ -787,6 +796,7 @@ impl EventKind {
     pub fn name(&self) -> &'static str {
         match self {
             Self::JobCreated { .. } => "JobCreated",
+            Self::JobTotalsSet { .. } => "JobTotalsSet",
             Self::JobPhaseChanged { .. } => "JobPhaseChanged",
             Self::JobPaused { .. } => "JobPaused",
             Self::JobResumed { .. } => "JobResumed",
@@ -814,6 +824,7 @@ impl EventKind {
     pub fn job_id(&self) -> Option<&JobId> {
         match self {
             Self::JobCreated { job_id, .. }
+            | Self::JobTotalsSet { job_id, .. }
             | Self::JobPhaseChanged { job_id, .. }
             | Self::JobPaused { job_id, .. }
             | Self::JobResumed { job_id, .. }
@@ -858,6 +869,7 @@ impl EventKind {
             | Self::WorkerRecovered { worker_id } => Some(*worker_id),
 
             Self::JobCreated { .. }
+            | Self::JobTotalsSet { .. }
             | Self::JobPhaseChanged { .. }
             | Self::JobPaused { .. }
             | Self::JobResumed { .. }
