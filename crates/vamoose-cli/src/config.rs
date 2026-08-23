@@ -514,6 +514,7 @@ fn compatibility_worker_config(
                 fixed_buffer_size: "1 MiB".to_string(),
                 use_bucketed_pool: false,
                 use_raw_fh: false,
+                direct_commit: false,
             },
             batch: wcfg::BatchCfg {
                 bytes_budget: worker.bytes_budget,
