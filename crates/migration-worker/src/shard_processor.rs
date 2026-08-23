@@ -234,6 +234,7 @@ impl ShardProcessor {
             let mover = Arc::clone(&self.mover);
             let inflight = self.inflight.clone();
             let fence = self.fence.clone();
+            let live = Arc::clone(&self.live);
             joins.spawn(async move {
                 if !fence.is_valid() {
                     return Vec::new();
@@ -247,6 +248,8 @@ impl ShardProcessor {
                 if !fence.is_valid() {
                     return Vec::new();
                 }
+                live.rows_started
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let outcome = mover.move_one(&row).await;
                 vec![(row, outcome)]
             });

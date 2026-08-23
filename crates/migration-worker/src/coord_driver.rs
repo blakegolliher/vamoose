@@ -60,6 +60,11 @@ pub struct CoordDriverHandle {
 ///   when the worker runs in legacy mode.
 pub struct DriverInputs {
     pub progress: Arc<RwLock<ProgressState>>,
+    /// Live per-row counters (see `heartbeat::LivePending`); sampled
+    /// for the heartbeat's `inflight_ops` gauge (rows started minus
+    /// rows recorded — floors at 0 during phases that don't stamp
+    /// starts, never reads high).
+    pub live: Arc<crate::heartbeat::LivePending>,
     pub throughput: ThroughputCounter,
     pub fence: Fence,
     pub fence_rx: Option<tokio::sync::mpsc::Receiver<String>>,
@@ -644,7 +649,10 @@ async fn sample_heartbeat(inputs: &DriverInputs, run_control: &RunControl) -> He
         files_per_sec: 0.0,
         bytes_per_sec,
         errors_per_min: 0.0,
-        inflight_ops: 0,
+        inflight_ops: inputs.live.inflight() as u32,
+        // No real queue concept in the worker: batches admit rows
+        // straight into the inflight window. Reported as 0 honestly
+        // rather than inventing a number.
         queue_depth: 0,
     }
 }
@@ -666,6 +674,7 @@ mod tests {
         let fence = Fence::new();
         fence.trip("test-trip");
         let inputs = DriverInputs {
+            live: Arc::new(crate::heartbeat::LivePending::default()),
             progress,
             throughput,
             fence,
@@ -683,6 +692,7 @@ mod tests {
         let throughput = ThroughputCounter::new();
         let fence = Fence::new();
         let inputs = DriverInputs {
+            live: Arc::new(crate::heartbeat::LivePending::default()),
             progress,
             throughput,
             fence,
@@ -705,6 +715,7 @@ mod tests {
         let throughput = ThroughputCounter::new();
         let fence = Fence::new();
         let inputs = DriverInputs {
+            live: Arc::new(crate::heartbeat::LivePending::default()),
             progress,
             throughput,
             fence,
@@ -722,6 +733,7 @@ mod tests {
         let throughput = ThroughputCounter::new();
         let fence = Fence::new();
         let inputs = DriverInputs {
+            live: Arc::new(crate::heartbeat::LivePending::default()),
             progress,
             throughput,
             fence,

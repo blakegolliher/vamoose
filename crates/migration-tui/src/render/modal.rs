@@ -206,7 +206,10 @@ fn render_worker_modal(
         kv_key("State"),
         worker_state_span(w.state, theme),
     ]));
-    lines.push(kv_line("Last HB", format_elapsed(w.last_heartbeat, now)));
+    lines.push(kv_line(
+        "Last HB",
+        format_elapsed(state.worker_freshness(w.id, w.last_heartbeat), now),
+    ));
     lines.push(kv_line("Inflight", format!("{} ops", w.inflight_ops)));
     lines.push(kv_line("Queue depth", format!("{}", w.queue_depth)));
     if let Some(shard) = &w.assigned_shard {
@@ -215,14 +218,15 @@ fn render_worker_modal(
     lines.push(Line::raw(""));
 
     lines.push(section_header("Counters"));
+    // Client-side 60s rates from the ProgressDelta stream — same
+    // source as the workers table (worker-reported heartbeat rates
+    // under-report; the files rate is stubbed 0.0 on the wire).
+    let (files_ps, bytes_ps) = state.worker_rates(&w.job_id, w.id, 60, now);
     lines.push(kv_line(
         "Throughput",
-        format!("{}/s", format_bytes(w.counters.bytes_per_sec as u64)),
+        format!("{}/s", format_bytes(bytes_ps as u64)),
     ));
-    lines.push(kv_line(
-        "Files/s",
-        format!("{:.2}", w.counters.files_per_sec),
-    ));
+    lines.push(kv_line("Files/s", format!("{files_ps:.0}")));
     lines.push(kv_line(
         "Errs/min",
         format!("{:.2}", w.counters.errors_per_min),

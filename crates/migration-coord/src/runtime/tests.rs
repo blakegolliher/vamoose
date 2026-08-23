@@ -604,9 +604,16 @@ async fn progress_delta_coalesced_per_job_worker() {
         .try_recv()
         .expect("the trailing frame must reach the subscriber");
     match &env.kind {
+        // Lossless coalescing: the trailing frame carries the SUM of
+        // every suppressed-and-undelivered delta for the key — the 4
+        // suppressed 10s from the first burst (40) plus this burst's
+        // suppressed 42. Delivered totals then equal ingested totals
+        // (10 + 1 + 100 + 82 = 50 + 1 + 100 + 42 = 193); latest-wins
+        // retention dropped the difference on the floor and every
+        // client-derived rate under-reported.
         EventKind::ProgressDelta { files_delta, .. } => assert_eq!(
-            *files_delta, 42,
-            "the trailing frame must carry the burst's final values",
+            *files_delta, 82,
+            "the trailing frame must carry the coalesced sum of all suppressed deltas",
         ),
         other => panic!("expected the trailing ProgressDelta, got {other:?}"),
     }

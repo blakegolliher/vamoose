@@ -196,6 +196,7 @@ async fn full_lifecycle_register_emit_pause_resume_fence() {
     let fence = Fence::new();
     let inputs = DriverInputs {
         progress: Arc::new(RwLock::new(ProgressState::new())),
+        live: std::sync::Arc::new(migration_worker::heartbeat::LivePending::default()),
         throughput: ThroughputCounter::new(),
         fence: fence.clone(),
         fence_rx: Some(fence_rx),
@@ -324,6 +325,7 @@ async fn worker_restart_dedups_prior_worker() {
     let fence_a = Fence::new();
     let inputs_a = DriverInputs {
         progress: Arc::new(RwLock::new(ProgressState::new())),
+        live: std::sync::Arc::new(migration_worker::heartbeat::LivePending::default()),
         throughput: ThroughputCounter::new(),
         fence: fence_a,
         fence_rx: None,
@@ -362,6 +364,7 @@ async fn worker_restart_dedups_prior_worker() {
     let fence_b = Fence::new();
     let inputs_b = DriverInputs {
         progress: Arc::new(RwLock::new(ProgressState::new())),
+        live: std::sync::Arc::new(migration_worker::heartbeat::LivePending::default()),
         throughput: ThroughputCounter::new(),
         fence: fence_b,
         fence_rx: None,
@@ -417,6 +420,7 @@ async fn coord_restart_buffered_events_drain_after_reconnect() {
     let fence = Fence::new();
     let inputs = DriverInputs {
         progress: Arc::new(RwLock::new(ProgressState::new())),
+        live: std::sync::Arc::new(migration_worker::heartbeat::LivePending::default()),
         throughput: ThroughputCounter::new(),
         fence,
         fence_rx: None,

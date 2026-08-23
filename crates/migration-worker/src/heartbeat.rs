@@ -113,6 +113,10 @@ pub struct HeldClaim {
 /// gap briefly under-counts, never double-counts).
 #[derive(Debug, Default)]
 pub struct LivePending {
+    /// Rows admitted to the mover (permit acquired, copy underway).
+    /// `rows_started - rows_done` = live in-flight ops, sampled by
+    /// the coord heartbeat's `inflight_ops` gauge.
+    pub rows_started: std::sync::atomic::AtomicU64,
     pub rows_done: std::sync::atomic::AtomicU64,
     pub bytes_moved: std::sync::atomic::AtomicU64,
     pub files_ok: std::sync::atomic::AtomicU64,
@@ -121,8 +125,17 @@ pub struct LivePending {
 }
 
 impl LivePending {
+    /// Live in-flight ops (started but not yet recorded).
+    pub fn inflight(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.rows_started
+            .load(Relaxed)
+            .saturating_sub(self.rows_done.load(Relaxed))
+    }
+
     pub fn reset(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        self.rows_started.store(0, Relaxed);
         self.rows_done.store(0, Relaxed);
         self.bytes_moved.store(0, Relaxed);
         self.files_ok.store(0, Relaxed);
