@@ -29,3 +29,4 @@
 
 # Per-session tool state
 .claude/
+/dist

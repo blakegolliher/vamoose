@@ -194,6 +194,8 @@ mod tests {
                 dest: "nfs://dst".into(),
                 owner: "blake".into(),
                 config_hash: ConfigHash("deadbeef".into()),
+                total_files: 0,
+                total_bytes: 0,
             },
         )
     }

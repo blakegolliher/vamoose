@@ -126,6 +126,13 @@ pub struct MoverCfg {
     /// via `vamoose worker --use-bucketed-pool`. Off by default.
     #[serde(default)]
     pub use_bucketed_pool: bool,
+    /// When true, regular-file copies use the raw NFSv3 filehandle
+    /// path (cached parent-dir filehandles, attrs at CREATE, one
+    /// SETATTR, RENAME by dir fh) — ~6 RPCs per small file instead of
+    /// the path-based API's per-component LOOKUP storm. See
+    /// `migration_mover::libnfs::raw`. Off by default.
+    #[serde(default)]
+    pub use_raw_fh: bool,
 }
 fn default_strategy() -> String {
     "libnfs_io_uring".into()

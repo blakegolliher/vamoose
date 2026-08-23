@@ -72,6 +72,36 @@ pub struct Args {
     /// port. Intended only for isolated lab networks.
     #[arg(long)]
     pub allow_unauthenticated_nonloopback: bool,
+
+    /// Seed a job into the registry at startup if it does not already
+    /// exist (idempotent across restarts — replay wins when the job is
+    /// already in the log). This is the bootstrap for a fresh coord:
+    /// there is deliberately no job-create HTTP route yet, and workers'
+    /// /workers/register 404s for unknown jobs. The id must match the
+    /// workers' `[coord] job_id`.
+    #[arg(long)]
+    pub seed_job: Option<String>,
+
+    /// Human-readable name for `--seed-job` (defaults to the job id).
+    #[arg(long)]
+    pub seed_job_name: Option<String>,
+
+    /// `source` field recorded on the seeded job (display only).
+    #[arg(long, default_value = "nfs://unspecified")]
+    pub seed_source: String,
+
+    /// `dest` field recorded on the seeded job (display only).
+    #[arg(long, default_value = "nfs://unspecified")]
+    pub seed_dest: String,
+
+    /// Planned total files for the seeded job (drives percent/ETA in
+    /// the TUI; 0 = unknown). Typically the manifest's `total_rows`.
+    #[arg(long, default_value_t = 0)]
+    pub seed_total_files: u64,
+
+    /// Planned total bytes for the seeded job (0 = unknown).
+    #[arg(long, default_value_t = 0)]
+    pub seed_total_bytes: u64,
 }
 
 pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -116,6 +146,34 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
     let rt_cfg = RuntimeConfig::default_for_prod();
     tracing::info!(holder_id = %me.holder_id, listen = %args.listen, "coord: starting runtime");
     let runtime = CoordRuntime::start(store, Arc::new(SystemClock), me, rt_cfg.clone()).await?;
+
+    // 4b. Seed the job registry if asked. After replay, so an
+    //     existing job (from a previous coord generation's log) wins
+    //     and no duplicate JobCreated is appended.
+    if let Some(job) = &args.seed_job {
+        let job_id = migration_coord::schema::JobId::new(job.clone())
+            .map_err(|e| anyhow::anyhow!("--seed-job: {e}"))?;
+        if runtime.job_view(&job_id).await.is_some() {
+            tracing::info!(job = %job_id, "seed job already present (replayed); skipping");
+        } else {
+            let seq = runtime
+                .ingest(migration_coord::schema::EventKind::JobCreated {
+                    job_id: job_id.clone(),
+                    name: args
+                        .seed_job_name
+                        .clone()
+                        .unwrap_or_else(|| job.clone()),
+                    source: args.seed_source.clone(),
+                    dest: args.seed_dest.clone(),
+                    owner: whoami_owner(),
+                    config_hash: migration_coord::schema::ConfigHash("seeded-via-cli".into()),
+                    total_files: args.seed_total_files,
+                    total_bytes: args.seed_total_bytes,
+                })
+                .await?;
+            tracing::info!(job = %job_id, seq, "seeded job into registry");
+        }
+    }
 
     // 5. Background ticks + signal handler.
     let shutdown = CancellationToken::new();
@@ -286,6 +344,8 @@ mod tests {
             dest: "nfs://dst".into(),
             owner: "test".into(),
             config_hash: ConfigHash("ab".into()),
+            total_files: 0,
+            total_bytes: 0,
         }
     }
 
@@ -376,4 +436,12 @@ mod tests {
         check_dev_mode_bind(true, &addr("0.0.0.0:8443"), true)
             .expect("--allow-unauthenticated-nonloopback must permit the bind");
     }
+}
+
+
+/// Owner string for seeded jobs: the invoking user, best-effort.
+fn whoami_owner() -> String {
+    std::env::var("SUDO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "operator".to_string())
 }

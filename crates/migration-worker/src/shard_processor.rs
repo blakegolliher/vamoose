@@ -57,11 +57,23 @@ type HardlinkKey = (Option<u64>, u64);
 
 pub struct ShardProcessor {
     pub mover: Arc<dyn FileMover>,
+    /// Live per-row counters published by the heartbeat between batch
+    /// commits (see `heartbeat::LivePending`). Reset by the
+    /// orchestrator when it merges shard-end totals into
+    /// `ProgressState`.
+    pub live: Arc<crate::heartbeat::LivePending>,
     pub fence: Fence,
     pub budget: BatchBudget,
     pub inflight: InflightLimiter,
     pub failures: FailureSink,
     pub throughput: ThroughputCounter,
+    /// Directory rows seen in this shard, kept for the shard-end
+    /// attr re-stamp: every file CREATE bumps its parent dir's mtime,
+    /// so per-batch dir stamping is undone by later batches. One
+    /// idempotent DirAttrs replay after the last batch makes dir
+    /// mtimes correct at shard scope (cross-shard children remain the
+    /// documented caveat).
+    pub dir_restamp: Vec<RowView>,
     /// Set true the first time we see an `inode`-bearing row with no
     /// `fsid`; gates the one-shot WARN + `FsidUngrouped` downgrade.
     pub fsid_fallback_warned: bool,
@@ -80,6 +92,7 @@ impl ShardProcessor {
 
         // Per-shard state reset.
         self.fsid_fallback_warned = false;
+        self.dir_restamp.clear();
 
         let mut current = Batch::default();
         let mut outcome = ProcessOutcome {
@@ -110,6 +123,56 @@ impl ShardProcessor {
         if !self.fence.is_valid() {
             return Ok(outcome.with_fenced(true));
         }
+
+        // ---- Shard-end dir attr re-stamp -----------------------------
+        // Replays DirAttrs for every dir row now that no more file
+        // CREATEs in this shard can bump parent mtimes. Idempotent; no
+        // ordering requirement (SETATTR on a child dir does not touch
+        // its parent). Failures count normally.
+        if !self.dir_restamp.is_empty() {
+            tracing::info!(
+                dirs = self.dir_restamp.len(),
+                "shard-end directory attr re-stamp",
+            );
+            let rows = std::mem::take(&mut self.dir_restamp);
+            let mut joins: JoinSet<Vec<(RowView, MoveOutcome)>> = JoinSet::new();
+            for row in rows {
+                let mover = Arc::clone(&self.mover);
+                let inflight = self.inflight.clone();
+                let fence = self.fence.clone();
+                joins.spawn(async move {
+                    if !fence.is_valid() {
+                        return Vec::new();
+                    }
+                    let _permit = inflight.acquire(row.size).await;
+                    if !fence.is_valid() {
+                        return Vec::new();
+                    }
+                    let mo = mover.move_one(&row).await;
+                    vec![(row, mo)]
+                });
+            }
+            while let Some(joined) = joins.join_next().await {
+                match joined {
+                    Ok(results) => {
+                        for (row, mo) in results {
+                            // Only surface restamp *failures*; successes were
+                            // already counted when the row ran in its batch.
+                            if mo.result.is_err() {
+                                self.record(&row, mo, &mut outcome);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        outcome.files_failed += 1;
+                        tracing::error!(error = ?e, "dir restamp task join failed");
+                    }
+                }
+            }
+            if !self.fence.is_valid() {
+                return Ok(outcome.with_fenced(true));
+            }
+        }
         Ok(outcome)
     }
 
@@ -132,6 +195,7 @@ impl ShardProcessor {
         let mut dirs: Vec<RowView> = Vec::new();
         for row in batch.rows {
             if row.file_type == FileTypeTag::Dir {
+                self.dir_restamp.push(row.clone());
                 dirs.push(row);
                 continue;
             }
@@ -145,6 +209,16 @@ impl ShardProcessor {
                 _ => singletons.push(row),
             }
         }
+
+        // Interleave singletons round-robin across parent directories.
+        // Row order is directory-clustered (walker DFS), so the
+        // in-flight window otherwise targets only a handful of parent
+        // dirs at a time — and the NFS server serializes creates
+        // within one parent (measured ~185 creates/s/dir on VAST).
+        // Spreading the window across parents turns the per-dir
+        // ceiling into a non-factor. Deterministic: first-seen parent
+        // order, original row order within each parent.
+        let singletons = interleave_by_parent(singletons);
 
         // ---- Phase 1: dispatch non-dir work concurrently -------------
         let mut joins: JoinSet<Vec<(RowView, MoveOutcome)>> = JoinSet::new();
@@ -195,27 +269,67 @@ impl ShardProcessor {
             }
         }
 
-        // ---- Phase 2: dirs, deepest-first, sequential ----------------
+        // ---- Phase 2: dirs, deepest-first, level-parallel ------------
         //
-        // Sequential because applying attrs to a child dir is fast
-        // enough that concurrency isn't worth it, and serializing keeps
-        // the deepest-first invariant trivially intact (a parallel
-        // run could mkdir an empty child dir after the parent's setattr,
-        // restamping the parent).
+        // Deepest-first is the invariant that keeps dir mtimes honest: a
+        // parent's setattr must come after every deeper mkdir that could
+        // restamp it. Fully sequential processing preserved that but
+        // serializes ~5 ms metadata RPCs per dir, which dominates
+        // dir-dense batches. Instead: group dirs into depth levels and
+        // run each level concurrently with a barrier between levels.
+        // Within one level no dir is an ancestor of another, and all
+        // deeper levels (the only possible restampers) are fully
+        // committed before a shallower level's setattr runs — the same
+        // guarantee the sequential loop gave.
         if !dirs.is_empty() {
             sort_deepest_first(&mut dirs);
+            let mut levels: Vec<Vec<RowView>> = Vec::new();
+            let mut level_depth: Option<usize> = None;
             for row in dirs {
+                let d = row.path.iter().filter(|&&b| b == b'/').count();
+                if level_depth != Some(d) {
+                    levels.push(Vec::new());
+                    level_depth = Some(d);
+                }
+                levels.last_mut().expect("just pushed").push(row);
+            }
+
+            for level in levels {
                 if !self.fence.is_valid() {
                     break;
                 }
-                let _permit = self.inflight.acquire(row.size).await;
-                // Fence may have tripped while waiting for the inflight
-                // permit; recheck before launching the mover op.
-                if !self.fence.is_valid() {
-                    break;
+                let mut joins: JoinSet<Vec<(RowView, MoveOutcome)>> = JoinSet::new();
+                for row in level {
+                    let mover = Arc::clone(&self.mover);
+                    let inflight = self.inflight.clone();
+                    let fence = self.fence.clone();
+                    joins.spawn(async move {
+                        if !fence.is_valid() {
+                            return Vec::new();
+                        }
+                        let _permit = inflight.acquire(row.size).await;
+                        // Fence may have tripped while waiting for the
+                        // inflight permit; recheck before the mover op.
+                        if !fence.is_valid() {
+                            return Vec::new();
+                        }
+                        let mo = mover.move_one(&row).await;
+                        vec![(row, mo)]
+                    });
                 }
-                let mo = self.mover.move_one(&row).await;
-                self.record(&row, mo, outcome);
+                while let Some(joined) = joins.join_next().await {
+                    match joined {
+                        Ok(results) => {
+                            for (row, mo) in results {
+                                self.record(&row, mo, outcome);
+                            }
+                        }
+                        Err(e) => {
+                            outcome.files_failed += 1;
+                            tracing::error!(error = ?e, "dir task join failed");
+                        }
+                    }
+                }
             }
         }
 
@@ -238,6 +352,23 @@ impl ShardProcessor {
     }
 
     fn record(&mut self, row: &RowView, mo: MoveOutcome, outcome: &mut ProcessOutcome) {
+        // Live counters first — same classification as record_outcome.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.live.rows_done.fetch_add(1, Relaxed);
+            match (&mo.result, mo.strategy) {
+                (Ok(()), _) => {
+                    self.live.files_ok.fetch_add(1, Relaxed);
+                    self.live.bytes_moved.fetch_add(mo.bytes_moved, Relaxed);
+                }
+                (Err(e), _) if matches!(e.phase, migration_core::records::FailurePhase::Fenced) => {
+                    self.live.files_fenced.fetch_add(1, Relaxed);
+                }
+                (Err(_), _) => {
+                    self.live.files_failed.fetch_add(1, Relaxed);
+                }
+            }
+        }
         record_outcome(
             &row.path,
             mo,
@@ -398,6 +529,36 @@ pub(crate) fn hardlink_key(row: &RowView) -> Option<HardlinkKey> {
 ///
 /// "Depth" here is just the count of `/` separators. Stable so
 /// equal-depth paths keep their input order.
+/// Round-robin rows across their parent directories: one row from each
+/// parent in first-seen order, repeating until all queues drain. See
+/// the call site in `run_batch` for why (per-directory create
+/// serialization on the NFS server).
+pub(crate) fn interleave_by_parent(rows: Vec<RowView>) -> Vec<RowView> {
+    let total = rows.len();
+    let mut queues: Vec<std::collections::VecDeque<RowView>> = Vec::new();
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+    for row in rows {
+        let parent = match row.path.iter().rposition(|&b| b == b'/') {
+            Some(i) => row.path[..i].to_vec(),
+            None => Vec::new(),
+        };
+        let qi = *index.entry(parent).or_insert_with(|| {
+            queues.push(std::collections::VecDeque::new());
+            queues.len() - 1
+        });
+        queues[qi].push_back(row);
+    }
+    let mut out = Vec::with_capacity(total);
+    while out.len() < total {
+        for q in queues.iter_mut() {
+            if let Some(row) = q.pop_front() {
+                out.push(row);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn sort_deepest_first(dirs: &mut [RowView]) {
     dirs.sort_by(|a, b| {
         let da = a.path.iter().filter(|&&b| b == b'/').count();

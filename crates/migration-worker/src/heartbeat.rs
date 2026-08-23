@@ -53,6 +53,10 @@ pub struct HeartbeatTask {
     /// Updated by the shard processor as batches complete; read-only
     /// here. Initialized by the orchestrator at startup.
     pub progress: Arc<RwLock<ProgressState>>,
+    /// Pending per-row deltas for the in-flight shard (see
+    /// [`LivePending`]); added on top of the `ProgressState` snapshot
+    /// so published counters move at heartbeat granularity.
+    pub live: Arc<LivePending>,
     /// Cumulative byte counter; sampled here on every tick to compute
     /// the rolling 60s MB/s the heartbeat publishes.
     pub throughput: ThroughputCounter,
@@ -98,6 +102,35 @@ pub struct HeldClaim {
 /// Snapshot of worker state, written into `progress/host-<id>.json` on
 /// each heartbeat tick. The processor and orchestrator update fields
 /// here; the heartbeat task only reads.
+/// Per-row counters the shard processor bumps as each row commits,
+/// read by the heartbeat tick so `progress/host-*.json` moves every
+/// 30s instead of only at shard completion (a 7.68M-row shard is
+/// hours of zeros otherwise — the "run looks hung" trap from the
+/// 2026-08-22 rig run). These are the *pending* deltas for the shard
+/// in flight; the orchestrator's existing shard-end merge into
+/// `ProgressState` remains the durable accumulation, and it resets
+/// the pending set immediately before merging (a tick landing in the
+/// gap briefly under-counts, never double-counts).
+#[derive(Debug, Default)]
+pub struct LivePending {
+    pub rows_done: std::sync::atomic::AtomicU64,
+    pub bytes_moved: std::sync::atomic::AtomicU64,
+    pub files_ok: std::sync::atomic::AtomicU64,
+    pub files_failed: std::sync::atomic::AtomicU64,
+    pub files_fenced: std::sync::atomic::AtomicU64,
+}
+
+impl LivePending {
+    pub fn reset(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.rows_done.store(0, Relaxed);
+        self.bytes_moved.store(0, Relaxed);
+        self.files_ok.store(0, Relaxed);
+        self.files_failed.store(0, Relaxed);
+        self.files_fenced.store(0, Relaxed);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProgressState {
     pub started_utc: UtcTime,
@@ -368,17 +401,27 @@ impl HeartbeatTask {
     ) -> migration_core::Result<()> {
         let throughput_mb_s = self.throughput.sample_mb_s(self.throughput_window_secs);
         let snap = self.progress.read().await.clone();
+        let live = &self.live;
+        use std::sync::atomic::Ordering::Relaxed;
         let record = ProgressRecord {
             host: self.host_id.clone(),
             started_utc: snap.started_utc,
             heartbeat_utc: UtcTime::now(),
             current_shard: snap.current_shard,
             shard_rows_total: snap.shard_rows_total,
-            shard_rows_done: snap.shard_rows_done,
-            shard_bytes_done: snap.shard_bytes_done,
-            files_ok: snap.files_ok,
-            files_failed: snap.files_failed,
-            files_fenced: snap.files_fenced,
+            shard_rows_done: snap
+                .shard_rows_done
+                .saturating_add(live.rows_done.load(Relaxed)),
+            shard_bytes_done: snap
+                .shard_bytes_done
+                .saturating_add(live.bytes_moved.load(Relaxed)),
+            files_ok: snap.files_ok.saturating_add(live.files_ok.load(Relaxed)),
+            files_failed: snap
+                .files_failed
+                .saturating_add(live.files_failed.load(Relaxed)),
+            files_fenced: snap
+                .files_fenced
+                .saturating_add(live.files_fenced.load(Relaxed)),
             throughput_mb_s_1m: throughput_mb_s,
             status: status.to_string(),
             // Cross-check fields (PROGRESS_LIVENESS_CROSS_CHECK.md):
@@ -617,6 +660,7 @@ mod tests {
         let (coord_tx, coord_rx) = tokio::sync::mpsc::channel(8);
         *store.cell.lock().unwrap() = Some(current.clone());
         let task = HeartbeatTask {
+            live: std::sync::Arc::new(crate::heartbeat::LivePending::default()),
             store: store.clone() as Arc<dyn ClaimStore>,
             fence: fence.clone(),
             host_id: HOST.to_string(),

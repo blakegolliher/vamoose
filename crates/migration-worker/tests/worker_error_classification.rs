@@ -21,6 +21,8 @@
 // file links a separate full-workspace debug executable, and one
 // binary too many has tipped CI runners into linker SIGBUS (disk
 // exhaustion).
+#[path = "worker_error_classification/lease_liveness.rs"]
+mod lease_liveness;
 #[path = "worker_error_classification/transient_retry.rs"]
 mod transient_retry;
 

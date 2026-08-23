@@ -43,7 +43,10 @@ pub(super) fn render_top_banner(
     // 1-min total throughput across all jobs. Append "/s" so the
     // unit is unambiguous even when the value rounds to 0.
     let total_bps = state.total_bytes_per_sec(60, now);
-    let throughput_label = if total_bps > 0.0 {
+    let total_fps = state.total_files_per_sec(60, now);
+    let throughput_label = if total_fps >= 1.0 {
+        format!(" · {total_fps:.0} files/s · {}/s", format_bytes(total_bps as u64))
+    } else if total_bps > 0.0 {
         format!(" · {}/s", format_bytes(total_bps as u64))
     } else {
         String::new()

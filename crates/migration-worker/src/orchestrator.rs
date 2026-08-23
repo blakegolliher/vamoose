@@ -184,7 +184,17 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     // ---- 3. Mount libnfs pool + build mover -----------------------
     // M3: pre-mount cfg.mover.nfs_connections context pairs so
     // concurrent shard dispatch has distinct contexts to draw from.
+    // In bucketed-async mode the sync pool only serves fallback rows
+    // (symlink/hardlink/dir/empty), so cap it — every context pair
+    // costs two reserved ports (libnfs as root binds ports < 1024;
+    // ~111 pairs is the observed per-host ceiling) and the async pool
+    // needs that headroom for its small-bucket pairs.
     let pool_size = cfg.mover.nfs_connections.max(1) as usize;
+    let pool_size = if cfg.mover.use_bucketed_pool {
+        pool_size.min(16)
+    } else {
+        pool_size
+    };
     let pool: Arc<dyn LibnfsContextPool> = MultiPool::build(
         &manifest.source.url,
         &manifest.dest.url,
@@ -212,6 +222,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     );
     mover_cfg.require_chown = require_chown && cap_chown;
     mover_cfg.require_unchanged_size = cfg.copy.require_unchanged_size;
+    mover_cfg.use_raw_fh = cfg.mover.use_raw_fh;
     // F12: [mover] rpc_timeout_ms flows config → MoverConfig →
     // MountOpts (both pools read it from here / from cfg.mover).
     mover_cfg.rpc_timeout_ms = cfg.mover.rpc_timeout_ms;
@@ -229,6 +240,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
 
     // ---- 4. Shared progress + heartbeat ----------------------------
     let progress = Arc::new(RwLock::new(ProgressState::new()));
+    let live = Arc::new(crate::heartbeat::LivePending::default());
     let current = Arc::new(Mutex::new(None::<HeldClaim>));
     let fence = Fence::new();
 
@@ -244,13 +256,15 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
                 &manifest.source.url,
                 &manifest.dest.url,
                 mover_cfg.rpc_timeout_ms,
+                cfg.mover.nfs_connections.max(1) as usize,
             )
             .await?,
         );
         tracing::info!(
             src = %manifest.source.url,
             dst = %manifest.dest.url,
-            "bucketed async libnfs pool mounted (6 contexts)",
+            small_pairs = async_pool.small_pairs(),
+            "bucketed async libnfs pool mounted",
         );
         let sync_mover = Mover::new(
             mover_cfg.clone(),
@@ -322,6 +336,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     };
 
     let hb = HeartbeatTask {
+        live: Arc::clone(&live),
         store: s3.clone() as Arc<dyn ClaimStore>,
         fence: fence.clone(),
         host_id: host_id.clone(),
@@ -685,6 +700,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
             p.shard_bytes_done = 0;
             p.status = "active".into();
         }
+        live.reset();
 
         // Download the parquet shard to scratch and verify its etag
         // against the manifest (F40). F42: neither failure may take
@@ -738,6 +754,8 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
         // limiter/sinks/throughput so all shards report into one
         // throughput counter and one failure log per host.
         let mut processor = ShardProcessor {
+            dir_restamp: Vec::new(),
+            live: Arc::clone(&live),
             mover: Arc::clone(&mover),
             fence: fence.clone(),
             budget,
@@ -785,6 +803,10 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
         };
 
         // Push final per-shard counters into the shared progress.
+        // Reset the live pending set FIRST: a heartbeat tick landing
+        // between reset and merge briefly under-counts; the reverse
+        // order would double-count.
+        live.reset();
         {
             let mut p = progress.write().await;
             p.shard_rows_total = outcome.rows_total;
@@ -1360,18 +1382,33 @@ pub async fn scan_shards(
                         all_terminal = false;
                         let age = now.signed_duration_since(record.claimed_utc.0);
                         let stale_by_lease = age.to_std().map(|d| d > lease).unwrap_or(false);
-                        // Cross-check the per-host progress file. Lets
-                        // a peer reclaim within ~2× the owner's
-                        // heartbeat_sec when the owner has stopped
-                        // heartbeating, instead of waiting the full
-                        // lease window. See
-                        // docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md.
+                        // Progress-liveness cross-check — AUTHORITATIVE
+                        // for Active claims. `claimed_utc` is written
+                        // once at acquire and never advances (refresh
+                        // is HEAD-and-compare), so `stale_by_lease` is
+                        // true for EVERY shard held longer than the
+                        // lease window; on its own it is not evidence
+                        // of a dead owner. Acting on it alone stole a
+                        // live, heartbeating owner's shard on the
+                        // 2026-08-22 600M rig run (dual-writer window
+                        // closed only by the owner's self-fence).
+                        //
+                        // The per-host progress file is the real
+                        // heartbeat: a fresh, matching-`held_etag`
+                        // record VETOES reclaim regardless of claim
+                        // age; a stale/absent/mismatched one makes the
+                        // shard reclaimable within ~2× the owner's
+                        // heartbeat_sec (see
+                        // docs/work-items/PROGRESS_LIVENESS_CROSS_CHECK.md).
+                        // `stale_by_lease` survives only as the
+                        // conservative fallback when the progress
+                        // object cannot be read at all.
                         //
                         // Only fetch when we'd act on the result — and
                         // dedupe by host within a single pass so M
                         // active shards owned by N hosts cost at most
                         // N progress GETs.
-                        let stale_by_progress = if next.is_none() && !skipped && !stale_by_lease {
+                        let stale = if next.is_none() && !skipped {
                             let fetch = match progress_cache.get(&record.host).cloned() {
                                 Some(cached) => cached,
                                 None => {
@@ -1409,12 +1446,15 @@ pub async fn scan_shards(
                                     heartbeat_sec,
                                     now,
                                 ),
-                                ProgressFetch::Error => false,
+                                // Progress unreadable: fall back to the
+                                // lease window as the only (coarse)
+                                // dead-owner signal.
+                                ProgressFetch::Error => stale_by_lease,
                             }
                         } else {
                             false
                         };
-                        if (stale_by_lease || stale_by_progress) && next.is_none() && !skipped {
+                        if stale && next.is_none() && !skipped {
                             next = Some(ClaimTarget::Stale {
                                 shard: shard_filename.clone(),
                                 stale_etag: e.etag.clone(),

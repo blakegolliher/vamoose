@@ -40,6 +40,7 @@ use std::os::raw::{c_char, c_int, c_void};
 
 pub mod asyncio;
 pub mod ops;
+pub mod raw;
 pub mod pool;
 
 pub use pool::{ContextPair, LibnfsContextPool, MultiPool, SimplePool};
@@ -166,6 +167,8 @@ extern "C" {
     // Attributes
     pub fn nfs_chmod(nfs: *mut nfs_context, path: *const c_char, mode: c_int) -> c_int;
     pub fn nfs_chown(nfs: *mut nfs_context, path: *const c_char, uid: c_int, gid: c_int) -> c_int;
+    pub fn nfs_fchmod(nfs: *mut nfs_context, nfsfh: *mut nfsfh, mode: c_int) -> c_int;
+    pub fn nfs_fchown(nfs: *mut nfs_context, nfsfh: *mut nfsfh, uid: c_int, gid: c_int) -> c_int;
     /// `times` points to an array of two `struct timeval` —
     /// `[atime, mtime]`. Sub-second precision is microseconds; the
     /// nanosecond columns in the index are truncated and the precision

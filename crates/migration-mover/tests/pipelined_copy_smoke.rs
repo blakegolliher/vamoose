@@ -75,6 +75,7 @@ async fn pipelined_copy_roundtrip_byte_perfect() {
         &src_url(),
         &dst_url(),
         migration_mover::DEFAULT_RPC_TIMEOUT_MS,
+        1,
     )
     .await
     .expect("BucketedAsyncPool::new");

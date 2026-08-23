@@ -118,6 +118,8 @@ fn job_created(seq: u64, j: &str) -> EventEnvelope {
             dest: "nfs://dst".into(),
             owner: "test".into(),
             config_hash: ConfigHash("ab".into()),
+            total_files: 0,
+            total_bytes: 0,
         },
     }
 }

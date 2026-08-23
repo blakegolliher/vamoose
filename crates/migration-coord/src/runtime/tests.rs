@@ -44,6 +44,8 @@ fn job_created(job: &str) -> EventKind {
         dest: "nfs://dst".into(),
         owner: "test".into(),
         config_hash: crate::schema::ConfigHash("ab".into()),
+        total_files: 0,
+        total_bytes: 0,
     }
 }
 
@@ -189,7 +191,10 @@ async fn restart_replays_prior_state() {
         .unwrap();
     let snap = rt2.state().await;
     assert_eq!(snap.jobs[&jid("bobby")].progress.files_done, 100);
-    assert_eq!(snap.jobs[&jid("bobby")].phase, Phase::Planned);
+    // Progress flowed, so the reducer derives Copying from the first
+    // ProgressDelta — identically live and on replay (that derivation
+    // living in the shared reducer is what this test now also proves).
+    assert_eq!(snap.jobs[&jid("bobby")].phase, Phase::Copying);
     // 3b replay equality: the stale Disconnected row was pruned
     // at snapshot write, the fresh one survives, and the replayed
     // worker table converges with the live coord's post-prune

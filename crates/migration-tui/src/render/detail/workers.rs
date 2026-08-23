@@ -64,7 +64,10 @@ pub(super) fn render_workers_tab(
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = workers.iter().map(|w| worker_row(w, state, now)).collect();
+    let rows: Vec<Row> = workers
+        .iter()
+        .map(|w| worker_row(w, state, &job.id, now))
+        .collect();
 
     let widths = [
         Constraint::Min(12),    // Host (flex)
@@ -80,7 +83,17 @@ pub(super) fn render_workers_tab(
     frame.render_widget(table, chunks[1]);
 }
 
-fn worker_row<'a>(w: &'a Worker, state: &AppState, now: DateTime<Utc>) -> Row<'a> {
+fn worker_row<'a>(
+    w: &'a Worker,
+    state: &AppState,
+    job_id: &JobId,
+    now: DateTime<Utc>,
+) -> Row<'a> {
+    // Client-side 60s rates from the ProgressDelta stream — the
+    // worker-reported heartbeat counters under-report (files rate is
+    // stubbed 0.0 by current workers).
+    let (files_ps, bytes_ps) = state.worker_rates(job_id, w.id, 60, now);
+    let freshness = state.worker_freshness(w.id, w.last_heartbeat);
     let theme = &state.theme;
     let selected = state.ui.selected_worker.as_ref() == Some(&w.id);
     let base_style = if selected {
@@ -98,12 +111,12 @@ fn worker_row<'a>(w: &'a Worker, state: &AppState, now: DateTime<Utc>) -> Row<'a
     Row::new(vec![
         Cell::from(host),
         Cell::from(worker_state_span(w.state, theme)),
-        Cell::from(format_bytes(w.counters.bytes_per_sec as u64)),
-        Cell::from(format!("{:.1}", w.counters.files_per_sec)),
+        Cell::from(format_bytes(bytes_ps as u64)),
+        Cell::from(format!("{:.0}", files_ps)),
         Cell::from(format!("{:.1}", w.counters.errors_per_min)),
         Cell::from(format!("{}", w.inflight_ops)),
         Cell::from(format!("{}", w.queue_depth)),
-        Cell::from(format_elapsed(w.last_heartbeat, now)),
+        Cell::from(format_elapsed(freshness, now)),
     ])
     .style(base_style)
 }
