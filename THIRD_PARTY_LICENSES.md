@@ -8439,7 +8439,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 > Crates using this license: 2
 
 - [`h2`](https://crates.io/crates/h2) v0.3.27
-- [`h2`](https://crates.io/crates/h2) v0.4.13
+- [`h2`](https://crates.io/crates/h2) v0.4.18
 
 <details>
 <summary>License text</summary>
