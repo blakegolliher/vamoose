@@ -263,6 +263,7 @@ fn validate_worker_event(kind: &EventKind, caller: WorkerId) -> Result<(), ApiEr
         // kinds: never accepted from workers.
         EventKind::JobCreated { .. }
         | EventKind::JobTotalsSet { .. }
+        | EventKind::ProgressSync { .. }
         | EventKind::JobPhaseChanged { .. }
         | EventKind::JobPaused { .. }
         | EventKind::JobResumed { .. }
