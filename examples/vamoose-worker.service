@@ -1,0 +1,24 @@
+[Unit]
+Description=vamoose migration worker
+Documentation=https://github.com/blakegolliher/vamoose
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root required: libnfs binds reserved ports (<1024) for AUTH_SYS and
+# preserve_owner needs CAP_CHOWN semantics on the wire.
+User=root
+ExecStart=/usr/bin/vamoose worker --config /etc/vamoose/vamoose.toml
+# /etc/vamoose/vamoose.env may set e.g. LIBNFS_USE_ALL_RESERVED=1
+# (use /etc/services-named reserved ports; lifts the ~115-connection
+# per-host cap) or RUST_LOG.
+EnvironmentFile=-/etc/vamoose/vamoose.env
+Restart=on-failure
+RestartSec=10
+# The worker exits 0 when every shard is terminal; don't restart then.
+SuccessExitStatus=0
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
