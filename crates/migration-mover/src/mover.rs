@@ -58,6 +58,18 @@ const SYMLINK_DEFAULT_MODE: u32 = 0o0777;
 /// active path deliberately uses a plain buffer.
 const STREAM_BUF_SIZE: usize = 1 << 20; // 1 MiB
 
+/// Bound READDIRPLUS prefetch memory for pathological flat directories.
+/// Typical source directories in the 600M-file run held ~120 children.
+const DIR_CHILDREN_ENTRY_CAP: usize = 100_000;
+/// Bound the aggregate number of cached child filehandles instead of assuming
+/// a small directory working set. The worker interleaves parents within each
+/// dispatch batch; a 91-directory hardware smoke test thrashed a 64-directory
+/// LRU even though those directories held only ~13K children in total.
+const DIR_CHILDREN_CACHE_FH_CAPACITY: usize = 1_000_000;
+/// Disabled sentinels have no child filehandles, so retain a separate directory
+/// bound to keep failed/oversized prefetches from accumulating indefinitely.
+const DIR_CHILDREN_CACHE_DIR_CAPACITY: usize = 4_096;
+
 /// Outcome of attempting to move one file.
 #[derive(Debug, Clone)]
 pub struct MoveOutcome {
@@ -111,13 +123,14 @@ pub struct MoverConfig {
     /// Route regular-file copies through the raw NFSv3 filehandle
     /// path ([`crate::libnfs::raw`]): cached parent-dir filehandles,
     /// attrs stamped at CREATE, FILE_SYNC single-chunk writes, one
-    /// SETATTR for times. ~6 RPCs per small file vs ~60-80 on the
-    /// path-based API. Regular files only; other row types keep the
-    /// path-based ops.
+    /// SETATTR for times, and READDIRPLUS child-FH prefetch. ~5 RPCs
+    /// per small file (plus an amortized per-directory READDIRPLUS)
+    /// vs ~60-80 on the path-based API. Regular files only; other row
+    /// types keep the path-based ops.
     pub use_raw_fh: bool,
     /// Raw-FH path only: CREATE the destination under its *final*
-    /// name and skip the `.partial` + RENAME publish — 5 RPCs per
-    /// small file instead of 6. Trades the atomic-publish property
+    /// name and skip the `.partial` + RENAME publish — 4 RPCs per
+    /// typical small file instead of 5. Trades the atomic-publish property
     /// for throughput: a crash mid-copy can leave a torn file
     /// visible at the final path. Safe when nothing consumes the
     /// destination namespace until the migration completes — CREATE
@@ -196,6 +209,11 @@ pub struct Mover {
     /// because source and destination are different exports.
     src_dir_fhs: Arc<FhCache>,
     dst_dir_fhs: Arc<FhCache>,
+    /// Source directory → child-name/filehandle maps filled by paged
+    /// READDIRPLUS. This removes the per-file source LOOKUP from the
+    /// raw-FH path. Misses, omitted handles, oversize directories,
+    /// and prefetch errors all fall back to ordinary LOOKUP.
+    src_dir_children: Arc<DirChildren>,
 }
 
 /// Path → directory-filehandle cache with per-path single-flight, so a
@@ -205,6 +223,165 @@ pub struct Mover {
 struct FhCache {
     map: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<Vec<u8>>>>,
     locks: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<std::sync::Mutex<()>>>>,
+}
+
+type ChildFhs = std::collections::HashMap<Vec<u8>, Arc<Vec<u8>>>;
+
+#[derive(Clone)]
+enum DirChildrenEntry {
+    Ready(Arc<ChildFhs>),
+    /// Prefetch was abandoned (entry cap or RPC error). Keep the
+    /// sentinel in the bounded cache so every file in the same
+    /// grouped directory does not retry the failed optimization.
+    Disabled,
+}
+
+impl DirChildrenEntry {
+    fn child_fh_count(&self) -> usize {
+        match self {
+            Self::Ready(children) => children.len(),
+            Self::Disabled => 0,
+        }
+    }
+}
+
+struct CachedDirChildren {
+    entry: DirChildrenEntry,
+    /// Second-chance bit: child hits set it in O(1); eviction clears it
+    /// and rotates the directory once before considering it again.
+    referenced: bool,
+}
+
+enum DirChildLookup {
+    Uncached,
+    Hit(Arc<Vec<u8>>),
+    Miss,
+}
+
+#[derive(Default)]
+struct DirChildrenState {
+    entries: std::collections::HashMap<Vec<u8>, CachedDirChildren>,
+    lru: std::collections::VecDeque<Vec<u8>>,
+    cached_child_fhs: usize,
+}
+
+/// Bounded source-directory child-FH cache with per-directory single-flight.
+/// Its second-chance queue keeps hits O(1), holds exactly one queue key per
+/// cached directory, and still keeps recently used parents through eviction.
+struct DirChildren {
+    state: std::sync::Mutex<DirChildrenState>,
+    locks: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<std::sync::Mutex<()>>>>,
+    dir_capacity: usize,
+    child_fh_capacity: usize,
+}
+
+impl Default for DirChildren {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(DirChildrenState::default()),
+            locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dir_capacity: DIR_CHILDREN_CACHE_DIR_CAPACITY,
+            child_fh_capacity: DIR_CHILDREN_CACHE_FH_CAPACITY,
+        }
+    }
+}
+
+impl DirChildren {
+    #[cfg(test)]
+    fn with_limits(dir_capacity: usize, child_fh_capacity: usize) -> Self {
+        assert!(dir_capacity > 0);
+        assert!(child_fh_capacity > 0);
+        Self {
+            state: std::sync::Mutex::new(DirChildrenState::default()),
+            locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dir_capacity,
+            child_fh_capacity,
+        }
+    }
+
+    fn lookup(&self, dir: &[u8], name: &[u8]) -> DirChildLookup {
+        let mut state = self.state.lock().unwrap();
+        let entry = match state.entries.get_mut(dir) {
+            Some(cached) => {
+                cached.referenced = true;
+                cached.entry.clone()
+            }
+            None => return DirChildLookup::Uncached,
+        };
+        match entry {
+            DirChildrenEntry::Ready(children) => {
+                children.get(name).map_or(DirChildLookup::Miss, |fh| {
+                    DirChildLookup::Hit(Arc::clone(fh))
+                })
+            }
+            DirChildrenEntry::Disabled => DirChildLookup::Miss,
+        }
+    }
+
+    fn insert(&self, dir: Vec<u8>, entry: DirChildrenEntry) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(pos) = state.lru.iter().position(|key| key == &dir) {
+            state.lru.remove(pos);
+        }
+        if let Some(replaced) = state.entries.remove(dir.as_slice()) {
+            state.cached_child_fhs -= replaced.entry.child_fh_count();
+        }
+
+        let child_fh_count = entry.child_fh_count();
+        while state.entries.len() >= self.dir_capacity
+            || state.cached_child_fhs.saturating_add(child_fh_count) > self.child_fh_capacity
+        {
+            let Some(oldest) = state.lru.pop_front() else {
+                break;
+            };
+            if let Some(cached) = state.entries.get_mut(oldest.as_slice()) {
+                if cached.referenced {
+                    cached.referenced = false;
+                    state.lru.push_back(oldest);
+                    continue;
+                }
+            }
+            if let Some(evicted) = state.entries.remove(oldest.as_slice()) {
+                state.cached_child_fhs -= evicted.entry.child_fh_count();
+            }
+        }
+        state.cached_child_fhs += child_fh_count;
+        state.lru.push_back(dir.clone());
+        state.entries.insert(
+            dir,
+            CachedDirChildren {
+                entry,
+                referenced: false,
+            },
+        );
+        debug_assert!(state.entries.len() <= self.dir_capacity);
+        debug_assert_eq!(state.entries.len(), state.lru.len());
+        debug_assert!(state.cached_child_fhs <= self.child_fh_capacity);
+    }
+
+    fn disable(&self, dir: &[u8]) {
+        self.insert(dir.to_vec(), DirChildrenEntry::Disabled);
+    }
+
+    fn flight(&self, dir: &[u8]) -> Arc<std::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap();
+        Arc::clone(
+            locks
+                .entry(dir.to_vec())
+                .or_insert_with(|| Arc::new(std::sync::Mutex::new(()))),
+        )
+    }
+
+    fn finish_flight(&self, dir: &[u8], flight: &Arc<std::sync::Mutex<()>>) {
+        let mut locks = self.locks.lock().unwrap();
+        if locks
+            .get(dir)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+            && Arc::strong_count(flight) == 2
+        {
+            locks.remove(dir);
+        }
+    }
 }
 
 impl Mover {
@@ -226,6 +403,87 @@ impl Mover {
             dir_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             src_dir_fhs: Arc::new(FhCache::default()),
             dst_dir_fhs: Arc::new(FhCache::default()),
+            src_dir_children: Arc::new(DirChildren::default()),
+        }
+    }
+
+    /// Resolve a source child filehandle through the READDIRPLUS
+    /// cache. The optimization is fail-open: a missing/omitted handle,
+    /// an oversize directory, or any prefetch RPC error uses the same
+    /// per-name LOOKUP as the original raw path.
+    fn resolve_source_child_fh(
+        &self,
+        ctx: &mut NfsContext,
+        dir_path: &[u8],
+        dir_fh: &[u8],
+        name: &[u8],
+    ) -> Result<(Arc<Vec<u8>>, bool), raw::RawError> {
+        match self.src_dir_children.lookup(dir_path, name) {
+            DirChildLookup::Hit(fh) => return Ok((fh, true)),
+            DirChildLookup::Miss => {
+                return raw::lookup(ctx, dir_fh, name).map(|fh| (Arc::new(fh), false));
+            }
+            DirChildLookup::Uncached => {}
+        }
+
+        let flight = self.src_dir_children.flight(dir_path);
+        let _guard = flight.lock().unwrap();
+        match self.src_dir_children.lookup(dir_path, name) {
+            DirChildLookup::Hit(fh) => {
+                self.src_dir_children.finish_flight(dir_path, &flight);
+                return Ok((fh, true));
+            }
+            DirChildLookup::Miss => {
+                self.src_dir_children.finish_flight(dir_path, &flight);
+                return raw::lookup(ctx, dir_fh, name).map(|fh| (Arc::new(fh), false));
+            }
+            DirChildLookup::Uncached => {}
+        }
+
+        let entry = match raw::readdirplus(ctx, dir_fh, DIR_CHILDREN_ENTRY_CAP) {
+            Ok(raw::ReaddirplusResult::Complete(entries)) => {
+                let entry_count = entries.len();
+                let children: ChildFhs = entries
+                    .into_iter()
+                    .filter_map(|entry| entry.fh.map(|fh| (entry.name, Arc::new(fh))))
+                    .collect();
+                tracing::debug!(
+                    dir = %String::from_utf8_lossy(dir_path),
+                    entries = entry_count,
+                    handles = children.len(),
+                    "source child filehandles prefetched",
+                );
+                DirChildrenEntry::Ready(Arc::new(children))
+            }
+            Ok(raw::ReaddirplusResult::TooMany) => {
+                tracing::debug!(
+                    dir = %String::from_utf8_lossy(dir_path),
+                    cap = DIR_CHILDREN_ENTRY_CAP,
+                    "source directory exceeds prefetch cap; using LOOKUP",
+                );
+                DirChildrenEntry::Disabled
+            }
+            Err(error) => {
+                tracing::warn!(
+                    dir = %String::from_utf8_lossy(dir_path),
+                    error = %error.detail,
+                    "source READDIRPLUS prefetch failed; using LOOKUP",
+                );
+                DirChildrenEntry::Disabled
+            }
+        };
+        self.src_dir_children
+            .insert(dir_path.to_vec(), entry.clone());
+        self.src_dir_children.finish_flight(dir_path, &flight);
+
+        match entry {
+            DirChildrenEntry::Ready(children) => match children.get(name) {
+                Some(fh) => Ok((Arc::clone(fh), true)),
+                None => raw::lookup(ctx, dir_fh, name).map(|fh| (Arc::new(fh), false)),
+            },
+            DirChildrenEntry::Disabled => {
+                raw::lookup(ctx, dir_fh, name).map(|fh| (Arc::new(fh), false))
+            }
         }
     }
 
@@ -742,9 +1000,10 @@ impl Mover {
     /// Raw-FH copy path. Same commit contract as `do_libnfs_copy`
     /// (write `.partial`, durable before publish, attrs before rename,
     /// R8 fence check immediately before RENAME) with the RPC budget
-    /// collapsed: LOOKUP(src) + READs + CREATE(attrs) + WRITEs +
-    /// SETATTR(times) + RENAME. Single-chunk files write FILE_SYNC and
-    /// skip COMMIT; multi-chunk files write UNSTABLE then COMMIT.
+    /// collapsed: one amortized READDIRPLUS per source directory, then
+    /// READs + CREATE(attrs) + WRITEs + SETATTR(times) + RENAME for
+    /// each cache hit. Single-chunk files write FILE_SYNC and skip
+    /// COMMIT; multi-chunk files write UNSTABLE then COMMIT.
     ///
     /// With `direct_commit` the `.partial` + RENAME publish is
     /// skipped: CREATE targets the final name and the R8 fence check
@@ -772,7 +1031,8 @@ impl Mover {
             .resolve_dir_fh(pair.dst(), &self.dst_dir_fhs, dst_parent, true)
             .map_err(|e| raw_move_err(e, FailurePhase::Write))?;
 
-        let src_fh = raw::lookup(pair.src(), &src_dir, src_name)
+        let (mut src_fh, mut src_fh_prefetched) = self
+            .resolve_source_child_fh(pair.src(), src_parent, &src_dir, src_name)
             .map_err(|e| raw_move_err(e, FailurePhase::Open))?;
 
         // Same null-attribute downgrades the path-based flow records.
@@ -824,8 +1084,35 @@ impl Mover {
             // (measured: 87% of wall time in futex). If the file is
             // larger than the hint, the loop simply issues more reads.
             let want = (row.size.saturating_sub(off)).clamp(4096, CHUNK) as u32;
-            let (data, eof) = raw::read(pair.src(), &src_fh, off, want)
-                .map_err(|e| raw_move_err(e, FailurePhase::Read))?;
+            let (data, eof) = match raw::read(pair.src(), &src_fh, off, want) {
+                Ok(read) => read,
+                Err(error) if src_fh_prefetched && error.tag == "ESTALE" => {
+                    // A child may have been replaced between READDIRPLUS
+                    // and READ. Disable the whole directory map, resolve
+                    // the current name with LOOKUP, and restart if any
+                    // bytes from the stale object were already written.
+                    self.src_dir_children.disable(src_parent);
+                    src_fh = Arc::new(
+                        raw::lookup(pair.src(), &src_dir, src_name)
+                            .map_err(|e| raw_move_err(e, FailurePhase::Open))?,
+                    );
+                    src_fh_prefetched = false;
+                    if off > 0 {
+                        raw::setattr(
+                            pair.dst(),
+                            &dst_fh,
+                            &RawSattr {
+                                size: Some(0),
+                                ..Default::default()
+                            },
+                        )
+                        .map_err(|e| raw_move_err(e, FailurePhase::Write))?;
+                        off = 0;
+                    }
+                    continue;
+                }
+                Err(error) => return Err(raw_move_err(error, FailurePhase::Read)),
+            };
             if !data.is_empty() {
                 let mut sent = 0usize;
                 while sent < data.len() {
@@ -1545,6 +1832,142 @@ mod tests {
         );
         assert!(!cfg.use_raw_fh);
         assert!(!cfg.direct_commit);
+    }
+
+    fn child_entry(name: &[u8], fh: &[u8]) -> DirChildrenEntry {
+        DirChildrenEntry::Ready(Arc::new(std::collections::HashMap::from([(
+            name.to_vec(),
+            Arc::new(fh.to_vec()),
+        )])))
+    }
+
+    fn child_entries(count: usize) -> DirChildrenEntry {
+        DirChildrenEntry::Ready(Arc::new(
+            (0..count)
+                .map(|i| (format!("file-{i}").into_bytes(), Arc::new(vec![i as u8])))
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn dir_children_distinguishes_uncached_hit_and_fallback_miss() {
+        let cache = DirChildren::default();
+        assert!(matches!(
+            cache.lookup(b"/src/d", b"file"),
+            DirChildLookup::Uncached
+        ));
+
+        cache.insert(b"/src/d".to_vec(), child_entry(b"file", b"prefetched-fh"));
+        match cache.lookup(b"/src/d", b"file") {
+            DirChildLookup::Hit(fh) => assert_eq!(fh.as_slice(), b"prefetched-fh"),
+            _ => panic!("prefetched child must be a cache hit"),
+        }
+        assert!(matches!(
+            cache.lookup(b"/src/d", b"server-omitted-handle"),
+            DirChildLookup::Miss
+        ));
+
+        cache.disable(b"/src/d");
+        assert!(matches!(
+            cache.lookup(b"/src/d", b"file"),
+            DirChildLookup::Miss
+        ));
+    }
+
+    #[test]
+    fn dir_children_second_chance_is_bounded_and_retains_hits() {
+        let cache = DirChildren::with_limits(3, usize::MAX);
+        for i in 0..3 {
+            cache.insert(
+                format!("/dir-{i}").into_bytes(),
+                child_entry(b"file", &[i as u8]),
+            );
+        }
+
+        // Reference the oldest entry, then insert one more. It gets a
+        // second chance and the next unreferenced entry is evicted.
+        assert!(matches!(
+            cache.lookup(b"/dir-0", b"file"),
+            DirChildLookup::Hit(_)
+        ));
+        cache.insert(b"/dir-3".to_vec(), child_entry(b"file", b"new"));
+
+        assert!(matches!(
+            cache.lookup(b"/dir-1", b"file"),
+            DirChildLookup::Uncached
+        ));
+        assert!(matches!(
+            cache.lookup(b"/dir-0", b"file"),
+            DirChildLookup::Hit(_)
+        ));
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 3);
+    }
+
+    #[test]
+    fn dir_children_cache_is_bounded_by_total_child_filehandles() {
+        let cache = DirChildren::with_limits(10, 3);
+        cache.insert(b"/dir-a".to_vec(), child_entries(2));
+        cache.insert(b"/dir-b".to_vec(), child_entries(2));
+
+        assert!(matches!(
+            cache.lookup(b"/dir-a", b"file-0"),
+            DirChildLookup::Uncached
+        ));
+        assert!(matches!(
+            cache.lookup(b"/dir-b", b"file-0"),
+            DirChildLookup::Hit(_)
+        ));
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.cached_child_fhs, 2);
+    }
+
+    #[test]
+    fn dir_children_default_retains_parent_interleaved_working_set() {
+        let cache = DirChildren::default();
+        for i in 0..128 {
+            cache.insert(
+                format!("/dir-{i}").into_bytes(),
+                child_entry(b"file", &[i as u8]),
+            );
+        }
+
+        for i in 0..128 {
+            assert!(matches!(
+                cache.lookup(format!("/dir-{i}").as_bytes(), b"file"),
+                DirChildLookup::Hit(_)
+            ));
+        }
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), 128);
+        assert_eq!(state.lru.len(), 128);
+        assert_eq!(state.cached_child_fhs, 128);
+    }
+
+    #[test]
+    fn dir_children_single_flight_guard_is_shared_then_released() {
+        let cache = DirChildren::default();
+        let first = cache.flight(b"/src/d");
+        let second = cache.flight(b"/src/d");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // The first caller to finish must retain the shared flight while
+        // another waiter still owns it.
+        cache.finish_flight(b"/src/d", &first);
+        let still_shared = cache.flight(b"/src/d");
+        assert!(Arc::ptr_eq(&first, &still_shared));
+        drop(second);
+        drop(still_shared);
+
+        cache.finish_flight(b"/src/d", &first);
+        let next = cache.flight(b"/src/d");
+        assert!(!Arc::ptr_eq(&first, &next));
+
+        // A waiter that still owns the old Arc must not remove the new
+        // flight from the map after the directory is evicted/restarted.
+        cache.finish_flight(b"/src/d", &first);
+        let same_next = cache.flight(b"/src/d");
+        assert!(Arc::ptr_eq(&next, &same_next));
     }
 
     // ---- F41: honest byte counts ----------------------------------

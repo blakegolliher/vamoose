@@ -16,8 +16,10 @@
 //! - set atime+mtime in one SETATTR against the file handle;
 //! - RENAME by (dir_fh, name) pairs.
 //!
-//! Per tiny file: LOOKUP(src) + READ + CREATE + WRITE + SETATTR +
-//! RENAME = 6 RPCs.
+//! After one amortized READDIRPLUS per source directory, a typical
+//! tiny file costs READ + CREATE + WRITE + SETATTR + RENAME = 5 RPCs
+//! (4 with direct commit). Missing/omitted/stale prefetched handles
+//! retain the original per-name LOOKUP fallback.
 //!
 //! ## Execution model
 //!
@@ -46,7 +48,7 @@
 )]
 pub mod bindings;
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
 use bindings as b;
@@ -63,6 +65,30 @@ const PUMP_DEADLINE_SECS: u64 = 120;
 
 /// A server filehandle. Plain bytes; valid for the life of the export.
 pub type Fh = Vec<u8>;
+
+/// One name returned by READDIRPLUS. `fh` is absent when the server
+/// omitted the optional `name_handle`; callers must LOOKUP that name.
+#[derive(Debug)]
+pub struct ReaddirplusEntry {
+    pub name: Vec<u8>,
+    pub fh: Option<Fh>,
+}
+
+/// Result of a bounded, fully paged READDIRPLUS scan.
+#[derive(Debug)]
+pub enum ReaddirplusResult {
+    Complete(Vec<ReaddirplusEntry>),
+    /// The directory has more entries than the caller's cap. Partial
+    /// results are deliberately discarded so memory remains bounded.
+    TooMany,
+}
+
+struct ReaddirplusPage {
+    entries: Vec<ReaddirplusEntry>,
+    last_cookie: Option<u64>,
+    cookieverf: b::cookieverf3,
+    eof: bool,
+}
 
 /// Error from one raw op: the NFS3 status name (errno-style, e.g.
 /// "ENOENT", "EEXIST") or a transport-level description.
@@ -130,6 +156,7 @@ fn nfsstat_tag(status: u32) -> &'static str {
 /// What a completed op handed back from its callback.
 enum Out {
     Fh(Fh),
+    Readdirplus(ReaddirplusPage),
     Read { count: u32, eof: bool },
     Write { count: u32 },
     Unit,
@@ -341,6 +368,121 @@ pub fn lookup(nfs: &mut NfsContext, dir_fh: &[u8], name: &[u8]) -> Result<Fh, Ra
     match slot.finish("LOOKUP")? {
         Out::Fh(fh) => Ok(fh),
         _ => unreachable!("LOOKUP slot holds Fh"),
+    }
+}
+
+unsafe extern "C" fn cb_readdirplus(
+    rpc: *mut b::rpc_context,
+    status: c_int,
+    data: *mut c_void,
+    pd: *mut c_void,
+) {
+    let slot = &mut *(pd as *mut Slot);
+    if let Some(data) = slot.begin(rpc, status, data) {
+        let res = &*(data as *const b::READDIRPLUS3res);
+        slot.nfs_status = res.status;
+        if res.status == b::NFS3_OK {
+            let ok = &res.READDIRPLUS3res_u.resok;
+            let mut entries = Vec::new();
+            let mut last_cookie = None;
+            let mut cur = ok.reply.entries;
+            while !cur.is_null() {
+                let entry = &*cur;
+                last_cookie = Some(entry.cookie);
+                if !entry.name.is_null() {
+                    let name = CStr::from_ptr(entry.name).to_bytes().to_vec();
+                    let handle = &entry.name_handle;
+                    let fh = if handle.handle_follows != 0 {
+                        let fh = &handle.post_op_fh3_u.handle;
+                        if fh.data.data_len > 0 && !fh.data.data_val.is_null() {
+                            Some(copy_fh3(fh))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    entries.push(ReaddirplusEntry { name, fh });
+                }
+                cur = entry.nextentry;
+            }
+            slot.out = Some(Out::Readdirplus(ReaddirplusPage {
+                entries,
+                last_cookie,
+                cookieverf: ok.cookieverf,
+                eof: ok.reply.eof != 0,
+            }));
+        }
+    }
+}
+
+/// Page through `dir_fh` with READDIRPLUS, copying child names and
+/// optional filehandles out of each callback before libnfs frees the
+/// decoded reply. The 64 KiB `dircount` and 1 MiB `maxcount` keep the
+/// common case to one page without asking the server for an unbounded
+/// response.
+///
+/// At most `entry_cap` entries are retained. If the server indicates
+/// more entries exist, all partial results are dropped and `TooMany`
+/// tells the caller to use per-name LOOKUP instead.
+pub fn readdirplus(
+    nfs: &mut NfsContext,
+    dir_fh: &[u8],
+    entry_cap: usize,
+) -> Result<ReaddirplusResult, RawError> {
+    const DIRCOUNT: u32 = 64 * 1024;
+    const MAXCOUNT: u32 = 1024 * 1024;
+
+    let mut cookie = 0;
+    let mut cookieverf: b::cookieverf3 = [0; 8];
+    let mut all = Vec::new();
+    loop {
+        let mut slot = Slot::new();
+        let mut args = b::READDIRPLUS3args {
+            dir: fh3(dir_fh),
+            cookie,
+            cookieverf,
+            dircount: DIRCOUNT,
+            maxcount: MAXCOUNT,
+        };
+        issue!(nfs, &slot, "READDIRPLUS", {
+            b::rpc_nfs3_readdirplus_task(
+                rpc_of(nfs),
+                Some(cb_readdirplus),
+                &mut args,
+                &mut slot as *mut Slot as *mut c_void,
+            )
+        });
+        let page = match slot.finish("READDIRPLUS")? {
+            Out::Readdirplus(page) => page,
+            _ => unreachable!("READDIRPLUS slot holds Readdirplus"),
+        };
+
+        let total = all.len().saturating_add(page.entries.len());
+        if total > entry_cap || (total == entry_cap && !page.eof) {
+            return Ok(ReaddirplusResult::TooMany);
+        }
+        all.extend(page.entries);
+        if page.eof {
+            return Ok(ReaddirplusResult::Complete(all));
+        }
+
+        let next_cookie = page.last_cookie.ok_or_else(|| {
+            RawError::transport(
+                "READDIRPLUS",
+                RPC_STATUS_SUCCESS,
+                "non-EOF page contained no entries".into(),
+            )
+        })?;
+        if next_cookie == cookie {
+            return Err(RawError::transport(
+                "READDIRPLUS",
+                RPC_STATUS_SUCCESS,
+                "server returned a non-advancing cookie".into(),
+            ));
+        }
+        cookie = next_cookie;
+        cookieverf = page.cookieverf;
     }
 }
 

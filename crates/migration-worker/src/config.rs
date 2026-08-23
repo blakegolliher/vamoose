@@ -128,15 +128,16 @@ pub struct MoverCfg {
     pub use_bucketed_pool: bool,
     /// When true, regular-file copies use the raw NFSv3 filehandle
     /// path (cached parent-dir filehandles, attrs at CREATE, one
-    /// SETATTR, RENAME by dir fh) — ~6 RPCs per small file instead of
-    /// the path-based API's per-component LOOKUP storm. See
+    /// SETATTR, RENAME by dir fh, READDIRPLUS child-FH prefetch) — ~5
+    /// RPCs per small file instead of the path-based API's
+    /// per-component LOOKUP storm. See
     /// `migration_mover::libnfs::raw`. Off by default.
     #[serde(default)]
     pub use_raw_fh: bool,
     /// Raw-FH path only (no effect unless `use_raw_fh` is set): CREATE
     /// destination files under their final name and skip the
-    /// `.partial` + RENAME publish — 5 RPCs per small file instead of
-    /// 6. Trades atomic publish for throughput: a crash can leave a
+    /// `.partial` + RENAME publish — 4 RPCs per typical small file
+    /// instead of 5. Trades atomic publish for throughput: a crash can leave a
     /// torn file visible at the final path; a re-run heals it (CREATE
     /// is UNCHECKED with size=0, so it truncates). Use only when
     /// nothing consumes the destination namespace mid-migration. Off
