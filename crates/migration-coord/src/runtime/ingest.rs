@@ -36,8 +36,10 @@ pub(super) struct StreamCaps {
     /// the tick re-broadcasts. Cleared whenever a fresh delta for
     /// the key broadcasts (the retained frame is then stale) and on
     /// delivery.
-    retained_progress:
-        std::collections::HashMap<(crate::schema::JobId, crate::schema::WorkerId), EventEnvelope>,
+    retained_progress: std::collections::HashMap<
+        (crate::schema::JobId, crate::schema::WorkerId),
+        (EventEnvelope, DateTime<Utc>),
+    >,
     error_window_start: Option<DateTime<Utc>>,
     error_counts: std::collections::HashMap<crate::schema::ErrorClass, u32>,
 }
@@ -63,9 +65,9 @@ impl StreamCaps {
                         // client-derived rate under-reported — the
                         // 600M-rig TUI read ~60% of the true files/s.
                         match self.retained_progress.get_mut(&key) {
-                            Some(retained) => merge_progress_delta(retained, env),
+                            Some((retained, _first_at)) => merge_progress_delta(retained, env),
                             None => {
-                                self.retained_progress.insert(key, env.clone());
+                                self.retained_progress.insert(key, (env.clone(), now));
                             }
                         }
                         false
@@ -111,25 +113,24 @@ impl StreamCaps {
     fn take_due_trailing(&mut self, now: DateTime<Utc>) -> Vec<EventEnvelope> {
         let min_interval =
             chrono::Duration::milliseconds(crate::schema::PROGRESS_STREAM_MIN_INTERVAL_MS);
+        // Due-ness is the RETAINED frame's age, not time since the
+        // key's last broadcast: under a steady event flow a fresh
+        // frame broadcasts every interval, which would keep resetting
+        // a broadcast-based clock and the retained sums would
+        // accumulate for the entire run (observed on the 600M rig:
+        // only each batch's leading event reached the wire — clients
+        // saw ~67% of the counts). Draining by age bounds the wire at
+        // ≤2 frames per interval per key: the leading edge plus one
+        // coalesced trailing sum.
         let due: Vec<_> = self
             .retained_progress
-            .keys()
-            .filter(|key| match self.progress_last.get(*key) {
-                // Deliver once the key has gone a cap interval
-                // without a broadcast — retained sums must drain even
-                // under a constant event flow, otherwise they
-                // accumulate for the whole run and land as one giant
-                // correction at the end. Delivery itself counts as a
-                // broadcast, so the wire stays paced at ~1 Hz per key.
-                Some(last) => now.signed_duration_since(*last) >= min_interval,
-                None => true,
-            })
-            .cloned()
+            .iter()
+            .filter(|(_, (_, first_at))| now.signed_duration_since(*first_at) >= min_interval)
+            .map(|(key, _)| key.clone())
             .collect();
         let mut out = Vec::with_capacity(due.len());
         for key in due {
-            if let Some(env) = self.retained_progress.remove(&key) {
-                self.progress_last.insert(key, now);
+            if let Some((env, _)) = self.retained_progress.remove(&key) {
                 out.push(env);
             }
         }
