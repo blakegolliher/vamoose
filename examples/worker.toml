@@ -34,12 +34,12 @@ nfs_connections      = 16
 # Default: 60000 — matches libnfs's implicit 60 s, now explicit.
 rpc_timeout_ms       = 60000
 # Raw NFSv3 filehandle fast path for regular files: cached parent-dir
-# filehandles, attrs stamped at CREATE, one SETATTR — ~6 RPCs per
-# small file instead of the path-based API's per-component LOOKUP
-# storm. Off by default.
+# filehandles, READDIRPLUS child-FH prefetch, attrs stamped at CREATE,
+# one SETATTR — ~5 RPCs per small file instead of the path-based API's
+# per-component LOOKUP storm. Off by default.
 #use_raw_fh = true
 # With use_raw_fh: CREATE the final name directly and skip the
-# .partial + RENAME publish (5 RPCs per small file). A crash can
+# .partial + RENAME publish (~4 RPCs per typical small file). A crash can
 # leave a torn file visible at the final path; a re-run heals it.
 # Only for destinations nothing consumes mid-migration. Off by default.
 #direct_commit = true

@@ -100,6 +100,14 @@ unsafe extern "C" {
     ) -> *mut rpc_pdu;
 }
 unsafe extern "C" {
+    pub fn rpc_nfs3_readdirplus_task(
+        rpc: *mut rpc_context,
+        cb: rpc_cb,
+        args: *mut READDIRPLUS3args,
+        private_data: *mut ::std::os::raw::c_void,
+    ) -> *mut rpc_pdu;
+}
+unsafe extern "C" {
     pub fn rpc_nfs3_rename_task(
         rpc: *mut rpc_context,
         cb: rpc_cb,
@@ -107,6 +115,8 @@ unsafe extern "C" {
         private_data: *mut ::std::os::raw::c_void,
     ) -> *mut rpc_pdu;
 }
+pub type cookieverf3 = [::std::os::raw::c_char; 8usize];
+pub type cookie3 = u64;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct nfs_fh3 {
@@ -1156,6 +1166,130 @@ const _: () = {
     ["Offset of field: RENAME3res::status"][::std::mem::offset_of!(RENAME3res, status) - 0usize];
     ["Offset of field: RENAME3res::RENAME3res_u"]
         [::std::mem::offset_of!(RENAME3res, RENAME3res_u) - 8usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct READDIRPLUS3args {
+    pub dir: nfs_fh3,
+    pub cookie: cookie3,
+    pub cookieverf: cookieverf3,
+    pub dircount: count3,
+    pub maxcount: count3,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of READDIRPLUS3args"][::std::mem::size_of::<READDIRPLUS3args>() - 40usize];
+    ["Alignment of READDIRPLUS3args"][::std::mem::align_of::<READDIRPLUS3args>() - 8usize];
+    ["Offset of field: READDIRPLUS3args::dir"]
+        [::std::mem::offset_of!(READDIRPLUS3args, dir) - 0usize];
+    ["Offset of field: READDIRPLUS3args::cookie"]
+        [::std::mem::offset_of!(READDIRPLUS3args, cookie) - 16usize];
+    ["Offset of field: READDIRPLUS3args::cookieverf"]
+        [::std::mem::offset_of!(READDIRPLUS3args, cookieverf) - 24usize];
+    ["Offset of field: READDIRPLUS3args::dircount"]
+        [::std::mem::offset_of!(READDIRPLUS3args, dircount) - 32usize];
+    ["Offset of field: READDIRPLUS3args::maxcount"]
+        [::std::mem::offset_of!(READDIRPLUS3args, maxcount) - 36usize];
+};
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct entryplus3 {
+    pub fileid: fileid3,
+    pub name: filename3,
+    pub cookie: cookie3,
+    pub name_attributes: post_op_attr,
+    pub name_handle: post_op_fh3,
+    pub nextentry: *mut entryplus3,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of entryplus3"][::std::mem::size_of::<entryplus3>() - 152usize];
+    ["Alignment of entryplus3"][::std::mem::align_of::<entryplus3>() - 8usize];
+    ["Offset of field: entryplus3::fileid"][::std::mem::offset_of!(entryplus3, fileid) - 0usize];
+    ["Offset of field: entryplus3::name"][::std::mem::offset_of!(entryplus3, name) - 8usize];
+    ["Offset of field: entryplus3::cookie"][::std::mem::offset_of!(entryplus3, cookie) - 16usize];
+    ["Offset of field: entryplus3::name_attributes"]
+        [::std::mem::offset_of!(entryplus3, name_attributes) - 24usize];
+    ["Offset of field: entryplus3::name_handle"]
+        [::std::mem::offset_of!(entryplus3, name_handle) - 120usize];
+    ["Offset of field: entryplus3::nextentry"]
+        [::std::mem::offset_of!(entryplus3, nextentry) - 144usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct dirlistplus3 {
+    pub entries: *mut entryplus3,
+    pub eof: u32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of dirlistplus3"][::std::mem::size_of::<dirlistplus3>() - 16usize];
+    ["Alignment of dirlistplus3"][::std::mem::align_of::<dirlistplus3>() - 8usize];
+    ["Offset of field: dirlistplus3::entries"]
+        [::std::mem::offset_of!(dirlistplus3, entries) - 0usize];
+    ["Offset of field: dirlistplus3::eof"][::std::mem::offset_of!(dirlistplus3, eof) - 8usize];
+};
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct READDIRPLUS3resok {
+    pub dir_attributes: post_op_attr,
+    pub cookieverf: cookieverf3,
+    pub reply: dirlistplus3,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of READDIRPLUS3resok"][::std::mem::size_of::<READDIRPLUS3resok>() - 120usize];
+    ["Alignment of READDIRPLUS3resok"][::std::mem::align_of::<READDIRPLUS3resok>() - 8usize];
+    ["Offset of field: READDIRPLUS3resok::dir_attributes"]
+        [::std::mem::offset_of!(READDIRPLUS3resok, dir_attributes) - 0usize];
+    ["Offset of field: READDIRPLUS3resok::cookieverf"]
+        [::std::mem::offset_of!(READDIRPLUS3resok, cookieverf) - 96usize];
+    ["Offset of field: READDIRPLUS3resok::reply"]
+        [::std::mem::offset_of!(READDIRPLUS3resok, reply) - 104usize];
+};
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct READDIRPLUS3resfail {
+    pub dir_attributes: post_op_attr,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of READDIRPLUS3resfail"][::std::mem::size_of::<READDIRPLUS3resfail>() - 96usize];
+    ["Alignment of READDIRPLUS3resfail"][::std::mem::align_of::<READDIRPLUS3resfail>() - 8usize];
+    ["Offset of field: READDIRPLUS3resfail::dir_attributes"]
+        [::std::mem::offset_of!(READDIRPLUS3resfail, dir_attributes) - 0usize];
+};
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct READDIRPLUS3res {
+    pub status: nfsstat3,
+    pub READDIRPLUS3res_u: READDIRPLUS3res__bindgen_ty_1,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union READDIRPLUS3res__bindgen_ty_1 {
+    pub resok: READDIRPLUS3resok,
+    pub resfail: READDIRPLUS3resfail,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of READDIRPLUS3res__bindgen_ty_1"]
+        [::std::mem::size_of::<READDIRPLUS3res__bindgen_ty_1>() - 120usize];
+    ["Alignment of READDIRPLUS3res__bindgen_ty_1"]
+        [::std::mem::align_of::<READDIRPLUS3res__bindgen_ty_1>() - 8usize];
+    ["Offset of field: READDIRPLUS3res__bindgen_ty_1::resok"]
+        [::std::mem::offset_of!(READDIRPLUS3res__bindgen_ty_1, resok) - 0usize];
+    ["Offset of field: READDIRPLUS3res__bindgen_ty_1::resfail"]
+        [::std::mem::offset_of!(READDIRPLUS3res__bindgen_ty_1, resfail) - 0usize];
+};
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of READDIRPLUS3res"][::std::mem::size_of::<READDIRPLUS3res>() - 128usize];
+    ["Alignment of READDIRPLUS3res"][::std::mem::align_of::<READDIRPLUS3res>() - 8usize];
+    ["Offset of field: READDIRPLUS3res::status"]
+        [::std::mem::offset_of!(READDIRPLUS3res, status) - 0usize];
+    ["Offset of field: READDIRPLUS3res::READDIRPLUS3res_u"]
+        [::std::mem::offset_of!(READDIRPLUS3res, READDIRPLUS3res_u) - 8usize];
 };
 #[repr(C)]
 #[derive(Copy, Clone)]
