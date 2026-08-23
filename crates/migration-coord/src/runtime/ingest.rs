@@ -30,6 +30,18 @@ use chrono::{DateTime, Utc};
 /// — the envelope was already applied and logged at ingest.
 #[derive(Debug, Default)]
 pub(super) struct StreamCaps {
+    /// Accounting (observability): total files_delta ingested through
+    /// the cap, broadcast on the leading edge, and drained via the
+    /// trailing tick. ingested == leading + drained + currently
+    /// retained, at all times — logged by the flush tick so wire
+    /// losslessness is verifiable in production.
+    /// Last emitted (files_done, bytes_done) per job — dedups
+    /// per-tick ProgressSync emission for idle jobs.
+    pub(super) last_sync:
+        std::collections::HashMap<crate::schema::JobId, (u64, u64)>,
+    pub(super) acct_ingested_files: u64,
+    pub(super) acct_leading_files: u64,
+    pub(super) acct_drained_files: u64,
     progress_last:
         std::collections::HashMap<(crate::schema::JobId, crate::schema::WorkerId), DateTime<Utc>>,
     /// Latest SUPPRESSED delta per (job, worker) — the trailing edge
@@ -51,8 +63,13 @@ impl StreamCaps {
     fn should_broadcast(&mut self, env: &EventEnvelope, now: DateTime<Utc>) -> bool {
         match &env.kind {
             EventKind::ProgressDelta {
-                job_id, worker_id, ..
+                job_id,
+                worker_id,
+                files_delta,
+                ..
             } => {
+                self.acct_ingested_files = self.acct_ingested_files.saturating_add(*files_delta);
+                let files_delta_now = *files_delta;
                 let min_interval =
                     chrono::Duration::milliseconds(crate::schema::PROGRESS_STREAM_MIN_INTERVAL_MS);
                 let key = (job_id.clone(), *worker_id);
@@ -78,6 +95,8 @@ impl StreamCaps {
                         // reached subscribers yet; the flush tick
                         // delivers them. Removing them here silently
                         // dropped their counts.
+                        self.acct_leading_files =
+                            self.acct_leading_files.saturating_add(files_delta_now);
                         self.progress_last.insert(key, now);
                         true
                     }
@@ -131,6 +150,10 @@ impl StreamCaps {
         let mut out = Vec::with_capacity(due.len());
         for key in due {
             if let Some((env, _)) = self.retained_progress.remove(&key) {
+                if let EventKind::ProgressDelta { files_delta, .. } = &env.kind {
+                    self.acct_drained_files =
+                        self.acct_drained_files.saturating_add(*files_delta);
+                }
                 out.push(env);
             }
         }
@@ -318,6 +341,69 @@ impl CoordRuntime {
     /// already-ingested, already-logged envelope — same seq, no new
     /// event, no log write; log and replay are untouched. Driven by
     /// the flush tick ([`crate::ticks::flush_aged_loop`]). Returns
+    /// Emit one authoritative `ProgressSync` per active (Copying /
+    /// Scanning / Verifying) job, built from reducer state. Rates and
+    /// progress derived from these absolutes are immune to the
+    /// ProgressDelta stream cap; ~1 event/s/job of log growth. Skips
+    /// jobs whose counters haven't moved since the last sync so idle
+    /// jobs cost nothing.
+    pub async fn emit_progress_syncs(&self) -> Result<usize> {
+        let pending: Vec<EventKind> = {
+            let guard = self.inner.lock().await;
+            guard
+                .state
+                .jobs
+                .values()
+                .filter(|j| j.phase.is_active() && !j.phase.is_terminal())
+                .map(|j| {
+                    let workers = guard
+                        .state
+                        .workers
+                        .values()
+                        .filter(|w| w.job_id == j.id)
+                        .map(|w| crate::schema::WorkerCum {
+                            worker_id: w.id,
+                            files_done: w.files_done,
+                            bytes_done: w.bytes_done,
+                        })
+                        .collect();
+                    EventKind::ProgressSync {
+                        job_id: j.id.clone(),
+                        files_done: j.progress.files_done,
+                        bytes_done: j.progress.bytes_done,
+                        workers,
+                    }
+                })
+                .collect()
+        };
+        let mut n = 0;
+        for kind in pending {
+            // Dedup: don't log a sync identical to the previous one
+            // for this job (idle job, nothing moved).
+            let fresh = {
+                let mut guard = self.inner.lock().await;
+                let key = kind.job_id().cloned();
+                let sig = match &kind {
+                    EventKind::ProgressSync {
+                        files_done,
+                        bytes_done,
+                        ..
+                    } => (*files_done, *bytes_done),
+                    _ => (0, 0),
+                };
+                match key {
+                    Some(k) => guard.stream_caps.last_sync.insert(k, sig) != Some(sig),
+                    None => false,
+                }
+            };
+            if fresh {
+                self.ingest(kind).await?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// the number of frames re-broadcast.
     pub async fn flush_trailing_progress(&self) -> usize {
         let now = self.clock.now();
@@ -329,6 +415,17 @@ impl CoordRuntime {
         // Send outside the lock, like every other broadcast.
         for env in due {
             let _ = self.bus.send(env);
+        }
+        {
+            let guard = self.inner.lock().await;
+            let c = &guard.stream_caps;
+            tracing::debug!(
+                ingested = c.acct_ingested_files,
+                leading = c.acct_leading_files,
+                drained = c.acct_drained_files,
+                retained_keys = c.retained_progress.len(),
+                "progress stream cap accounting",
+            );
         }
         n
     }

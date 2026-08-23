@@ -67,6 +67,10 @@ pub struct AppState {
     /// broadcast as events, so the snapshot value goes stale on a
     /// long-lived connection while the worker is demonstrably alive).
     pub worker_activity: HashMap<WorkerId, chrono::DateTime<chrono::Utc>>,
+    /// Absolute-counter samples from `ProgressSync` frames — the
+    /// preferred rate source (see `AbsoluteWindow`).
+    pub job_syncs: HashMap<JobId, super::activity::AbsoluteWindow>,
+    pub worker_syncs: HashMap<(JobId, WorkerId), super::activity::AbsoluteWindow>,
     /// Per-job recent-errors tail. The coord aggregates totals into
     /// `ErrorBucket`s on the snapshot; the TUI keeps a chronological
     /// ring so the Errors tab can show recent activity.
@@ -107,6 +111,8 @@ impl AppState {
             progress_windows: HashMap::new(),
             worker_windows: HashMap::new(),
             worker_activity: HashMap::new(),
+            job_syncs: HashMap::new(),
+            worker_syncs: HashMap::new(),
             recent_errors: HashMap::new(),
             recent_verify_mismatches: HashMap::new(),
             verify_status: HashMap::new(),
@@ -194,6 +200,25 @@ impl AppState {
             .or_else(|| envelope.kind.attributed_worker())
         {
             self.worker_activity.insert(w, envelope.at);
+        }
+        if let EventKind::ProgressSync {
+            job_id,
+            files_done,
+            bytes_done,
+            workers,
+        } = &envelope.kind
+        {
+            self.job_syncs
+                .entry(job_id.clone())
+                .or_default()
+                .push(envelope.at, *files_done, *bytes_done);
+            for wc in workers {
+                self.worker_syncs
+                    .entry((job_id.clone(), wc.worker_id))
+                    .or_default()
+                    .push(envelope.at, wc.files_done, wc.bytes_done);
+                self.worker_activity.insert(wc.worker_id, envelope.at);
+            }
         }
         // Side-effect: append to the per-job recent-errors ring when
         // this was an `ErrorEmitted`. The dedup is implicit — we
@@ -299,14 +324,23 @@ impl AppState {
     /// rolling `window_secs`. Used by the banner's aggregate line.
     /// Aggregate files/s across every job, over `window_secs`.
     pub fn total_files_per_sec(&self, window_secs: i64, now: DateTime<Utc>) -> f64 {
-        self.progress_windows
-            .values()
-            .map(|h| h.files_per_sec(window_secs, now))
+        self.snapshot
+            .jobs
+            .keys()
+            .map(|id| self.job_files_per_sec(id, window_secs, now))
             .sum()
     }
 
-    /// Files/s for one job over `window_secs`.
+    /// Files/s for one job over `window_secs`. Prefers absolute
+    /// `ProgressSync` samples (lossless); falls back to delta sums.
     pub fn job_files_per_sec(&self, job_id: &JobId, window_secs: i64, now: DateTime<Utc>) -> f64 {
+        if let Some((f, _)) = self
+            .job_syncs
+            .get(job_id)
+            .and_then(|w| w.rates(window_secs, now))
+        {
+            return f;
+        }
         self.progress_windows
             .get(job_id)
             .map(|h| h.files_per_sec(window_secs, now))
@@ -321,6 +355,13 @@ impl AppState {
         window_secs: i64,
         now: DateTime<Utc>,
     ) -> (f64, f64) {
+        if let Some(r) = self
+            .worker_syncs
+            .get(&(job_id.clone(), worker_id))
+            .and_then(|w| w.rates(window_secs, now))
+        {
+            return r;
+        }
         self.worker_windows
             .get(&(job_id.clone(), worker_id))
             .map(|h| {

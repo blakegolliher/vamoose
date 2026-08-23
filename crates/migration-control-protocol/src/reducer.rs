@@ -199,6 +199,8 @@ impl Snapshot {
                         joined_at: env.at,
                         last_heartbeat: env.at,
                         state: WorkerState::Idle,
+                        files_done: 0,
+                        bytes_done: 0,
                         assigned_shard: None,
                         queue_depth: 0,
                         inflight_ops: 0,
@@ -245,13 +247,40 @@ impl Snapshot {
                 }
             }
 
+            EventKind::ProgressSync {
+                job_id,
+                files_done,
+                bytes_done,
+                workers,
+            } => {
+                // Floor-merge: sync carries absolutes captured from
+                // this same reducer's state at emit time, so on live
+                // application it is a no-op; on replay (or for a
+                // client that missed capped delta frames) it heals
+                // counters upward. Never moves anything backward.
+                if let Some(j) = self.jobs.get_mut(job_id) {
+                    j.progress.files_done = j.progress.files_done.max(*files_done);
+                    j.progress.bytes_done = j.progress.bytes_done.max(*bytes_done);
+                }
+                for wc in workers {
+                    if let Some(w) = self.workers.get_mut(&wc.worker_id) {
+                        w.files_done = w.files_done.max(wc.files_done);
+                        w.bytes_done = w.bytes_done.max(wc.bytes_done);
+                    }
+                }
+            }
+
             EventKind::ProgressDelta {
                 job_id,
-                worker_id: _,
+                worker_id,
                 files_delta,
                 bytes_delta,
                 errors_delta,
             } => {
+                if let Some(w) = self.workers.get_mut(worker_id) {
+                    w.files_done = w.files_done.saturating_add(*files_delta);
+                    w.bytes_done = w.bytes_done.saturating_add(*bytes_delta);
+                }
                 let was_planned = if let Some(j) = self.jobs.get_mut(job_id) {
                     j.progress.files_done = j.progress.files_done.saturating_add(*files_delta);
                     j.progress.bytes_done = j.progress.bytes_done.saturating_add(*bytes_delta);

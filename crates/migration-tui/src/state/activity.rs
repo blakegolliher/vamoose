@@ -185,3 +185,44 @@ impl ProgressDeltaHistory {
         self.samples.is_empty()
     }
 }
+
+/// Rolling samples of ABSOLUTE cumulative counters from
+/// `ProgressSync` frames. Rates computed between two absolutes are
+/// immune to event-stream capping/loss — preferred over the
+/// delta-derived windows whenever two samples exist in the window.
+#[derive(Debug, Clone, Default)]
+pub struct AbsoluteWindow {
+    samples: VecDeque<(DateTime<Utc>, u64, u64)>,
+}
+
+impl AbsoluteWindow {
+    pub fn push(&mut self, at: DateTime<Utc>, files: u64, bytes: u64) {
+        let cutoff = at - ChronoDuration::seconds(MAX_WINDOW_SECS);
+        while let Some(&(t, _, _)) = self.samples.front() {
+            if t < cutoff {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.samples.push_back((at, files, bytes));
+    }
+
+    /// (files/s, bytes/s) between the oldest and newest sample inside
+    /// `window_secs`. None until two samples span the window — the
+    /// caller falls back to delta-derived rates.
+    pub fn rates(&self, window_secs: i64, now: DateTime<Utc>) -> Option<(f64, f64)> {
+        let cutoff = now - ChronoDuration::seconds(window_secs);
+        let mut inside = self.samples.iter().filter(|(t, _, _)| *t >= cutoff);
+        let first = inside.next()?;
+        let last = self.samples.back()?;
+        let dt = (last.0 - first.0).num_milliseconds() as f64 / 1000.0;
+        if dt <= 0.0 {
+            return None;
+        }
+        Some((
+            last.1.saturating_sub(first.1) as f64 / dt,
+            last.2.saturating_sub(first.2) as f64 / dt,
+        ))
+    }
+}
