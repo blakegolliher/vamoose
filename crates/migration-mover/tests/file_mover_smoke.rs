@@ -146,6 +146,7 @@ async fn async_bucketed_mover_copies_regular_file_end_to_end() {
         require_chown: false, // running as root in the test but be defensive
         require_unchanged_size: false,
         use_raw_fh: false,
+        direct_commit: false,
         rpc_timeout_ms: DEFAULT_RPC_TIMEOUT_MS,
     });
 
@@ -287,6 +288,7 @@ async fn hardlink_replay_is_idempotent() {
         require_chown: false,
         require_unchanged_size: false,
         use_raw_fh: false,
+        direct_commit: false,
         rpc_timeout_ms: DEFAULT_RPC_TIMEOUT_MS,
     });
 
@@ -440,6 +442,7 @@ async fn symlink_replay_is_idempotent() {
         require_chown: false,
         require_unchanged_size: false,
         use_raw_fh: false,
+        direct_commit: false,
         rpc_timeout_ms: DEFAULT_RPC_TIMEOUT_MS,
     });
 

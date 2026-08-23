@@ -133,6 +133,16 @@ pub struct MoverCfg {
     /// `migration_mover::libnfs::raw`. Off by default.
     #[serde(default)]
     pub use_raw_fh: bool,
+    /// Raw-FH path only (no effect unless `use_raw_fh` is set): CREATE
+    /// destination files under their final name and skip the
+    /// `.partial` + RENAME publish — 5 RPCs per small file instead of
+    /// 6. Trades atomic publish for throughput: a crash can leave a
+    /// torn file visible at the final path; a re-run heals it (CREATE
+    /// is UNCHECKED with size=0, so it truncates). Use only when
+    /// nothing consumes the destination namespace mid-migration. Off
+    /// by default.
+    #[serde(default)]
+    pub direct_commit: bool,
 }
 fn default_strategy() -> String {
     "libnfs_io_uring".into()
@@ -463,6 +473,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.rpc_timeout_ms, 0, "0 = leave libnfs default");
+    }
+
+    /// `direct_commit` drops the `.partial` + RENAME atomic publish,
+    /// so it must be a deliberate opt-in: absent key parses to false,
+    /// and existing operator TOMLs keep the safe behavior unedited.
+    #[test]
+    fn mover_cfg_direct_commit_defaults_off_and_parses() {
+        let m: MoverCfg = toml::from_str(
+            r#"
+            src_url = "nfs://src/export"
+            dst_url = "nfs://dst/export"
+        "#,
+        )
+        .unwrap();
+        assert!(!m.direct_commit, "direct_commit must default to false");
+
+        let m: MoverCfg = toml::from_str(
+            r#"
+            src_url       = "nfs://src/export"
+            dst_url       = "nfs://dst/export"
+            use_raw_fh    = true
+            direct_commit = true
+        "#,
+        )
+        .unwrap();
+        assert!(m.use_raw_fh);
+        assert!(m.direct_commit);
     }
 
     #[test]

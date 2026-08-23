@@ -115,6 +115,15 @@ pub struct MoverConfig {
     /// path-based API. Regular files only; other row types keep the
     /// path-based ops.
     pub use_raw_fh: bool,
+    /// Raw-FH path only: CREATE the destination under its *final*
+    /// name and skip the `.partial` + RENAME publish — 5 RPCs per
+    /// small file instead of 6. Trades the atomic-publish property
+    /// for throughput: a crash mid-copy can leave a torn file
+    /// visible at the final path. Safe when nothing consumes the
+    /// destination namespace until the migration completes — CREATE
+    /// is UNCHECKED with size=0, so a re-run truncates and heals any
+    /// torn file. Off by default.
+    pub direct_commit: bool,
     /// F12: per-RPC timeout in milliseconds, applied to every libnfs
     /// context (sync pools and the bucketed async pool) at creation.
     /// `0` = leave the libnfs built-in default untouched. Seeded to
@@ -141,6 +150,7 @@ impl MoverConfig {
             require_chown: true,
             require_unchanged_size: false,
             use_raw_fh: false,
+            direct_commit: false,
             rpc_timeout_ms: crate::libnfs::DEFAULT_RPC_TIMEOUT_MS,
         }
     }
@@ -735,6 +745,11 @@ impl Mover {
     /// collapsed: LOOKUP(src) + READs + CREATE(attrs) + WRITEs +
     /// SETATTR(times) + RENAME. Single-chunk files write FILE_SYNC and
     /// skip COMMIT; multi-chunk files write UNSTABLE then COMMIT.
+    ///
+    /// With `direct_commit` the `.partial` + RENAME publish is
+    /// skipped: CREATE targets the final name and the R8 fence check
+    /// moves to just before CREATE (the new publish point). See the
+    /// `MoverConfig::direct_commit` doc for the safety argument.
     fn do_raw_copy(&self, pair: &mut ContextPair, row: &RowView) -> Result<u64, MoveError> {
         const CHUNK: u64 = 1 << 20; // 1 MiB per READ/WRITE
 
@@ -787,7 +802,15 @@ impl Mover {
             atime: None,
             mtime: None,
         };
-        let dst_fh = raw::create(pair.dst(), &dst_dir, partial_name, &create_attrs)
+        // Direct-commit mode publishes at CREATE (there is no
+        // `.partial` + RENAME step), so the R8 fence check moves to
+        // this publish point instead of the pre-rename check below.
+        let direct = self.cfg.direct_commit;
+        let commit_name = if direct { dst_name } else { partial_name };
+        if direct {
+            self.check_fence()?;
+        }
+        let dst_fh = raw::create(pair.dst(), &dst_dir, commit_name, &create_attrs)
             .map_err(|e| raw_move_err(e, FailurePhase::Open))?;
 
         let single_chunk = row.size <= CHUNK;
@@ -860,17 +883,19 @@ impl Mover {
             .map_err(|e| raw_move_err(e, FailurePhase::Setattr))?;
         }
 
-        // R8: fence check immediately before the commit-point rename.
-        self.check_fence()?;
-        tracing::debug!(
-            dest = %String::from_utf8_lossy(&dst),
-            host = %self.host_id,
-            pid = self.pid,
-            row_id = row.row_id,
-            "commit: rename .partial → final (raw-fh)",
-        );
-        raw::rename(pair.dst(), &dst_dir, partial_name, dst_name)
-            .map_err(|e| raw_move_err(e, FailurePhase::Rename))?;
+        if !direct {
+            // R8: fence check immediately before the commit-point rename.
+            self.check_fence()?;
+            tracing::debug!(
+                dest = %String::from_utf8_lossy(&dst),
+                host = %self.host_id,
+                pid = self.pid,
+                row_id = row.row_id,
+                "commit: rename .partial → final (raw-fh)",
+            );
+            raw::rename(pair.dst(), &dst_dir, partial_name, dst_name)
+                .map_err(|e| raw_move_err(e, FailurePhase::Rename))?;
+        }
         Ok(written)
     }
 
@@ -1478,6 +1503,7 @@ mod tests {
             require_chown: false,
             require_unchanged_size: false,
             use_raw_fh: false,
+            direct_commit: false,
             rpc_timeout_ms: crate::libnfs::DEFAULT_RPC_TIMEOUT_MS,
         };
         Mover::new(
@@ -1502,6 +1528,23 @@ mod tests {
             &MigrationOptions::default(),
         );
         assert_eq!(cfg.rpc_timeout_ms, crate::libnfs::DEFAULT_RPC_TIMEOUT_MS);
+    }
+
+    /// Both raw-path opt-ins are off unless the orchestrator flips
+    /// them from `[mover]` config: `use_raw_fh` gates the raw path,
+    /// `direct_commit` additionally drops the `.partial` + RENAME
+    /// publish (and with it atomic publish — must never be implicit).
+    #[test]
+    fn from_options_defaults_raw_path_opt_ins_off() {
+        let cfg = MoverConfig::from_options(
+            "nfs://src/exp".into(),
+            "nfs://dst/exp".into(),
+            "/".into(),
+            "/".into(),
+            &MigrationOptions::default(),
+        );
+        assert!(!cfg.use_raw_fh);
+        assert!(!cfg.direct_commit);
     }
 
     // ---- F41: honest byte counts ----------------------------------

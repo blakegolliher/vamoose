@@ -223,6 +223,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     mover_cfg.require_chown = require_chown && cap_chown;
     mover_cfg.require_unchanged_size = cfg.copy.require_unchanged_size;
     mover_cfg.use_raw_fh = cfg.mover.use_raw_fh;
+    mover_cfg.direct_commit = cfg.mover.direct_commit;
     // F12: [mover] rpc_timeout_ms flows config → MoverConfig →
     // MountOpts (both pools read it from here / from cfg.mover).
     mover_cfg.rpc_timeout_ms = cfg.mover.rpc_timeout_ms;
