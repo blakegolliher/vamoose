@@ -20,8 +20,8 @@ use migration_core::claim::test_util::{FakeStore, RiggedFailureKind};
 use migration_core::claim::ClaimStore;
 use migration_core::layout;
 use migration_core::records::{
-    ClaimRecord, ClaimState, Endpoint, EndpointKind, Manifest, MigrationOptions,
-    ProgressRecord, ShardEntry, RUN_FORMAT_VERSION,
+    ClaimRecord, ClaimState, Endpoint, EndpointKind, Manifest, MigrationOptions, ProgressRecord,
+    ShardEntry, RUN_FORMAT_VERSION,
 };
 use migration_core::time::UtcTime;
 use migration_worker::orchestrator::{scan_shards, ClaimBodyCache, ClaimTarget};
@@ -142,7 +142,9 @@ async fn stale_heartbeat_is_reclaimable() {
 
     let mut cache = ClaimBodyCache::new();
     match scan(&store, &mut cache).await {
-        Some(ClaimTarget::Stale { shard, stale_etag, .. }) => {
+        Some(ClaimTarget::Stale {
+            shard, stale_etag, ..
+        }) => {
             assert_eq!(shard, SHARD);
             assert_eq!(stale_etag, etag);
         }

@@ -169,7 +169,12 @@ impl Slot {
 
     /// Record transport-level completion; returns None when the RPC
     /// failed and the res pointer must not be touched.
-    unsafe fn begin(&mut self, rpc: *mut b::rpc_context, status: c_int, data: *mut c_void) -> Option<*mut c_void> {
+    unsafe fn begin(
+        &mut self,
+        rpc: *mut b::rpc_context,
+        status: c_int,
+        data: *mut c_void,
+    ) -> Option<*mut c_void> {
         self.done.set(true);
         self.rpc_status = status;
         if status != RPC_STATUS_SUCCESS {
@@ -299,11 +304,16 @@ macro_rules! issue {
     }};
 }
 
-unsafe extern "C" fn cb_lookup(rpc: *mut b::rpc_context, status: c_int, data: *mut c_void, pd: *mut c_void) {
+unsafe extern "C" fn cb_lookup(
+    rpc: *mut b::rpc_context,
+    status: c_int,
+    data: *mut c_void,
+    pd: *mut c_void,
+) {
     let slot = &mut *(pd as *mut Slot);
     if let Some(data) = slot.begin(rpc, status, data) {
         let res = &*(data as *const b::LOOKUP3res);
-        slot.nfs_status = res.status as u32;
+        slot.nfs_status = res.status;
         if res.status == b::NFS3_OK {
             slot.out = Some(Out::Fh(copy_fh3(&res.LOOKUP3res_u.resok.object)));
         }
@@ -321,7 +331,12 @@ pub fn lookup(nfs: &mut NfsContext, dir_fh: &[u8], name: &[u8]) -> Result<Fh, Ra
         },
     };
     issue!(nfs, &slot, "LOOKUP", {
-        b::rpc_nfs3_lookup_task(rpc_of(nfs), Some(cb_lookup), &mut args, &mut slot as *mut Slot as *mut c_void)
+        b::rpc_nfs3_lookup_task(
+            rpc_of(nfs),
+            Some(cb_lookup),
+            &mut args,
+            &mut slot as *mut Slot as *mut c_void,
+        )
     });
     match slot.finish("LOOKUP")? {
         Out::Fh(fh) => Ok(fh),
@@ -329,11 +344,16 @@ pub fn lookup(nfs: &mut NfsContext, dir_fh: &[u8], name: &[u8]) -> Result<Fh, Ra
     }
 }
 
-unsafe extern "C" fn cb_create(rpc: *mut b::rpc_context, status: c_int, data: *mut c_void, pd: *mut c_void) {
+unsafe extern "C" fn cb_create(
+    rpc: *mut b::rpc_context,
+    status: c_int,
+    data: *mut c_void,
+    pd: *mut c_void,
+) {
     let slot = &mut *(pd as *mut Slot);
     if let Some(data) = slot.begin(rpc, status, data) {
         let res = &*(data as *const b::CREATE3res);
-        slot.nfs_status = res.status as u32;
+        slot.nfs_status = res.status;
         if res.status == b::NFS3_OK {
             let obj = &res.CREATE3res_u.resok.obj;
             if obj.handle_follows != 0 {
@@ -400,7 +420,12 @@ fn sattr3(a: &RawSattr) -> b::sattr3 {
 /// CREATE (UNCHECKED) `name` in `dir_fh` with `attrs` stamped at
 /// creation. Returns the new file's fh (falls back to a LOOKUP if the
 /// server omitted it from the reply).
-pub fn create(nfs: &mut NfsContext, dir_fh: &[u8], name: &[u8], attrs: &RawSattr) -> Result<Fh, RawError> {
+pub fn create(
+    nfs: &mut NfsContext,
+    dir_fh: &[u8],
+    name: &[u8],
+    attrs: &RawSattr,
+) -> Result<Fh, RawError> {
     let cname = cstring(name, "CREATE")?;
     let mut slot = Slot::new();
     let mut args: b::CREATE3args = unsafe { std::mem::zeroed() };
@@ -411,7 +436,12 @@ pub fn create(nfs: &mut NfsContext, dir_fh: &[u8], name: &[u8], attrs: &RawSattr
     args.how.mode = b::UNCHECKED;
     args.how.createhow3_u.obj_attributes = sattr3(attrs);
     issue!(nfs, &slot, "CREATE", {
-        b::rpc_nfs3_create_task(rpc_of(nfs), Some(cb_create), &mut args, &mut slot as *mut Slot as *mut c_void)
+        b::rpc_nfs3_create_task(
+            rpc_of(nfs),
+            Some(cb_create),
+            &mut args,
+            &mut slot as *mut Slot as *mut c_void,
+        )
     });
     match slot.finish("CREATE")? {
         Out::Fh(fh) if !fh.is_empty() => Ok(fh),
@@ -420,11 +450,16 @@ pub fn create(nfs: &mut NfsContext, dir_fh: &[u8], name: &[u8], attrs: &RawSattr
     }
 }
 
-unsafe extern "C" fn cb_mkdir(rpc: *mut b::rpc_context, status: c_int, data: *mut c_void, pd: *mut c_void) {
+unsafe extern "C" fn cb_mkdir(
+    rpc: *mut b::rpc_context,
+    status: c_int,
+    data: *mut c_void,
+    pd: *mut c_void,
+) {
     let slot = &mut *(pd as *mut Slot);
     if let Some(data) = slot.begin(rpc, status, data) {
         let res = &*(data as *const b::MKDIR3res);
-        slot.nfs_status = res.status as u32;
+        slot.nfs_status = res.status;
         if res.status == b::NFS3_OK {
             let obj = &res.MKDIR3res_u.resok.obj;
             if obj.handle_follows != 0 {
@@ -452,7 +487,12 @@ pub fn mkdir(nfs: &mut NfsContext, dir_fh: &[u8], name: &[u8], mode: u32) -> Res
         ..Default::default()
     });
     issue!(nfs, &slot, "MKDIR", {
-        b::rpc_nfs3_mkdir_task(rpc_of(nfs), Some(cb_mkdir), &mut args, &mut slot as *mut Slot as *mut c_void)
+        b::rpc_nfs3_mkdir_task(
+            rpc_of(nfs),
+            Some(cb_mkdir),
+            &mut args,
+            &mut slot as *mut Slot as *mut c_void,
+        )
     });
     match slot.finish("MKDIR")? {
         Out::Fh(fh) if !fh.is_empty() => Ok(fh),
@@ -461,11 +501,16 @@ pub fn mkdir(nfs: &mut NfsContext, dir_fh: &[u8], name: &[u8], mode: u32) -> Res
     }
 }
 
-unsafe extern "C" fn cb_read(rpc: *mut b::rpc_context, status: c_int, data: *mut c_void, pd: *mut c_void) {
+unsafe extern "C" fn cb_read(
+    rpc: *mut b::rpc_context,
+    status: c_int,
+    data: *mut c_void,
+    pd: *mut c_void,
+) {
     let slot = &mut *(pd as *mut Slot);
     if let Some(data) = slot.begin(rpc, status, data) {
         let res = &*(data as *const b::READ3res);
-        slot.nfs_status = res.status as u32;
+        slot.nfs_status = res.status;
         if res.status == b::NFS3_OK {
             let ok = &res.READ3res_u.resok;
             // Data was copied into the caller's buffer by libnfs's
@@ -479,7 +524,12 @@ unsafe extern "C" fn cb_read(rpc: *mut b::rpc_context, status: c_int, data: *mut
 }
 
 /// READ up to `count` bytes at `offset`. Returns (data, eof).
-pub fn read(nfs: &mut NfsContext, fh: &[u8], offset: u64, count: u32) -> Result<(Vec<u8>, bool), RawError> {
+pub fn read(
+    nfs: &mut NfsContext,
+    fh: &[u8],
+    offset: u64,
+    count: u32,
+) -> Result<(Vec<u8>, bool), RawError> {
     let mut slot = Slot::new();
     // libnfs copies reply data into this buffer (rpc_nfs3_read_task
     // wraps it in an iovec); a NULL buffer segfaults inside libnfs.
@@ -507,11 +557,16 @@ pub fn read(nfs: &mut NfsContext, fh: &[u8], offset: u64, count: u32) -> Result<
     }
 }
 
-unsafe extern "C" fn cb_write(rpc: *mut b::rpc_context, status: c_int, data: *mut c_void, pd: *mut c_void) {
+unsafe extern "C" fn cb_write(
+    rpc: *mut b::rpc_context,
+    status: c_int,
+    data: *mut c_void,
+    pd: *mut c_void,
+) {
     let slot = &mut *(pd as *mut Slot);
     if let Some(data) = slot.begin(rpc, status, data) {
         let res = &*(data as *const b::WRITE3res);
-        slot.nfs_status = res.status as u32;
+        slot.nfs_status = res.status;
         if res.status == b::NFS3_OK {
             slot.out = Some(Out::Write {
                 count: res.WRITE3res_u.resok.count,
@@ -523,7 +578,13 @@ unsafe extern "C" fn cb_write(rpc: *mut b::rpc_context, status: c_int, data: *mu
 /// WRITE `data` at `offset`. `stable = true` → FILE_SYNC (bytes are
 /// durable when the reply arrives; no COMMIT needed), else UNSTABLE
 /// (caller must COMMIT before publishing). Returns bytes accepted.
-pub fn write(nfs: &mut NfsContext, fh: &[u8], offset: u64, data: &[u8], stable: bool) -> Result<u32, RawError> {
+pub fn write(
+    nfs: &mut NfsContext,
+    fh: &[u8],
+    offset: u64,
+    data: &[u8],
+    stable: bool,
+) -> Result<u32, RawError> {
     let mut slot = Slot::new();
     let mut args: b::WRITE3args = unsafe { std::mem::zeroed() };
     args.file = fh3(fh);
@@ -533,7 +594,12 @@ pub fn write(nfs: &mut NfsContext, fh: &[u8], offset: u64, data: &[u8], stable: 
     args.data.data_len = data.len() as u32;
     args.data.data_val = data.as_ptr() as *mut c_char;
     issue!(nfs, &slot, "WRITE", {
-        b::rpc_nfs3_write_task(rpc_of(nfs), Some(cb_write), &mut args, &mut slot as *mut Slot as *mut c_void)
+        b::rpc_nfs3_write_task(
+            rpc_of(nfs),
+            Some(cb_write),
+            &mut args,
+            &mut slot as *mut Slot as *mut c_void,
+        )
     });
     match slot.finish("WRITE")? {
         Out::Write { count } => Ok(count),
@@ -541,11 +607,16 @@ pub fn write(nfs: &mut NfsContext, fh: &[u8], offset: u64, data: &[u8], stable: 
     }
 }
 
-unsafe extern "C" fn cb_unit_commit(rpc: *mut b::rpc_context, status: c_int, data: *mut c_void, pd: *mut c_void) {
+unsafe extern "C" fn cb_unit_commit(
+    rpc: *mut b::rpc_context,
+    status: c_int,
+    data: *mut c_void,
+    pd: *mut c_void,
+) {
     let slot = &mut *(pd as *mut Slot);
     if let Some(data) = slot.begin(rpc, status, data) {
         let res = &*(data as *const b::COMMIT3res);
-        slot.nfs_status = res.status as u32;
+        slot.nfs_status = res.status;
         if res.status == b::NFS3_OK {
             slot.out = Some(Out::Unit);
         }
@@ -558,16 +629,26 @@ pub fn commit(nfs: &mut NfsContext, fh: &[u8]) -> Result<(), RawError> {
     let mut args: b::COMMIT3args = unsafe { std::mem::zeroed() };
     args.file = fh3(fh);
     issue!(nfs, &slot, "COMMIT", {
-        b::rpc_nfs3_commit_task(rpc_of(nfs), Some(cb_unit_commit), &mut args, &mut slot as *mut Slot as *mut c_void)
+        b::rpc_nfs3_commit_task(
+            rpc_of(nfs),
+            Some(cb_unit_commit),
+            &mut args,
+            &mut slot as *mut Slot as *mut c_void,
+        )
     });
     slot.finish("COMMIT").map(|_| ())
 }
 
-unsafe extern "C" fn cb_unit_setattr(rpc: *mut b::rpc_context, status: c_int, data: *mut c_void, pd: *mut c_void) {
+unsafe extern "C" fn cb_unit_setattr(
+    rpc: *mut b::rpc_context,
+    status: c_int,
+    data: *mut c_void,
+    pd: *mut c_void,
+) {
     let slot = &mut *(pd as *mut Slot);
     if let Some(data) = slot.begin(rpc, status, data) {
         let res = &*(data as *const b::SETATTR3res);
-        slot.nfs_status = res.status as u32;
+        slot.nfs_status = res.status;
         if res.status == b::NFS3_OK {
             slot.out = Some(Out::Unit);
         }
@@ -582,16 +663,26 @@ pub fn setattr(nfs: &mut NfsContext, fh: &[u8], attrs: &RawSattr) -> Result<(), 
     args.new_attributes = sattr3(attrs);
     // guard.check = 0 (no ctime guard) via zeroed.
     issue!(nfs, &slot, "SETATTR", {
-        b::rpc_nfs3_setattr_task(rpc_of(nfs), Some(cb_unit_setattr), &mut args, &mut slot as *mut Slot as *mut c_void)
+        b::rpc_nfs3_setattr_task(
+            rpc_of(nfs),
+            Some(cb_unit_setattr),
+            &mut args,
+            &mut slot as *mut Slot as *mut c_void,
+        )
     });
     slot.finish("SETATTR").map(|_| ())
 }
 
-unsafe extern "C" fn cb_unit_rename(rpc: *mut b::rpc_context, status: c_int, data: *mut c_void, pd: *mut c_void) {
+unsafe extern "C" fn cb_unit_rename(
+    rpc: *mut b::rpc_context,
+    status: c_int,
+    data: *mut c_void,
+    pd: *mut c_void,
+) {
     let slot = &mut *(pd as *mut Slot);
     if let Some(data) = slot.begin(rpc, status, data) {
         let res = &*(data as *const b::RENAME3res);
-        slot.nfs_status = res.status as u32;
+        slot.nfs_status = res.status;
         if res.status == b::NFS3_OK {
             slot.out = Some(Out::Unit);
         }
@@ -599,7 +690,12 @@ unsafe extern "C" fn cb_unit_rename(rpc: *mut b::rpc_context, status: c_int, dat
 }
 
 /// RENAME `from_name` → `to_name`, both within `dir_fh`.
-pub fn rename(nfs: &mut NfsContext, dir_fh: &[u8], from_name: &[u8], to_name: &[u8]) -> Result<(), RawError> {
+pub fn rename(
+    nfs: &mut NfsContext,
+    dir_fh: &[u8],
+    from_name: &[u8],
+    to_name: &[u8],
+) -> Result<(), RawError> {
     let cfrom = cstring(from_name, "RENAME")?;
     let cto = cstring(to_name, "RENAME")?;
     let mut slot = Slot::new();
@@ -614,7 +710,12 @@ pub fn rename(nfs: &mut NfsContext, dir_fh: &[u8], from_name: &[u8], to_name: &[
         },
     };
     issue!(nfs, &slot, "RENAME", {
-        b::rpc_nfs3_rename_task(rpc_of(nfs), Some(cb_unit_rename), &mut args, &mut slot as *mut Slot as *mut c_void)
+        b::rpc_nfs3_rename_task(
+            rpc_of(nfs),
+            Some(cb_unit_rename),
+            &mut args,
+            &mut slot as *mut Slot as *mut c_void,
+        )
     });
     slot.finish("RENAME").map(|_| ())
 }

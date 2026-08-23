@@ -325,8 +325,14 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
 /// skip; the payload is unrecoverable by definition.
 #[derive(Debug, Clone)]
 pub enum SseFrame {
-    Event { seq: u64, envelope: EventEnvelope },
-    UnknownEvent { seq: u64, kind: String },
+    Event {
+        seq: u64,
+        envelope: Box<EventEnvelope>,
+    },
+    UnknownEvent {
+        seq: u64,
+        kind: String,
+    },
     Resync,
     Keepalive,
 }
@@ -408,7 +414,10 @@ impl PartialFrame {
                     }
                 };
                 match serde_json::from_str::<EventEnvelope>(data_str) {
-                    Ok(envelope) => Some(Ok(SseFrame::Event { seq, envelope })),
+                    Ok(envelope) => Some(Ok(SseFrame::Event {
+                        seq,
+                        envelope: Box::new(envelope),
+                    })),
                     // F38: distinguish future-version skew from
                     // corruption via a lightweight pre-parse. A JSON
                     // object with a string `kind` tag is a versioned

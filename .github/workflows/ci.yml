@@ -76,12 +76,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install libnfs build deps
-        # migration-mover's build.rs links against libnfs. Match the
-        # versions the lab cluster uses.
+      - name: Build + install libnfs (vamoose fork)
+        # migration-mover's raw-FH path links the rpc_nfs3_*_task API,
+        # which Ubuntu's packaged libnfs predates — build the same
+        # patched fork production deploys (keepalive + reserved-port
+        # patches). Pinned to the exact commit the 600M run shipped.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnfs-dev pkg-config
+          sudo apt-get install -y pkg-config cmake
+          git clone https://github.com/blakegolliher/libnfs /tmp/libnfs
+          git -C /tmp/libnfs checkout 6073b694784b95c39c3f1c3c563b2fff68bc9e13
+          cmake -S /tmp/libnfs -B /tmp/libnfs/build -DCMAKE_BUILD_TYPE=Release
+          make -C /tmp/libnfs/build -j"$(nproc)"
+          sudo make -C /tmp/libnfs/build install
+          sudo ldconfig
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
       - name: cargo build
         run: cargo build --workspace --all-targets --locked

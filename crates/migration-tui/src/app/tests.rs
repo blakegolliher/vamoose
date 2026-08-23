@@ -200,7 +200,7 @@ fn sse_frame_event_applies_envelope_and_marks_traffic() {
         &mut s,
         Input::SseFrame(SseFrame::Event {
             seq: 1,
-            envelope: env,
+            envelope: Box::new(env),
         }),
         at(7),
     );
@@ -223,7 +223,7 @@ fn sse_frame_event_auto_selects_first_job() {
         &mut s,
         Input::SseFrame(SseFrame::Event {
             seq: 1,
-            envelope: job_created(1, "alpha"),
+            envelope: Box::new(job_created(1, "alpha")),
         }),
         at(0),
     );
@@ -233,7 +233,7 @@ fn sse_frame_event_auto_selects_first_job() {
         &mut s,
         Input::SseFrame(SseFrame::Event {
             seq: 2,
-            envelope: job_created(2, "bravo"),
+            envelope: Box::new(job_created(2, "bravo")),
         }),
         at(0),
     );
@@ -302,7 +302,7 @@ fn driver_advances_cursor_past_unknown() {
         &mut s,
         Input::SseFrame(SseFrame::Event {
             seq: 6,
-            envelope: job_created(6, "bravo"),
+            envelope: Box::new(job_created(6, "bravo")),
         }),
         at(5),
     );
