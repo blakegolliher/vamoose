@@ -29,8 +29,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let t = std::time::Instant::now();
-    let (data, eof) = raw::read(&mut ctx, &cur, 0, 1 << 20)
-        .map_err(|e| anyhow::anyhow!("READ: {}", e.detail))?;
+    let (data, eof) =
+        raw::read(&mut ctx, &cur, 0, 1 << 20).map_err(|e| anyhow::anyhow!("READ: {}", e.detail))?;
     eprintln!("read {} bytes eof={eof} in {:?}", data.len(), t.elapsed());
     Ok(())
 }

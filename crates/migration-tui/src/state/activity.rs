@@ -175,7 +175,6 @@ impl ProgressDeltaHistory {
         total as f64 / window_secs as f64
     }
 
-
     /// Sample count (mostly for tests and diagnostics).
     pub fn len(&self) -> usize {
         self.samples.len()

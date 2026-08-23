@@ -32,6 +32,15 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+    # h2 unbounded empty DATA frames (DoS). The h2 0.4 line is
+    # updated past the patch (>=0.4.16); this entry covers only the
+    # unpatched h2 0.3 pulled by the same aws-smithy legacy stack as
+    # above. vamoose runs no h2 0.3 SERVER — that stack is an S3
+    # client speaking to an operator-configured endpoint, so a
+    # malicious-peer frame flood requires the operator's own storage
+    # to attack it. Remove with the legacy stack (same condition as
+    # the three above).
+    "RUSTSEC-2026-0258",
 ]
 
 # -----------------------------------------------------------------------------

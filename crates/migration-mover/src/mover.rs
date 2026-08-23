@@ -152,6 +152,9 @@ impl MoverConfig {
 /// per R8), and policy. Cloning is cheap (Arc inside) and required
 /// because concurrent shard dispatch hands a clone to each spawned
 /// task. The fence is Arc-backed; all clones share the same atomic flag.
+/// Per-directory single-flight guards keyed by destination path.
+type DirLocks = std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<std::sync::Mutex<()>>>>;
+
 #[derive(Clone)]
 pub struct Mover {
     cfg: Arc<MoverConfig>,
@@ -176,7 +179,7 @@ pub struct Mover {
     /// with the plain cache). Losers of the race block on the winner's
     /// per-dir mutex (blocking-pool threads, so parking is fine) and
     /// then hit the cache.
-    dir_locks: Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<std::sync::Mutex<()>>>>>,
+    dir_locks: Arc<DirLocks>,
     /// Raw-FH path (see [`crate::libnfs::raw`]): directory filehandles
     /// resolved once and shared across every context — NFSv3 fhs are
     /// server-scoped, not connection-scoped. Separate caches per side
@@ -273,7 +276,11 @@ impl Mover {
                 Err(e) => return Err(e),
             };
             let fh = Arc::new(fh);
-            cache.map.lock().unwrap().insert(acc.clone(), Arc::clone(&fh));
+            cache
+                .map
+                .lock()
+                .unwrap()
+                .insert(acc.clone(), Arc::clone(&fh));
             cache.locks.lock().unwrap().remove(acc.as_slice());
             cur = fh;
         }
@@ -736,10 +743,10 @@ impl Mover {
         let dst_partial = partial_path(&dst, &self.host_id, self.pid)?;
         self.check_self_target(&src, &dst, &dst_partial)?;
 
-        let (src_parent, src_name) = split_parent_name(&src)
-            .ok_or_else(|| MoveError::new(FailurePhase::Open, "EINVAL"))?;
-        let (dst_parent, dst_name) = split_parent_name(&dst)
-            .ok_or_else(|| MoveError::new(FailurePhase::Open, "EINVAL"))?;
+        let (src_parent, src_name) =
+            split_parent_name(&src).ok_or_else(|| MoveError::new(FailurePhase::Open, "EINVAL"))?;
+        let (dst_parent, dst_name) =
+            split_parent_name(&dst).ok_or_else(|| MoveError::new(FailurePhase::Open, "EINVAL"))?;
         let (_, partial_name) = split_parent_name(&dst_partial)
             .ok_or_else(|| MoveError::new(FailurePhase::Open, "EINVAL"))?;
 

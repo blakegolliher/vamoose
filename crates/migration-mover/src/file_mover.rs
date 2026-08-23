@@ -142,6 +142,10 @@ impl FileMover for Mover {
     }
 }
 
+/// Per-directory single-flight guards keyed by destination path.
+type AsyncDirLocks =
+    tokio::sync::Mutex<std::collections::HashMap<Vec<u8>, Arc<tokio::sync::Mutex<()>>>>;
+
 /// Routes regular-file rows through the bucketed async pool +
 /// [`pipelined_copy`]. Everything else delegates to a wrapped sync [`Mover`];
 /// the async pipe handles regular files only. The two impls share the same
@@ -162,11 +166,7 @@ pub struct AsyncBucketedFileMover {
     /// a depth-8 tree). Entries are only added after a successful
     /// mkdir chain and nothing removes destination dirs during a run.
     dirs_known: Arc<tokio::sync::Mutex<std::collections::HashSet<Vec<u8>>>>,
-    dir_locks: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<Vec<u8>, Arc<tokio::sync::Mutex<()>>>,
-        >,
-    >,
+    dir_locks: Arc<AsyncDirLocks>,
 }
 
 impl AsyncBucketedFileMover {

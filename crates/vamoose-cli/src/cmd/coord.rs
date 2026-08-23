@@ -159,10 +159,7 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
             let seq = runtime
                 .ingest(migration_coord::schema::EventKind::JobCreated {
                     job_id: job_id.clone(),
-                    name: args
-                        .seed_job_name
-                        .clone()
-                        .unwrap_or_else(|| job.clone()),
+                    name: args.seed_job_name.clone().unwrap_or_else(|| job.clone()),
                     source: args.seed_source.clone(),
                     dest: args.seed_dest.clone(),
                     owner: whoami_owner(),
@@ -317,6 +314,13 @@ fn build_auth(args: &Args) -> anyhow::Result<AuthConfig> {
     Ok(auth)
 }
 
+/// Owner string for seeded jobs: the invoking user, best-effort.
+fn whoami_owner() -> String {
+    std::env::var("SUDO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "operator".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,12 +440,4 @@ mod tests {
         check_dev_mode_bind(true, &addr("0.0.0.0:8443"), true)
             .expect("--allow-unauthenticated-nonloopback must permit the bind");
     }
-}
-
-
-/// Owner string for seeded jobs: the invoking user, best-effort.
-fn whoami_owner() -> String {
-    std::env::var("SUDO_USER")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "operator".to_string())
 }

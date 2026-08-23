@@ -83,12 +83,7 @@ pub(super) fn render_workers_tab(
     frame.render_widget(table, chunks[1]);
 }
 
-fn worker_row<'a>(
-    w: &'a Worker,
-    state: &AppState,
-    job_id: &JobId,
-    now: DateTime<Utc>,
-) -> Row<'a> {
+fn worker_row<'a>(w: &'a Worker, state: &AppState, job_id: &JobId, now: DateTime<Utc>) -> Row<'a> {
     // Client-side 60s rates from the ProgressDelta stream — the
     // worker-reported heartbeat counters under-report (files rate is
     // stubbed 0.0 by current workers).
