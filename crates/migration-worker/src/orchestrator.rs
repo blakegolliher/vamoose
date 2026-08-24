@@ -389,6 +389,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     let coord_handle: Option<CoordDriverHandle> = match coord_cfg.as_ref() {
         Some(c) => {
             let driver_inputs = DriverInputs {
+                live: Arc::clone(&live),
                 progress: progress.clone(),
                 throughput: throughput.clone(),
                 fence: fence.clone(),

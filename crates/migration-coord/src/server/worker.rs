@@ -262,6 +262,8 @@ fn validate_worker_event(kind: &EventKind, caller: WorkerId) -> Result<(), ApiEr
         // Operator/lifecycle kinds and register-path-synthesized
         // kinds: never accepted from workers.
         EventKind::JobCreated { .. }
+        | EventKind::JobTotalsSet { .. }
+        | EventKind::ProgressSync { .. }
         | EventKind::JobPhaseChanged { .. }
         | EventKind::JobPaused { .. }
         | EventKind::JobResumed { .. }

@@ -502,6 +502,14 @@ impl ControlMode {
     }
 }
 
+/// Per-worker cumulative counters carried by `ProgressSync`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCum {
+    pub worker_id: WorkerId,
+    pub files_done: u64,
+    pub bytes_done: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Worker {
     pub id: WorkerId,
@@ -519,6 +527,13 @@ pub struct Worker {
     pub joined_at: DateTime<Utc>,
     pub last_heartbeat: DateTime<Utc>,
     pub state: WorkerState,
+    /// Cumulative counters accumulated by the reducer from this
+    /// worker's ProgressDelta events. Serde-defaulted so pre-field
+    /// snapshots load unchanged.
+    #[serde(default)]
+    pub files_done: u64,
+    #[serde(default)]
+    pub bytes_done: u64,
     #[serde(default)]
     pub assigned_shard: Option<ShardId>,
     #[serde(default)]
@@ -681,6 +696,28 @@ pub enum EventKind {
         #[serde(default)]
         total_bytes: u64,
     },
+    /// Authoritative cumulative counters, emitted by the coord's
+    /// flush tick (~1 Hz per active job). Rates and progress derived
+    /// client-side from these ABSOLUTES are immune to ProgressDelta
+    /// stream capping/loss — deltas remain for responsiveness, sync
+    /// frames are the truth. Carries a fresh seq like any event, so
+    /// every monotonic-seq guard passes; the reducer treats it as a
+    /// floor (max-merge) so replay stays deterministic.
+    ProgressSync {
+        job_id: JobId,
+        files_done: u64,
+        bytes_done: u64,
+        workers: Vec<WorkerCum>,
+    },
+    /// Install or correct a job's planned totals after creation —
+    /// the normal case: totals become known when a scan or index
+    /// build finishes, which is after JobCreated. Operator-nature;
+    /// rejected on the worker events route.
+    JobTotalsSet {
+        job_id: JobId,
+        total_files: u64,
+        total_bytes: u64,
+    },
     JobPhaseChanged {
         job_id: JobId,
         from: Phase,
@@ -787,6 +824,8 @@ impl EventKind {
     pub fn name(&self) -> &'static str {
         match self {
             Self::JobCreated { .. } => "JobCreated",
+            Self::JobTotalsSet { .. } => "JobTotalsSet",
+            Self::ProgressSync { .. } => "ProgressSync",
             Self::JobPhaseChanged { .. } => "JobPhaseChanged",
             Self::JobPaused { .. } => "JobPaused",
             Self::JobResumed { .. } => "JobResumed",
@@ -814,6 +853,8 @@ impl EventKind {
     pub fn job_id(&self) -> Option<&JobId> {
         match self {
             Self::JobCreated { job_id, .. }
+            | Self::JobTotalsSet { job_id, .. }
+            | Self::ProgressSync { job_id, .. }
             | Self::JobPhaseChanged { job_id, .. }
             | Self::JobPaused { job_id, .. }
             | Self::JobResumed { job_id, .. }
@@ -858,6 +899,8 @@ impl EventKind {
             | Self::WorkerRecovered { worker_id } => Some(*worker_id),
 
             Self::JobCreated { .. }
+            | Self::JobTotalsSet { .. }
+            | Self::ProgressSync { .. }
             | Self::JobPhaseChanged { .. }
             | Self::JobPaused { .. }
             | Self::JobResumed { .. }
@@ -1561,6 +1604,8 @@ mod tests {
             joined_at: at(),
             last_heartbeat: at(),
             state: WorkerState::Copying,
+            files_done: 0,
+            bytes_done: 0,
             assigned_shard: Some(ShardId("part-0042".into())),
             queue_depth: 7,
             inflight_ops: 3,

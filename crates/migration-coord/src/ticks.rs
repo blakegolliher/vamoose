@@ -234,6 +234,9 @@ pub async fn flush_aged_loop(
             _ = shutdown.cancelled() => return Ok(()),
             _ = tick.tick() => {
                 let _ = rt.flush_trailing_progress().await;
+                if let Err(e) = rt.emit_progress_syncs().await {
+                    tracing::warn!(error = %e, "progress sync emission failed; retry next tick");
+                }
                 if let Err(e) = rt.flush_aged().await {
                     tracing::warn!(error = %e, "flush_aged failed; retry next tick");
                 }
@@ -527,7 +530,11 @@ mod tests {
             env.kind,
         );
         assert_eq!(env.seq, last_seq, "re-broadcast, not a new event");
-        assert_eq!(rt.last_seq().await, last_seq, "no new event minted");
+        // The tick also mints ProgressSync events for the active job
+        // (authoritative absolutes for client-side rates) — so
+        // last_seq may advance; the trailing re-broadcast itself
+        // still reuses its original envelope.
+        assert!(rt.last_seq().await >= last_seq, "seq must never regress",);
 
         shutdown.cancel();
         task.await.unwrap().unwrap();

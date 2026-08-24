@@ -47,6 +47,45 @@ pub(super) fn render_overview_tab(
         kv_key("Phase"),
         phase_span(job.phase, theme),
     ]));
+    // Run start = the moment work first flowed (Planned -> Copying
+    // in phase_history). "Created" is the registry seed time and can
+    // predate the actual run by hours; operators asked for the real
+    // start, elapsed, and the honest average rate since then — the
+    // instantaneous rate swings with per-region RPC cost (dir-dense
+    // stretches read low even at a saturated server).
+    if let Some(t) = job
+        .phase_history
+        .iter()
+        .find(|t| t.to == migration_control_protocol::schema::Phase::Copying)
+    {
+        let secs = (now - t.at).num_seconds().max(1);
+        let avg = job.progress.files_done as f64 / secs as f64;
+        lines.push(kv_line(
+            "Started",
+            format!(
+                "{} ({} ago)  ·  avg {:.0} files/s since start",
+                t.at.format("%Y-%m-%d %H:%M:%SZ"),
+                format_elapsed(t.at, now),
+                avg,
+            ),
+        ));
+        if job.progress.files_total > 0 && avg > 0.0 {
+            let remaining = job
+                .progress
+                .files_total
+                .saturating_sub(job.progress.files_done);
+            let eta_secs = (remaining as f64 / avg) as i64;
+            let eta_at = now + chrono::Duration::seconds(eta_secs);
+            lines.push(kv_line(
+                "ETA",
+                format!(
+                    "~{} ({})",
+                    human_duration(eta_secs),
+                    eta_at.format("%H:%M:%SZ"),
+                ),
+            ));
+        }
+    }
     lines.push(kv_line("Files", files_summary(job)));
     lines.push(kv_line("Bytes", bytes_summary(job)));
     lines.push(kv_line("Errors", format!("{}", job.progress.errors_total)));
@@ -90,4 +129,15 @@ pub(super) fn render_overview_tab(
 
     let para = Paragraph::new(Text::from(lines));
     frame.render_widget(para, area);
+}
+
+/// Compact duration: "3h12m", "48m", "90s".
+fn human_duration(secs: i64) -> String {
+    if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
 }
