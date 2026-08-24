@@ -28,6 +28,16 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::Client;
 use tokio::io::AsyncWriteExt;
 
+/// What an HTTP HEAD reports about an object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectHead {
+    /// Unquoted etag.
+    pub etag: String,
+    pub size: u64,
+    /// User metadata (`x-amz-meta-*`), keys lower-cased.
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct S3Client {
     inner: Client,
@@ -480,6 +490,66 @@ impl S3Client {
             .bucket(&self.bucket)
             .key(key)
             .body(body.into())
+            .send()
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("S3 PUT {key}: {e:?}")))?;
+        Ok(resp.e_tag().map(unquote_etag).unwrap_or_default())
+    }
+
+    /// HTTP HEAD with the object's size and user metadata. `None` when
+    /// the key is absent. Used by `vamoose prepare` to decide whether an
+    /// index shard already in the bucket is byte-for-byte the one it
+    /// would upload.
+    pub async fn head_meta(&self, key: &str) -> Result<Option<ObjectHead>> {
+        match self
+            .inner
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let etag = resp.e_tag().map(unquote_etag).unwrap_or_default();
+                let size = u64::try_from(resp.content_length().unwrap_or(0)).unwrap_or(0);
+                let metadata = resp
+                    .metadata()
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(Some(ObjectHead {
+                    etag,
+                    size,
+                    metadata,
+                }))
+            }
+            Err(SdkError::ServiceError(svc)) if svc.err().is_not_found() => Ok(None),
+            Err(e) => Err(Error::Other(anyhow::anyhow!("S3 HEAD {key}: {e}"))),
+        }
+    }
+
+    /// Upload a local file with user metadata, streaming from disk.
+    /// Returns the object's etag. Single-part PUT, so the etag is the
+    /// body MD5 that workers compare on download.
+    pub async fn put_file_with_metadata(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        metadata: std::collections::HashMap<String, String>,
+    ) -> Result<String> {
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(path)
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(format!("{}: {e}", path.display()))))?;
+        let resp = self
+            .inner
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .set_metadata(Some(metadata))
+            .body(body)
             .send()
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("S3 PUT {key}: {e:?}")))?;
