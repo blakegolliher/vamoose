@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "rustc": "1.98.0",
+  "cargo": "1.98.0",
+  "cargo_zigbuild": "0.20.1",
+  "zig": "0.16.0"
+}

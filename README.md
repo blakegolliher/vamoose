@@ -25,8 +25,8 @@ claim authority out of the data plane.
 - `migration-tui` — optional ratatui dashboard over coordinator REST and SSE.
 - `migration-aggr` — standalone `mig-aggr`; `clean-partials` is implemented,
   while its observability commands currently fail safely as unimplemented.
-- `mig-walker-rewrite` — temporary converter from legacy walker Parquet to the
-  canonical schema.
+- `mig-walker-rewrite` — resumable converter from legacy walker Parquet to the
+  canonical schema, with atomic shard activation and JSON checkpoints.
 - `vamoose-cli` — the unified `vamoose` entry point and lifecycle boundary.
 
 There is no implemented custom io_uring mover, NFSv4.2 server-side COPY, or
@@ -56,7 +56,7 @@ Binaries land in `target/release/`. The unified entry point is
 | Command | Status |
 |---|---|
 | `vamoose worker` | Implemented migration worker |
-| `vamoose status` | Implemented one-shot or watched S3 status |
+| `vamoose status` | Implemented text/JSON S3 status, one-shot or watched |
 | `vamoose doctor` | Implemented configuration, S3, NFS, and permission checks |
 | `vamoose init` | Implemented S3 layout marker initialization |
 | `vamoose coord` | Implemented optional REST/SSE coordinator |
@@ -78,20 +78,22 @@ an unknown job. This provisioning gap is tracked in
 
 ## Quick start
 
-See `scripts/manual-verify.sh` and the per-crate notes for the end-to-end
-cookbook. At a high level:
+The recommended production-style entry point is the tracked
+[`ops/`](ops/README.md) harness. At a high level:
 
-1. Configure S3 access (endpoint, region/profile, and run bucket).
-2. Create a canonical configuration from `examples/worker.toml`. The same
-   `[run]`-rooted file configures standalone `mig-worker` and the
-   configuration-consuming `vamoose` commands. Source and destination must not
-   overlap.
-3. Run `vamoose init --config <path>` to materialize the bucket-prefix markers.
-4. Run `nfs-walker`, convert legacy output with `mig-walker-rewrite` if needed,
-   and upload the canonical immutable Parquet shards plus `manifest.json`.
-   `scripts/manual-verify.sh` shows the current explicit pipeline.
-5. Start `vamoose worker --config <path>` on each migration host.
-6. Monitor the data plane with `vamoose status --config <path>`. The optional
+1. Copy `ops/run.env.example` to ignored `ops/run.env`, fill in the site and
+   pinned artifact details, then run `ops/validate-run.sh --require-artifacts`.
+2. Run `ops/init-run.sh` and `ops/prepare-run.sh` to bind a fresh bucket and
+   checkpoint scan, canonical rewrite, verified upload, and immutable manifest
+   creation.
+3. Run `ops/deploy-release.sh`, then `ops/begin-run.sh` to start every configured
+   systemd worker instance and require fresh readiness heartbeats.
+4. Monitor with `vamoose status --config <rendered-local.toml> --watch` or the
+   tracked worker-status helper.
+5. Run `ops/finalize-run.sh` after terminal state. It checks failed claims and
+   records, performs deterministic content/metadata/symlink sampling, captures
+   timing and provenance evidence, and resumes any paused resources.
+6. The optional
    coordinator and TUI can operate once control-plane job state is provisioned,
    but the repository does not yet provide that provisioning command or route:
    - add `[coord]` to the worker configuration;

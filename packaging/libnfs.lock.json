@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "source_url": "https://github.com/blakegolliher/libnfs",
+  "source_git_sha": "6073b694784b95c39c3f1c3c563b2fff68bc9e13",
+  "soname": "libnfs.so.16.2.0",
+  "artifact_sha256": "c586d6ed1938ee0c6670ca8c752ec6cede1946fc8a9b330521d757d208f2e25d"
+}

@@ -1,7 +1,7 @@
-//! Throwaway pre-flight shim: read a directory of nfs-walker parquet
-//! shards, write canonical-schema parquet shards. See `README.md` and
-//! `migration/SHIM_PLAN.md` for scope and the loud limitation around
-//! file-type tag synthesis.
+//! Resumable pre-flight converter: read nfs-walker Parquet shards and
+//! atomically write canonical-schema shards with machine-readable
+//! checkpoints. See `README.md` and `docs/work-items/SHIM_PLAN.md` for
+//! the schema translation and file-type synthesis constraints.
 
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{
@@ -19,9 +19,14 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use parquet::format::KeyValue;
-use std::fs::File;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, Metadata};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // =============================================================================
 // CLI
@@ -42,8 +47,8 @@ struct Cli {
     #[arg(short = 'i', long)]
     input: PathBuf,
 
-    /// Directory to write canonical shards into. Created if absent;
-    /// refuses to clobber non-empty.
+    /// Directory to write canonical shards into. Created if absent.
+    /// Refuses to clobber non-empty unless --resume is supplied.
     #[arg(short = 'o', long)]
     output: PathBuf,
 
@@ -55,6 +60,15 @@ struct Cli {
     /// Walker version string for parquet KV metadata.
     #[arg(long, default_value = "shim-via-unknown")]
     walker_version: String,
+
+    /// Resume from validated per-shard entries in the rewrite report.
+    #[arg(long)]
+    resume: bool,
+
+    /// Machine-readable checkpoint report. Defaults to
+    /// <output>/rewrite-report.json.
+    #[arg(long)]
+    report: Option<PathBuf>,
 
     /// Per-row trace logging.
     #[arg(short, long)]
@@ -72,6 +86,10 @@ fn main() -> Result<()> {
         )
         .init();
 
+    run_rewrite(&args)
+}
+
+fn run_rewrite(args: &Cli) -> Result<()> {
     let scan_dir = resolve_scan_dir(&args.input)?;
     if scan_dir != args.input {
         tracing::info!(
@@ -94,22 +112,119 @@ fn main() -> Result<()> {
 
     std::fs::create_dir_all(&args.output)
         .with_context(|| format!("creating output dir {}", args.output.display()))?;
-    if std::fs::read_dir(&args.output)?.next().is_some() {
+    if !args.resume && std::fs::read_dir(&args.output)?.next().is_some() {
         bail!("output directory not empty: {}", args.output.display());
+    }
+
+    let scan_dir = std::fs::canonicalize(&scan_dir)
+        .with_context(|| format!("canonicalizing {}", scan_dir.display()))?;
+    let output_dir = std::fs::canonicalize(&args.output)
+        .with_context(|| format!("canonicalizing {}", args.output.display()))?;
+    let report_path = args
+        .report
+        .clone()
+        .unwrap_or_else(|| output_dir.join("rewrite-report.json"));
+    let report_path = absolute_path(&report_path)?;
+
+    validate_resume_directory(&output_dir, &report_path, &inputs, args.resume)?;
+    let mut report = load_or_create_report(
+        &report_path,
+        &scan_dir,
+        &output_dir,
+        &args.source_root,
+        &args.walker_version,
+        args.resume,
+    )?;
+    let mut checkpoints: HashMap<String, ShardCheckpoint> = report
+        .shards
+        .drain(..)
+        .map(|checkpoint| (checkpoint.input_name.clone(), checkpoint))
+        .collect();
+
+    let input_names: HashSet<String> = inputs
+        .iter()
+        .map(|input| input.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    if let Some(stale) = checkpoints
+        .keys()
+        .find(|name| !input_names.contains(name.as_str()))
+    {
+        bail!("rewrite report contains shard no longer present in input: {stale}");
     }
 
     let source_root = args.source_root.as_bytes();
 
     for (shard_idx, input) in inputs.iter().enumerate() {
-        let output = args.output.join(input.file_name().unwrap());
+        let input = std::fs::canonicalize(input)
+            .with_context(|| format!("canonicalizing input shard {}", input.display()))?;
+        let input_name = input.file_name().unwrap().to_string_lossy().into_owned();
+        let output = output_dir.join(input.file_name().unwrap());
+        let partial = partial_path(&output);
+        let fingerprint = source_fingerprint(&std::fs::metadata(&input)?)?;
+        if args.resume {
+            if let Some(checkpoint) = checkpoints.get(&input_name) {
+                if checkpoint_is_valid(checkpoint, &output, shard_idx as u32, &fingerprint) {
+                    if partial.exists() {
+                        std::fs::remove_file(&partial).with_context(|| {
+                            format!("removing stale partial {}", partial.display())
+                        })?;
+                    }
+                    tracing::info!(
+                        input = %input.display(),
+                        output = %output.display(),
+                        shard_idx,
+                        rows = checkpoint.rows,
+                        "validated checkpoint; shard already rewritten",
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    input = %input.display(),
+                    output = %output.display(),
+                    shard_idx,
+                    "checkpoint or output failed validation; rewriting shard",
+                );
+            }
+        }
+
+        if partial.exists() {
+            std::fs::remove_file(&partial)
+                .with_context(|| format!("removing stale partial {}", partial.display()))?;
+        }
         let rows = rewrite_shard(
-            input,
-            &output,
+            &input,
+            &partial,
             shard_idx as u32,
             source_root,
             &args.walker_version,
         )
         .with_context(|| format!("rewriting shard {}", input.display()))?;
+        File::open(&partial)?.sync_all()?;
+        std::fs::rename(&partial, &output).with_context(|| {
+            format!(
+                "atomically activating rewritten shard {} as {}",
+                partial.display(),
+                output.display()
+            )
+        })?;
+        File::open(&output_dir)?.sync_all()?;
+        let output_bytes = std::fs::metadata(&output)?.len();
+        let output_sha256 = file_sha256(&output)?;
+        checkpoints.insert(
+            input_name.clone(),
+            ShardCheckpoint {
+                input_name,
+                shard_index: shard_idx as u32,
+                input_bytes: fingerprint.bytes,
+                input_modified_unix_ns: fingerprint.modified_unix_ns,
+                output_name: output.file_name().unwrap().to_string_lossy().into_owned(),
+                output_bytes,
+                output_sha256,
+                rows,
+            },
+        );
+        update_report(&mut report, &checkpoints, false);
+        write_report_atomic(&report_path, &report)?;
         tracing::info!(
             input = %input.display(),
             output = %output.display(),
@@ -119,6 +234,270 @@ fn main() -> Result<()> {
         );
     }
 
+    update_report(&mut report, &checkpoints, true);
+    write_report_atomic(&report_path, &report)?;
+    tracing::info!(
+        report = %report_path.display(),
+        shards = report.shards.len(),
+        rows = report.total_rows,
+        "rewrite complete; machine-readable report committed",
+    );
+    Ok(())
+}
+
+// =============================================================================
+// Resumable rewrite report
+// =============================================================================
+
+const REWRITE_REPORT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RewriteReport {
+    schema_version: u32,
+    input_dir: String,
+    output_dir: String,
+    source_root: String,
+    walker_version: String,
+    started_unix_seconds: u64,
+    updated_unix_seconds: u64,
+    complete: bool,
+    total_rows: u64,
+    total_output_bytes: u64,
+    shards: Vec<ShardCheckpoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShardCheckpoint {
+    input_name: String,
+    shard_index: u32,
+    input_bytes: u64,
+    input_modified_unix_ns: u64,
+    output_name: String,
+    output_bytes: u64,
+    output_sha256: String,
+    rows: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceFingerprint {
+    bytes: u64,
+    modified_unix_ns: u64,
+}
+
+fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("resolving current directory")?
+            .join(path))
+    }
+}
+
+fn source_fingerprint(metadata: &Metadata) -> Result<SourceFingerprint> {
+    let modified_unix_ns = metadata
+        .modified()
+        .context("reading input shard modification time")?
+        .duration_since(UNIX_EPOCH)
+        .context("input shard modification time predates Unix epoch")?
+        .as_nanos()
+        .try_into()
+        .context("input shard modification time does not fit in u64 nanoseconds")?;
+    Ok(SourceFingerprint {
+        bytes: metadata.len(),
+        modified_unix_ns,
+    })
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let file =
+        File::open(path).with_context(|| format!("opening {} for SHA256", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("hashing {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn partial_path(output: &Path) -> PathBuf {
+    let mut name = output.as_os_str().to_owned();
+    name.push(".partial");
+    PathBuf::from(name)
+}
+
+fn validate_resume_directory(
+    output_dir: &Path,
+    report_path: &Path,
+    inputs: &[PathBuf],
+    resume: bool,
+) -> Result<()> {
+    if !resume {
+        return Ok(());
+    }
+    let mut allowed: HashSet<PathBuf> = HashSet::new();
+    for input in inputs {
+        let output = output_dir.join(input.file_name().unwrap());
+        allowed.insert(output.clone());
+        allowed.insert(partial_path(&output));
+    }
+    if report_path.parent() == Some(output_dir) {
+        allowed.insert(report_path.to_path_buf());
+        allowed.insert(partial_path(report_path));
+    }
+    for entry in std::fs::read_dir(output_dir)
+        .with_context(|| format!("reading output directory {}", output_dir.display()))?
+    {
+        let path = entry?.path();
+        if !allowed.contains(&path) {
+            bail!(
+                "resume refuses unexpected entry in output directory: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn load_or_create_report(
+    report_path: &Path,
+    scan_dir: &Path,
+    output_dir: &Path,
+    source_root: &str,
+    walker_version: &str,
+    resume: bool,
+) -> Result<RewriteReport> {
+    let input_dir = scan_dir.to_string_lossy().into_owned();
+    let output_dir_string = output_dir.to_string_lossy().into_owned();
+    if report_path.exists() {
+        if !resume {
+            bail!(
+                "rewrite report already exists; use --resume: {}",
+                report_path.display()
+            );
+        }
+        let bytes = std::fs::read(report_path)
+            .with_context(|| format!("reading rewrite report {}", report_path.display()))?;
+        let report: RewriteReport = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing rewrite report {}", report_path.display()))?;
+        if report.schema_version != REWRITE_REPORT_VERSION {
+            bail!(
+                "unsupported rewrite report schema version {}",
+                report.schema_version
+            );
+        }
+        if report.input_dir != input_dir
+            || report.output_dir != output_dir_string
+            || report.source_root != source_root
+            || report.walker_version != walker_version
+        {
+            bail!("rewrite report context does not match input/output/source-root/walker-version");
+        }
+        return Ok(report);
+    }
+
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating report directory {}", parent.display()))?;
+    }
+    let now = unix_seconds_now();
+    Ok(RewriteReport {
+        schema_version: REWRITE_REPORT_VERSION,
+        input_dir,
+        output_dir: output_dir_string,
+        source_root: source_root.to_string(),
+        walker_version: walker_version.to_string(),
+        started_unix_seconds: now,
+        updated_unix_seconds: now,
+        complete: false,
+        total_rows: 0,
+        total_output_bytes: 0,
+        shards: Vec::new(),
+    })
+}
+
+fn checkpoint_is_valid(
+    checkpoint: &ShardCheckpoint,
+    output: &Path,
+    shard_index: u32,
+    fingerprint: &SourceFingerprint,
+) -> bool {
+    if checkpoint.shard_index != shard_index
+        || checkpoint.input_bytes != fingerprint.bytes
+        || checkpoint.input_modified_unix_ns != fingerprint.modified_unix_ns
+        || checkpoint.output_name != output.file_name().unwrap().to_string_lossy()
+    {
+        return false;
+    }
+    let Ok(metadata) = std::fs::metadata(output) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != checkpoint.output_bytes {
+        return false;
+    }
+    if file_sha256(output).ok().as_deref() != Some(checkpoint.output_sha256.as_str()) {
+        return false;
+    }
+    let Ok(reader) = migration_core::shard::ShardReader::open(output) else {
+        return false;
+    };
+    reader.rows() == checkpoint.rows && reader.shard_index() == Some(shard_index)
+}
+
+fn update_report(
+    report: &mut RewriteReport,
+    checkpoints: &HashMap<String, ShardCheckpoint>,
+    complete: bool,
+) {
+    report.shards = checkpoints.values().cloned().collect();
+    report
+        .shards
+        .sort_by_key(|checkpoint| checkpoint.shard_index);
+    report.total_rows = report.shards.iter().map(|checkpoint| checkpoint.rows).sum();
+    report.total_output_bytes = report
+        .shards
+        .iter()
+        .map(|checkpoint| checkpoint.output_bytes)
+        .sum();
+    report.complete = complete;
+    report.updated_unix_seconds = unix_seconds_now();
+}
+
+fn write_report_atomic(report_path: &Path, report: &RewriteReport) -> Result<()> {
+    let partial = partial_path(report_path);
+    if partial.exists() {
+        std::fs::remove_file(&partial)
+            .with_context(|| format!("removing stale report partial {}", partial.display()))?;
+    }
+    let bytes = serde_json::to_vec_pretty(report)?;
+    let mut file = File::create(&partial)
+        .with_context(|| format!("creating report partial {}", partial.display()))?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    std::fs::rename(&partial, report_path).with_context(|| {
+        format!(
+            "atomically activating rewrite report {}",
+            report_path.display()
+        )
+    })?;
+    if let Some(parent) = report_path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -470,7 +849,8 @@ fn translate_batch(
             "path" => "path_legacy",
             "file_type" => "file_type_mime",
             // Already covered by canonical columns of the same name.
-            "size" | "uid" | "gid" | "nlink" | "inode" => continue,
+            "size" | "uid" | "gid" | "nlink" | "inode" | "mtime_sec" | "mtime_nsec"
+            | "atime_sec" | "atime_nsec" => continue,
             other => other,
         };
         let array = input.column(idx).clone();
@@ -991,6 +1371,22 @@ mod tests {
         assert_eq!(reader.rows(), 3);
         assert_eq!(reader.shard_index(), Some(0));
 
+        let parquet_schema =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                File::open(&out_path).unwrap(),
+            )
+            .unwrap()
+            .schema()
+            .clone();
+        let mut field_names = std::collections::HashSet::new();
+        for field in parquet_schema.fields() {
+            assert!(
+                field_names.insert(field.name()),
+                "rewritten schema must not contain duplicate field: {}",
+                field.name()
+            );
+        }
+
         let rows: Vec<_> = reader
             .into_rows()
             .unwrap()
@@ -1041,6 +1437,91 @@ mod tests {
             assert_eq!(r.xattr_blob, None);
             assert_eq!(r.symlink_target, None);
         }
+    }
+
+    #[test]
+    fn rewrite_report_resumes_valid_shards_and_repairs_corruption() {
+        let source_root = "/src-test";
+        let work = tempdir("resume");
+        let in_dir = work.join("in");
+        let out_dir = work.join("out");
+        let batch = synthetic_walker_batch(source_root);
+        write_walker_parquet(&in_dir, &batch);
+
+        let mut args = Cli {
+            input: in_dir,
+            output: out_dir.clone(),
+            source_root: source_root.to_string(),
+            walker_version: "test-walker".to_string(),
+            resume: false,
+            report: None,
+            verbose: false,
+        };
+        run_rewrite(&args).expect("initial rewrite");
+
+        let report_path = out_dir.join("rewrite-report.json");
+        let report: RewriteReport =
+            serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+        assert!(report.complete);
+        assert_eq!(report.total_rows, 3);
+        assert_eq!(report.shards.len(), 1);
+        let output = out_dir.join("part-r00-00000.parquet");
+        let original_bytes = report.shards[0].output_bytes;
+        let original_modified = std::fs::metadata(&output).unwrap().modified().unwrap();
+
+        // A fully valid checkpoint is skipped: the canonical shard is not
+        // opened for writing, so its modification time remains identical.
+        // A stale uncommitted partial is safe to discard once the final and
+        // checkpoint both validate.
+        std::fs::write(partial_path(&output), b"stale partial").unwrap();
+        args.resume = true;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        run_rewrite(&args).expect("resume valid output");
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().modified().unwrap(),
+            original_modified
+        );
+        assert!(!partial_path(&output).exists());
+
+        // A changed output size invalidates the checkpoint. Resume rewrites
+        // that shard through a partial and atomically restores a valid file.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&output)
+            .unwrap()
+            .write_all(b"corrupt")
+            .unwrap();
+        assert_ne!(std::fs::metadata(&output).unwrap().len(), original_bytes);
+        run_rewrite(&args).expect("resume repairs corrupt output");
+        assert_eq!(std::fs::metadata(&output).unwrap().len(), original_bytes);
+        assert!(migration_core::shard::ShardReader::open(&output).is_ok());
+    }
+
+    #[test]
+    fn rewrite_resume_refuses_untracked_output_entries() {
+        let source_root = "/src-test";
+        let work = tempdir("resume-unknown");
+        let in_dir = work.join("in");
+        let out_dir = work.join("out");
+        write_walker_parquet(&in_dir, &synthetic_walker_batch(source_root));
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("operator-notes.txt"), b"do not overwrite").unwrap();
+
+        let args = Cli {
+            input: in_dir,
+            output: out_dir,
+            source_root: source_root.to_string(),
+            walker_version: "test-walker".to_string(),
+            resume: true,
+            report: None,
+            verbose: false,
+        };
+        let error = run_rewrite(&args).expect_err("unknown output must block resume");
+        assert!(
+            format!("{error:#}").contains("unexpected entry"),
+            "{error:#}"
+        );
     }
 
     #[test]

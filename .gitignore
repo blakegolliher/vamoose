@@ -30,3 +30,11 @@
 # Per-session tool state
 .claude/
 /dist
+
+# Rendered/site-specific operations state. The example specification and
+# harness are tracked; real endpoints, hostnames, and release paths are not.
+/ops/run.env
+/ops/generated/
+/ops/state/
+__pycache__/
+*.py[cod]

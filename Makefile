@@ -3,12 +3,15 @@
 #   make build              release build (native toolchain)
 #   make build TARGET=x86_64-unknown-linux-gnu.2.34
 #                           cross build via cargo-zigbuild (older glibc)
+#   make bundle TARGET=x86_64-unknown-linux-gnu.2.34 \
+#               LIBNFS_SO=/path/to/libnfs.so.16.2.0
+#                           provenance-checked, self-contained tarball
 #   make install            install into DESTDIR (default /)
 #   make rpm                build an .rpm into dist/
 #   make deb                build a .deb into dist/
 #
-# Packages contain: vamoose / mig-worker / mig-aggr, an example config
-# at /etc/vamoose/vamoose.toml.example, a systemd unit, and (when
+# Packages contain all four executables, an example config at
+# /etc/vamoose/vamoose.toml.example, a systemd template unit, and (when
 # LIBNFS_SO points at a built library) a vendored libnfs under
 # /usr/lib/vamoose with an ld.so.conf.d drop-in. libnfs is
 # LGPL-2.1-or-later and stays dynamically linked; the patched source
@@ -27,18 +30,34 @@ TARGET      :=
 # Path to a built libnfs.so.16.* to vendor into the package. Empty =
 # the package depends on a system-provided libnfs instead.
 LIBNFS_SO   :=
+# cargo-zigbuild needs the real Zig executable. On confined Snap hosts the
+# /snap/bin shim cannot run from automation, while the mounted executable can.
+# Callers may always override this with ZIG=/absolute/path/to/zig.
+ZIG         ?= $(shell if command -v zig >/dev/null 2>&1 && zig version >/dev/null 2>&1; then \
+                    command -v zig; \
+                  elif test -x /snap/zig/current/zig; then \
+                    echo /snap/zig/current/zig; \
+                  fi)
+ZIG_CACHE_ROOT ?= $(CURDIR)/target/zig-cache
 
-BINS        := vamoose mig-worker mig-aggr
+BINS        := vamoose mig-worker mig-aggr mig-walker-rewrite
+PACKAGES    := -p vamoose-cli -p migration-worker -p migration-aggr \
+               -p mig-walker-rewrite
 CARGO_FLAGS := --release --locked
 
 ifneq ($(TARGET),)
-  CARGO      := cargo zigbuild $(CARGO_FLAGS) --target $(TARGET)
+  CARGO      := env PATH="$(dir $(ZIG)):$(PATH)" \
+                ZIG_GLOBAL_CACHE_DIR="$(ZIG_CACHE_ROOT)/global" \
+                ZIG_LOCAL_CACHE_DIR="$(ZIG_CACHE_ROOT)/local" \
+                cargo zigbuild $(CARGO_FLAGS) --target $(TARGET)
   # cargo puts artifacts under the triple without the glibc suffix.
-  TRIPLE     := $(firstword $(subst ., ,$(TARGET))).$(word 2,$(subst ., ,$(TARGET)))
-  TARGET_DIR := target/$(basename $(TARGET))/release
+  TRIPLE     := $(firstword $(subst ., ,$(TARGET)))
+  TARGET_DIR := target/$(TRIPLE)/release
+  BUNDLE_TARGET := $(TARGET)
 else
   CARGO      := cargo build $(CARGO_FLAGS)
   TARGET_DIR := target/release
+  BUNDLE_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 endif
 
 DESTDIR     :=
@@ -52,15 +71,53 @@ DOCDIR      := $(PREFIX)/share/doc/$(NAME)
 DIST        := dist
 STAGE       := $(DIST)/stage
 
-.PHONY: all build install stage rpm deb clean version
+.PHONY: all build bundle verify-bundle check-cross-toolchain \
+        install stage rpm deb clean version
 
 all: build
 
 version:
 	@echo $(VERSION)
 
+check-cross-toolchain:
+	@mkdir -p "$(ZIG_CACHE_ROOT)/global" "$(ZIG_CACHE_ROOT)/local"
+	@scripts/check-release-toolchain.sh --zig "$(ZIG)"
+
+ifneq ($(TARGET),)
+build bundle: check-cross-toolchain
+endif
+
 build:
-	$(CARGO) -p vamoose-cli -p migration-worker -p migration-aggr
+	$(CARGO) $(PACKAGES)
+
+# A release bundle is deliberately stricter than a package build:
+# - LIBNFS_SO is mandatory and must match packaging/libnfs.lock.json.
+# - binaries carry an origin-relative RUNPATH, so they always load the
+#   bundled libnfs rather than a mutable system copy.
+# - scripts/build-release.sh refuses a dirty Git tree unless the caller
+#   explicitly sets ALLOW_DIRTY=1 (dirty bundles are rejected by the
+#   installer by default and are intended only for local testing).
+bundle:
+	@test -n "$(LIBNFS_SO)" || { \
+	    echo "LIBNFS_SO is required for a release bundle" >&2; exit 1; \
+	}
+	scripts/stage-pinned-libnfs.sh "$(LIBNFS_SO)" \
+	    "target/release-input/libnfs"
+	VAMOOSE_LIBNFS_DIR="$(CURDIR)/target/release-input/libnfs" \
+	    RUSTFLAGS='$(strip $(RUSTFLAGS) -C link-arg=-Wl,-rpath,$$ORIGIN/../lib)' \
+	    $(CARGO) $(PACKAGES)
+	ALLOW_DIRTY='$(ALLOW_DIRTY)' scripts/build-release.sh \
+	    --binary-dir "$(TARGET_DIR)" \
+	    --target "$(BUNDLE_TARGET)" \
+	    --zig-bin "$(ZIG)" \
+	    --libnfs "$(LIBNFS_SO)" \
+	    --output-dir "$(DIST)"
+
+verify-bundle:
+	@test -n "$(BUNDLE_DIR)" || { \
+	    echo "BUNDLE_DIR=/path/to/extracted/release is required" >&2; exit 1; \
+	}
+	scripts/verify-release.sh "$(BUNDLE_DIR)"
 
 # DESTDIR-aware install of everything the packages ship.
 install:
@@ -72,8 +129,8 @@ install:
 	install -m 0644 examples/worker.toml \
 	    $(DESTDIR)$(SYSCONFDIR)/vamoose.toml.example
 	install -d $(DESTDIR)$(UNITDIR)
-	install -m 0644 examples/vamoose-worker.service \
-	    $(DESTDIR)$(UNITDIR)/vamoose-worker.service
+	install -m 0644 examples/vamoose-worker@.service \
+	    $(DESTDIR)$(UNITDIR)/vamoose-worker@.service
 	install -d $(DESTDIR)$(DOCDIR)
 	install -m 0644 README.md $(DESTDIR)$(DOCDIR)/README.md
 	install -m 0644 THIRD_PARTY_LICENSES.md \
@@ -115,7 +172,7 @@ rpm: stage
 	  '$(BINDIR)/*' \
 	  '%dir $(SYSCONFDIR)' \
 	  '$(SYSCONFDIR)/vamoose.toml.example' \
-	  '$(UNITDIR)/vamoose-worker.service' \
+	  '$(UNITDIR)/vamoose-worker@.service' \
 	  '$(DOCDIR)/*' \
 	  > $(DIST)/rpmroot/SPECS/$(NAME).spec
 ifneq ($(LIBNFS_SO),)
