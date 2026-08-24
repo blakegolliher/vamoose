@@ -2,6 +2,7 @@ pub mod aggr;
 pub mod coord;
 pub mod doctor;
 pub mod init;
+pub mod prepare;
 pub mod rewrite;
 pub mod run;
 pub mod status;

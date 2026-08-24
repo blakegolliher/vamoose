@@ -117,6 +117,9 @@ pub(crate) async fn run(
         Command::Init(args) => crate::cmd::init::run(args, config_path)
             .await
             .map(|()| CommandCompletion::ordinary(CommandOutcome::Success)),
+        Command::Prepare(args) => crate::cmd::prepare::run(args, config_path)
+            .await
+            .map(|()| CommandCompletion::ordinary(CommandOutcome::Success)),
         Command::Run(args) => crate::cmd::run::run(args, config_path)
             .await
             .map(|()| CommandCompletion::ordinary(CommandOutcome::Success)),

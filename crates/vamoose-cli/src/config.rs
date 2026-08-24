@@ -24,7 +24,65 @@ pub(crate) struct Config {
     aggr: Option<Aggr>,
     logging: Option<Logging>,
     coord_server: Option<CoordServer>,
+    prepare: Option<Prepare>,
     worker: WorkerInput,
+}
+
+/// `vamoose prepare` settings. Every field has a default; the roots
+/// are the paths inside the source and destination exports that the
+/// migration covers and are recorded in `manifest.json`.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Prepare {
+    /// Scratch and checkpoints: `<work_dir>/<run_id>/`.
+    #[serde(default = "default_prepare_work_dir")]
+    pub(crate) work_dir: PathBuf,
+    /// Path inside `[mover] src_url` to scan and migrate.
+    #[serde(default = "default_export_root")]
+    pub(crate) source_root: String,
+    /// Path inside `[mover] dst_url` to write into.
+    #[serde(default = "default_export_root")]
+    pub(crate) dest_root: String,
+    /// nfs-walker executable. Default: the packaged
+    /// `/usr/libexec/vamoose/nfs-walker`, then `nfs-walker` on PATH.
+    #[serde(default)]
+    pub(crate) walker_bin: Option<PathBuf>,
+    /// nfs-walker GETATTR worker threads.
+    #[serde(default = "default_walker_workers")]
+    pub(crate) walker_workers: usize,
+    /// nfs-walker `--exclude` patterns.
+    #[serde(default)]
+    pub(crate) exclude: Vec<String>,
+    /// Parquet part-file rotation size handed to nfs-walker; one part
+    /// becomes one index shard, i.e. one unit of claimable work.
+    #[serde(default = "default_shard_size_mb")]
+    pub(crate) shard_size_mb: u64,
+}
+
+impl Default for Prepare {
+    fn default() -> Self {
+        Self {
+            work_dir: default_prepare_work_dir(),
+            source_root: default_export_root(),
+            dest_root: default_export_root(),
+            walker_bin: None,
+            walker_workers: default_walker_workers(),
+            exclude: Vec::new(),
+            shard_size_mb: default_shard_size_mb(),
+        }
+    }
+}
+
+fn default_prepare_work_dir() -> PathBuf {
+    PathBuf::from("/var/lib/vamoose/prepare")
+}
+fn default_export_root() -> String {
+    "/".to_string()
+}
+fn default_walker_workers() -> usize {
+    32
+}
+fn default_shard_size_mb() -> u64 {
+    512
 }
 
 /// Coordinator-daemon and TUI settings. They live in the same `[coord]`
@@ -124,6 +182,8 @@ struct CanonicalInput {
     aggr: Option<Aggr>,
     #[serde(default)]
     logging: Option<Logging>,
+    #[serde(default)]
+    prepare: Option<Prepare>,
 }
 
 /// Private representation of the older vamoose configuration shape.
@@ -458,6 +518,7 @@ impl Config {
             aggr: input.aggr,
             logging: input.logging,
             coord_server,
+            prepare: input.prepare,
             worker: WorkerInput::Canonical(Box::new(CanonicalWorkerInput {
                 run: input.run,
                 worker: input.worker,
@@ -487,6 +548,7 @@ impl Config {
             aggr: input.aggr,
             logging: input.logging,
             coord_server: None,
+            prepare: None,
             worker: WorkerInput::Compatibility(CompatibilityWorkerInput {
                 worker: input.worker,
                 copy: input.copy,
@@ -518,6 +580,11 @@ impl Config {
     /// Coordinator-daemon / TUI extras from the same `[coord]` table.
     pub(crate) fn coord_server(&self) -> Option<&CoordServer> {
         self.coord_server.as_ref()
+    }
+
+    /// `[prepare]` settings, defaulted when the table is absent.
+    pub(crate) fn prepare(&self) -> Prepare {
+        self.prepare.clone().unwrap_or_default()
     }
 
     pub(crate) fn logging_policy(&self) -> LoggingPolicy {
