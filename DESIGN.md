@@ -80,10 +80,15 @@ and durability invariants.
 
 ## Immutable migration input
 
-An external `nfs-walker` scan produces sharded Parquet. Until the walker emits
-the canonical schema directly, `mig-walker-rewrite` converts its output. The
+An `nfs-walker` scan produces sharded Parquet. Until the walker emits the
+canonical schema directly, `mig-walker-rewrite` converts its output. The
 canonical column and metadata contract is mirrored with the walker repository
-in [SCHEMA_CONTRACT.md](SCHEMA_CONTRACT.md).
+in [SCHEMA_CONTRACT.md](SCHEMA_CONTRACT.md). `vamoose prepare` drives the
+three stages — scan (bundled walker), rewrite, and verified upload with a
+conditional-create `manifest.json` — with per-stage checkpoints under
+`[prepare] work_dir`, so an interrupted preparation resumes rather than
+restarts, and a bucket that already holds a different run's manifest is
+refused.
 
 Each run bucket contains an immutable `manifest.json` and immutable objects
 under `index/`. The manifest identifies the format version, run, source and

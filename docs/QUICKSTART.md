@@ -107,19 +107,38 @@ and poll; the coordinator logs that it will seed the job when a manifest
 appears. This is the intended idle state — the services can be enabled at
 install time and left alone.
 
-## 4. Build the index
+## 4. Build the index — this starts the migration
 
-The index is the immutable work list: sharded Parquet under `index/` plus
-`manifest.json` in the bucket. The moment the manifest lands, every worker
-starts claiming shards and the coordinator seeds the job under the
-manifest's run id.
+On any one host:
 
-> **Interim.** The one-command `vamoose prepare` (bundling `nfs-walker`) is
-> the next item in [NEXT.md](NEXT.md). Until it lands, build the index from
-> one host with the tracked harness — see [ops/README.md](../ops/README.md)
-> (`ops/prepare-run.sh`; needs `nfs-walker`, `python3`, and the `aws` CLI).
-> Everything else in this guide is unchanged by how the manifest was
-> produced.
+```bash
+sudo vamoose prepare
+```
+
+It scans the source with the bundled `nfs-walker`, converts the scan to
+the canonical index (sharded Parquet under `index/` in the bucket), and
+publishes `manifest.json` with a conditional create. The moment the
+manifest lands, every enabled worker starts claiming shards and the
+coordinator seeds the job under the manifest's run id — there is no
+separate "start" command.
+
+Things worth knowing:
+
+- **It resumes.** Interrupt it and run it again: a finished scan is not
+  redone, converted shards are kept, uploaded shards are verified (size
+  plus a SHA256 stamped on the object) rather than re-sent. Use `--fresh`
+  to start a new run instead, or `--run-id NAME` to pick the run's name
+  (it becomes the coordinator job id). Scan output and checkpoints live
+  under `/var/lib/vamoose/prepare/<run_id>/`.
+- **Subtrees.** `[prepare] source_root = "/projects/alpha"` migrates that
+  path within the source export; `dest_root` is where it lands in the
+  destination export. Both default to `/`.
+- **Existing scan.** `--scan-dir /path/to/walk.parquet` skips the scan and
+  uses an nfs-walker output you already have.
+- **One run per bucket.** A bucket that already holds a different
+  manifest is refused; use a fresh bucket for a second migration.
+- Runs as root because `nfs-walker` binds reserved NFS ports; it reads
+  S3 credentials from `/etc/vamoose/vamoose.env` automatically.
 
 ## 5. Watch it
 
@@ -200,6 +219,8 @@ sudo systemctl enable --now vamoose-worker@fast
 - Configuration search order for every `vamoose` command:
   `--config` / `VAMOOSE_CONFIG`, then `/etc/vamoose/workers/<instance>.toml`
   (services only), then `./vamoose.toml`, then `/etc/vamoose/vamoose.toml`.
+- Scan output, canonical shards, and checkpoints:
+  `/var/lib/vamoose/prepare/<run_id>/` (`[prepare] work_dir`).
 - Full configuration reference with every tunable:
   `/usr/share/doc/vamoose/vamoose.toml.full` (a copy of
   [examples/worker.toml](../examples/worker.toml)).

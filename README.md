@@ -59,10 +59,11 @@ Binaries land in `target/release/`. The unified entry point is
 | `vamoose status` | Implemented text/JSON S3 status, one-shot or watched |
 | `vamoose doctor` | Implemented configuration, S3, NFS, and permission checks |
 | `vamoose init` | Implemented S3 layout marker initialization |
+| `vamoose prepare` | Implemented scan (bundled `nfs-walker`) → canonical index → verified upload → `manifest.json` |
 | `vamoose coord` | Implemented optional REST/SSE coordinator |
 | `vamoose tui` | Implemented terminal dashboard and controls |
-| `vamoose walker` | Stub; invoke `nfs-walker` directly |
-| `vamoose rewrite` | Stub; invoke `mig-walker-rewrite` directly |
+| `vamoose walker` | Stub; `vamoose prepare` runs the scan |
+| `vamoose rewrite` | Stub; `vamoose prepare` runs the rewrite |
 | `vamoose aggr` | Stub; use `vamoose status`, the TUI, or standalone `mig-aggr` |
 | `vamoose run` | Stub; script the pipeline explicitly |
 
@@ -89,13 +90,14 @@ sudo cp /etc/vamoose/vamoose.toml.example /etc/vamoose/vamoose.toml   # edit, co
 sudo install -m 0600 /etc/vamoose/vamoose.env.example /etc/vamoose/vamoose.env
 sudo systemctl enable --now vamoose-coord             # one host
 sudo systemctl enable --now vamoose-worker@main       # every host; idles until the index exists
+sudo vamoose prepare                                  # one host: scan -> index -> manifest; the run starts
 sudo vamoose tui                                      # any host: watch, :stop, :resume, :abort
 ```
 
-Building the index (scan → canonical shards → `manifest.json`) currently uses
-the tracked [`ops/`](ops/README.md) harness with the external `nfs-walker`;
-the one-command `vamoose prepare` that bundles it is the next item in
-[docs/NEXT.md](docs/NEXT.md). The `ops/` harness is also the advanced,
+`vamoose prepare` runs the bundled `nfs-walker` (packages built with
+`NFS_WALKER_BIN=`), `mig-walker-rewrite`, and a verified upload with a
+conditional-create `manifest.json`, checkpointing every stage so it can be
+re-run. The tracked [`ops/`](ops/README.md) harness remains the advanced,
 fully scripted lifecycle (validated run specification, provenance-checked
 bundle deployment over SSH, timing, reset, and sampled verification) for
 sites that want that level of control.

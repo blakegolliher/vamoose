@@ -52,13 +52,13 @@ and pass criteria are in [CORRECTNESS_RULES.md](CORRECTNESS_RULES.md).
 - **Aggregation and observability:** standalone `mig-aggr` implements only
   `clean-partials`. `watch`, `summary`, `metrics`, `inspect`, and `verify`
   return safe unimplemented errors; `vamoose aggr` is also a stub.
-- **`vamoose prepare` (decided, next):** one command that bundles the
-  external `nfs-walker`, runs scan → `mig-walker-rewrite` → verified upload →
-  conditional-PUT `manifest.json`, resumable, taking source/destination/options
-  from `/etc/vamoose/vamoose.toml`. It replaces the python/aws-cli
-  `ops/prepare-run.sh` path in the quickstart; the package should ship the
-  pinned `nfs-walker` binary. `vamoose walker`, `rewrite`, and `run` retain
-  CLI shapes but are not implemented.
+- **Pipeline stubs:** `vamoose walker`, `rewrite`, and `run` retain CLI
+  shapes but are not implemented; `vamoose prepare` is the supported path
+  (bundled `nfs-walker` → `mig-walker-rewrite` → verified upload →
+  conditional-create `manifest.json`). Remaining prepare follow-ups: a
+  `packaging/nfs-walker.lock.json` digest pin checked at bundle time (the
+  bundle records the SHA256 today), and overlapping scan → index → copy so
+  workers start on the first uploaded shard (HANDOFF lever 3).
 - **Walker schema completion:** coordinate the walker repository's canonical
   output and xattr capture before deleting `mig-walker-rewrite` or claiming
   xattr fidelity.
