@@ -153,10 +153,11 @@ install:
 ifneq ($(NFS_WALKER_BIN),)
 	install -d $(DESTDIR)$(LIBEXECDIR)
 	install -m 0755 $(NFS_WALKER_BIN) $(DESTDIR)$(LIBEXECDIR)/nfs-walker
-	printf 'Bundled nfs-walker (MIT), run by vamoose prepare.\n\
-Source: https://github.com/blakegolliher/nfs-walker\n\
-SHA256: %s\n' "$$(sha256sum $(NFS_WALKER_BIN) | cut -d" " -f1)" \
-	    > $(DESTDIR)$(DOCDIR)/NFS_WALKER_SOURCE.txt
+	printf '%s\n' \
+	  'Bundled nfs-walker (MIT), run by vamoose prepare.' \
+	  'Source: https://github.com/blakegolliher/nfs-walker' \
+	  "SHA256: $$(sha256sum $(NFS_WALKER_BIN) | cut -d' ' -f1)" \
+	  > $(DESTDIR)$(DOCDIR)/NFS_WALKER_SOURCE.txt
 endif
 ifneq ($(LIBNFS_SO),)
 	install -d $(DESTDIR)$(VENDORLIB)
@@ -164,10 +165,10 @@ ifneq ($(LIBNFS_SO),)
 	    $(DESTDIR)$(VENDORLIB)/$(notdir $(LIBNFS_SO))
 	install -d $(DESTDIR)/etc/ld.so.conf.d
 	echo $(VENDORLIB) > $(DESTDIR)/etc/ld.so.conf.d/$(NAME).conf
-	printf 'Vendored libnfs: LGPL-2.1-or-later, dynamically linked.\n\
-Source for this exact build: \
-https://github.com/blakegolliher/libnfs (branch vamoose-patches)\n' \
-	    > $(DESTDIR)$(DOCDIR)/LIBNFS_SOURCE.txt
+	printf '%s\n' \
+	  'Vendored libnfs: LGPL-2.1-or-later, dynamically linked.' \
+	  'Source for this exact build: https://github.com/blakegolliher/libnfs (branch vamoose-patches)' \
+	  > $(DESTDIR)$(DOCDIR)/LIBNFS_SOURCE.txt
 endif
 
 stage: build
