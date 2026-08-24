@@ -41,3 +41,13 @@ cluster_secret_env = "VAMOOSE_CLUSTER_SECRET"
 
 [shard]
 local_scratch = "/var/lib/vamoose/scratch"   # tmpfs preferred (shard indexes only)
+
+[prepare]
+# `sudo vamoose prepare` scans the source with the bundled nfs-walker,
+# builds the index, and publishes manifest.json — which starts the run.
+# Paths inside the exports to migrate from / into ("/" = the whole export).
+source_root = "/"
+dest_root   = "/"
+# work_dir      = "/var/lib/vamoose/prepare"   # scan output and checkpoints
+# walker_workers = 32
+# exclude        = [".snapshot"]

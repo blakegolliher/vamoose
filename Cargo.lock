@@ -4096,10 +4096,13 @@ name = "vamoose-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "file-rotate",
+ "hex",
  "hostname",
+ "libc",
  "migration-coord",
  "migration-core",
  "migration-mover",
@@ -4107,6 +4110,7 @@ dependencies = [
  "migration-worker",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-util",

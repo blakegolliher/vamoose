@@ -21,8 +21,14 @@ The supported lab target is glibc 2.34:
 ```bash
 make bundle \
   TARGET=x86_64-unknown-linux-gnu.2.34 \
-  LIBNFS_SO=/path/to/libnfs.so.16.2.0
+  LIBNFS_SO=/path/to/libnfs.so.16.2.0 \
+  NFS_WALKER_BIN=/path/to/nfs-walker
 ```
+
+`NFS_WALKER_BIN` (also honored by `make rpm` / `make deb`) ships the
+scanner as `libexec/nfs-walker` so `vamoose prepare` works out of the box;
+its SHA256 is recorded in `share/doc/vamoose/NFS_WALKER_SOURCE.txt`. Without
+it, `prepare` falls back to `nfs-walker` on PATH or `[prepare] walker_bin`.
 
 The libnfs file must match `packaging/libnfs.lock.json`. Updating libnfs means
 updating its source commit and exact artifact digest in that reviewed lock.

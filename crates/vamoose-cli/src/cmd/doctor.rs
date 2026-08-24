@@ -404,44 +404,32 @@ fn check_mount(checks: &mut Checks, label: &str, mount: &str, writable: bool) {
     }
 }
 
+/// Same resolution as `vamoose prepare`: `[prepare] walker_bin`, the
+/// legacy `[walker] binary_path`, the packaged path, then PATH.
 fn check_walker(checks: &mut Checks, cfg: &Config) {
-    let configured = cfg.walker().and_then(|w| w.binary_path.clone());
-    if let Some(path) = configured {
-        if path.is_file() {
-            checks.record(Status::Pass, "walker binary", format!("{}", path.display()));
-        } else {
-            checks.record(
-                Status::Fail,
-                "walker binary",
-                format!("configured path {} is not a file", path.display()),
-            );
-        }
-        return;
-    }
-    if let Ok(found) = which("nfs-walker") {
-        checks.record(
+    let configured = cfg
+        .prepare()
+        .walker_bin
+        .or_else(|| cfg.walker().and_then(|w| w.binary_path.clone()));
+    match crate::cmd::prepare::tools::find_walker(configured.as_deref()) {
+        Ok(found) => checks.record(
             Status::Pass,
             "walker binary",
             format!("{}", found.display()),
-        );
-    } else {
-        checks.record(
+        ),
+        Err(e) if configured.is_some() => {
+            checks.record(Status::Fail, "walker binary", format!("{e:#}"));
+        }
+        Err(_) => checks.record(
             Status::Warn,
             "walker binary",
-            "nfs-walker not on PATH (set walker.binary_path in config or install it)",
-        );
+            format!(
+                "nfs-walker not found at {} or on PATH; `vamoose prepare` needs it (install the \
+                 package built with NFS_WALKER_BIN, or set [prepare] walker_bin)",
+                crate::cmd::prepare::tools::PACKAGED_WALKER
+            ),
+        ),
     }
-}
-
-fn which(name: &str) -> Result<PathBuf, ()> {
-    let path_var = std::env::var_os("PATH").ok_or(())?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(())
 }
 
 fn print_summary(c: &Checks) {

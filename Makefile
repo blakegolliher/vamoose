@@ -4,7 +4,8 @@
 #   make build TARGET=x86_64-unknown-linux-gnu.2.34
 #                           cross build via cargo-zigbuild (older glibc)
 #   make bundle TARGET=x86_64-unknown-linux-gnu.2.34 \
-#               LIBNFS_SO=/path/to/libnfs.so.16.2.0
+#               LIBNFS_SO=/path/to/libnfs.so.16.2.0 \
+#               NFS_WALKER_BIN=/path/to/nfs-walker
 #                           provenance-checked, self-contained tarball
 #   make install            install into DESTDIR (default /)
 #   make rpm                build an .rpm into dist/
@@ -12,7 +13,8 @@
 #
 # Packages contain all four executables, example config and secrets
 # files under /etc/vamoose, the worker template unit and coord unit, the
-# quickstart under /usr/share/doc/vamoose, and (when
+# quickstart under /usr/share/doc/vamoose, the bundled nfs-walker (when
+# NFS_WALKER_BIN points at a built scanner), and (when
 # LIBNFS_SO points at a built library) a vendored libnfs under
 # /usr/lib/vamoose with an ld.so.conf.d drop-in. libnfs is
 # LGPL-2.1-or-later and stays dynamically linked; the patched source
@@ -31,6 +33,10 @@ TARGET      :=
 # Path to a built libnfs.so.16.* to vendor into the package. Empty =
 # the package depends on a system-provided libnfs instead.
 LIBNFS_SO   :=
+# Path to a built nfs-walker executable to ship as
+# /usr/libexec/vamoose/nfs-walker (what `vamoose prepare` runs). Empty =
+# prepare falls back to nfs-walker on PATH or [prepare] walker_bin.
+NFS_WALKER_BIN :=
 # cargo-zigbuild needs the real Zig executable. On confined Snap hosts the
 # /snap/bin shim cannot run from automation, while the mounted executable can.
 # Callers may always override this with ZIG=/absolute/path/to/zig.
@@ -67,6 +73,7 @@ BINDIR      := $(PREFIX)/bin
 UNITDIR     := $(PREFIX)/lib/systemd/system
 SYSCONFDIR  := /etc/$(NAME)
 VENDORLIB   := $(PREFIX)/lib/$(NAME)
+LIBEXECDIR  := $(PREFIX)/libexec/$(NAME)
 DOCDIR      := $(PREFIX)/share/doc/$(NAME)
 
 DIST        := dist
@@ -112,6 +119,7 @@ bundle:
 	    --target "$(BUNDLE_TARGET)" \
 	    --zig-bin "$(ZIG)" \
 	    --libnfs "$(LIBNFS_SO)" \
+	    $(if $(NFS_WALKER_BIN),--nfs-walker "$(NFS_WALKER_BIN)",) \
 	    --output-dir "$(DIST)"
 
 verify-bundle:
@@ -142,6 +150,14 @@ install:
 	install -m 0644 examples/worker.toml $(DESTDIR)$(DOCDIR)/vamoose.toml.full
 	install -m 0644 THIRD_PARTY_LICENSES.md \
 	    $(DESTDIR)$(DOCDIR)/THIRD_PARTY_LICENSES.md
+ifneq ($(NFS_WALKER_BIN),)
+	install -d $(DESTDIR)$(LIBEXECDIR)
+	install -m 0755 $(NFS_WALKER_BIN) $(DESTDIR)$(LIBEXECDIR)/nfs-walker
+	printf 'Bundled nfs-walker (MIT), run by vamoose prepare.\n\
+Source: https://github.com/blakegolliher/nfs-walker\n\
+SHA256: %s\n' "$$(sha256sum $(NFS_WALKER_BIN) | cut -d" " -f1)" \
+	    > $(DESTDIR)$(DOCDIR)/NFS_WALKER_SOURCE.txt
+endif
 ifneq ($(LIBNFS_SO),)
 	install -d $(DESTDIR)$(VENDORLIB)
 	install -m 0755 $(LIBNFS_SO) \
@@ -184,6 +200,10 @@ rpm: stage
 	  '$(UNITDIR)/vamoose-coord.service' \
 	  '$(DOCDIR)/*' \
 	  > $(DIST)/rpmroot/SPECS/$(NAME).spec
+ifneq ($(NFS_WALKER_BIN),)
+	printf '%s\n' '$(LIBEXECDIR)/nfs-walker' \
+	  >> $(DIST)/rpmroot/SPECS/$(NAME).spec
+endif
 ifneq ($(LIBNFS_SO),)
 	printf '%s\n' \
 	  '$(VENDORLIB)/*' \

@@ -40,6 +40,8 @@ pub(crate) enum Command {
     Doctor(cmd::doctor::Args),
     /// Initialize an empty bucket layout.
     Init(cmd::init::Args),
+    /// Scan the source, build the index, and publish manifest.json.
+    Prepare(cmd::prepare::Args),
     /// End-to-end pipeline: walker + rewrite + workers.
     Run(cmd::run::Args),
     /// Control-plane HTTP daemon (REST + SSE).

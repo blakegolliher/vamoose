@@ -82,6 +82,16 @@ failure_pct_window_sec = 60
 failure_pct_threshold  = 5.0
 throughput_floor_mb_s  = 100
 
+# `vamoose prepare` (scan -> canonical index -> manifest.json).
+#[prepare]
+#work_dir       = "/var/lib/vamoose/prepare"   # <work_dir>/<run_id>/ holds scan + checkpoints
+#source_root    = "/"                          # path inside src_url to migrate
+#dest_root      = "/"                          # path inside dst_url to write into
+## walker_bin   = "/usr/libexec/vamoose/nfs-walker"   # default: packaged, then PATH
+#walker_workers = 32                           # nfs-walker GETATTR threads
+#exclude        = [".snapshot"]                # nfs-walker --exclude patterns
+#shard_size_mb  = 512                          # one Parquet part = one claimable shard
+
 # Optional control plane. One table serves the worker (client wiring),
 # `vamoose coord` (daemon settings), and `vamoose tui` (token file).
 #[coord]

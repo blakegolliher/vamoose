@@ -12,11 +12,15 @@ mod cli;
 mod cmd;
 mod config;
 mod dispatch;
+mod envfile;
 mod logging;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
+    // Interactive commands get the same secrets the services get from
+    // their EnvironmentFile, without a `set -a; . vamoose.env` dance.
+    envfile::load_if_present(std::path::Path::new(envfile::SYSTEM_ENV_PATH));
     let filter = cli::build_filter(cli.log.as_deref());
 
     // Load config first so logging can use the source format's explicit
