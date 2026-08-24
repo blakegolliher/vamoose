@@ -12,7 +12,7 @@ use crate::{cmd, logging};
     about = "Distributed NFS migration with S3 coordination"
 )]
 pub(crate) struct Cli {
-    /// Path to config file (default: vamoose.toml in CWD).
+    /// Path to config file. Default search order: /etc/vamoose/workers/$VAMOOSE_INSTANCE.toml (systemd template instances), ./vamoose.toml, then /etc/vamoose/vamoose.toml.
     #[arg(short, long, env = "VAMOOSE_CONFIG", global = true)]
     pub(crate) config: Option<PathBuf>,
 

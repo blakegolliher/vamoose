@@ -141,7 +141,7 @@ async fn spawn_coord_listener(
 fn driver_cfg(addr: SocketAddr) -> CoordCfg {
     CoordCfg {
         url: format!("http://{addr}"),
-        job_id: "bobby".into(),
+        job_id: Some("bobby".into()),
         cluster_secret_env: None,
         heartbeat_sec: 1,
         events_flush_sec: 1,

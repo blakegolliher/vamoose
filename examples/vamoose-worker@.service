@@ -11,8 +11,11 @@ Type=simple
 # Root is currently required: libnfs binds reserved ports (<1024) for
 # AUTH_SYS and preserve_owner needs CAP_CHOWN semantics on the wire.
 User=root
-ExecStartPre=/usr/bin/test -r /etc/vamoose/workers/%i.toml
-ExecStart=/usr/bin/vamoose worker --config /etc/vamoose/workers/%i.toml
+# Configuration: /etc/vamoose/workers/%i.toml if it exists, otherwise the
+# shared /etc/vamoose/vamoose.toml. One worker per host needs only the
+# shared file (`systemctl enable --now vamoose-worker@main`).
+Environment=VAMOOSE_INSTANCE=%i
+ExecStart=/usr/bin/vamoose worker
 EnvironmentFile=-/etc/vamoose/vamoose.env
 EnvironmentFile=-/etc/vamoose/workers/%i.env
 Restart=on-failure

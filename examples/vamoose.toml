@@ -1,0 +1,43 @@
+# vamoose — one configuration file for every migration host.
+#
+# Install as /etc/vamoose/vamoose.toml on each node (same file on all of
+# them). Secrets never go here: S3 keys and the cluster secret live in
+# /etc/vamoose/vamoose.env (see vamoose.env.example).
+#
+# Every setting not listed below has a production default. The complete
+# reference with every tunable is /usr/share/doc/vamoose/vamoose.toml.full.
+
+[run]
+# Coordination bucket. Must be empty (or created for this migration) and
+# must have object versioning OFF. All hosts point at the same bucket.
+bucket   = "vamoose-migration-1"
+endpoint = "https://s3.example.com"
+region   = "us-east-1"
+# verify_tls = false        # only for lab S3 endpoints with self-signed certs
+
+[mover]
+# Source and destination as NFS URLs (the hosts talk NFSv3 directly and
+# do not need these mounted). The two must not overlap.
+src_url = "nfs://source.example.com/source-export"
+dst_url = "nfs://destination.example.com/destination-export"
+nfs_connections = 32
+# Raw-filehandle fast path: fewer RPCs per file, validated at 600M files.
+use_raw_fh = true
+
+[coord]
+# Control plane. Run `vamoose coord` on exactly ONE node (vamoose-coord.service);
+# every worker and `vamoose tui` connect to it at this URL.
+url = "http://node1.example.com:8443"
+no_tls = true               # trusted network. For HTTPS set tls_cert/tls_key instead.
+# tls_cert = "/etc/vamoose/coord.crt"
+# tls_key  = "/etc/vamoose/coord.key"
+# One bearer token per line; the TUI uses the first one.
+admin_tokens_file  = "/etc/vamoose/admin-token"
+# Name of the environment variable (from vamoose.env) holding the shared
+# worker secret. Used by the coord to authenticate workers and by workers
+# to sign their requests.
+cluster_secret_env = "VAMOOSE_CLUSTER_SECRET"
+# job_id defaults to the run ID recorded in the bucket's manifest.json.
+
+[shard]
+local_scratch = "/var/lib/vamoose/scratch"   # tmpfs preferred (shard indexes only)

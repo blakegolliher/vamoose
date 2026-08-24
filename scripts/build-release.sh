@@ -120,10 +120,16 @@ for binary_name in "${binaries[@]}"; do
     install -m 0755 "$binary_path" "$release_root/bin/$binary_name"
 done
 install -m 0755 "$libnfs" "$release_root/lib/$libnfs_soname"
-install -m 0644 "$repo_root/examples/worker.toml" "$release_root/etc/vamoose.toml.example"
+install -m 0644 "$repo_root/examples/vamoose.toml" "$release_root/etc/vamoose.toml.example"
+install -m 0600 "$repo_root/examples/vamoose.env.example" \
+    "$release_root/etc/vamoose.env.example"
 install -m 0644 "$repo_root/examples/vamoose-worker@.service" \
     "$release_root/systemd/vamoose-worker@.service"
+install -m 0644 "$repo_root/examples/vamoose-coord.service" \
+    "$release_root/systemd/vamoose-coord.service"
 install -m 0644 "$repo_root/README.md" "$release_root/share/doc/vamoose/README.md"
+install -m 0644 "$repo_root/docs/QUICKSTART.md" "$release_root/share/doc/vamoose/QUICKSTART.md"
+install -m 0644 "$repo_root/examples/worker.toml" "$release_root/share/doc/vamoose/vamoose.toml.full"
 install -m 0644 "$repo_root/THIRD_PARTY_LICENSES.md" \
     "$release_root/share/doc/vamoose/THIRD_PARTY_LICENSES.md"
 install -m 0644 "$lock_file" "$release_root/provenance/libnfs.lock.json"
