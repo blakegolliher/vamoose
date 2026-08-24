@@ -52,9 +52,13 @@ and pass criteria are in [CORRECTNESS_RULES.md](CORRECTNESS_RULES.md).
 - **Aggregation and observability:** standalone `mig-aggr` implements only
   `clean-partials`. `watch`, `summary`, `metrics`, `inspect`, and `verify`
   return safe unimplemented errors; `vamoose aggr` is also a stub.
-- **Unified pipeline composition:** `vamoose walker`, `rewrite`, and `run`
-  retain CLI shapes but are not implemented. Operators currently invoke
-  `nfs-walker`, `mig-walker-rewrite`, upload tooling, and workers explicitly.
+- **`vamoose prepare` (decided, next):** one command that bundles the
+  external `nfs-walker`, runs scan → `mig-walker-rewrite` → verified upload →
+  conditional-PUT `manifest.json`, resumable, taking source/destination/options
+  from `/etc/vamoose/vamoose.toml`. It replaces the python/aws-cli
+  `ops/prepare-run.sh` path in the quickstart; the package should ship the
+  pinned `nfs-walker` binary. `vamoose walker`, `rewrite`, and `run` retain
+  CLI shapes but are not implemented.
 - **Walker schema completion:** coordinate the walker repository's canonical
   output and xattr capture before deleting `mig-walker-rewrite` or claiming
   xattr fidelity.
@@ -64,10 +68,9 @@ and pass criteria are in [CORRECTNESS_RULES.md](CORRECTNESS_RULES.md).
 - **Archived control history restore:** the coordinator writes
   `archivelogs/`, but replay does not restore from it and no restore command is
   implemented.
-- **Control-plane job provisioning:** the coordinator exposes no production
-  job-create/import command or route. A fresh runtime has an empty job registry,
-  and worker registration rejects unknown jobs; define a supported way to seed
-  the control job and its immutable configuration.
+- **`vamoose verify --sample N`:** a Rust, libnfs-based sampled verifier so
+  the quickstart does not need the kernel-mount/SSH `ops/finalize-run.sh`
+  path to confirm a run.
 
 ## 4. Focused follow-ups
 

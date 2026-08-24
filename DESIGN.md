@@ -220,11 +220,14 @@ the coordinator's reducer and durable event log still see every accepted
 event. See [docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md) for the module map and
 concurrency/durability details.
 
-No production CLI or REST route currently creates/imports a control-plane job.
-A fresh coordinator starts with an empty job registry, and worker registration
-requires the configured job to exist. The runtime, replay, command, worker, and
-TUI paths are implemented and tested once `JobCreated` state is present; an
-operator provisioning workflow is deferred.
+The control-plane job is provisioned from the data plane's own input: at
+startup `vamoose coord` waits for the bucket's `manifest.json` and seeds one
+`JobCreated` event under the manifest's run id, carrying the manifest's
+source, destination, and totals. Seeding is idempotent against replay, and an
+explicit id (`--seed-job` or `[coord] job_id`) overrides the manifest. Workers
+default their `[coord] job_id` to the same run id and keep retrying
+registration while the job is not seeded yet. There is still no REST route
+that creates a job.
 
 ## Configuration
 
@@ -232,20 +235,26 @@ The canonical operator input is the existing worker-shaped TOML:
 
 ```toml
 [run]          # bucket, endpoint, region, profile, verify_tls
-[worker]
-[shard]
-[mover]
-[batch]
-[copy]
-[backpressure]
-[coord]        # optional worker-to-coordinator connection
+[mover]        # src_url, dst_url, connection and fast-path tuning
+[worker]       # optional
+[shard]        # optional
+[batch]        # optional
+[copy]         # optional
+[backpressure] # optional
+[coord]        # optional worker-to-coordinator connection; the same table
+               # also carries `vamoose coord` listen/TLS/token settings and
+               # the TUI's token file
 ```
 
 The full shape and defaults are demonstrated by
-[examples/worker.toml](examples/worker.toml). The same file is accepted by
-standalone `mig-worker` and by every configuration-consuming `vamoose`
-subcommand. Control-only commands need only `[run]`; `vamoose worker` also
-requires the worker-specific sections. Unified-CLI-only `[nfs]`, `[walker]`,
+[examples/worker.toml](examples/worker.toml); the slim operator file the
+packages install is [examples/vamoose.toml](examples/vamoose.toml). The same
+file is accepted by standalone `mig-worker` and by every
+configuration-consuming `vamoose` subcommand. Control-only commands need only
+`[run]`; `vamoose worker` also requires `[mover]`, and every other worker
+section falls back to production defaults. Without `--config`, commands search
+`/etc/vamoose/workers/$VAMOOSE_INSTANCE.toml`, `./vamoose.toml`, then
+`/etc/vamoose/vamoose.toml`. Unified-CLI-only `[nfs]`, `[walker]`,
 `[aggr]`, and `[logging]` sections are optional additions, and standalone
 `mig-worker` ignores them through Serde's normal unknown-field behavior.
 
@@ -305,7 +314,6 @@ boundaries include:
 - the S3 data-plane layout represents one run at the bucket root;
 - archive restore, scoped control-plane credentials, and an atomic coordinator
   snapshot boundary for TUI bootstrap are deferred;
-- fresh-deployment control-plane job provisioning is not implemented;
 - distinct drain execution and retry-failed queueing are not implemented; and
 - compatibility configuration and control-plane re-exports remain until a
   separately approved breaking cleanup.
