@@ -31,6 +31,17 @@
 //!
 //! Cross-shard hardlinks remain out of scope for v1.
 //!
+//! ## Operator pause (coord `Pause`)
+//!
+//! Checked between batches only: a paused worker finishes the batch in
+//! flight, then blocks until the mode changes. The claim stays ours
+//! throughout — the heartbeat task keeps writing the per-host progress
+//! record, which is the liveness signal reclaimers trust (see
+//! `check_progress_liveness`), so a long pause never turns into a
+//! peer stealing the shard. Drain/Cancel are NOT honored mid-shard:
+//! the shard runs to completion and the orchestrator's claim loop
+//! stops claiming, so no partial shard is ever left for replay.
+//!
 //! ## Fence checks (R3)
 //!
 //! - Between batches (in `process`).
@@ -82,6 +93,9 @@ pub struct ShardProcessor {
     /// `WorkerEventDraft` per file outcome so the coord_driver can
     /// coalesce a `ProgressDelta` for `/workers/{id}/events`.
     pub emitter: crate::coord_driver::EventEmitter,
+    /// Coord-driven run control, consulted between batches for
+    /// `Pause`. `None` in S3-only mode (no `[coord]`).
+    pub run_control: Option<crate::run_control::RunControlReader>,
 }
 
 impl ShardProcessor {
@@ -109,6 +123,11 @@ impl ShardProcessor {
             if current.would_overflow(&row, &self.budget) {
                 let to_run = current.take();
                 self.run_batch(to_run, &mut outcome).await?;
+                if !self.fence.is_valid() {
+                    return Ok(outcome.with_fenced(true));
+                }
+                self.hold_while_paused().await;
+                // The fence may have tripped during a long hold.
                 if !self.fence.is_valid() {
                     return Ok(outcome.with_fenced(true));
                 }
@@ -174,6 +193,22 @@ impl ShardProcessor {
             }
         }
         Ok(outcome)
+    }
+
+    /// Block between batches while the coord has the job paused. The
+    /// batch boundary is the only safe point: no row is mid-copy, and
+    /// the heartbeat keeps the claim alive for as long as the hold
+    /// lasts.
+    async fn hold_while_paused(&mut self) {
+        let Some(rc) = self.run_control.as_mut() else {
+            return;
+        };
+        if !rc.is_paused() {
+            return;
+        }
+        tracing::info!("coord requested pause; holding at batch boundary");
+        let after = rc.wait_while_paused().await;
+        tracing::info!(?after, "pause released; resuming shard");
     }
 
     async fn run_batch(

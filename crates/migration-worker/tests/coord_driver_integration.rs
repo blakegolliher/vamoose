@@ -107,7 +107,7 @@ async fn spawn_coord() -> (CoordRuntime, SocketAddr, CancellationToken) {
 fn driver_cfg(addr: SocketAddr) -> CoordCfg {
     CoordCfg {
         url: format!("http://{addr}"),
-        job_id: "bobby".into(),
+        job_id: Some("bobby".into()),
         cluster_secret_env: None,
         // Sub-second heartbeat for fast tests; non-default but the
         // schema accepts u64 — we just pass it through.

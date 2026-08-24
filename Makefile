@@ -10,8 +10,9 @@
 #   make rpm                build an .rpm into dist/
 #   make deb                build a .deb into dist/
 #
-# Packages contain all four executables, an example config at
-# /etc/vamoose/vamoose.toml.example, a systemd template unit, and (when
+# Packages contain all four executables, example config and secrets
+# files under /etc/vamoose, the worker template unit and coord unit, the
+# quickstart under /usr/share/doc/vamoose, and (when
 # LIBNFS_SO points at a built library) a vendored libnfs under
 # /usr/lib/vamoose with an ld.so.conf.d drop-in. libnfs is
 # LGPL-2.1-or-later and stays dynamically linked; the patched source
@@ -126,13 +127,19 @@ install:
 	    install -m 0755 $(TARGET_DIR)/$$b $(DESTDIR)$(BINDIR)/$$b; \
 	done
 	install -d $(DESTDIR)$(SYSCONFDIR)
-	install -m 0644 examples/worker.toml \
+	install -m 0644 examples/vamoose.toml \
 	    $(DESTDIR)$(SYSCONFDIR)/vamoose.toml.example
+	install -m 0600 examples/vamoose.env.example \
+	    $(DESTDIR)$(SYSCONFDIR)/vamoose.env.example
 	install -d $(DESTDIR)$(UNITDIR)
 	install -m 0644 examples/vamoose-worker@.service \
 	    $(DESTDIR)$(UNITDIR)/vamoose-worker@.service
+	install -m 0644 examples/vamoose-coord.service \
+	    $(DESTDIR)$(UNITDIR)/vamoose-coord.service
 	install -d $(DESTDIR)$(DOCDIR)
 	install -m 0644 README.md $(DESTDIR)$(DOCDIR)/README.md
+	install -m 0644 docs/QUICKSTART.md $(DESTDIR)$(DOCDIR)/QUICKSTART.md
+	install -m 0644 examples/worker.toml $(DESTDIR)$(DOCDIR)/vamoose.toml.full
 	install -m 0644 THIRD_PARTY_LICENSES.md \
 	    $(DESTDIR)$(DOCDIR)/THIRD_PARTY_LICENSES.md
 ifneq ($(LIBNFS_SO),)
@@ -172,7 +179,9 @@ rpm: stage
 	  '$(BINDIR)/*' \
 	  '%dir $(SYSCONFDIR)' \
 	  '$(SYSCONFDIR)/vamoose.toml.example' \
+	  '%attr(0600,root,root) $(SYSCONFDIR)/vamoose.env.example' \
 	  '$(UNITDIR)/vamoose-worker@.service' \
+	  '$(UNITDIR)/vamoose-coord.service' \
 	  '$(DOCDIR)/*' \
 	  > $(DIST)/rpmroot/SPECS/$(NAME).spec
 ifneq ($(LIBNFS_SO),)

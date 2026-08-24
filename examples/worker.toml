@@ -1,14 +1,17 @@
-# Canonical worker and unified-vamoose configuration. This same file
+# Full reference configuration: every worker and unified-vamoose setting
+# with its default. The slim file most installs need is
+# examples/vamoose.toml (installed as /etc/vamoose/vamoose.toml.example);
+# only [run] and [mover] src_url/dst_url are required. This same file
 # works with `mig-worker` and every configuration-consuming `vamoose`
 # subcommand. See DESIGN.md "Configuration" for full semantics.
-# Values shown are starting points; tune in M6.
 
 [run]
 bucket     = "vamoose"
-endpoint   = "https://main.selab-var204.selab.vastdata.com"
+endpoint   = "https://s3.example.com"
 region     = "us-east-1"
-profile    = "var204"      # named ~/.aws/credentials profile; omit to use the default chain
-verify_tls = false         # set true outside of lab/dev (default). false skips cert verification entirely.
+# profile  = "vamoose"      # named ~/.aws/credentials profile; omit to use the default chain
+                            # (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY from /etc/vamoose/vamoose.env)
+verify_tls = true          # false skips S3 certificate verification entirely (lab/dev only)
 
 [worker]
 # host_id = "worker-07"     # auto-generated if omitted
@@ -78,3 +81,17 @@ require_unchanged_size    = false  # default; treat row.size as advisory.
 failure_pct_window_sec = 60
 failure_pct_threshold  = 5.0
 throughput_floor_mb_s  = 100
+
+# Optional control plane. One table serves the worker (client wiring),
+# `vamoose coord` (daemon settings), and `vamoose tui` (token file).
+#[coord]
+#url                = "http://node1.example.com:8443"   # workers + TUI connect here
+## job_id           = "run-id"        # default: the run id in the bucket's manifest.json
+#cluster_secret_env = "VAMOOSE_CLUSTER_SECRET"           # env var from /etc/vamoose/vamoose.env
+#verify_tls         = true            # false for self-signed coord certs
+## --- daemon-only settings ---
+#listen             = "0.0.0.0:8443"
+#no_tls             = true            # or set tls_cert/tls_key for HTTPS
+## tls_cert         = "/etc/vamoose/coord.crt"
+## tls_key          = "/etc/vamoose/coord.key"
+#admin_tokens_file  = "/etc/vamoose/admin-token"        # one token per line; TUI uses the first

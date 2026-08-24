@@ -8,11 +8,19 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub run: RunCfg,
+    /// Every section except `[run]` and `[mover]` has production
+    /// defaults, so a minimal operator file needs only the bucket and
+    /// the two NFS URLs.
+    #[serde(default)]
     pub worker: WorkerCfg,
+    #[serde(default)]
     pub shard: ShardCfg,
     pub mover: MoverCfg,
+    #[serde(default)]
     pub batch: BatchCfg,
+    #[serde(default)]
     pub copy: CopyCfg,
+    #[serde(default)]
     pub backpressure: BackpressureCfg,
     /// Coord wiring. When absent, the worker runs in legacy S3-only
     /// mode (heartbeat to S3, no HTTP traffic). When present, the
@@ -55,6 +63,16 @@ pub struct WorkerCfg {
     pub lease_timeout_sec: u64,
 }
 
+impl Default for WorkerCfg {
+    fn default() -> Self {
+        Self {
+            host_id: None,
+            heartbeat_sec: default_heartbeat_sec(),
+            lease_timeout_sec: default_lease_timeout_sec(),
+        }
+    }
+}
+
 fn default_heartbeat_sec() -> u64 {
     migration_core::time::DEFAULT_HEARTBEAT_SEC
 }
@@ -69,9 +87,23 @@ fn default_lease_timeout_sec() -> u64 {
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct ShardCfg {
+    #[serde(default = "default_local_scratch")]
     pub local_scratch: std::path::PathBuf,
     #[serde(default = "one")]
     pub max_in_flight: u32,
+}
+impl Default for ShardCfg {
+    fn default() -> Self {
+        Self {
+            local_scratch: default_local_scratch(),
+            max_in_flight: one(),
+        }
+    }
+}
+/// Matches the directory the packaged systemd units expect; the
+/// orchestrator creates it on startup.
+fn default_local_scratch() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/lib/vamoose/scratch")
 }
 fn one() -> u32 {
     1
@@ -169,6 +201,7 @@ fn default_fixed_buf_size() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct BatchCfg {
+    #[serde(default = "default_bytes_budget")]
     pub bytes_budget: String,
     #[serde(default = "default_files_budget")]
     pub files_budget: u64,
@@ -182,6 +215,22 @@ pub struct BatchCfg {
     pub large_stripe_size: String,
     #[serde(default = "default_large_stripe_depth")]
     pub large_stripe_depth: usize,
+}
+impl Default for BatchCfg {
+    fn default() -> Self {
+        Self {
+            bytes_budget: default_bytes_budget(),
+            files_budget: default_files_budget(),
+            inflight_small: default_inflight_small(),
+            inflight_medium: default_inflight_medium(),
+            inflight_large: default_inflight_large(),
+            large_stripe_size: default_large_stripe_size(),
+            large_stripe_depth: default_large_stripe_depth(),
+        }
+    }
+}
+fn default_bytes_budget() -> String {
+    "8 GiB".into()
 }
 fn default_files_budget() -> u64 {
     100_000
@@ -229,6 +278,19 @@ pub struct CopyCfg {
     #[serde(default = "default_false")]
     pub require_unchanged_size: bool,
 }
+impl Default for CopyCfg {
+    fn default() -> Self {
+        Self {
+            preserve_owner: true,
+            preserve_mode: true,
+            preserve_times: true,
+            preserve_xattr: true,
+            server_side_copy: default_ssc(),
+            require_chown_capability: true,
+            require_unchanged_size: false,
+        }
+    }
+}
 fn t() -> bool {
     true
 }
@@ -252,6 +314,15 @@ pub struct BackpressureCfg {
     #[serde(default = "default_throughput_floor")]
     pub throughput_floor_mb_s: u64,
 }
+impl Default for BackpressureCfg {
+    fn default() -> Self {
+        Self {
+            failure_pct_window_sec: default_failure_window(),
+            failure_pct_threshold: default_failure_threshold(),
+            throughput_floor_mb_s: default_throughput_floor(),
+        }
+    }
+}
 fn default_failure_window() -> u64 {
     60
 }
@@ -271,9 +342,13 @@ fn default_throughput_floor() -> u64 {
 pub struct CoordCfg {
     /// Coord base URL, e.g. `https://coord.example:8443`.
     pub url: String,
-    /// Job the worker is associated with. The coord enforces that
-    /// this job exists (404s register otherwise).
-    pub job_id: String,
+    /// Job the worker is associated with. Defaults to the run ID in
+    /// the bucket's `manifest.json`, which is also what `vamoose
+    /// coord` seeds from that manifest; set it only to join a job
+    /// that was seeded under a different id. The coord requires the
+    /// job to exist; registration keeps retrying until it does.
+    #[serde(default)]
+    pub job_id: Option<String>,
     /// Env var holding the worker cluster secret. The variable's
     /// value is sent as `X-Cluster-Secret` on every request. When
     /// None, no secret header is set — matches coord dev mode.
@@ -381,12 +456,12 @@ mod tests {
             toml::from_str(&s).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
         // Just spot-check fields that come from the new [run] block.
         assert_eq!(cfg.run.bucket, "vamoose");
-        assert_eq!(
-            cfg.run.endpoint,
-            "https://main.selab-var204.selab.vastdata.com",
-        );
-        assert_eq!(cfg.run.profile.as_deref(), Some("var204"));
-        assert!(!cfg.run.verify_tls);
+        assert_eq!(cfg.run.endpoint, "https://s3.example.com");
+        // The shipped example must not pin a site profile or disable
+        // TLS verification: the default credential chain and verified
+        // TLS are the production defaults.
+        assert_eq!(cfg.run.profile, None);
+        assert!(cfg.run.verify_tls);
         assert_eq!(cfg.mover.strategy_default, "libnfs_io_uring");
         assert_eq!(cfg.mover.pipeline_depth, 8);
         assert_eq!(cfg.mover.io_uring_queue_depth, 256);
@@ -511,7 +586,7 @@ mod tests {
         "#;
         let c: CoordCfg = toml::from_str(toml_str).unwrap();
         assert_eq!(c.url, "https://coord.example:8443");
-        assert_eq!(c.job_id, "bobby-mig");
+        assert_eq!(c.job_id.as_deref(), Some("bobby-mig"));
         assert_eq!(c.cluster_secret_env, None);
         assert_eq!(c.heartbeat_sec, 5);
         assert_eq!(c.events_flush_sec, 1);

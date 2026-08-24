@@ -25,17 +25,22 @@ use migration_coord::server::auth::AuthConfig;
 use migration_coord::server::{build_router, listen, AppState};
 use migration_coord::store::{CoordStore, S3Store};
 use migration_coord::ticks::{self, TickerConfig};
+use migration_core::claim::ClaimStore as _;
 use migration_core::s3::S3Client;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// Bind address when neither `--listen` nor `[coord] listen` is set.
+const DEFAULT_LISTEN: &str = "0.0.0.0:8443";
+
 #[derive(ClapArgs, Debug)]
 pub struct Args {
-    /// Address to bind the HTTP listener to.
-    #[arg(long, default_value = "0.0.0.0:8443")]
-    pub listen: SocketAddr,
+    /// Address to bind the HTTP listener to. Overrides `[coord]
+    /// listen`; default 0.0.0.0:8443.
+    #[arg(long)]
+    pub listen: Option<SocketAddr>,
 
     /// TLS certificate PEM file. If omitted (and `--no-tls` is
     /// not set), the listener requires a cert; the operator
@@ -75,10 +80,10 @@ pub struct Args {
 
     /// Seed a job into the registry at startup if it does not already
     /// exist (idempotent across restarts — replay wins when the job is
-    /// already in the log). This is the bootstrap for a fresh coord:
-    /// there is deliberately no job-create HTTP route yet, and workers'
-    /// /workers/register 404s for unknown jobs. The id must match the
-    /// workers' `[coord] job_id`.
+    /// already in the log). Overrides `[coord] job_id`. When neither is
+    /// set, the coord waits for the bucket's manifest.json and seeds
+    /// the job under the manifest's run id — the same id workers
+    /// default to. There is deliberately no job-create HTTP route.
     #[arg(long)]
     pub seed_job: Option<String>,
 
@@ -104,29 +109,89 @@ pub struct Args {
     pub seed_total_bytes: u64,
 }
 
+/// The coordinator's effective settings: CLI flags win, then the
+/// `[coord]` table of the configuration file, then defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Effective {
+    listen: SocketAddr,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    no_tls: bool,
+    admin_tokens: Option<PathBuf>,
+    cluster_secret_env: Option<String>,
+    allow_unauthenticated_nonloopback: bool,
+    /// Explicit job id (`--seed-job` or `[coord] job_id`); `None`
+    /// means "follow the manifest".
+    seed_job: Option<String>,
+}
+
+fn effective_settings(
+    args: &Args,
+    server: Option<&crate::config::CoordServer>,
+    client: Option<&migration_worker::config::CoordCfg>,
+) -> anyhow::Result<Effective> {
+    let listen = match (args.listen, server.and_then(|s| s.listen.as_deref())) {
+        (Some(l), _) => l,
+        (None, Some(text)) => text
+            .parse::<SocketAddr>()
+            .map_err(|e| anyhow::anyhow!("[coord] listen {text:?} is not host:port: {e}"))?,
+        (None, None) => DEFAULT_LISTEN.parse().expect("static default parses"),
+    };
+    Ok(Effective {
+        listen,
+        tls_cert: args
+            .tls_cert
+            .clone()
+            .or_else(|| server.and_then(|s| s.tls_cert.clone())),
+        tls_key: args
+            .tls_key
+            .clone()
+            .or_else(|| server.and_then(|s| s.tls_key.clone())),
+        no_tls: args.no_tls || server.is_some_and(|s| s.no_tls),
+        admin_tokens: args
+            .admin_tokens
+            .clone()
+            .or_else(|| server.and_then(|s| s.admin_tokens_file.clone())),
+        cluster_secret_env: args
+            .cluster_secret_env
+            .clone()
+            .or_else(|| client.and_then(|c| c.cluster_secret_env.clone())),
+        allow_unauthenticated_nonloopback: args.allow_unauthenticated_nonloopback
+            || server.is_some_and(|s| s.allow_unauthenticated_nonloopback),
+        seed_job: args
+            .seed_job
+            .clone()
+            .or_else(|| client.and_then(|c| c.job_id.clone())),
+    })
+}
+
 pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()> {
     // 1. Config + S3 client.
     let cfg = Config::load(config_path)?;
+    let eff = effective_settings(&args, cfg.coord_server(), cfg.coord())?;
     let s3 = build_s3(cfg.storage()).await?;
-    let store: Arc<dyn CoordStore> = Arc::new(S3Store::new(s3));
+    let store: Arc<dyn CoordStore> = Arc::new(S3Store::new(s3.clone()));
 
     // 2. Auth. F21: dev mode (no tokens, no cluster secret) must not
     //    silently bind a non-loopback address — refuse startup unless
     //    the operator opted in explicitly.
-    let auth = build_auth(&args)?;
+    let auth = build_auth(
+        eff.admin_tokens.as_deref(),
+        eff.cluster_secret_env.as_deref(),
+    )?;
     check_dev_mode_bind(
         auth.is_dev_mode(),
-        &args.listen,
-        args.allow_unauthenticated_nonloopback,
+        &eff.listen,
+        eff.allow_unauthenticated_nonloopback,
     )?;
     if auth.is_dev_mode() {
         tracing::warn!(
             "coord running in DEV MODE — no admin tokens, no cluster secret. \
              Audit log will record token_label='dev-mode'. Do not use in production."
         );
-        if !args.listen.ip().is_loopback() {
+        if !eff.listen.ip().is_loopback() {
             tracing::warn!(
-                listen = %args.listen,
+                listen = %eff.listen,
                 "DEV MODE on a NON-LOOPBACK bind (--allow-unauthenticated-nonloopback): \
                  anyone who can reach this port has full unauthenticated job control",
             );
@@ -144,37 +209,38 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
 
     // 4. Bring up the runtime.
     let rt_cfg = RuntimeConfig::default_for_prod();
-    tracing::info!(holder_id = %me.holder_id, listen = %args.listen, "coord: starting runtime");
+    tracing::info!(holder_id = %me.holder_id, listen = %eff.listen, "coord: starting runtime");
     let runtime = CoordRuntime::start(store, Arc::new(SystemClock), me, rt_cfg.clone()).await?;
 
-    // 4b. Seed the job registry if asked. After replay, so an
-    //     existing job (from a previous coord generation's log) wins
-    //     and no duplicate JobCreated is appended.
-    if let Some(job) = &args.seed_job {
-        let job_id = migration_coord::schema::JobId::new(job.clone())
-            .map_err(|e| anyhow::anyhow!("--seed-job: {e}"))?;
-        if runtime.job_view(&job_id).await.is_some() {
-            tracing::info!(job = %job_id, "seed job already present (replayed); skipping");
-        } else {
-            let seq = runtime
-                .ingest(migration_coord::schema::EventKind::JobCreated {
-                    job_id: job_id.clone(),
-                    name: args.seed_job_name.clone().unwrap_or_else(|| job.clone()),
-                    source: args.seed_source.clone(),
-                    dest: args.seed_dest.clone(),
-                    owner: whoami_owner(),
-                    config_hash: migration_coord::schema::ConfigHash("seeded-via-cli".into()),
-                    total_files: args.seed_total_files,
-                    total_bytes: args.seed_total_bytes,
-                })
-                .await?;
-            tracing::info!(job = %job_id, seq, "seeded job into registry");
-        }
+    // 4b. Seed the job registry. After replay, so an existing job
+    //     (from a previous coord generation's log) wins and no
+    //     duplicate JobCreated is appended. An explicit id (flag or
+    //     `[coord] job_id`) fails fast on a bad value; an omitted id
+    //     follows the bucket's manifest, which may not exist yet, so
+    //     the seeding runs in the background and the HTTP listener
+    //     comes up regardless.
+    let seed = SeedSpec {
+        explicit_job: eff.seed_job.clone(),
+        name: args.seed_job_name.clone(),
+        source: args.seed_source.clone(),
+        dest: args.seed_dest.clone(),
+        total_files: args.seed_total_files,
+        total_bytes: args.seed_total_bytes,
+    };
+    if let Some(job) = &seed.explicit_job {
+        migration_coord::schema::JobId::new(job.clone())
+            .map_err(|e| anyhow::anyhow!("seed job id {job:?}: {e}"))?;
     }
 
-    // 5. Background ticks + signal handler.
+    // 5. Background ticks + signal handler + seeding.
     let shutdown = CancellationToken::new();
     listen::install_signal_handler(shutdown.clone());
+    let seed_handle = tokio::spawn(seed_job_from_manifest(
+        runtime.clone(),
+        s3.clone(),
+        seed,
+        shutdown.clone(),
+    ));
     let ticker_cfg = TickerConfig::default_for_prod();
     let ticks_handle = tokio::spawn(ticks::run_all(
         runtime.clone(),
@@ -185,24 +251,25 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
     // 6. Router + HTTP listener.
     let router = build_router(AppState::with_auth(runtime.clone(), auth));
 
-    if args.no_tls {
-        tracing::info!(addr = %args.listen, "coord: binding plain HTTP");
-        listen::serve_plain(args.listen, router, shutdown.clone()).await?;
+    if eff.no_tls {
+        tracing::info!(addr = %eff.listen, "coord: binding plain HTTP");
+        listen::serve_plain(eff.listen, router, shutdown.clone()).await?;
     } else {
-        let cert = args
-            .tls_cert
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--tls-cert is required unless --no-tls is set"))?;
-        let key = args
-            .tls_key
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--tls-key is required unless --no-tls is set"))?;
+        let cert = eff.tls_cert.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "TLS certificate required: set --tls-cert/--tls-key (or [coord] tls_cert/tls_key), \
+                 or opt into plain HTTP with --no-tls / [coord] no_tls = true"
+            )
+        })?;
+        let key = eff.tls_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--tls-key / [coord] tls_key is required with a certificate")
+        })?;
         tracing::info!(
-            addr = %args.listen,
+            addr = %eff.listen,
             cert = %cert.display(),
             "coord: binding HTTPS",
         );
-        listen::serve_tls(args.listen, cert, key, router, shutdown.clone()).await?;
+        listen::serve_tls(eff.listen, cert, key, router, shutdown.clone()).await?;
     }
 
     // 7. Graceful shutdown of the runtime — flush log, snapshot,
@@ -212,7 +279,10 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
     tracing::info!("coord: serving stopped, shutting runtime down");
     let shutdown_result = finish_shutdown(&runtime, ticker_cfg.history_keep).await;
 
-    // 8. Wait for the ticks task to observe the cancel and finish.
+    // 8. Wait for the background tasks to observe the cancel and finish.
+    if let Err(e) = seed_handle.await {
+        tracing::error!(error = %e, "coord: seed task join failed");
+    }
     match ticks_handle.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::error!(error = %e, "coord: ticks loop errored"),
@@ -293,16 +363,19 @@ fn check_dev_mode_bind(
     )
 }
 
-fn build_auth(args: &Args) -> anyhow::Result<AuthConfig> {
+fn build_auth(
+    admin_tokens: Option<&std::path::Path>,
+    cluster_secret_env: Option<&str>,
+) -> anyhow::Result<AuthConfig> {
     let mut auth = AuthConfig::default();
 
-    if let Some(path) = &args.admin_tokens {
+    if let Some(path) = admin_tokens {
         let body = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read admin tokens file {}: {e}", path.display()))?;
         auth.admin_tokens = AuthConfig::parse_admin_tokens_file(&body)?;
     }
 
-    if let Some(var) = &args.cluster_secret_env {
+    if let Some(var) = cluster_secret_env {
         let value = std::env::var(var)
             .map_err(|e| anyhow::anyhow!("read cluster secret from env ${var}: {e}"))?;
         if value.is_empty() {
@@ -312,6 +385,137 @@ fn build_auth(args: &Args) -> anyhow::Result<AuthConfig> {
     }
 
     Ok(auth)
+}
+
+/// What to seed. `explicit_job = None` means "the manifest's run id".
+#[derive(Debug, Clone)]
+struct SeedSpec {
+    explicit_job: Option<String>,
+    name: Option<String>,
+    source: String,
+    dest: String,
+    total_files: u64,
+    total_bytes: u64,
+}
+
+/// Poll cadence while the bucket has no `manifest.json` yet.
+const MANIFEST_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Seed the control-plane job, waiting for the bucket's manifest when
+/// no explicit id was given. Idempotent: an already-registered job
+/// (replayed from the log, or seeded by a previous generation) is
+/// left untouched. Runs until seeded or shutdown; errors are logged
+/// and retried because a coord that serves the TUI is more useful than
+/// one that exits over a transient S3 hiccup.
+async fn seed_job_from_manifest(
+    runtime: CoordRuntime,
+    s3: S3Client,
+    spec: SeedSpec,
+    shutdown: CancellationToken,
+) {
+    let mut announced_wait = false;
+    loop {
+        let manifest = match load_manifest(&s3).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "coord: manifest read failed; retrying");
+                None
+            }
+        };
+        let job = match (&spec.explicit_job, &manifest) {
+            (Some(id), _) => Some(id.clone()),
+            (None, Some(m)) => Some(m.run_id.clone()),
+            (None, None) => None,
+        };
+        if let Some(job) = job {
+            match seed_once(&runtime, &job, &spec, manifest.as_ref()).await {
+                Ok(()) => return,
+                Err(e) => tracing::warn!(job, error = %e, "coord: seeding failed; retrying"),
+            }
+        } else if !announced_wait {
+            announced_wait = true;
+            tracing::info!(
+                bucket = %s3.bucket(),
+                "coord: no manifest.json in bucket yet; will seed the job when `vamoose prepare` \
+                 publishes one",
+            );
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(MANIFEST_POLL) => {}
+        }
+    }
+}
+
+async fn load_manifest(s3: &S3Client) -> anyhow::Result<Option<migration_core::records::Manifest>> {
+    let Some((body, _etag)) = s3.get(migration_core::layout::MANIFEST_KEY).await? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_slice(&body)?))
+}
+
+/// The `JobCreated` event for a seed: manifest facts win over the
+/// display-only CLI defaults so the TUI shows real source, destination,
+/// and totals (percent / ETA) without the operator retyping them.
+fn seed_event(
+    job_id: migration_coord::schema::JobId,
+    spec: &SeedSpec,
+    manifest: Option<&migration_core::records::Manifest>,
+) -> migration_coord::schema::EventKind {
+    let (source, dest, total_files, total_bytes, config_hash) = match manifest {
+        Some(m) => (
+            format!("{}{}", m.source.url, m.source.root),
+            format!("{}{}", m.dest.url, m.dest.root),
+            m.total_rows,
+            m.shards.iter().map(|s| s.bytes).sum(),
+            format!("manifest:{}", m.run_id),
+        ),
+        None => (
+            spec.source.clone(),
+            spec.dest.clone(),
+            spec.total_files,
+            spec.total_bytes,
+            "seeded-via-cli".to_string(),
+        ),
+    };
+    migration_coord::schema::EventKind::JobCreated {
+        name: spec
+            .name
+            .clone()
+            .unwrap_or_else(|| job_id.as_str().to_string()),
+        job_id,
+        source,
+        dest,
+        owner: whoami_owner(),
+        config_hash: migration_coord::schema::ConfigHash(config_hash),
+        total_files,
+        total_bytes,
+    }
+}
+
+async fn seed_once(
+    runtime: &CoordRuntime,
+    job: &str,
+    spec: &SeedSpec,
+    manifest: Option<&migration_core::records::Manifest>,
+) -> anyhow::Result<()> {
+    let job_id = migration_coord::schema::JobId::new(job.to_string())
+        .map_err(|e| anyhow::anyhow!("seed job id {job:?}: {e}"))?;
+    if runtime.job_view(&job_id).await.is_some() {
+        tracing::info!(job = %job_id, "seed job already present (replayed); skipping");
+        return Ok(());
+    }
+    let seq = runtime
+        .ingest(seed_event(job_id.clone(), spec, manifest))
+        .await?;
+    tracing::info!(
+        job = %job_id,
+        seq,
+        from_manifest = manifest.is_some(),
+        "seeded job into registry",
+    );
+    Ok(())
 }
 
 /// Owner string for seeded jobs: the invoking user, best-effort.
@@ -325,6 +529,217 @@ fn whoami_owner() -> String {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use migration_core::records::{Endpoint, EndpointKind, Manifest, MigrationOptions, ShardEntry};
+
+    fn bare_args() -> Args {
+        Args {
+            listen: None,
+            tls_cert: None,
+            tls_key: None,
+            no_tls: false,
+            admin_tokens: None,
+            cluster_secret_env: None,
+            allow_unauthenticated_nonloopback: false,
+            seed_job: None,
+            seed_job_name: None,
+            seed_source: "nfs://unspecified".into(),
+            seed_dest: "nfs://unspecified".into(),
+            seed_total_files: 0,
+            seed_total_bytes: 0,
+        }
+    }
+
+    fn server_cfg() -> crate::config::CoordServer {
+        crate::config::CoordServer {
+            listen: Some("127.0.0.1:9443".into()),
+            tls_cert: Some("/etc/vamoose/coord.crt".into()),
+            tls_key: Some("/etc/vamoose/coord.key".into()),
+            no_tls: false,
+            admin_tokens_file: Some("/etc/vamoose/admin-token".into()),
+            allow_unauthenticated_nonloopback: false,
+        }
+    }
+
+    fn client_cfg() -> migration_worker::config::CoordCfg {
+        toml::from_str(
+            r#"
+            url = "http://node1:8443"
+            job_id = "from-config"
+            cluster_secret_env = "VAMOOSE_CLUSTER_SECRET"
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// No flags, no config: the historical defaults.
+    #[test]
+    fn effective_settings_defaults() {
+        let eff = effective_settings(&bare_args(), None, None).unwrap();
+        assert_eq!(eff.listen, DEFAULT_LISTEN.parse::<SocketAddr>().unwrap());
+        assert!(!eff.no_tls);
+        assert_eq!(eff.tls_cert, None);
+        assert_eq!(eff.admin_tokens, None);
+        assert_eq!(eff.cluster_secret_env, None);
+        assert_eq!(eff.seed_job, None, "no id means follow the manifest");
+    }
+
+    /// The `[coord]` table supplies every knob when flags are absent.
+    #[test]
+    fn effective_settings_from_config() {
+        let eff =
+            effective_settings(&bare_args(), Some(&server_cfg()), Some(&client_cfg())).unwrap();
+        assert_eq!(eff.listen, "127.0.0.1:9443".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            eff.tls_cert.as_deref(),
+            Some(std::path::Path::new("/etc/vamoose/coord.crt"))
+        );
+        assert_eq!(
+            eff.admin_tokens.as_deref(),
+            Some(std::path::Path::new("/etc/vamoose/admin-token"))
+        );
+        assert_eq!(
+            eff.cluster_secret_env.as_deref(),
+            Some("VAMOOSE_CLUSTER_SECRET")
+        );
+        assert_eq!(eff.seed_job.as_deref(), Some("from-config"));
+    }
+
+    /// Flags override the configuration file.
+    #[test]
+    fn effective_settings_flags_win() {
+        let mut args = bare_args();
+        args.listen = Some("0.0.0.0:1".parse().unwrap());
+        args.no_tls = true;
+        args.seed_job = Some("from-flag".into());
+        args.cluster_secret_env = Some("OTHER".into());
+        let eff = effective_settings(&args, Some(&server_cfg()), Some(&client_cfg())).unwrap();
+        assert_eq!(eff.listen, "0.0.0.0:1".parse::<SocketAddr>().unwrap());
+        assert!(eff.no_tls);
+        assert_eq!(eff.seed_job.as_deref(), Some("from-flag"));
+        assert_eq!(eff.cluster_secret_env.as_deref(), Some("OTHER"));
+    }
+
+    #[test]
+    fn effective_settings_rejects_bad_listen_text() {
+        let mut server = server_cfg();
+        server.listen = Some("not-an-address".into());
+        let err = effective_settings(&bare_args(), Some(&server), None).unwrap_err();
+        assert!(format!("{err:#}").contains("listen"), "{err:#}");
+    }
+
+    fn manifest() -> Manifest {
+        Manifest {
+            format_version: 2,
+            run_id: "run-2026".into(),
+            created_utc: migration_core::time::UtcTime(
+                Utc.with_ymd_and_hms(2026, 8, 24, 0, 0, 0).unwrap(),
+            ),
+            shards: vec![
+                ShardEntry {
+                    key: "index/part-0000.parquet".into(),
+                    rows: 10,
+                    bytes: 100,
+                    etag: "a".into(),
+                },
+                ShardEntry {
+                    key: "index/part-0001.parquet".into(),
+                    rows: 5,
+                    bytes: 50,
+                    etag: "b".into(),
+                },
+            ],
+            total_rows: 15,
+            source: Endpoint {
+                kind: EndpointKind::Nfs,
+                url: "nfs://src/export".into(),
+                root: "/data".into(),
+            },
+            dest: Endpoint {
+                kind: EndpointKind::Nfs,
+                url: "nfs://dst/export".into(),
+                root: "/data".into(),
+            },
+            options: MigrationOptions::default(),
+        }
+    }
+
+    fn spec(explicit: Option<&str>) -> SeedSpec {
+        SeedSpec {
+            explicit_job: explicit.map(str::to_string),
+            name: None,
+            source: "nfs://cli-src".into(),
+            dest: "nfs://cli-dst".into(),
+            total_files: 7,
+            total_bytes: 70,
+        }
+    }
+
+    /// Manifest facts populate the seeded job; the CLI display
+    /// defaults are only used without a manifest.
+    #[test]
+    fn seed_event_prefers_manifest_facts() {
+        let id = JobId::new("run-2026").unwrap();
+        match seed_event(id.clone(), &spec(None), Some(&manifest())) {
+            EventKind::JobCreated {
+                job_id,
+                name,
+                source,
+                dest,
+                total_files,
+                total_bytes,
+                config_hash,
+                ..
+            } => {
+                assert_eq!(job_id, id);
+                assert_eq!(name, "run-2026");
+                assert_eq!(source, "nfs://src/export/data");
+                assert_eq!(dest, "nfs://dst/export/data");
+                assert_eq!(total_files, 15);
+                assert_eq!(total_bytes, 150);
+                assert_eq!(config_hash.0, "manifest:run-2026");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match seed_event(id, &spec(Some("run-2026")), None) {
+            EventKind::JobCreated {
+                source,
+                dest,
+                total_files,
+                total_bytes,
+                config_hash,
+                ..
+            } => {
+                assert_eq!(source, "nfs://cli-src");
+                assert_eq!(dest, "nfs://cli-dst");
+                assert_eq!(total_files, 7);
+                assert_eq!(total_bytes, 70);
+                assert_eq!(config_hash.0, "seeded-via-cli");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Seeding is idempotent and takes its id from the manifest when
+    /// no explicit id is configured.
+    #[tokio::test]
+    async fn seed_once_uses_manifest_run_id_and_is_idempotent() {
+        let (rt, _store) = fresh_runtime().await;
+        let m = manifest();
+        seed_once(&rt, &m.run_id, &spec(None), Some(&m))
+            .await
+            .unwrap();
+        let job = rt.job_view(&JobId::new("run-2026").unwrap()).await.unwrap();
+        assert_eq!(job.progress.files_total, 15);
+        let seq_after_first = rt.last_seq().await;
+        seed_once(&rt, &m.run_id, &spec(None), Some(&m))
+            .await
+            .unwrap();
+        assert_eq!(
+            rt.last_seq().await,
+            seq_after_first,
+            "second seed must append nothing"
+        );
+    }
     use migration_coord::runtime::test_clock::FixedClock;
     use migration_coord::schema::{ConfigHash, EventKind, JobId};
     use migration_coord::store::MemStore;

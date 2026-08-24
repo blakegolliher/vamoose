@@ -1,6 +1,16 @@
-# Release bundles
+# Packages and release bundles
 
-Production deployment starts from one immutable bundle. A bundle contains all
+Two artifacts come out of the same tree. The **RPM/deb** (`make rpm`,
+`make deb`) is what operators install per [QUICKSTART.md](QUICKSTART.md): it
+places the executables in `/usr/bin`, the example configuration and secrets
+files in `/etc/vamoose`, and the `vamoose-worker@` and `vamoose-coord` units
+in `/usr/lib/systemd/system`. The **bundle** below is the provenance-checked
+tarball for sites that deploy with the `ops/` harness or need the pinned
+libnfs and glibc verification before activation.
+
+## Release bundles
+
+Production deployment from a bundle starts from one immutable archive. A bundle contains all
 four executables, the exact pinned libnfs binary, example configuration and
 service files, `build-info.json`, and `SHA256SUMS`.
 

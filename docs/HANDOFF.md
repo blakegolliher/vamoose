@@ -74,8 +74,6 @@ contract. In particular, hardlink grouping and directory-attribute ordering
 are bounded by the current micro-batch/shard execution model, most aggregation
 commands are not implemented, and the TUI's atomic bootstrap boundary is still
 a client-side retry rather than a coordinator `as_of_seq` API.
-The coordinator also lacks a supported production job-create/import workflow;
-a fresh runtime has no job row for worker registration.
 
 Several data-plane fixes are CI-covered but still await the recorded VAST
 hardware exercises: reclaim timing, pipelined copy, replay idempotency,

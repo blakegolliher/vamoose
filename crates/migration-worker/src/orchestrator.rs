@@ -130,16 +130,30 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     let retry_budget =
         transient_retry_budget(cfg.worker.lease_timeout_sec, cfg.worker.heartbeat_sec);
 
-    let manifest = {
+    // A missing manifest is not an error: workers are enabled at
+    // install time and idle until `vamoose prepare` publishes one.
+    // Transient store failures still consume the F42 budget.
+    let manifest = loop {
         let mut st = &*s3;
-        retry_transient(
+        let found = retry_transient(
             "manifest GET",
             retry_budget,
             cfg.worker.heartbeat_sec,
             &mut st,
             |s3c| Box::pin(load_manifest(s3c)),
         )
-        .await?
+        .await?;
+        match found {
+            Some(m) => break m,
+            None => {
+                tracing::info!(
+                    bucket = %s3.bucket(),
+                    retry_sec = MANIFEST_WAIT_POLL_SEC,
+                    "no manifest.json in bucket yet; waiting for `vamoose prepare`",
+                );
+                tokio::time::sleep(Duration::from_secs(MANIFEST_WAIT_POLL_SEC)).await;
+            }
+        }
     };
     if manifest.format_version != RUN_FORMAT_VERSION {
         anyhow::bail!(
@@ -363,7 +377,16 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     // mode — `run_control_reader` stays None and the claim loop is
     // bit-for-bit unchanged.
     let coord_cancel = CancellationToken::new();
-    let coord_handle: Option<CoordDriverHandle> = match cfg.coord.as_ref() {
+    let coord_cfg = cfg.coord.as_ref().map(|c| {
+        // An omitted job_id follows the manifest: `vamoose coord`
+        // seeds its job from the same manifest under the run id.
+        let mut resolved = c.clone();
+        if resolved.job_id.is_none() {
+            resolved.job_id = Some(manifest.run_id.clone());
+        }
+        resolved
+    });
+    let coord_handle: Option<CoordDriverHandle> = match coord_cfg.as_ref() {
         Some(c) => {
             let driver_inputs = DriverInputs {
                 progress: progress.clone(),
@@ -382,7 +405,8 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
                 coord_cancel.clone(),
             ) {
                 Ok(h) => {
-                    tracing::info!(coord_url = %c.url, job_id = %c.job_id,
+                    tracing::info!(coord_url = %c.url,
+                        job_id = c.job_id.as_deref().unwrap_or("?"),
                         "coord driver spawned");
                     Some(h)
                 }
@@ -765,6 +789,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
             throughput: throughput.clone(),
             fsid_fallback_warned: false,
             emitter: event_emitter.clone(),
+            run_control: coord_handle.as_ref().map(|h| h.run_control.subscribe()),
         };
         let outcome = match processor.process(&scratch).await {
             Ok(o) => o,
@@ -1141,13 +1166,17 @@ async fn flush_one(store: &dyn ClaimStore, key: String, body: Vec<u8>) -> Result
     }
 }
 
-async fn load_manifest(s3: &S3Client) -> anyhow::Result<Manifest> {
-    let (body, _etag) = s3
-        .get(layout::MANIFEST_KEY)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("manifest.json not found in bucket {}", s3.bucket()))?;
+/// Poll cadence while the bucket has no `manifest.json` yet.
+const MANIFEST_WAIT_POLL_SEC: u64 = 15;
+
+/// `Ok(None)` means the bucket is reachable but has no manifest yet;
+/// the caller waits rather than failing.
+async fn load_manifest(s3: &S3Client) -> anyhow::Result<Option<Manifest>> {
+    let Some((body, _etag)) = s3.get(layout::MANIFEST_KEY).await? else {
+        return Ok(None);
+    };
     let m: Manifest = serde_json::from_slice(&body)?;
-    Ok(m)
+    Ok(Some(m))
 }
 
 /// Effective copy options = manifest defaults overlaid with worker

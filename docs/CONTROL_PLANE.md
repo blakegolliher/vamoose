@@ -214,11 +214,13 @@ The coordinator is not in the copy or claim commit path. A missing `[coord]`,
 temporary coordinator outage, or TUI absence does not transfer claim authority
 away from the worker's S3 protocol.
 
-The current repository does not expose a production job-create/import command
-or REST route. A fresh coordinator therefore has an empty job registry, and
-worker registration for an unknown job returns 404. Replay and tests exercise
-the implemented runtime after a `JobCreated` event has seeded state, but a
-supported fresh-deployment provisioning workflow remains to be designed.
+Job provisioning is manifest-driven: `vamoose coord` seeds one `JobCreated`
+event from the bucket's `manifest.json` (id = run id, source/dest/totals from
+the manifest) once the manifest exists, skipping the seed when replay already
+holds the job. An explicit id (`--seed-job`, `[coord] job_id`) is accepted for
+tests and unusual layouts. Worker registration for a job that is not seeded
+yet returns 404, which the worker treats as "wait and retry", not as a fatal
+misconfiguration. There is no REST route that creates a job.
 
 ## TUI relationship
 

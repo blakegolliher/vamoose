@@ -70,61 +70,68 @@ Standalone `mig-aggr clean-partials` is real and dry-run by default. Its
 `watch`, `summary`, `metrics`, `inspect`, and `verify` commands return clear
 unimplemented errors.
 
-The coordinator daemon, worker client, REST/SSE surface, and TUI are
-implemented, but a fresh coordinator has no supported job-create/import
-workflow yet. It starts with an empty job registry and rejects registration for
-an unknown job. This provisioning gap is tracked in
-[docs/NEXT.md](docs/NEXT.md).
+The coordinator seeds its control-plane job from the bucket's `manifest.json`
+(job id = the manifest's run id), so a fresh deployment needs no job-create
+step; `vamoose coord --seed-job` remains for an explicit id. Workers register
+against the same id by default and wait, rather than fail, while the job is
+not seeded yet.
 
 ## Quick start
 
-The recommended production-style entry point is the tracked
-[`ops/`](ops/README.md) harness. At a high level:
+The operator story is [docs/QUICKSTART.md](docs/QUICKSTART.md): install the
+package on each host, copy one configuration file and one secrets file to
+`/etc/vamoose`, enable `vamoose-coord` on one host and `vamoose-worker@main`
+on all of them, build the index, and drive the run from `vamoose tui`.
 
-1. Copy `ops/run.env.example` to ignored `ops/run.env`, fill in the site and
-   pinned artifact details, then run `ops/validate-run.sh --require-artifacts`.
-2. Run `ops/init-run.sh` and `ops/prepare-run.sh` to bind a fresh bucket and
-   checkpoint scan, canonical rewrite, verified upload, and immutable manifest
-   creation.
-3. Run `ops/deploy-release.sh`, then `ops/begin-run.sh` to start every configured
-   systemd worker instance and require fresh readiness heartbeats.
-4. Monitor with `vamoose status --config <rendered-local.toml> --watch` or the
-   tracked worker-status helper.
-5. Run `ops/finalize-run.sh` after terminal state. It checks failed claims and
-   records, performs deterministic content/metadata/symlink sampling, captures
-   timing and provenance evidence, and resumes any paused resources.
-6. The optional
-   coordinator and TUI can operate once control-plane job state is provisioned,
-   but the repository does not yet provide that provisioning command or route:
-   - add `[coord]` to the worker configuration;
-   - start `vamoose coord --config <path>` with the desired TLS/auth options;
-   - connect with `vamoose tui --coord-url https://coord.host:8443`.
+```bash
+sudo dnf install ./vamoose-*.rpm                      # every host
+sudo cp /etc/vamoose/vamoose.toml.example /etc/vamoose/vamoose.toml   # edit, copy to all hosts
+sudo install -m 0600 /etc/vamoose/vamoose.env.example /etc/vamoose/vamoose.env
+sudo systemctl enable --now vamoose-coord             # one host
+sudo systemctl enable --now vamoose-worker@main       # every host; idles until the index exists
+sudo vamoose tui                                      # any host: watch, :stop, :resume, :abort
+```
 
-The TUI exposes pause, resume, cancel, drain, and retry-failed endpoints through
-its command palette. In the current control contract, drain maps to paused
-state and retry-failed is audit-only; neither is a separate worker execution
-mode yet. `NO_COLOR=1` and `VAMOOSE_THEME=light` are supported. Workers without
-`[coord]` continue to operate through S3 claims alone.
+Building the index (scan → canonical shards → `manifest.json`) currently uses
+the tracked [`ops/`](ops/README.md) harness with the external `nfs-walker`;
+the one-command `vamoose prepare` that bundles it is the next item in
+[docs/NEXT.md](docs/NEXT.md). The `ops/` harness is also the advanced,
+fully scripted lifecycle (validated run specification, provenance-checked
+bundle deployment over SSH, timing, reset, and sampled verification) for
+sites that want that level of control.
+
+The TUI exposes pause (`:stop`), resume, cancel (`:abort`), drain, and
+retry-failed through its command palette. Pause takes effect at the next batch
+boundary and keeps every claim; cancel is final and lets each worker finish
+the shard in hand. Drain maps to paused state and retry-failed is audit-only;
+neither is a separate worker execution mode yet. `NO_COLOR=1` and
+`VAMOOSE_THEME=light` are supported. Workers without `[coord]` continue to
+operate through S3 claims alone.
 
 ## Configuration
 
-`examples/worker.toml` is the canonical operator format:
+One file, `/etc/vamoose/vamoose.toml`, configures every command and service
+on a host. Commands look for it in this order: `--config` / `VAMOOSE_CONFIG`,
+`/etc/vamoose/workers/<instance>.toml` when `VAMOOSE_INSTANCE` is set (the
+systemd template exports it), `./vamoose.toml`, then
+`/etc/vamoose/vamoose.toml`.
+
+`examples/vamoose.toml` is the slim file the packages install as
+`vamoose.toml.example`; `examples/worker.toml` is the full reference with
+every tunable. The canonical format is:
 
 ```toml
-[run]
-[worker]
-[shard]
-[mover]
-[batch]
-[copy]
-[backpressure]
-[coord] # optional
+[run]           # bucket, endpoint, region; optional profile, verify_tls
+[mover]         # src_url, dst_url, and tuning
+[coord]         # optional: url + job wiring for workers, listen/TLS/tokens for the daemon
+[worker] [shard] [batch] [copy] [backpressure]   # optional; production defaults
 ```
 
-Control-only commands can use a file containing just `[run]`. Optional
-unified-CLI sections are `[nfs]`, `[walker]`, `[aggr]`, and `[logging]`. The
-older `[global]`/`[s3]` vamoose format remains accepted as a compatibility
-input; mixed canonical and compatibility roots are rejected.
+Only `[run]` and `[mover]` are required to run a worker. Control-only commands
+need only `[run]`. Optional unified-CLI sections are `[nfs]`, `[walker]`,
+`[aggr]`, and `[logging]`. The older `[global]`/`[s3]` vamoose format remains
+accepted as a compatibility input; mixed canonical and compatibility roots are
+rejected.
 
 Historical mover fields remain parseable, but do not enable removed or
 unimplemented strategies. See [DESIGN.md](DESIGN.md#configuration) and the
@@ -132,6 +139,8 @@ comments in [examples/worker.toml](examples/worker.toml) for current semantics.
 
 ## Documentation
 
+- [docs/QUICKSTART.md](docs/QUICKSTART.md) — install, configure, run, and stop a migration
+- [docs/RELEASES.md](docs/RELEASES.md) — building packages and release bundles
 - [DESIGN.md](DESIGN.md) — concise as-built system architecture
 - [docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md) — current control-plane ownership and invariants
 - [docs/CLAIM_PROTOCOL.md](docs/CLAIM_PROTOCOL.md) — authoritative S3 claim protocol

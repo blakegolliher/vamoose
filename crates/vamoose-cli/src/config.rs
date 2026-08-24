@@ -23,7 +23,35 @@ pub(crate) struct Config {
     #[allow(dead_code)]
     aggr: Option<Aggr>,
     logging: Option<Logging>,
+    coord_server: Option<CoordServer>,
     worker: WorkerInput,
+}
+
+/// Coordinator-daemon and TUI settings. They live in the same `[coord]`
+/// table as the worker's client wiring so an operator file has one
+/// coordinator block: the worker crate deserializes only the fields it
+/// knows and ignores these, and this struct ignores the worker's.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CoordServer {
+    /// Bind address for `vamoose coord` (default `0.0.0.0:8443`).
+    #[serde(default)]
+    pub(crate) listen: Option<String>,
+    #[serde(default)]
+    pub(crate) tls_cert: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) tls_key: Option<PathBuf>,
+    /// Serve plain HTTP. Must be explicit: a coord without TLS files
+    /// and without this flag refuses to start.
+    #[serde(default)]
+    pub(crate) no_tls: bool,
+    /// Admin bearer tokens, one per line (`token<TAB>label`, label
+    /// optional). The coord loads every line; the TUI uses the first.
+    #[serde(default)]
+    pub(crate) admin_tokens_file: Option<PathBuf>,
+    /// Permit dev mode (no tokens, no cluster secret) on a
+    /// non-loopback bind. Lab-only escape hatch.
+    #[serde(default)]
+    pub(crate) allow_unauthenticated_nonloopback: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,13 +330,74 @@ fn default_log_poll_secs() -> u64 {
     10
 }
 
+/// System-wide configuration directory. Packages install the example
+/// files here and the systemd units run with this directory's files.
+pub(crate) const SYSTEM_CONFIG_DIR: &str = "/etc/vamoose";
+
+/// Default configuration file when no `--config` / `VAMOOSE_CONFIG`
+/// is given and the working directory has no `vamoose.toml`.
+pub(crate) const SYSTEM_CONFIG_PATH: &str = "/etc/vamoose/vamoose.toml";
+
+/// Candidate paths, in order, for a command started without an
+/// explicit configuration path:
+///
+/// 1. `/etc/vamoose/workers/<instance>.toml` when `VAMOOSE_INSTANCE`
+///    is set (the `vamoose-worker@.service` template exports its
+///    instance name so one host can run differently tuned workers);
+/// 2. `./vamoose.toml` — the development convenience;
+/// 3. `/etc/vamoose/vamoose.toml` — the packaged default.
+///
+/// A per-instance file is optional: an instance with no dedicated
+/// file falls through to the shared system file, so the common
+/// single-worker-per-host install needs exactly one config.
+pub(crate) fn default_config_candidates(instance: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(3);
+    if let Some(name) = instance.filter(|n| !n.is_empty()) {
+        let mut file = std::ffi::OsString::from(name);
+        file.push(".toml");
+        out.push(PathBuf::from(SYSTEM_CONFIG_DIR).join("workers").join(file));
+    }
+    out.push(PathBuf::from("vamoose.toml"));
+    out.push(PathBuf::from(SYSTEM_CONFIG_PATH));
+    out
+}
+
+/// Pick the first existing candidate from [`default_config_candidates`].
+/// `exists` is injected so the search order is unit-testable without
+/// touching `/etc`.
+pub(crate) fn resolve_default_path(
+    instance: Option<&std::ffi::OsStr>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Result<PathBuf> {
+    let candidates = default_config_candidates(instance);
+    if let Some(found) = candidates.iter().find(|c| exists(c)) {
+        return Ok(found.clone());
+    }
+    let tried = candidates
+        .iter()
+        .map(|c| c.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "no configuration file found (tried {tried}); pass --config <path>, set \
+         VAMOOSE_CONFIG, or install one at {SYSTEM_CONFIG_PATH} \
+         (see {SYSTEM_CONFIG_PATH}.example)"
+    )
+}
+
 impl Config {
     pub(crate) fn load(path: Option<PathBuf>) -> Result<Self> {
         Self::load_with_path(path).map(|(config, _)| config)
     }
 
     pub(crate) fn load_with_path(path: Option<PathBuf>) -> Result<(Self, PathBuf)> {
-        let resolved = path.unwrap_or_else(|| PathBuf::from("vamoose.toml"));
+        let resolved = match path {
+            Some(p) => p,
+            None => resolve_default_path(
+                std::env::var_os("VAMOOSE_INSTANCE").as_deref(),
+                |candidate| candidate.is_file(),
+            )?,
+        };
         let text = std::fs::read_to_string(&resolved)
             .with_context(|| format!("reading config from {}", resolved.display()))?;
         let config = Self::parse(&text)
@@ -330,7 +419,16 @@ impl Config {
         if has_run {
             let input: CanonicalInput =
                 toml::from_str(text).context("invalid canonical [run] configuration")?;
-            return Ok(Self::from_canonical(input));
+            let coord_server = match roots.get("coord") {
+                Some(table) => Some(
+                    table
+                        .clone()
+                        .try_into::<CoordServer>()
+                        .context("invalid [coord] coordinator/TUI settings")?,
+                ),
+                None => None,
+            };
+            return Ok(Self::from_canonical(input, coord_server));
         }
 
         if has_compatibility_root {
@@ -344,7 +442,7 @@ impl Config {
         )
     }
 
-    fn from_canonical(input: CanonicalInput) -> Self {
+    fn from_canonical(input: CanonicalInput, coord_server: Option<CoordServer>) -> Self {
         let storage = StorageSettings {
             bucket: input.run.bucket.clone(),
             endpoint: input.run.endpoint.clone(),
@@ -359,6 +457,7 @@ impl Config {
             walker: input.walker,
             aggr: input.aggr,
             logging: input.logging,
+            coord_server,
             worker: WorkerInput::Canonical(Box::new(CanonicalWorkerInput {
                 run: input.run,
                 worker: input.worker,
@@ -387,6 +486,7 @@ impl Config {
             walker: input.walker,
             aggr: input.aggr,
             logging: input.logging,
+            coord_server: None,
             worker: WorkerInput::Compatibility(CompatibilityWorkerInput {
                 worker: input.worker,
                 copy: input.copy,
@@ -404,6 +504,20 @@ impl Config {
 
     pub(crate) fn walker(&self) -> Option<&Walker> {
         self.walker.as_ref()
+    }
+
+    /// The worker-shaped `[coord]` client wiring (URL, job, secret).
+    /// `None` for the compatibility format or when the table is absent.
+    pub(crate) fn coord(&self) -> Option<&wcfg::CoordCfg> {
+        match &self.worker {
+            WorkerInput::Canonical(input) => input.coord.as_ref(),
+            WorkerInput::Compatibility(_) => None,
+        }
+    }
+
+    /// Coordinator-daemon / TUI extras from the same `[coord]` table.
+    pub(crate) fn coord_server(&self) -> Option<&CoordServer> {
+        self.coord_server.as_ref()
     }
 
     pub(crate) fn logging_policy(&self) -> LoggingPolicy {
@@ -425,33 +539,21 @@ impl Config {
 }
 
 fn canonical_worker_config(input: CanonicalWorkerInput) -> Result<(wcfg::Config, Option<String>)> {
-    let missing = [
-        ("worker", input.worker.is_none()),
-        ("shard", input.shard.is_none()),
-        ("mover", input.mover.is_none()),
-        ("batch", input.batch.is_none()),
-        ("copy", input.copy.is_none()),
-        ("backpressure", input.backpressure.is_none()),
-    ]
-    .into_iter()
-    .filter_map(|(section, is_missing)| is_missing.then_some(format!("[{section}]")))
-    .collect::<Vec<_>>();
-
-    if !missing.is_empty() {
+    // Only `[mover]` carries settings without a production default
+    // (the source and destination URLs); every other section falls
+    // back to the worker crate's defaults so a minimal operator file
+    // is `[run]` + `[mover]`.
+    let Some(mover) = input.mover else {
         anyhow::bail!(
-            "canonical [run] configuration cannot start `vamoose worker`; missing required worker sections: {}",
-            missing.join(", ")
+            "canonical [run] configuration cannot start `vamoose worker`; missing required \
+             section [mover] (src_url / dst_url)"
         );
-    }
-
-    let worker = input.worker.context("missing [worker] after validation")?;
-    let shard = input.shard.context("missing [shard] after validation")?;
-    let mover = input.mover.context("missing [mover] after validation")?;
-    let batch = input.batch.context("missing [batch] after validation")?;
-    let copy = input.copy.context("missing [copy] after validation")?;
-    let backpressure = input
-        .backpressure
-        .context("missing [backpressure] after validation")?;
+    };
+    let worker = input.worker.unwrap_or_default();
+    let shard = input.shard.unwrap_or_default();
+    let batch = input.batch.unwrap_or_default();
+    let copy = input.copy.unwrap_or_default();
+    let backpressure = input.backpressure.unwrap_or_default();
     let host_id = worker.host_id.clone();
     Ok((
         wcfg::Config {
@@ -693,22 +795,109 @@ mod tests {
     }
 
     #[test]
-    fn canonical_run_only_worker_error_names_every_missing_section() {
+    fn canonical_run_only_worker_error_names_mover() {
         let error = Config::parse(RUN_ONLY)
             .expect("composition parse must succeed")
             .into_worker_config()
             .expect_err("worker projection must fail");
         let message = error.to_string();
-        for section in [
-            "[worker]",
-            "[shard]",
-            "[mover]",
-            "[batch]",
-            "[copy]",
-            "[backpressure]",
-        ] {
-            assert!(message.contains(section), "missing {section} in: {message}");
-        }
+        assert!(message.contains("[mover]"), "missing [mover] in: {message}");
+    }
+
+    /// The minimal operator file: `[run]` plus the two NFS URLs. Every
+    /// other worker section takes the crate defaults.
+    #[test]
+    fn run_plus_mover_projects_with_defaults() {
+        let text = r#"
+            [run]
+            bucket = "b"
+            endpoint = "https://s3.example.test"
+            region = "us-east-1"
+
+            [mover]
+            src_url = "nfs://src/export"
+            dst_url = "nfs://dst/export"
+        "#;
+        let (worker, host_id) = Config::parse(text)
+            .expect("parse")
+            .into_worker_config()
+            .expect("minimal file must project");
+        assert_eq!(host_id, None);
+        assert_eq!(worker.worker.heartbeat_sec, 30);
+        assert_eq!(worker.worker.lease_timeout_sec, 180);
+        assert_eq!(
+            worker.shard.local_scratch,
+            std::path::PathBuf::from("/var/lib/vamoose/scratch")
+        );
+        assert_eq!(worker.batch.bytes_budget, "8 GiB");
+        assert!(worker.copy.preserve_owner);
+        assert_eq!(worker.backpressure.throughput_floor_mb_s, 100);
+        assert!(worker.coord.is_none());
+    }
+
+    /// The shipped quickstart example is the slim file the packages
+    /// install as `/etc/vamoose/vamoose.toml.example`; it must project
+    /// to a worker config and expose the coordinator settings.
+    #[test]
+    fn examples_vamoose_toml_projects_and_carries_coord_settings() {
+        let config = Config::parse(include_str!("../../../examples/vamoose.toml"))
+            .expect("quickstart example must parse");
+        let server = config
+            .coord_server()
+            .cloned()
+            .expect("[coord] must yield server settings");
+        assert!(server.no_tls);
+        assert_eq!(
+            server.admin_tokens_file.as_deref(),
+            Some(std::path::Path::new("/etc/vamoose/admin-token"))
+        );
+        let client = config.coord().expect("[coord] must yield client wiring");
+        assert_eq!(client.url, "http://node1.example.com:8443");
+        assert_eq!(
+            client.job_id, None,
+            "job_id follows the manifest by default"
+        );
+        assert_eq!(
+            client.cluster_secret_env.as_deref(),
+            Some("VAMOOSE_CLUSTER_SECRET")
+        );
+        let (worker, _) = config.into_worker_config().expect("must project");
+        assert!(worker.mover.use_raw_fh);
+        assert_eq!(worker.mover.nfs_connections, 32);
+    }
+
+    /// `[coord]` extras must not break the worker projection, and a
+    /// file without `[coord]` yields no server settings.
+    #[test]
+    fn coord_server_settings_are_optional_and_parsed_from_the_same_table() {
+        let text = r#"
+            [run]
+            bucket = "b"
+            endpoint = "https://s3.example.test"
+            region = "us-east-1"
+
+            [coord]
+            url = "https://coord.example.test:8443"
+            listen = "127.0.0.1:9000"
+            tls_cert = "/etc/vamoose/coord.crt"
+            tls_key = "/etc/vamoose/coord.key"
+        "#;
+        let config = Config::parse(text).expect("parse");
+        let server = config.coord_server().expect("server settings");
+        assert_eq!(server.listen.as_deref(), Some("127.0.0.1:9000"));
+        assert!(!server.no_tls);
+        assert_eq!(
+            server.tls_cert.as_deref(),
+            Some(std::path::Path::new("/etc/vamoose/coord.crt"))
+        );
+        assert_eq!(
+            config.coord().map(|c| c.url.as_str()),
+            Some("https://coord.example.test:8443")
+        );
+
+        let none = Config::parse(RUN_ONLY).expect("parse");
+        assert!(none.coord_server().is_none());
+        assert!(none.coord().is_none());
     }
 
     #[test]
@@ -758,7 +947,7 @@ mod tests {
 
         let coord = worker.coord.expect("[coord] must survive projection");
         assert_eq!(coord.url, "https://coord.example.test");
-        assert_eq!(coord.job_id, "job-17");
+        assert_eq!(coord.job_id.as_deref(), Some("job-17"));
         assert_eq!(coord.cluster_secret_env.as_deref(), Some("CLUSTER_SECRET"));
         assert_eq!(coord.heartbeat_sec, 13);
         assert_eq!(coord.events_flush_sec, 4);
@@ -974,5 +1163,73 @@ mod tests {
         assert!(message.contains("compatibility [global]/[s3]"));
         assert!(!message.contains("canonical [run] configuration"));
         assert!(format!("{:#}", Config::parse(&malformed).unwrap_err()).contains("endpoint"));
+    }
+}
+
+#[cfg(test)]
+mod default_path_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    #[test]
+    fn candidates_prefer_instance_then_cwd_then_system() {
+        let with = default_config_candidates(Some(OsStr::new("main")));
+        assert_eq!(
+            with,
+            vec![
+                PathBuf::from("/etc/vamoose/workers/main.toml"),
+                PathBuf::from("vamoose.toml"),
+                PathBuf::from(SYSTEM_CONFIG_PATH),
+            ]
+        );
+        let without = default_config_candidates(None);
+        assert_eq!(
+            without,
+            vec![
+                PathBuf::from("vamoose.toml"),
+                PathBuf::from(SYSTEM_CONFIG_PATH)
+            ]
+        );
+        // An empty instance name is the same as none.
+        assert_eq!(default_config_candidates(Some(OsStr::new(""))), without);
+    }
+
+    #[test]
+    fn instance_without_dedicated_file_falls_through_to_system_file() {
+        let resolved = resolve_default_path(Some(OsStr::new("main")), |p| {
+            p == Path::new(SYSTEM_CONFIG_PATH)
+        })
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from(SYSTEM_CONFIG_PATH));
+    }
+
+    #[test]
+    fn dedicated_instance_file_wins_over_shared_file() {
+        let resolved = resolve_default_path(Some(OsStr::new("fast")), |_| true).unwrap();
+        assert_eq!(resolved, PathBuf::from("/etc/vamoose/workers/fast.toml"));
+    }
+
+    #[test]
+    fn cwd_file_wins_over_system_file() {
+        let resolved = resolve_default_path(None, |p| {
+            p == Path::new("vamoose.toml") || p == Path::new(SYSTEM_CONFIG_PATH)
+        })
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("vamoose.toml"));
+    }
+
+    #[test]
+    fn nothing_found_names_every_candidate() {
+        let err = resolve_default_path(Some(OsStr::new("main")), |_| false).unwrap_err();
+        let msg = format!("{err:#}");
+        for needle in [
+            "/etc/vamoose/workers/main.toml",
+            "vamoose.toml",
+            SYSTEM_CONFIG_PATH,
+            "--config",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in {msg}");
+        }
     }
 }
