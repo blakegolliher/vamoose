@@ -70,7 +70,10 @@ pub(super) fn render_overview_tab(
             ),
         ));
         if job.progress.files_total > 0 && avg > 0.0 {
-            let remaining = job.progress.files_total.saturating_sub(job.progress.files_done);
+            let remaining = job
+                .progress
+                .files_total
+                .saturating_sub(job.progress.files_done);
             let eta_secs = (remaining as f64 / avg) as i64;
             let eta_at = now + chrono::Duration::seconds(eta_secs);
             lines.push(kv_line(
@@ -127,7 +130,6 @@ pub(super) fn render_overview_tab(
     let para = Paragraph::new(Text::from(lines));
     frame.render_widget(para, area);
 }
-
 
 /// Compact duration: "3h12m", "48m", "90s".
 fn human_duration(secs: i64) -> String {

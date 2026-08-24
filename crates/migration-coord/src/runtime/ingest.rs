@@ -37,8 +37,7 @@ pub(super) struct StreamCaps {
     /// losslessness is verifiable in production.
     /// Last emitted (files_done, bytes_done) per job — dedups
     /// per-tick ProgressSync emission for idle jobs.
-    pub(super) last_sync:
-        std::collections::HashMap<crate::schema::JobId, (u64, u64)>,
+    pub(super) last_sync: std::collections::HashMap<crate::schema::JobId, (u64, u64)>,
     pub(super) acct_ingested_files: u64,
     pub(super) acct_leading_files: u64,
     pub(super) acct_drained_files: u64,
@@ -151,8 +150,7 @@ impl StreamCaps {
         for key in due {
             if let Some((env, _)) = self.retained_progress.remove(&key) {
                 if let EventKind::ProgressDelta { files_delta, .. } = &env.kind {
-                    self.acct_drained_files =
-                        self.acct_drained_files.saturating_add(*files_delta);
+                    self.acct_drained_files = self.acct_drained_files.saturating_add(*files_delta);
                 }
                 out.push(env);
             }

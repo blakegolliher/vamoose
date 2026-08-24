@@ -208,10 +208,11 @@ impl AppState {
             workers,
         } = &envelope.kind
         {
-            self.job_syncs
-                .entry(job_id.clone())
-                .or_default()
-                .push(envelope.at, *files_done, *bytes_done);
+            self.job_syncs.entry(job_id.clone()).or_default().push(
+                envelope.at,
+                *files_done,
+                *bytes_done,
+            );
             for wc in workers {
                 self.worker_syncs
                     .entry((job_id.clone(), wc.worker_id))

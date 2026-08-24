@@ -534,10 +534,7 @@ mod tests {
         // (authoritative absolutes for client-side rates) — so
         // last_seq may advance; the trailing re-broadcast itself
         // still reuses its original envelope.
-        assert!(
-            rt.last_seq().await >= last_seq,
-            "seq must never regress",
-        );
+        assert!(rt.last_seq().await >= last_seq, "seq must never regress",);
 
         shutdown.cancel();
         task.await.unwrap().unwrap();
