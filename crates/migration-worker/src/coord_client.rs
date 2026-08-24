@@ -91,6 +91,13 @@ impl CoordError {
             Self::Serde(_) => false,
         }
     }
+
+    /// `404` from the coord: the configured job is not (yet) in its
+    /// registry. Registration treats this as "wait", not "fail", so
+    /// workers may start before the coord has seeded the job.
+    pub fn is_job_not_found(&self) -> bool {
+        matches!(self, Self::Http { status, .. } if *status == reqwest::StatusCode::NOT_FOUND)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, CoordError>;
@@ -286,6 +293,13 @@ impl Backoff {
         let doubled = self.current.saturating_mul(2);
         self.current = doubled.min(self.max);
         self.current
+    }
+
+    /// Jump straight to the maximum delay. Used while waiting on a
+    /// condition that is expected to take a while (the coord has not
+    /// seeded the job yet) so the wait does not spam the log.
+    pub fn saturate(&mut self) {
+        self.current = self.max;
     }
 
     /// Reset to the initial delay. Call after a successful HTTP

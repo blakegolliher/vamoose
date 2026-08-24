@@ -179,8 +179,15 @@ pub fn spawn(
     )
     .context("build CoordClient")?;
 
-    let job_id = JobId::new(cfg.job_id.clone())
-        .map_err(|e| anyhow::anyhow!("invalid coord.job_id {:?}: {e}", cfg.job_id))?;
+    // The orchestrator resolves an omitted `[coord] job_id` to the
+    // manifest's run id before spawning (see `CoordCfg::job_id`); by
+    // the time we get here the id must be concrete.
+    let raw_job_id = cfg
+        .job_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("coord.job_id is unresolved (no manifest run id)"))?;
+    let job_id = JobId::new(raw_job_id.to_string())
+        .map_err(|e| anyhow::anyhow!("invalid coord.job_id {raw_job_id:?}: {e}"))?;
 
     let run_control = RunControl::new();
     let (worker_id_tx, worker_id_rx) = watch::channel(None);
@@ -591,6 +598,27 @@ async fn register_with_backoff(
             ) => {
                 match res {
                     Ok(reg) => return Ok(Some(reg.worker_id)),
+                    Err(e) if e.is_job_not_found() => {
+                        // The coord is up but has not seeded this job
+                        // yet — normal when workers are enabled at
+                        // install time and the coord seeds from a
+                        // manifest that appears later. Keep waiting at
+                        // the slowest backoff step; a wrong job_id
+                        // shows up as this warning repeating forever.
+                        backoff.saturate();
+                        let delay = backoff.current();
+                        tracing::warn!(
+                            job_id = %params.job_id,
+                            delay_ms = delay.as_millis() as u64,
+                            "coord_driver: job not found on coord; waiting for it to be \
+                             seeded (check [coord] job_id if this persists)",
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Ok(None),
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                    }
                     Err(e) if !e.is_retryable() => {
                         anyhow::bail!("coord register failed (non-retryable): {e}");
                     }
