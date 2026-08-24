@@ -158,7 +158,7 @@ pub fn parse(buffer: &str, default_job_id: Option<&JobId>) -> Result<PaletteComm
     // which is more confusing.
     let is_known_job_verb = matches!(
         verb.as_str(),
-        "pause" | "resume" | "cancel" | "drain" | "retry-failed" | "retry"
+        "pause" | "stop" | "resume" | "cancel" | "abort" | "drain" | "retry-failed" | "retry"
     );
     if !is_known_job_verb {
         return Err(ParseError::UnknownVerb(verb));
@@ -174,9 +174,12 @@ pub fn parse(buffer: &str, default_job_id: Option<&JobId>) -> Result<PaletteComm
     };
 
     Ok(match verb.as_str() {
-        "pause" => PaletteCommand::Pause { job_id },
+        // `stop` = pause: workers hold at the next batch boundary and
+        // `resume` continues. `abort` = cancel: final; workers finish
+        // the shard in hand and exit.
+        "pause" | "stop" => PaletteCommand::Pause { job_id },
         "resume" => PaletteCommand::Resume { job_id },
-        "cancel" => PaletteCommand::Cancel { job_id },
+        "cancel" | "abort" => PaletteCommand::Cancel { job_id },
         "drain" => PaletteCommand::Drain { job_id },
         "retry-failed" | "retry" => PaletteCommand::RetryFailed { job_id },
         // Unreachable: is_known_job_verb gated above.
@@ -280,6 +283,19 @@ mod tests {
         assert_eq!(parse("quit", None).unwrap(), PaletteCommand::Quit);
         assert_eq!(parse("q", None).unwrap(), PaletteCommand::Quit);
         assert_eq!(parse("exit", None).unwrap(), PaletteCommand::Quit);
+    }
+
+    #[test]
+    fn parse_stop_and_abort_aliases() {
+        let dj = JobId::new("bobby").unwrap();
+        assert!(matches!(
+            parse("stop", Some(&dj)).unwrap(),
+            PaletteCommand::Pause { .. }
+        ));
+        assert!(matches!(
+            parse("abort", Some(&dj)).unwrap(),
+            PaletteCommand::Cancel { .. }
+        ));
     }
 
     #[test]

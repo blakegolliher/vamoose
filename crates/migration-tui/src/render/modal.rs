@@ -103,6 +103,11 @@ fn render_help_modal(frame: &mut Frame, body_area: Rect, theme: &Theme) {
         "verbs",
         "pause / resume / cancel / drain / retry-failed",
     );
+    push_kv(
+        &mut lines,
+        "aliases",
+        "stop = pause (holds at next batch); abort = cancel (final)",
+    );
     push_kv(&mut lines, "local verbs", "help, quit");
 
     push_section(&mut lines, "Other");
