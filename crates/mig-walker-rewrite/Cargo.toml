@@ -4,7 +4,7 @@ version     = { workspace = true }
 edition     = { workspace = true }
 authors     = { workspace = true }
 license     = { workspace = true }
-description = "Throwaway shim: nfs-walker parquet → canonical migration schema"
+description = "Resumable nfs-walker Parquet → canonical migration schema converter"
 publish     = false
 
 [[bin]]
@@ -20,3 +20,6 @@ anyhow             = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 libc               = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+sha2               = "0.10.9"
