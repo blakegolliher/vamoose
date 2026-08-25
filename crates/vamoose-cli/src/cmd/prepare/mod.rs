@@ -266,7 +266,8 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
     let rewrite = tools::RewriteInvocation {
         input: scan.scan_dir.clone(),
         output: run_dir.join("canonical"),
-        source_root: spec.source.root.clone(),
+        // Not `spec.source.root`: the scan was anchored there already.
+        source_root: tools::REWRITE_SOURCE_ROOT.to_string(),
         walker_version: scan.walker_version.clone(),
         report: rewrite_report.clone(),
     };
