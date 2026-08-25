@@ -532,19 +532,34 @@ fn probe_export(url: &str, root: &str, write: bool, rpc_timeout_ms: u32) -> Resu
     let mut ctx = migration_mover::NfsContext::mount_url(url, rpc_timeout_ms)
         .map_err(|e| format!("mount {url}: {e:#}{}", hint()))?;
     let root = norm_root(root);
-    ops::stat_times(&mut ctx, root.as_bytes())
-        .map_err(|e| format!("{url} mounted, but {root}: {}", e.error))?;
     if !write {
+        ops::stat_times(&mut ctx, root.as_bytes())
+            .map_err(|e| format!("{url} mounted, but {root}: {}", e.error))?;
         return Ok(format!("{url} mounted, {root} present"));
     }
-    let marker = if root == "/" {
+    // The destination root usually does not exist before the first
+    // run — the workers create it — so prove the nearest existing
+    // ancestor takes a file instead.
+    let mut existing = None;
+    for candidate in ancestors_of(&root) {
+        if ops::stat_times(&mut ctx, candidate.as_bytes()).is_ok() {
+            existing = Some(candidate);
+            break;
+        }
+    }
+    let Some(existing) = existing else {
+        return Err(format!(
+            "{url} mounted, but neither {root} nor any ancestor of it can be stat'ed"
+        ));
+    };
+    let marker = if existing == "/" {
         "/.vamoose-doctor-probe".to_string()
     } else {
-        format!("{root}/.vamoose-doctor-probe")
+        format!("{existing}/.vamoose-doctor-probe")
     };
     let fh = ops::create_write(&mut ctx, marker.as_bytes(), 0o600).map_err(|e| {
         format!(
-            "{url} mounted, {root} present, but create {marker}: {}",
+            "{url} mounted, {existing} present, but create {marker}: {}",
             e.error
         )
     })?;
@@ -555,7 +570,32 @@ fn probe_export(url: &str, root: &str, write: bool, rpc_timeout_ms: u32) -> Resu
             e.error
         )
     })?;
-    Ok(format!("{url} mounted, {root} present and writable"))
+    if existing == root {
+        Ok(format!("{url} mounted, {root} present and writable"))
+    } else {
+        Ok(format!(
+            "{url} mounted, {root} absent (workers create it); {existing} writable"
+        ))
+    }
+}
+
+/// `root` and then each ancestor up to `/`, nearest first:
+/// `/a/b/c` → `/a/b/c`, `/a/b`, `/a`, `/`.
+fn ancestors_of(root: &str) -> Vec<String> {
+    let root = norm_root(root);
+    let mut out = vec![root.clone()];
+    let mut cur = root.as_str();
+    while let Some(idx) = cur.rfind('/') {
+        if idx == 0 {
+            if cur != "/" {
+                out.push("/".to_string());
+            }
+            break;
+        }
+        cur = &cur[..idx];
+        out.push(cur.to_string());
+    }
+    out
 }
 
 fn check_nfs_url(checks: &mut Checks, label: &str, url: &str) -> bool {
@@ -883,6 +923,14 @@ mod tests {
             let (got, detail) = status_of(&checks, "nfs roots differ");
             assert_eq!(got, &want, "{su} {du} {sr} {dr}: {detail}");
         }
+    }
+
+    #[test]
+    fn ancestors_nearest_first() {
+        assert_eq!(ancestors_of("/a/b/c"), vec!["/a/b/c", "/a/b", "/a", "/"]);
+        assert_eq!(ancestors_of("/v3"), vec!["/v3", "/"]);
+        assert_eq!(ancestors_of("/"), vec!["/"]);
+        assert_eq!(ancestors_of("x/"), vec!["/x", "/"]);
     }
 
     #[test]
