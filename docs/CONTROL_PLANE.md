@@ -222,6 +222,16 @@ tests and unusual layouts. Worker registration for a job that is not seeded
 yet returns 404, which the worker treats as "wait and retry", not as a fatal
 misconfiguration. There is no REST route that creates a job.
 
+Job completion is claim-driven: the reducer only derives `Copying` (from the
+first worker delta), so after seeding the coordinator polls the bucket's
+`shards/*.claim` records (`migration_coord::reconcile`, every 30 s). The rows
+and bytes of completed shards are ingested as a `ProgressSync` floor, so a
+delta lost with a killed worker cannot leave the job short of 100%, and once
+every manifest shard has a terminal claim the coordinator ingests
+`JobCompleted` (or `JobFailed` naming the failed-shard count). Terminal
+phases are absorbing, so the transition lands once and replay reconstructs
+it; workers still heartbeating after it receive `Cancel` and exit cleanly.
+
 ## TUI relationship
 
 The TUI performs a consistency-checked REST bootstrap: it reads the

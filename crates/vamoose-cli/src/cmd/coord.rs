@@ -235,7 +235,7 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
     // 5. Background ticks + signal handler + seeding.
     let shutdown = CancellationToken::new();
     listen::install_signal_handler(shutdown.clone());
-    let seed_handle = tokio::spawn(seed_job_from_manifest(
+    let seed_handle = tokio::spawn(seed_then_reconcile(
         runtime.clone(),
         s3.clone(),
         seed,
@@ -401,21 +401,44 @@ struct SeedSpec {
 /// Poll cadence while the bucket has no `manifest.json` yet.
 const MANIFEST_POLL: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Seed the control-plane job, waiting for the bucket's manifest when
-/// no explicit id was given. Idempotent: an already-registered job
-/// (replayed from the log, or seeded by a previous generation) is
-/// left untouched. Runs until seeded or shutdown; errors are logged
-/// and retried because a coord that serves the TUI is more useful than
-/// one that exits over a transient S3 hiccup.
-async fn seed_job_from_manifest(
+/// Seed the job, then follow the bucket's shard claims until the job
+/// is terminal ([`migration_coord::reconcile`]) — the reducer only
+/// learns `Copying` from worker deltas, so without this a finished run
+/// stays "Copying 98%" in the TUI forever.
+async fn seed_then_reconcile(
     runtime: CoordRuntime,
     s3: S3Client,
     spec: SeedSpec,
     shutdown: CancellationToken,
 ) {
+    let Some(job_id) = seed_job_from_manifest(&runtime, &s3, &spec, &shutdown).await else {
+        return;
+    };
+    migration_coord::reconcile::run(
+        runtime,
+        job_id,
+        migration_coord::reconcile::RECONCILE_INTERVAL,
+        shutdown,
+    )
+    .await;
+}
+
+/// Seed the control-plane job, waiting for the bucket's manifest when
+/// no explicit id was given. Idempotent: an already-registered job
+/// (replayed from the log, or seeded by a previous generation) is
+/// left untouched. Runs until seeded or shutdown; errors are logged
+/// and retried because a coord that serves the TUI is more useful than
+/// one that exits over a transient S3 hiccup. Returns the seeded job's
+/// id, or `None` when shutdown arrived first.
+async fn seed_job_from_manifest(
+    runtime: &CoordRuntime,
+    s3: &S3Client,
+    spec: &SeedSpec,
+    shutdown: &CancellationToken,
+) -> Option<migration_coord::schema::JobId> {
     let mut announced_wait = false;
     loop {
-        let manifest = match load_manifest(&s3).await {
+        let manifest = match load_manifest(s3).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "coord: manifest read failed; retrying");
@@ -428,9 +451,11 @@ async fn seed_job_from_manifest(
             (None, None) => None,
         };
         if let Some(job) = job {
-            match seed_once(&runtime, &job, &spec, manifest.as_ref()).await {
+            match seed_once(runtime, &job, spec, manifest.as_ref()).await {
                 // Seeded with manifest facts (or none are coming): done.
-                Ok(()) if manifest.is_some() || spec.explicit_job.is_none() => return,
+                Ok(()) if manifest.is_some() || spec.explicit_job.is_none() => {
+                    return migration_coord::schema::JobId::new(job).ok();
+                }
                 // Explicit id seeded before the manifest exists: keep
                 // polling so its totals land via JobTotalsSet later.
                 Ok(()) => {
@@ -455,7 +480,7 @@ async fn seed_job_from_manifest(
         }
         tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return,
+            _ = shutdown.cancelled() => return None,
             _ = tokio::time::sleep(MANIFEST_POLL) => {}
         }
     }
