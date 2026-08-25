@@ -95,11 +95,30 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Do
 
     let (cfg, cfg_path) = match Config::load_with_path(config_path) {
         Ok(p) => {
-            checks.record(
-                Status::Pass,
-                "config",
-                format!("{} parsed cleanly", p.1.display()),
-            );
+            // Absolute path, and a warning when a `./vamoose.toml` in
+            // the working directory shadows the installed one: a stale
+            // copy in an operator's home made doctor report the
+            // previous run's bucket on a freshly configured host.
+            let shown = std::fs::canonicalize(&p.1).unwrap_or_else(|_| p.1.clone());
+            let installed = Path::new(crate::config::SYSTEM_CONFIG_PATH);
+            if shown != installed && installed.is_file() {
+                checks.record(
+                    Status::Warn,
+                    "config",
+                    format!(
+                        "{} parsed cleanly — note: it shadows {} (search order: --config, \
+                         ./vamoose.toml, then the installed file)",
+                        shown.display(),
+                        installed.display()
+                    ),
+                );
+            } else {
+                checks.record(
+                    Status::Pass,
+                    "config",
+                    format!("{} parsed cleanly", shown.display()),
+                );
+            }
             p
         }
         Err(e) => {
