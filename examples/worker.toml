@@ -80,7 +80,9 @@ require_unchanged_size    = false  # default; treat row.size as advisory.
 [backpressure]
 failure_pct_window_sec = 60
 failure_pct_threshold  = 5.0
-throughput_floor_mb_s  = 100
+throughput_floor_mb_s  = 0        # MB/s below which a worker backs off (5 min probe
+                                   # cooldown, doubling to 30 min). 0 = off: small-file
+                                   # trees run at a few MB/s while perfectly healthy.
 
 # `vamoose prepare` (scan -> canonical index -> manifest.json).
 #[prepare]
