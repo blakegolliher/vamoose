@@ -125,10 +125,9 @@ install -m 0755 "$libnfs" "$release_root/lib/$libnfs_soname"
 if [[ -n "$nfs_walker" ]]; then
     [[ -x "$nfs_walker" ]] || fail "nfs-walker is not executable: $nfs_walker"
     install -d "$release_root/libexec"
-    install -m 0755 "$nfs_walker" "$release_root/libexec/nfs-walker"
-    printf 'Bundled nfs-walker (MIT), run by vamoose prepare.\nSource: https://github.com/blakegolliher/nfs-walker\nSHA256: %s\n' \
-        "$(sha256sum "$nfs_walker" | cut -d' ' -f1)" \
+    "$script_dir/check-pinned-walker.sh" "$nfs_walker" \
         > "$release_root/share/doc/vamoose/NFS_WALKER_SOURCE.txt"
+    install -m 0755 "$nfs_walker" "$release_root/libexec/nfs-walker"
 fi
 install -m 0644 "$repo_root/examples/vamoose.toml" "$release_root/etc/vamoose.toml.example"
 install -m 0600 "$repo_root/examples/vamoose.env.example" \

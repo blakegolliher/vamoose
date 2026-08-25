@@ -21,7 +21,7 @@
 //! The moment `manifest.json` lands in the bucket, enabled workers start
 //! claiming shards and the coordinator seeds the job from it.
 
-mod checkpoint;
+pub(crate) mod checkpoint;
 pub(crate) mod tools;
 mod upload;
 
@@ -452,6 +452,14 @@ async fn ensure_scan(
         }
         None => {
             let walker_bin = walker.as_deref().expect("walker resolved for a real scan");
+            println!(
+                "  walker   {} ({}; {})",
+                walker_bin.display(),
+                walker_version,
+                tools::walker_lock()
+                    .describe(walker_sha256.as_deref().unwrap_or(""), &walker_version)
+            );
+            tools::check_walker_flags(walker_bin, &walker_version).await?;
             let attempt_dir = next_attempt_dir(&run_dir.join("scan"))?;
             std::fs::create_dir_all(&attempt_dir)?;
             let invocation = tools::WalkerInvocation {

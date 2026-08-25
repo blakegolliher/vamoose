@@ -47,7 +47,10 @@ LIBNFS_SO   :=
 LIBNFS_STAGE := target/release-input/libnfs
 # Path to a built nfs-walker executable to ship as
 # /usr/libexec/vamoose/nfs-walker (what `vamoose prepare` runs). Empty =
-# prepare falls back to nfs-walker on PATH or [prepare] walker_bin.
+# prepare falls back to nfs-walker on PATH or [prepare] walker_bin. Must
+# be the build pinned in packaging/nfs-walker.lock.json (branch, commit,
+# SHA-256): `prepare` passes flags that other nfs-walker branches lack.
+# ALLOW_UNPINNED_WALKER=1 ships another build, marked as such.
 NFS_WALKER_BIN :=
 # cargo-zigbuild needs the real Zig executable. On confined Snap hosts the
 # /snap/bin shim cannot run from automation, while the mounted executable can.
@@ -186,12 +189,9 @@ install:
 	    $(DESTDIR)$(DOCDIR)/THIRD_PARTY_LICENSES.md
 ifneq ($(NFS_WALKER_BIN),)
 	install -d $(DESTDIR)$(LIBEXECDIR)
-	install -m 0755 $(NFS_WALKER_BIN) $(DESTDIR)$(LIBEXECDIR)/nfs-walker
-	printf '%s\n' \
-	  'Bundled nfs-walker (MIT), run by vamoose prepare.' \
-	  'Source: https://github.com/blakegolliher/nfs-walker' \
-	  "SHA256: $$(sha256sum $(NFS_WALKER_BIN) | cut -d' ' -f1)" \
+	scripts/check-pinned-walker.sh $(NFS_WALKER_BIN) \
 	  > $(DESTDIR)$(DOCDIR)/NFS_WALKER_SOURCE.txt
+	install -m 0755 $(NFS_WALKER_BIN) $(DESTDIR)$(LIBEXECDIR)/nfs-walker
 endif
 ifneq ($(LIBNFS_SO),)
 	install -d $(DESTDIR)$(VENDORLIB)

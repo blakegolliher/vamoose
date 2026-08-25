@@ -618,11 +618,25 @@ fn check_walker(checks: &mut Checks, cfg: &Config) {
         .walker_bin
         .or_else(|| cfg.walker().and_then(|w| w.binary_path.clone()));
     match crate::cmd::prepare::tools::find_walker(configured.as_deref()) {
-        Ok(found) => checks.record(
-            Status::Pass,
-            "walker binary",
-            format!("{}", found.display()),
-        ),
+        Ok(found) => {
+            // Which build: the pinned scanner passes; another build is
+            // a WARN — `prepare` probes its flags before scanning.
+            let lock = crate::cmd::prepare::tools::walker_lock();
+            let sha = crate::cmd::prepare::checkpoint::sha256_file(&found).unwrap_or_default();
+            let version = std::process::Command::new(&found)
+                .arg("--version")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|| "version unknown".to_string());
+            let detail = format!("{} — {}", found.display(), lock.describe(&sha, &version));
+            let status = if sha == lock.artifact_sha256 {
+                Status::Pass
+            } else {
+                Status::Warn
+            };
+            checks.record(status, "walker binary", detail);
+        }
         Err(e) if configured.is_some() => {
             checks.record(Status::Fail, "walker binary", format!("{e:#}"));
         }

@@ -34,9 +34,19 @@ the host's libnfs would import its newer glibc symbol versions and refuse
 to load on the target, so `TARGET=` without `LIBNFS_SO` is refused.
 
 `NFS_WALKER_BIN` ships the scanner as `libexec/nfs-walker` so `vamoose
-prepare` works out of the box; its SHA256 is recorded in
-`share/doc/vamoose/NFS_WALKER_SOURCE.txt`. Without it, `prepare` falls
-back to `nfs-walker` on PATH or `[prepare] walker_bin`.
+prepare` works out of the box. It must be the build pinned in
+`packaging/nfs-walker.lock.json` — branch, commit, `--version`, and
+SHA-256 — because `prepare` passes flags (`--parquet-file-size-mb`,
+`--log`, …) that other nfs-walker branches have dropped;
+`scripts/check-pinned-walker.sh` refuses anything else and writes the
+provenance to `share/doc/vamoose/NFS_WALKER_SOURCE.txt`
+(`ALLOW_UNPINNED_WALKER=1` ships another build, marked unpinned). Moving to
+a new scanner means rebuilding it from the new commit for the release
+target and updating the lock in the same change. Without `NFS_WALKER_BIN`,
+`prepare` falls back to `nfs-walker` on PATH or `[prepare] walker_bin`; in
+every case it probes the scanner's `--help` for the flags it needs before
+scanning and `vamoose doctor` reports whether the scanner is the pinned
+build.
 
 The libnfs file must match `packaging/libnfs.lock.json`. Updating libnfs means
 updating its source commit and exact artifact digest in that reviewed lock.
