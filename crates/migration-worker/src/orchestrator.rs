@@ -160,8 +160,15 @@ pub async fn run_with_stop(
 
     // A missing manifest is not an error: workers are enabled at
     // install time and idle until `vamoose prepare` publishes one.
-    // Transient store failures still consume the F42 budget.
+    // Transient store failures still consume the F42 budget. A stop
+    // request ends the wait at once: the worker holds nothing here,
+    // and an idle worker that ignores SIGTERM is killed by systemd
+    // after its stop timeout (found on the rig: 5 min, then SIGKILL).
     let manifest = loop {
+        if stop.is_cancelled() {
+            tracing::info!("stop requested while waiting for manifest.json; exiting");
+            return Ok(RunOutcome::Interrupted);
+        }
         let mut st = &*s3;
         let found = retry_transient(
             "manifest GET",
@@ -179,7 +186,7 @@ pub async fn run_with_stop(
                     retry_sec = MANIFEST_WAIT_POLL_SEC,
                     "no manifest.json in bucket yet; waiting for `vamoose prepare`",
                 );
-                tokio::time::sleep(Duration::from_secs(MANIFEST_WAIT_POLL_SEC)).await;
+                sleep_unless_stopped(&stop, Duration::from_secs(MANIFEST_WAIT_POLL_SEC)).await;
             }
         }
     };
