@@ -17,6 +17,7 @@ use migration_core::schema::{
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::format::KeyValue;
 use serde::{Deserialize, Serialize};
@@ -641,7 +642,13 @@ fn write_shard(
             value: Some(row_count.to_string()),
         },
     ];
+    // ZSTD like the walker's own output. The builder default is
+    // UNCOMPRESSED, which made the 600M index 241 GB in S3 (~400 B per
+    // row against the walker's ~68) — every worker downloads a shard
+    // of that before copying, and `prepare` keeps every shard on local
+    // disk until it is uploaded.
     let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
         .set_key_value_metadata(Some(kv))
         .build();
 
@@ -1371,13 +1378,22 @@ mod tests {
         assert_eq!(reader.rows(), 3);
         assert_eq!(reader.shard_index(), Some(0));
 
-        let parquet_schema =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-                File::open(&out_path).unwrap(),
-            )
-            .unwrap()
-            .schema()
-            .clone();
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            File::open(&out_path).unwrap(),
+        )
+        .unwrap();
+        // Every column chunk is ZSTD: the reader above (the workers')
+        // just decoded it, and the footer says so.
+        let footer = builder.metadata().row_group(0);
+        for column in footer.columns() {
+            assert!(
+                matches!(column.compression(), Compression::ZSTD(_)),
+                "{} is {:?}, expected ZSTD",
+                column.column_path(),
+                column.compression()
+            );
+        }
+        let parquet_schema = builder.schema().clone();
         let mut field_names = std::collections::HashSet::new();
         for field in parquet_schema.fields() {
             assert!(
