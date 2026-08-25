@@ -113,6 +113,11 @@ struct WorkerLine {
     heartbeat_age_seconds: u64,
     stale_after_seconds: Option<u64>,
     stale: Option<bool>,
+    /// The worker wrote a terminal status (`exiting` / `fenced`) on
+    /// its way out: the process is gone on purpose, its row is
+    /// history, and a stale heartbeat is expected rather than a
+    /// problem. See [`is_terminal_status`].
+    exited: bool,
     current_shard: Option<String>,
     rows_done: u64,
     rows_total: u64,
@@ -204,7 +209,14 @@ async fn collect_status(store: &Arc<dyn ClaimStore>) -> anyhow::Result<Snapshot>
             .max(0) as u64;
         let stale_after_seconds =
             (progress.heartbeat_sec > 0).then(|| progress.heartbeat_sec.saturating_mul(2));
-        let stale = stale_after_seconds.map(|threshold| heartbeat_age_seconds > threshold);
+        let exited = is_terminal_status(&progress.status);
+        // An exited worker's heartbeat is old by definition; only a
+        // worker that should still be writing can be stale.
+        let stale = if exited {
+            Some(false)
+        } else {
+            stale_after_seconds.map(|threshold| heartbeat_age_seconds > threshold)
+        };
 
         if let Some(shard_name) = progress.current_shard.as_deref() {
             if states.get(shard_name) == Some(&ClaimState::Active) {
@@ -226,6 +238,7 @@ async fn collect_status(store: &Arc<dyn ClaimStore>) -> anyhow::Result<Snapshot>
             heartbeat_age_seconds,
             stale_after_seconds,
             stale,
+            exited,
             current_shard: progress.current_shard,
             rows_done: progress.shard_rows_done,
             rows_total: progress.shard_rows_total,
@@ -235,7 +248,9 @@ async fn collect_status(store: &Arc<dyn ClaimStore>) -> anyhow::Result<Snapshot>
             throughput_mb_s: progress.throughput_mb_s_1m,
         });
     }
-    workers.sort_by(|a, b| a.host_id.cmp(&b.host_id));
+    // Live workers first, exited ones (old instances of restarted
+    // hosts, finished workers) at the bottom.
+    workers.sort_by(|a, b| a.exited.cmp(&b.exited).then(a.host_id.cmp(&b.host_id)));
 
     let rows_active = active_rows_by_shard.values().copied().sum::<u64>();
     let rows_progress = rows_completed.saturating_add(rows_active);
@@ -244,7 +259,11 @@ async fn collect_status(store: &Arc<dyn ClaimStore>) -> anyhow::Result<Snapshot>
     } else {
         100.0 * rows_progress.min(manifest.total_rows) as f64 / manifest.total_rows as f64
     };
-    let aggregate_throughput_mb_s = workers.iter().map(|worker| worker.throughput_mb_s).sum();
+    let aggregate_throughput_mb_s = workers
+        .iter()
+        .filter(|worker| !worker.exited)
+        .map(|worker| worker.throughput_mb_s)
+        .sum();
     let files_ok = workers.iter().map(|worker| worker.files_ok).sum();
     let files_failed = workers.iter().map(|worker| worker.files_failed).sum();
     let files_fenced = workers.iter().map(|worker| worker.files_fenced).sum();
@@ -330,7 +349,12 @@ fn render(snapshot: &Snapshot, interval: u64, watch: bool) {
             layout::PROGRESS_PREFIX
         );
     } else {
-        println!("Workers:");
+        let exited = snapshot.workers.iter().filter(|w| w.exited).count();
+        println!(
+            "Workers: {} live | {} exited",
+            snapshot.workers.len() - exited,
+            exited
+        );
         for worker in &snapshot.workers {
             let shard = worker.current_shard.as_deref().unwrap_or("-");
             let rows = if worker.rows_total > 0 {
@@ -340,11 +364,7 @@ fn render(snapshot: &Snapshot, interval: u64, watch: bool) {
             } else {
                 "-".to_string()
             };
-            let freshness = match worker.stale {
-                Some(true) => format!("STALE {}s", worker.heartbeat_age_seconds),
-                Some(false) => format!("age={}s", worker.heartbeat_age_seconds),
-                None => format!("age={}s (?)", worker.heartbeat_age_seconds),
-            };
+            let freshness = freshness_label(worker);
             println!(
                 "  {:<16} {:<9} {:<12} shard={:<20} rows={:<14} {:>7.1} MB/s fail={} fence={}",
                 worker.host_id,
@@ -366,6 +386,36 @@ fn render(snapshot: &Snapshot, interval: u64, watch: bool) {
         }
     } else if watch {
         println!("\nNext refresh in {interval}s (Ctrl-C to stop)");
+    }
+}
+
+/// Progress statuses a worker writes on its way out (see
+/// `migration_worker::heartbeat`): `exiting` on an orderly exit,
+/// `fenced` after a self-fence. Anything else means the worker was
+/// still running when it last wrote, so a stale heartbeat is real.
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "exiting" | "exited" | "fenced")
+}
+
+/// The freshness column: how long ago the worker last wrote, and
+/// whether that is a problem. An exited worker's age is shown as
+/// history ("exited 12m ago"), never as STALE — the old instance of a
+/// restarted host would otherwise read as trouble for the rest of the
+/// run (rig smoke 2026-08-25, HANDOFF.md finding #10).
+fn freshness_label(worker: &WorkerLine) -> String {
+    let age = worker.heartbeat_age_seconds;
+    if worker.exited {
+        let what = if worker.status == "fenced" {
+            "fenced"
+        } else {
+            "exited"
+        };
+        return format!("{what} {} ago", format_duration(age));
+    }
+    match worker.stale {
+        Some(true) => format!("STALE {age}s"),
+        Some(false) => format!("age={age}s"),
+        None => format!("age={age}s (?)"),
     }
 }
 
@@ -391,6 +441,75 @@ mod tests {
         assert_eq!(format_duration(9), "9s");
         assert_eq!(format_duration(69), "1m 09s");
         assert_eq!(format_duration(3_661), "1h 01m");
+    }
+
+    fn worker(status: &str, age: u64, stale: Option<bool>) -> WorkerLine {
+        let now = chrono::Utc::now();
+        WorkerLine {
+            host_id: format!("host-{status}"),
+            status: status.to_string(),
+            started_utc: now,
+            heartbeat_utc: now,
+            heartbeat_age_seconds: age,
+            stale_after_seconds: Some(60),
+            stale,
+            exited: is_terminal_status(status),
+            current_shard: None,
+            rows_done: 0,
+            rows_total: 0,
+            files_ok: 0,
+            files_failed: 0,
+            files_fenced: 0,
+            throughput_mb_s: 0.0,
+        }
+    }
+
+    /// Only the statuses the worker writes on its way out are
+    /// terminal; a worker that was `active` or `degraded` when it
+    /// last wrote may really be gone and must still read as STALE.
+    #[test]
+    fn terminal_statuses_are_the_exit_ones() {
+        for status in ["exiting", "exited", "fenced"] {
+            assert!(is_terminal_status(status), "{status}");
+        }
+        for status in [
+            "starting",
+            "active",
+            "degraded:throughput_low:probe-pending",
+            "",
+        ] {
+            assert!(!is_terminal_status(status), "{status}");
+        }
+    }
+
+    /// An exited worker is history, not STALE, however old its
+    /// heartbeat; a live worker keeps the STALE / age rendering.
+    #[test]
+    fn exited_workers_are_not_rendered_stale() {
+        assert_eq!(
+            freshness_label(&worker("exiting", 900, Some(false))),
+            "exited 15m 00s ago"
+        );
+        assert_eq!(
+            freshness_label(&worker("fenced", 61, Some(false))),
+            "fenced 1m 01s ago"
+        );
+        assert_eq!(
+            freshness_label(&worker("active", 61, Some(true))),
+            "STALE 61s"
+        );
+        assert_eq!(freshness_label(&worker("active", 5, Some(false))), "age=5s");
+        assert_eq!(freshness_label(&worker("active", 5, None)), "age=5s (?)");
+    }
+
+    #[test]
+    fn worker_json_exposes_exited_flag() {
+        let json = serde_json::to_value(worker("exiting", 120, Some(false))).unwrap();
+        assert_eq!(json["exited"], true);
+        assert_eq!(json["stale"], false);
+        let json = serde_json::to_value(worker("active", 120, Some(true))).unwrap();
+        assert_eq!(json["exited"], false);
+        assert_eq!(json["stale"], true);
     }
 
     #[test]

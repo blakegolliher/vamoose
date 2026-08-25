@@ -1050,9 +1050,12 @@ pub async fn run_with_stop(
         *g = None;
     }
     tracing::debug!(target: "shutdown", "released current lock");
-    // Best-effort: trip fence to wake the heartbeat loop out of its tick.
-    fence.trip("worker shutting down");
-    tracing::debug!(target: "shutdown", "fence tripped");
+    // Best-effort: close the fence to wake the heartbeat loop out of
+    // its tick (it writes the final "exiting" progress record on the
+    // way out). `close_for_shutdown` logs at info — this is not a
+    // self-fence, and a real one (already tripped) keeps its reason.
+    fence.close_for_shutdown();
+    tracing::debug!(target: "shutdown", "fence closed");
     // Bound the heartbeat-join. If the heartbeat task is wedged (e.g.
     // a stale S3 connection-pool entry blocking write_progress),
     // hb_handle.await would hang the worker process forever. Abort on
