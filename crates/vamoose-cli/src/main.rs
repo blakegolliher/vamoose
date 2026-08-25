@@ -17,10 +17,12 @@ mod logging;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    let cli = cli::Cli::parse();
     // Interactive commands get the same secrets the services get from
     // their EnvironmentFile, without a `set -a; . vamoose.env` dance.
+    // Before clap parses: flags with `env = ...` (the TUI's admin
+    // token, the coord URL) read the environment at parse time.
     envfile::load_if_present(std::path::Path::new(envfile::SYSTEM_ENV_PATH));
+    let cli = cli::Cli::parse();
     let filter = cli::build_filter(cli.log.as_deref());
 
     // Load config first so logging can use the source format's explicit

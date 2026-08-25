@@ -31,8 +31,9 @@ url = "http://node1.example.com:8443"
 no_tls = true               # trusted network. For HTTPS set tls_cert/tls_key instead.
 # tls_cert = "/etc/vamoose/coord.crt"
 # tls_key  = "/etc/vamoose/coord.key"
-# One bearer token per line; the TUI uses the first one.
-admin_tokens_file  = "/etc/vamoose/admin-token"
+# The TUI's admin token is VAMOOSE_ADMIN_TOKEN in vamoose.env (the coord
+# accepts it, the TUI sends it). Only for several labelled tokens:
+# admin_tokens_file = "/etc/vamoose/admin-tokens"   # one `token<TAB>label` per line
 # Name of the environment variable (from vamoose.env) holding the shared
 # worker secret. Used by the coord to authenticate workers and by workers
 # to sign their requests.

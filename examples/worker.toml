@@ -106,4 +106,6 @@ throughput_floor_mb_s  = 0        # MB/s below which a worker backs off (5 min p
 #no_tls             = true            # or set tls_cert/tls_key for HTTPS
 ## tls_cert         = "/etc/vamoose/coord.crt"
 ## tls_key          = "/etc/vamoose/coord.key"
-#admin_tokens_file  = "/etc/vamoose/admin-token"        # one token per line; TUI uses the first
+## The admin token is VAMOOSE_ADMIN_TOKEN in /etc/vamoose/vamoose.env; a tokens
+## file is only for several labelled tokens (`token<TAB>label` per line).
+#admin_tokens_file  = "/etc/vamoose/admin-tokens"

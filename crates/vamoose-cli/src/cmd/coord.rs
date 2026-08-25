@@ -177,6 +177,9 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
     //    the operator opted in explicitly.
     let auth = build_auth(
         eff.admin_tokens.as_deref(),
+        std::env::var(crate::config::ADMIN_TOKEN_ENV)
+            .ok()
+            .as_deref(),
         eff.cluster_secret_env.as_deref(),
     )?;
     check_dev_mode_bind(
@@ -356,15 +359,27 @@ fn check_dev_mode_bind(
     anyhow::bail!(
         "refusing to bind {listen} without authentication: no admin tokens and no \
          cluster secret are configured (dev mode), and {ip} is not a loopback \
-         address. Configure auth via --admin-tokens and/or --cluster-secret-env, \
+         address. Configure auth via {token_env} in /etc/vamoose/vamoose.env, \
+         --admin-tokens, and/or --cluster-secret-env, \
          bind a loopback address (e.g. --listen 127.0.0.1:8443), or — for \
          isolated lab networks only — pass --allow-unauthenticated-nonloopback.",
         ip = listen.ip(),
+        token_env = crate::config::ADMIN_TOKEN_ENV,
     )
 }
 
+/// Label recorded in the audit log for commands authenticated with
+/// the token from [`crate::config::ADMIN_TOKEN_ENV`].
+const ENV_TOKEN_LABEL: &str = "vamoose.env";
+
+/// Assemble the coord's auth from the three sources an operator has:
+/// the optional tokens file, the single token in `vamoose.env`
+/// (`env_token`, already read from [`crate::config::ADMIN_TOKEN_ENV`]),
+/// and the cluster secret. File and env tokens are both honoured; a
+/// token present in both keeps the file's label.
 fn build_auth(
     admin_tokens: Option<&std::path::Path>,
+    env_token: Option<&str>,
     cluster_secret_env: Option<&str>,
 ) -> anyhow::Result<AuthConfig> {
     let mut auth = AuthConfig::default();
@@ -373,6 +388,12 @@ fn build_auth(
         let body = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read admin tokens file {}: {e}", path.display()))?;
         auth.admin_tokens = AuthConfig::parse_admin_tokens_file(&body)?;
+    }
+
+    if let Some(token) = env_token.map(str::trim).filter(|t| !t.is_empty()) {
+        auth.admin_tokens
+            .entry(token.to_string())
+            .or_insert_with(|| ENV_TOKEN_LABEL.to_string());
     }
 
     if let Some(var) = cluster_secret_env {
@@ -914,5 +935,61 @@ mod tests {
     fn escape_hatch_allows_dev_mode_nonloopback() {
         check_dev_mode_bind(true, &addr("0.0.0.0:8443"), true)
             .expect("--allow-unauthenticated-nonloopback must permit the bind");
+    }
+
+    // ------------------------------------------------------------------
+    // Admin token from vamoose.env (VAMOOSE_ADMIN_TOKEN)
+    // ------------------------------------------------------------------
+
+    /// The single token in `vamoose.env` is enough on its own: the
+    /// coord leaves dev mode and the audit label names the source.
+    #[test]
+    fn env_token_alone_configures_auth() {
+        let auth = build_auth(None, Some("  s3cr3t  "), None).unwrap();
+        assert!(!auth.is_dev_mode());
+        assert_eq!(
+            auth.admin_tokens.get("s3cr3t").map(String::as_str),
+            Some(ENV_TOKEN_LABEL)
+        );
+    }
+
+    /// An empty or blank variable (the `REPLACE_ME`-less template
+    /// left untouched) configures nothing.
+    #[test]
+    fn blank_env_token_is_ignored() {
+        for blank in [None, Some(""), Some("   ")] {
+            let auth = build_auth(None, blank, None).unwrap();
+            assert!(auth.is_dev_mode(), "{blank:?} must not configure auth");
+        }
+    }
+
+    /// File and env tokens are both honoured; a token listed in both
+    /// keeps the file's label.
+    #[test]
+    fn env_token_merges_with_tokens_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin-token");
+        std::fs::write(
+            &path,
+            "from-file	ops
+shared	file-label
+",
+        )
+        .unwrap();
+        let auth = build_auth(Some(&path), Some("shared"), None).unwrap();
+        assert_eq!(auth.admin_tokens.len(), 2);
+        assert_eq!(auth.admin_tokens["from-file"], "ops");
+        assert_eq!(auth.admin_tokens["shared"], "file-label");
+
+        let auth = build_auth(Some(&path), Some("from-env"), None).unwrap();
+        assert_eq!(auth.admin_tokens.len(), 3);
+        assert_eq!(auth.admin_tokens["from-env"], ENV_TOKEN_LABEL);
+    }
+
+    /// The dev-mode refusal names the env variable as the first way out.
+    #[test]
+    fn dev_mode_refusal_names_env_token() {
+        let err = check_dev_mode_bind(true, &addr("0.0.0.0:8443"), false).unwrap_err();
+        assert!(format!("{err:#}").contains(crate::config::ADMIN_TOKEN_ENV));
     }
 }

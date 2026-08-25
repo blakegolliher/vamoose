@@ -19,8 +19,9 @@ pub struct Args {
     pub coord_url: Option<String>,
 
     /// Admin bearer token. Read directly from this flag or its env
-    /// var. Mutually exclusive with `--admin-token-file`.
-    #[arg(long, env = "VAMOOSE_ADMIN_TOKEN", hide_env_values = true)]
+    /// var — the one `/etc/vamoose/vamoose.env` sets, which is loaded
+    /// automatically. Mutually exclusive with `--admin-token-file`.
+    #[arg(long, env = crate::config::ADMIN_TOKEN_ENV, hide_env_values = true)]
     pub admin_token: Option<String>,
 
     /// Path to a file holding the admin bearer token: the first
