@@ -80,6 +80,15 @@ pub(crate) fn scan_url(src_url: &str, source_root: &str) -> String {
     }
 }
 
+/// The `--source-root` handed to `mig-walker-rewrite`. The scan URL
+/// already carries `[prepare] source_root` (see [`scan_url`]), so the
+/// walker emits paths relative to that root and there is nothing left
+/// to strip; workers re-attach `manifest.source.root` via `join_root`.
+/// Passing the configured root here instead makes the rewrite reject
+/// every row of a sub-tree run ("walker path does not start with
+/// --source-root"), because the walker never saw the export root.
+pub(crate) const REWRITE_SOURCE_ROOT: &str = "/";
+
 /// Everything that shapes one scan; kept as data so the argument list
 /// is unit-testable and recorded in the scan checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +287,16 @@ mod tests {
         assert!(args.contains(&"--resume".to_string()));
         assert_eq!(args[0..2], ["--input", "/w/scan/scans/abc"]);
         assert_eq!(args[args.len() - 2..], ["--report", "/w/rewrite.json"]);
+    }
+
+    #[test]
+    fn scan_url_and_rewrite_root_agree_on_who_strips_the_root() {
+        // The root goes into the scan URL, so the rewrite must strip
+        // nothing: a walker path from a sub-tree scan has no `/data`
+        // prefix to remove.
+        assert_eq!(scan_url("nfs://h/export/", "/data/"), "nfs://h/export/data");
+        assert_eq!(scan_url("nfs://h/export", "/"), "nfs://h/export");
+        assert_eq!(REWRITE_SOURCE_ROOT, "/");
     }
 
     #[test]
