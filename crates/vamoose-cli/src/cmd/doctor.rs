@@ -3,10 +3,13 @@
 //! Each check produces one PASS / WARN / FAIL / SKIP line. Exit code
 //! is non-zero only on FAIL; WARN is operator-actionable but doesn't
 //! block; SKIP means the check's config section is absent (the NFS
-//! block when `[nfs]` is omitted — F45a) and never affects the exit
-//! code. The S3 conditional-primitive checks here are the same
-//! contract the v2 claim protocol depends on; if those fail, no
-//! amount of worker tuning will save the run.
+//! block when neither `[mover]` nor the legacy `[nfs]` is present —
+//! F45a) and never affects the exit code. The S3 conditional-primitive
+//! checks here are the same contract the v2 claim protocol depends
+//! on; if those fail, no amount of worker tuning will save the run.
+//! The NFS block mounts the exports the workers will use, over libnfs
+//! (reserved port: run as root, like the services), and proves the
+//! roots exist and the destination root takes a file.
 
 use crate::config::Config;
 use clap::Args as ClapArgs;
@@ -194,81 +197,150 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Do
         }
     }
 
-    match s3.delete_if_match(probe, &etag).await {
+    // The contract the claim and lease code rely on: a DELETE with a
+    // stale etag must be refused (412) and leave the object in place;
+    // one with the current etag removes it. What a repeat DELETE of
+    // the now-missing key returns is *not* part of the contract —
+    // AWS answers 204, VAST answers 204, some stores 404 — so it is
+    // not probed (an earlier version failed VAST on exactly that).
+    match s3
+        .delete_if_match(probe, "0000000000deadbeef0000000000cafe")
+        .await
+    {
+        Ok(DeleteOutcome::EtagMismatch) => match s3.delete_if_match(probe, &etag).await {
+            Ok(DeleteOutcome::Deleted) => match s3.head_object(probe).await {
+                Ok(None) => checks.record(
+                    Status::Pass,
+                    "s3 delete-if-match",
+                    format!("DELETE /{probe} with stale etag → 412, with current etag → 204"),
+                ),
+                Ok(Some(_)) => checks.record(
+                    Status::Fail,
+                    "s3 delete-if-match",
+                    "DELETE with the current etag returned 204 but the object is still there",
+                ),
+                Err(e) => checks.record(
+                    Status::Fail,
+                    "s3 delete-if-match",
+                    format!("HEAD after DELETE errored: {e}"),
+                ),
+            },
+            other => checks.record(
+                Status::Fail,
+                "s3 delete-if-match",
+                format!("DELETE with the current etag returned {other:?} (expected Deleted)"),
+            ),
+        },
         Ok(DeleteOutcome::Deleted) => {
-            // Now repeat — should be NotFound.
-            match s3.delete_if_match(probe, &etag).await {
-                Ok(DeleteOutcome::NotFound) => {
-                    checks.record(
-                        Status::Pass,
-                        "s3 delete-if-match",
-                        format!("DELETE /{probe} → 204, repeat → 404"),
-                    );
-                }
-                other => {
-                    checks.record(
-                        Status::Fail,
-                        "s3 delete-if-match",
-                        format!("repeat DELETE returned {other:?} (expected NotFound)"),
-                    );
-                }
-            }
-        }
-        other => {
             checks.record(
                 Status::Fail,
                 "s3 delete-if-match",
-                format!("first DELETE returned {other:?} (expected Deleted)"),
+                "DELETE with a stale etag succeeded — endpoint does not enforce If-Match on \
+                 DELETE; a fenced worker could remove a claim it no longer owns",
+            );
+        }
+        other => {
+            let _ = s3.delete_if_match(probe, &etag).await;
+            checks.record(
+                Status::Fail,
+                "s3 delete-if-match",
+                format!("DELETE with a stale etag returned {other:?} (expected EtagMismatch)"),
             );
         }
     }
 
-    // 6. Layout keys. Missing layout is a WARN — operator can run
-    // `vamoose init` to materialize. Already-populated layout is the
-    // normal mid-run state.
-    let prefixes = [
+    // 6. Layout. What the bucket holds says where the migration is:
+    // nothing yet (prepare has not run), an index with no worker
+    // activity, or a run in flight. Only a lost manifest under a
+    // populated index is a problem. `failures/` is written only when
+    // a file fails, so an empty one is the good case, not a gap.
+    let mut present = Vec::new();
+    let mut layout_err = None;
+    for p in [
         layout::INDEX_PREFIX,
         layout::SHARDS_PREFIX,
         layout::PROGRESS_PREFIX,
-        layout::FAILURES_PREFIX,
-    ];
-    let mut missing = Vec::new();
-    for p in &prefixes {
+    ] {
         match s3.list(p).await {
-            Ok(entries) if entries.is_empty() => missing.push(*p),
+            Ok(entries) if !entries.is_empty() => present.push(p),
             Ok(_) => {}
             Err(e) => {
-                checks.record(Status::Fail, "s3 layout", format!("LIST {p}: {e}"));
-                missing.clear();
+                layout_err = Some(format!("LIST {p}: {e}"));
                 break;
             }
         }
     }
-    if missing.len() == prefixes.len() {
+    let manifest = match s3.head_object(layout::MANIFEST_KEY).await {
+        Ok(found) => found.is_some(),
+        Err(e) => {
+            layout_err.get_or_insert(format!("HEAD {}: {e}", layout::MANIFEST_KEY));
+            false
+        }
+    };
+    let has = |p: &str| present.contains(&p);
+    if let Some(err) = layout_err {
+        checks.record(Status::Fail, "s3 layout", err);
+    } else if !manifest && present.is_empty() {
+        checks.record(
+            Status::Pass,
+            "s3 layout",
+            "bucket has no run yet (`vamoose prepare` publishes the index and manifest)",
+        );
+    } else if !manifest {
         checks.record(
             Status::Warn,
             "s3 layout",
             format!(
-                "{} all empty (run `vamoose init` to create marker objects)",
-                missing.join(", "),
+                "{} present but no {} — an interrupted `vamoose prepare`? re-run it to finish",
+                present.join(", "),
+                layout::MANIFEST_KEY
             ),
         );
-    } else if !missing.is_empty() {
+    } else if !has(layout::INDEX_PREFIX) {
         checks.record(
-            Status::Warn,
+            Status::Fail,
             "s3 layout",
-            format!("partial layout: empty prefixes = {}", missing.join(", ")),
+            format!(
+                "{} present but {} is empty",
+                layout::MANIFEST_KEY,
+                layout::INDEX_PREFIX
+            ),
+        );
+    } else if !has(layout::SHARDS_PREFIX) && !has(layout::PROGRESS_PREFIX) {
+        checks.record(
+            Status::Pass,
+            "s3 layout",
+            "manifest and index published; no worker activity yet",
         );
     } else {
         checks.record(
             Status::Pass,
             "s3 layout",
-            "all expected prefixes have at least one object",
+            "manifest, index, and worker state present (run in flight or finished)",
         );
     }
 
-    // 7-11. NFS checks (or explicit SKIPs when `[nfs]` is absent).
-    run_nfs_checks(&mut checks, cfg.nfs());
+    // 7-11. NFS checks against the exports the workers will use, or
+    // explicit SKIPs when the config names none.
+    let prepare = cfg.prepare();
+    let target = match (cfg.mover(), cfg.nfs()) {
+        (Some(mover), _) => Some(NfsTarget::Mover {
+            src_url: &mover.src_url,
+            dst_url: &mover.dst_url,
+            source_root: &prepare.source_root,
+            dest_root: &prepare.dest_root,
+        }),
+        (None, Some(nfs)) => Some(NfsTarget::Legacy(nfs)),
+        (None, None) => None,
+    };
+    let rpc_timeout_ms = cfg
+        .mover()
+        .map(|m| m.rpc_timeout_ms)
+        .unwrap_or(migration_mover::DEFAULT_RPC_TIMEOUT_MS);
+    let probe = |url: &str, root: &str, write: bool| {
+        tokio::task::block_in_place(|| probe_export(url, root, write, rpc_timeout_ms))
+    };
+    run_nfs_checks(&mut checks, target, &probe);
 
     // 12. Walker binary on PATH (or at the configured path).
     check_walker(&mut checks, &cfg);
@@ -295,65 +367,198 @@ async fn build_s3(storage: &crate::config::StorageSettings) -> anyhow::Result<Ar
 }
 
 /// The labels of the five NFS checks, in report order. One SKIP line
-/// per label is emitted when the config has no `[nfs]` section, so
-/// the block's shape is identical whether or not the section exists.
+/// per label is emitted when the config names no exports, so the
+/// block's shape is identical whether or not they are configured.
 const NFS_CHECK_LABELS: [&str; 5] = [
     "nfs src parse",
     "nfs dst parse",
-    "nfs src mount",
-    "nfs dst mount",
+    "nfs src reach",
+    "nfs dst reach",
     "nfs roots differ",
 ];
 
-/// Checks 7-11: the NFS block. `None` means the config has no
-/// `[nfs]` section (it is optional as of F45a) — each check must
-/// still be reported, as an explicit SKIP naming the absent section.
-fn run_nfs_checks(checks: &mut Checks, nfs: Option<&crate::config::Nfs>) {
-    let Some(nfs) = nfs else {
+/// What the NFS block checks: the canonical `[mover]` URLs with the
+/// `[prepare]` roots (what `prepare` scans and the workers copy), or
+/// the legacy `[nfs]` section with its kernel mount points.
+#[derive(Debug, Clone, Copy)]
+enum NfsTarget<'a> {
+    Mover {
+        src_url: &'a str,
+        dst_url: &'a str,
+        source_root: &'a str,
+        dest_root: &'a str,
+    },
+    Legacy(&'a crate::config::Nfs),
+}
+
+/// Mounts `url` and looks at `root` inside it; with `write`, also
+/// creates and removes a marker file there. `Ok` carries the PASS
+/// detail, `Err` the FAIL detail. Injected so the block is testable
+/// without an NFS server.
+type ExportProbe<'p> = &'p dyn Fn(&str, &str, bool) -> Result<String, String>;
+
+/// Checks 7-11: the NFS block. `None` means the config names no
+/// exports (both `[mover]` and the legacy `[nfs]` are optional —
+/// F45a) — each check must still be reported, as an explicit SKIP
+/// naming the absent section.
+fn run_nfs_checks(checks: &mut Checks, target: Option<NfsTarget<'_>>, probe: ExportProbe<'_>) {
+    let Some(target) = target else {
         for label in NFS_CHECK_LABELS {
             checks.record(
                 Status::Skip,
                 label,
-                "no [nfs] section in config — check skipped",
+                "no [mover] section in config (nor legacy [nfs]) — check skipped",
             );
         }
         return;
     };
 
+    let (src_url, dst_url, src_root, dst_root) = match target {
+        NfsTarget::Mover {
+            src_url,
+            dst_url,
+            source_root,
+            dest_root,
+        } => (src_url, dst_url, source_root, dest_root),
+        NfsTarget::Legacy(nfs) => (
+            nfs.src_url.as_str(),
+            nfs.dst_url.as_str(),
+            nfs.src_root.as_str(),
+            nfs.dst_root.as_str(),
+        ),
+    };
+
     // 7/9. NFS URL parsing. libnfs URLs are `nfs://host/export[/path]`.
-    check_nfs_url(checks, NFS_CHECK_LABELS[0], &nfs.src_url);
-    check_nfs_url(checks, NFS_CHECK_LABELS[1], &nfs.dst_url);
+    let src_ok = check_nfs_url(checks, NFS_CHECK_LABELS[0], src_url);
+    let dst_ok = check_nfs_url(checks, NFS_CHECK_LABELS[1], dst_url);
 
-    // 8. Source mount: must exist + be readable. We don't try a
-    // libnfs mount here — that requires sudo and is expensive; the
-    // mount-point check is sufficient signal for a doctor pass.
-    check_mount(checks, NFS_CHECK_LABELS[2], &nfs.src_mount, false);
-    // 10. Dest mount: must exist + be writable. Probe by attempting
-    // to create + remove a marker file in the dst_root.
-    check_mount(checks, NFS_CHECK_LABELS[3], &nfs.dst_mount, true);
+    match target {
+        NfsTarget::Mover { .. } => {
+            // 8/10. Mount each export the way the workers will and look
+            // at the configured root: the source must be there, the
+            // destination must take a file.
+            for (label, url, root, write, ok) in [
+                (NFS_CHECK_LABELS[2], src_url, src_root, false, src_ok),
+                (NFS_CHECK_LABELS[3], dst_url, dst_root, true, dst_ok),
+            ] {
+                if !ok {
+                    checks.record(Status::Fail, label, "URL did not parse (see above)");
+                    continue;
+                }
+                match probe(url, root, write) {
+                    Ok(detail) => checks.record(Status::Pass, label, detail),
+                    Err(detail) => checks.record(Status::Fail, label, detail),
+                }
+            }
+        }
+        NfsTarget::Legacy(nfs) => {
+            // 8. Source mount point: must exist + be readable.
+            check_mount(checks, NFS_CHECK_LABELS[2], &nfs.src_mount, false);
+            // 10. Dest mount point: must exist + be writable. Probe by
+            // creating + removing a marker file.
+            check_mount(checks, NFS_CHECK_LABELS[3], &nfs.dst_mount, true);
+        }
+    }
 
-    // 11. src_root vs dst_root must differ when src and dst URLs
-    // resolve to the same host:export — otherwise the worker copies
-    // in place and the per-file overlap guard refuses to start.
-    if nfs.src_url == nfs.dst_url && nfs.src_root == nfs.dst_root {
+    // 11. When src and dst URLs name the same export the roots must
+    // not coincide or nest — otherwise the worker copies in place
+    // (or into its own source) and the per-file overlap guard
+    // refuses to start.
+    check_roots_differ(checks, src_url, dst_url, src_root, dst_root);
+}
+
+/// Normalise a root for comparison: `""`, `"/"`, `"/a/"`, `"a"` →
+/// `"/"`, `"/"`, `"/a"`, `"/a"`.
+fn norm_root(root: &str) -> String {
+    let inner = root.trim().trim_matches('/');
+    if inner.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{inner}")
+    }
+}
+
+fn check_roots_differ(
+    checks: &mut Checks,
+    src_url: &str,
+    dst_url: &str,
+    src_root: &str,
+    dst_root: &str,
+) {
+    let same_export = src_url.trim_end_matches('/') == dst_url.trim_end_matches('/');
+    let (s, d) = (norm_root(src_root), norm_root(dst_root));
+    let nested = |outer: &str, inner: &str| {
+        outer == "/"
+            || inner
+                .strip_prefix(outer)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    if same_export && s == d {
+        checks.record(
+            Status::Fail,
+            NFS_CHECK_LABELS[4],
+            format!("src and dst URLs identical AND source_root == dest_root ({s})"),
+        );
+    } else if same_export && (nested(&s, &d) || nested(&d, &s)) {
         checks.record(
             Status::Fail,
             NFS_CHECK_LABELS[4],
             format!(
-                "src and dst URLs identical AND src_root == dst_root ({})",
-                nfs.src_root
+                "src and dst URLs identical and the roots nest (source_root={s} dest_root={d})"
             ),
         );
     } else {
         checks.record(
             Status::Pass,
             NFS_CHECK_LABELS[4],
-            format!("src_root={} dst_root={}", nfs.src_root, nfs.dst_root),
+            format!("source_root={s} dest_root={d}"),
         );
     }
 }
 
-fn check_nfs_url(checks: &mut Checks, label: &str, url: &str) {
+/// Mount `url` over libnfs (NFSv3, reserved port — root, like the
+/// services), stat `root` inside it and, for the destination, create
+/// and remove a marker file there. Blocking: bounded by the mover's
+/// RPC timeout.
+fn probe_export(url: &str, root: &str, write: bool, rpc_timeout_ms: u32) -> Result<String, String> {
+    use migration_mover::libnfs::ops;
+    let hint = || {
+        if unsafe { libc::geteuid() } != 0 {
+            " (not root: libnfs needs a reserved port — run `sudo vamoose doctor`)"
+        } else {
+            ""
+        }
+    };
+    let mut ctx = migration_mover::NfsContext::mount_url(url, rpc_timeout_ms)
+        .map_err(|e| format!("mount {url}: {e:#}{}", hint()))?;
+    let root = norm_root(root);
+    ops::stat_times(&mut ctx, root.as_bytes())
+        .map_err(|e| format!("{url} mounted, but {root}: {}", e.error))?;
+    if !write {
+        return Ok(format!("{url} mounted, {root} present"));
+    }
+    let marker = if root == "/" {
+        "/.vamoose-doctor-probe".to_string()
+    } else {
+        format!("{root}/.vamoose-doctor-probe")
+    };
+    let fh = ops::create_write(&mut ctx, marker.as_bytes(), 0o600).map_err(|e| {
+        format!(
+            "{url} mounted, {root} present, but create {marker}: {}",
+            e.error
+        )
+    })?;
+    ops::close_quietly(&mut ctx, fh);
+    ops::unlink(&mut ctx, marker.as_bytes()).map_err(|e| {
+        format!(
+            "{url}: created {marker} but could not remove it: {}",
+            e.error
+        )
+    })?;
+    Ok(format!("{url} mounted, {root} present and writable"))
+}
+
+fn check_nfs_url(checks: &mut Checks, label: &str, url: &str) -> bool {
     if let Some(rest) = url.strip_prefix("nfs://") {
         if rest
             .split('/')
@@ -363,7 +568,7 @@ fn check_nfs_url(checks: &mut Checks, label: &str, url: &str) {
             && rest.contains('/')
         {
             checks.record(Status::Pass, label, url);
-            return;
+            return true;
         }
     }
     checks.record(
@@ -371,6 +576,7 @@ fn check_nfs_url(checks: &mut Checks, label: &str, url: &str) {
         label,
         format!("expected nfs://host/export[/path], got {url}"),
     );
+    false
 }
 
 fn check_mount(checks: &mut Checks, label: &str, mount: &str, writable: bool) {
@@ -469,52 +675,212 @@ mod tests {
         }
     }
 
-    /// F45a acceptance: with no `[nfs]` section, every NFS check is
-    /// reported as an explicit SKIP naming the absent section — not
-    /// failed, and not silently dropped from the report.
+    /// A probe that must never be reached (legacy and skip paths).
+    fn no_probe(url: &str, _root: &str, _write: bool) -> Result<String, String> {
+        panic!("probe must not run for {url}")
+    }
+
+    fn healthy_probe(url: &str, root: &str, write: bool) -> Result<String, String> {
+        Ok(format!("{url} {root} write={write}"))
+    }
+
+    fn labels(checks: &Checks) -> Vec<&str> {
+        checks.entries.iter().map(|(_, l, _)| l.as_str()).collect()
+    }
+
+    fn status_of<'a>(checks: &'a Checks, label: &str) -> (&'a Status, &'a str) {
+        let (s, _, d) = checks
+            .entries
+            .iter()
+            .find(|(_, l, _)| l == label)
+            .unwrap_or_else(|| panic!("no entry for {label}"));
+        (s, d.as_str())
+    }
+
+    /// F45a acceptance: with neither `[mover]` nor `[nfs]`, every NFS
+    /// check is reported as an explicit SKIP naming the absent section
+    /// — not failed, and not silently dropped from the report.
     #[test]
-    fn nfs_checks_skip_explicitly_without_nfs_section() {
+    fn nfs_checks_skip_explicitly_without_exports() {
         let mut checks = Checks::new();
-        run_nfs_checks(&mut checks, None);
+        run_nfs_checks(&mut checks, None, &no_probe);
         assert_eq!(
             checks.skip,
             NFS_CHECK_LABELS.len() as u32,
-            "every NFS check must be reported SKIPPED when [nfs] is absent",
+            "every NFS check must be reported SKIPPED when no exports are configured",
         );
-        assert_eq!(checks.fail, 0, "absent [nfs] is not a failure");
+        assert_eq!(checks.fail, 0, "absent sections are not a failure");
         assert_eq!(checks.pass, 0);
         assert_eq!(checks.warn, 0);
-        let labels: Vec<&str> = checks.entries.iter().map(|(_, l, _)| l.as_str()).collect();
         assert_eq!(
-            labels,
+            labels(&checks),
             NFS_CHECK_LABELS.to_vec(),
             "the skipped block must report the same labels in the same order",
         );
         for (status, label, detail) in &checks.entries {
             assert_eq!(*status, Status::Skip, "{label} must be Skip");
             assert!(
-                detail.contains("no [nfs] section"),
-                "{label} skip detail must say why (no [nfs] section), got: {detail}",
+                detail.contains("no [mover] section"),
+                "{label} skip detail must say why (no [mover] section), got: {detail}",
             );
         }
     }
 
-    /// With `[nfs]` present the block runs for real — nothing is
-    /// skipped and all five checks report.
+    /// With the legacy `[nfs]` section the block runs against the
+    /// kernel mount points — nothing is skipped, all five report.
     #[test]
-    fn nfs_checks_run_when_section_present() {
+    fn nfs_checks_run_when_legacy_section_present() {
         let nfs = nfs_section();
         let mut checks = Checks::new();
-        run_nfs_checks(&mut checks, Some(&nfs));
+        run_nfs_checks(&mut checks, Some(NfsTarget::Legacy(&nfs)), &no_probe);
         assert_eq!(checks.skip, 0, "present [nfs] must not skip anything");
-        assert_eq!(
-            checks.entries.len(),
-            NFS_CHECK_LABELS.len(),
-            "all five NFS checks must report",
-        );
+        assert_eq!(labels(&checks), NFS_CHECK_LABELS.to_vec());
         // This particular Nfs is fully healthy on any host: valid
         // URLs, readable "/", writable temp dir, differing roots.
         assert_eq!(checks.fail, 0, "healthy [nfs] must not fail");
         assert_eq!(checks.pass, NFS_CHECK_LABELS.len() as u32);
+    }
+
+    /// The quickstart shape — `[mover]` URLs plus `[prepare]` roots —
+    /// probes both exports and passes every check on a healthy pair.
+    #[test]
+    fn mover_checks_probe_both_exports() {
+        let mut checks = Checks::new();
+        run_nfs_checks(
+            &mut checks,
+            Some(NfsTarget::Mover {
+                src_url: "nfs://src/export",
+                dst_url: "nfs://dst/export",
+                source_root: "/projects",
+                dest_root: "/",
+            }),
+            &healthy_probe,
+        );
+        assert_eq!(labels(&checks), NFS_CHECK_LABELS.to_vec());
+        assert_eq!(checks.fail, 0);
+        assert_eq!(checks.skip, 0);
+        assert_eq!(checks.pass, 5);
+    }
+
+    /// The probes are called with the configured roots and only the
+    /// destination is asked to write.
+    #[test]
+    fn mover_probe_arguments() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let probe = |url: &str, root: &str, write: bool| {
+            calls
+                .borrow_mut()
+                .push((url.to_string(), root.to_string(), write));
+            Ok(String::new())
+        };
+        let mut checks = Checks::new();
+        run_nfs_checks(
+            &mut checks,
+            Some(NfsTarget::Mover {
+                src_url: "nfs://src/export",
+                dst_url: "nfs://dst/export",
+                source_root: "/projects",
+                dest_root: "/landing",
+            }),
+            &probe,
+        );
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                (
+                    "nfs://src/export".to_string(),
+                    "/projects".to_string(),
+                    false
+                ),
+                ("nfs://dst/export".to_string(), "/landing".to_string(), true),
+            ]
+        );
+    }
+
+    /// A failing probe is a FAIL on its own line and nothing else.
+    #[test]
+    fn mover_probe_failure_is_reported_per_export() {
+        let probe = |url: &str, _root: &str, _write: bool| {
+            if url.starts_with("nfs://dst") {
+                Err("mount nfs://dst/export: timed out".to_string())
+            } else {
+                Ok("fine".to_string())
+            }
+        };
+        let mut checks = Checks::new();
+        run_nfs_checks(
+            &mut checks,
+            Some(NfsTarget::Mover {
+                src_url: "nfs://src/export",
+                dst_url: "nfs://dst/export",
+                source_root: "/",
+                dest_root: "/",
+            }),
+            &probe,
+        );
+        assert_eq!(checks.fail, 1);
+        let (status, detail) = status_of(&checks, "nfs dst reach");
+        assert_eq!(*status, Status::Fail);
+        assert!(detail.contains("timed out"), "{detail}");
+        assert_eq!(*status_of(&checks, "nfs src reach").0, Status::Pass);
+        assert_eq!(*status_of(&checks, "nfs roots differ").0, Status::Pass);
+    }
+
+    /// An unparseable URL fails its parse line and its reach line
+    /// without ever probing.
+    #[test]
+    fn mover_bad_url_is_not_probed() {
+        let mut checks = Checks::new();
+        run_nfs_checks(
+            &mut checks,
+            Some(NfsTarget::Mover {
+                src_url: "src-filer:/export",
+                dst_url: "nfs://dst/export",
+                source_root: "/",
+                dest_root: "/",
+            }),
+            &|url, root, write| {
+                assert_eq!(url, "nfs://dst/export", "only the good URL is probed");
+                healthy_probe(url, root, write)
+            },
+        );
+        assert_eq!(*status_of(&checks, "nfs src parse").0, Status::Fail);
+        assert_eq!(*status_of(&checks, "nfs src reach").0, Status::Fail);
+        assert_eq!(*status_of(&checks, "nfs dst reach").0, Status::Pass);
+        assert_eq!(checks.fail, 2);
+    }
+
+    /// Same export: equal or nested roots are refused; distinct
+    /// siblings pass. Different exports always pass.
+    #[test]
+    fn roots_differ_rules() {
+        let cases = [
+            ("nfs://a/x", "nfs://a/x", "/", "/", Status::Fail),
+            ("nfs://a/x", "nfs://a/x/", "/data", "data/", Status::Fail),
+            ("nfs://a/x", "nfs://a/x", "/", "/dst", Status::Fail),
+            ("nfs://a/x", "nfs://a/x", "/src", "/src/copy", Status::Fail),
+            ("nfs://a/x", "nfs://a/x", "/src", "/srcopy", Status::Pass),
+            ("nfs://a/x", "nfs://a/x", "/src", "/dst", Status::Pass),
+            ("nfs://a/x", "nfs://b/x", "/", "/", Status::Pass),
+        ];
+        for (su, du, sr, dr, want) in cases {
+            let mut checks = Checks::new();
+            check_roots_differ(&mut checks, su, du, sr, dr);
+            let (got, detail) = status_of(&checks, "nfs roots differ");
+            assert_eq!(got, &want, "{su} {du} {sr} {dr}: {detail}");
+        }
+    }
+
+    #[test]
+    fn norm_root_shapes() {
+        for (input, want) in [
+            ("", "/"),
+            ("/", "/"),
+            ("/a/", "/a"),
+            ("a", "/a"),
+            (" /a/b ", "/a/b"),
+        ] {
+            assert_eq!(norm_root(input), want, "{input:?}");
+        }
     }
 }

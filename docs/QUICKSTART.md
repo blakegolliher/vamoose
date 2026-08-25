@@ -89,8 +89,11 @@ sudo vamoose doctor
 ```
 
 `doctor` parses the configuration, reaches the bucket, exercises the
-conditional-write primitives the claim protocol depends on, and checks the
-NFS URLs and permissions.
+conditional-write primitives the claim protocol depends on, mounts the
+source and destination exports over libnfs the way the workers will (hence
+`sudo`), and confirms `[prepare] source_root` exists and `dest_root` takes
+a file. Every line is PASS, WARN, FAIL, or SKIP; the exit code is non-zero
+only on FAIL.
 
 ## 3. Start the services
 
