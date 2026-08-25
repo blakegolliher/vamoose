@@ -183,6 +183,129 @@ pub(crate) async fn walker_version(bin: &Path) -> Result<String> {
     Ok(text)
 }
 
+/// `packaging/nfs-walker.lock.json`: the nfs-walker build vamoose is
+/// developed and packaged against. Embedded so `prepare` and `doctor`
+/// can say which branch a mismatching scanner should come from.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct WalkerLock {
+    pub(crate) source_url: String,
+    pub(crate) source_git_ref: String,
+    pub(crate) source_git_sha: String,
+    pub(crate) version: String,
+    pub(crate) artifact_sha256: String,
+}
+
+const WALKER_LOCK_JSON: &str = include_str!("../../../../../packaging/nfs-walker.lock.json");
+
+pub(crate) fn walker_lock() -> WalkerLock {
+    serde_json::from_str(WALKER_LOCK_JSON).expect("packaging/nfs-walker.lock.json parses")
+}
+
+impl WalkerLock {
+    /// `pinned` / `NOT the pinned build (...)` for a binary with this
+    /// digest and `--version` line.
+    pub(crate) fn describe(&self, sha256: &str, version: &str) -> String {
+        if sha256 == self.artifact_sha256 {
+            format!(
+                "pinned build ({} @ {})",
+                self.source_git_ref,
+                &self.source_git_sha[..12]
+            )
+        } else {
+            format!(
+                "NOT the pinned build: {version} sha256 {}…; vamoose is built against {} @ {} \
+                 ({}), see packaging/nfs-walker.lock.json",
+                &sha256[..12.min(sha256.len())],
+                self.source_git_ref,
+                &self.source_git_sha[..12],
+                self.version,
+            )
+        }
+    }
+}
+
+impl WalkerInvocation {
+    /// Every long option [`WalkerInvocation::args`] can emit — what a
+    /// scanner must accept for `prepare` to drive it.
+    pub(crate) fn long_flags() -> &'static [&'static str] {
+        &[
+            "--output",
+            "--workers",
+            "--parquet-file-size-mb",
+            "--log",
+            "--log-fmt",
+            "--exclude",
+        ]
+    }
+}
+
+/// `nfs-walker --help`, raw.
+pub(crate) async fn walker_help(bin: &Path) -> Result<String> {
+    let out = tokio::process::Command::new(bin)
+        .arg("--help")
+        .output()
+        .await
+        .with_context(|| format!("running {} --help", bin.display()))?;
+    if !out.status.success() {
+        anyhow::bail!("{} --help exited with {}", bin.display(), out.status);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The long options a `--help` text advertises: every `--name` token
+/// that starts a line (after whitespace, optionally preceded by a
+/// short alias like `-o, `).
+pub(crate) fn help_flags(help: &str) -> Vec<String> {
+    help.lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let line = line
+                .strip_prefix(|c: char| c == '-')
+                .and_then(|rest| rest.strip_prefix(|c: char| c.is_ascii_alphanumeric()))
+                .and_then(|rest| rest.strip_prefix(", "))
+                .unwrap_or(line);
+            let flag = line.strip_prefix("--")?;
+            let name: String = flag
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            (!name.is_empty()).then(|| format!("--{name}"))
+        })
+        .collect()
+}
+
+/// The flags in `required` that `help` does not advertise.
+pub(crate) fn missing_flags(help: &str, required: &[&str]) -> Vec<String> {
+    let have = help_flags(help);
+    required
+        .iter()
+        .filter(|f| !have.iter().any(|h| h == *f))
+        .map(|f| f.to_string())
+        .collect()
+}
+
+/// Refuse to scan with a scanner that lacks any flag `prepare` passes
+/// — another nfs-walker branch exits 2 on the first unknown option,
+/// after the operator has already waited for the mount. Names the
+/// missing flags and the pinned branch.
+pub(crate) async fn check_walker_flags(bin: &Path, version: &str) -> Result<()> {
+    let help = walker_help(bin).await?;
+    let missing = missing_flags(&help, WalkerInvocation::long_flags());
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let lock = walker_lock();
+    anyhow::bail!(
+        "{} ({version}) does not accept {}; vamoose prepare is built against nfs-walker {} @ {} \
+         ({}) — install the package built with that scanner, or point [prepare] walker_bin at it",
+        bin.display(),
+        missing.join(", "),
+        lock.source_git_ref,
+        &lock.source_git_sha[..12],
+        lock.version,
+    )
+}
+
 /// The directory holding the scan's part files. nfs-walker writes
 /// `<output>/scans/<scan_id>/part-*.parquet`; older layouts put the
 /// parts directly under `<output>`. Exactly one completed scan is
@@ -287,6 +410,79 @@ mod tests {
         assert!(args.contains(&"--resume".to_string()));
         assert_eq!(args[0..2], ["--input", "/w/scan/scans/abc"]);
         assert_eq!(args[args.len() - 2..], ["--report", "/w/rewrite.json"]);
+    }
+
+    #[test]
+    fn lock_parses_and_names_a_commit() {
+        let lock = walker_lock();
+        assert_eq!(lock.source_git_sha.len(), 40, "full commit sha");
+        assert!(lock.source_git_sha.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(lock.artifact_sha256.len(), 64);
+        assert!(!lock.source_git_ref.is_empty());
+        assert!(lock.version.starts_with("nfs-walker "));
+        assert!(lock
+            .describe(&lock.artifact_sha256, &lock.version)
+            .starts_with("pinned build"));
+        let other = lock.describe("deadbeefdeadbeefdeadbeef", "nfs-walker 0.2.0");
+        assert!(other.starts_with("NOT the pinned build"), "{other}");
+        assert!(other.contains(&lock.source_git_ref), "{other}");
+    }
+
+    /// Every long flag `args()` can emit is in `long_flags()`, so the
+    /// probe cannot silently fall behind the invocation.
+    #[test]
+    fn long_flags_cover_args() {
+        let inv = WalkerInvocation {
+            scan_url: "nfs://h/export".into(),
+            output: "/w/walk.parquet".into(),
+            workers: 1,
+            exclude: vec!["x".into()],
+            shard_size_mb: 1,
+            log: "/w/log".into(),
+        };
+        for arg in inv.args() {
+            let arg = arg.to_string_lossy();
+            if arg.starts_with("--") {
+                assert!(
+                    WalkerInvocation::long_flags().contains(&arg.as_ref()),
+                    "{arg} emitted by args() but not listed in long_flags()"
+                );
+            }
+        }
+    }
+
+    /// The `--help` shapes clap prints: bare long options, short
+    /// aliases, values, and the `--log-interval-secs` near-miss that
+    /// once fooled a grep for `--log`.
+    #[test]
+    fn help_flags_and_missing_flags() {
+        let help = "\
+Usage: nfs-walker [OPTIONS] <URL>
+
+Options:
+  -o, --output <PATH>            Output directory
+      --workers <N>              GETATTR workers [default: 32]
+      --log-interval-secs <SECS> Progress cadence
+      --log-fmt <FMT>            text|json
+      --exclude <GLOB>           May repeat
+  -h, --help                     Print help
+";
+        assert_eq!(
+            help_flags(help),
+            vec![
+                "--output",
+                "--workers",
+                "--log-interval-secs",
+                "--log-fmt",
+                "--exclude",
+                "--help"
+            ]
+        );
+        assert_eq!(
+            missing_flags(help, WalkerInvocation::long_flags()),
+            vec!["--parquet-file-size-mb", "--log"]
+        );
+        assert!(missing_flags(help, &["--output", "--exclude"]).is_empty());
     }
 
     #[test]

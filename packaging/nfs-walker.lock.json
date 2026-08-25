@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "source_url": "https://github.com/blakegolliher/nfs-walker",
+  "source_git_ref": "experiment/parquet-direct-write",
+  "source_git_sha": "e7181febc02bd1eb340ddd011a7ce1ec890d6e6e",
+  "version": "nfs-walker 0.1.0",
+  "artifact_sha256": "a1c6f48f9211cc7bbe5ed472e853a744a567946e8f5549850d852a723a7a6b1b",
+  "target": "x86_64-unknown-linux-gnu.2.34"
+}
