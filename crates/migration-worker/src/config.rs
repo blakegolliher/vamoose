@@ -329,8 +329,15 @@ fn default_failure_window() -> u64 {
 fn default_failure_threshold() -> f32 {
     5.0
 }
+/// Off by default. The floor is a MB/s number, so any tree of small
+/// files trips it on a perfectly healthy host: a lab tree averaging
+/// 4.5 KB per file copies at ~2K files/s ≈ 9 MB/s, and every worker
+/// went `throughput_low`, slept the 5-minute probe cooldown, "failed"
+/// the probe shard, and doubled the cooldown to 30 minutes while
+/// nothing was wrong. Set it deliberately when the workload's
+/// per-file size makes a MB/s floor meaningful.
 fn default_throughput_floor() -> u64 {
-    100
+    0
 }
 
 /// Coord wiring. Optional — when `[coord]` is omitted from the TOML

@@ -706,7 +706,7 @@ fn compatibility_worker_config(
             backpressure: wcfg::BackpressureCfg {
                 failure_pct_window_sec: 60,
                 failure_pct_threshold: 5.0,
-                throughput_floor_mb_s: 100,
+                throughput_floor_mb_s: 0,
             },
             coord: None,
         },
@@ -898,7 +898,7 @@ mod tests {
         );
         assert_eq!(worker.batch.bytes_budget, "8 GiB");
         assert!(worker.copy.preserve_owner);
-        assert_eq!(worker.backpressure.throughput_floor_mb_s, 100);
+        assert_eq!(worker.backpressure.throughput_floor_mb_s, 0);
         assert!(worker.coord.is_none());
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
         assert!(!worker.copy.require_unchanged_size);
         assert_eq!(worker.backpressure.failure_pct_window_sec, 60);
         assert_eq!(worker.backpressure.failure_pct_threshold, 5.0);
-        assert_eq!(worker.backpressure.throughput_floor_mb_s, 100);
+        assert_eq!(worker.backpressure.throughput_floor_mb_s, 0);
         assert!(worker.coord.is_none());
     }
 

@@ -59,7 +59,8 @@ pub struct Backpressure {
     failure_pct_threshold: f32,
     /// Throughput floor in MB/s; a *positive* sample below this trips
     /// degradation. Zero throughput before the first shard finishes
-    /// is normal and explicitly excluded.
+    /// is normal and explicitly excluded. A floor of 0 (the default)
+    /// disables the check.
     throughput_floor_mb_s: u64,
     /// Cooldown/probe recovery state machine.
     probe: ProbeState,

@@ -214,6 +214,17 @@ EOT
 sudo systemctl enable --now vamoose-worker@fast
 ```
 
+## Backing off
+
+A worker that sees more than `failure_pct_threshold` (5%) failed files in
+a shard degrades itself: it stops claiming, waits five minutes, copies one
+probe shard, and doubles the wait (to at most 30 minutes) each time the
+probe fails too. The journal says `degraded reason=failure_rate_high`.
+A MB/s floor (`[backpressure] throughput_floor_mb_s`) can trip the same
+state as `throughput_low`; it is off by default because small-file trees
+run at a few MB/s on a healthy host. Set it only for workloads whose
+per-file size makes a bytes-per-second floor meaningful.
+
 ## Where things are
 
 - Configuration search order for every `vamoose` command:
