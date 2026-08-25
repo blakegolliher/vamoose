@@ -172,12 +172,14 @@ In the TUI palette (`:`):
 | `:resume` | Workers continue where they held. |
 | `:abort` (alias of `:cancel`) | **Final.** Workers finish the shard in hand, then exit cleanly; the job cannot be resumed through the coordinator. |
 
-A hard stop is always available and safe: `sudo systemctl stop
-vamoose-worker@main`. The shard that host was copying is picked up by
-another worker once its heartbeat goes stale (about a minute), and already
-copied files are recognized on replay rather than copied twice.
+Stopping one host is always available and safe: `sudo systemctl stop
+vamoose-worker@main`. The worker finishes the batch it is copying, hands
+its shard back, and exits 0; another worker picks the shard up at once,
+and already copied files are recognized on replay rather than copied
+twice. (A worker killed outright — SIGKILL, power loss — is covered too:
+its shard is reclaimed once its heartbeat goes stale, about a minute.)
 
-To resume a run after a hard stop: `sudo systemctl start vamoose-worker@main`.
+To resume a run after a stop: `sudo systemctl start vamoose-worker@main`.
 
 ## 7. Finish
 

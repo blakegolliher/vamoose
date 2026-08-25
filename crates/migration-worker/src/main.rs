@@ -53,6 +53,9 @@ async fn main() -> anyhow::Result<()> {
             let code = orchestrator::exit_code_for_outcome(*outcome);
             let msg: &[u8] = match outcome {
                 orchestrator::RunOutcome::Clean => b"mig-worker: clean exit via libc::_exit(0)\n",
+                orchestrator::RunOutcome::Interrupted => {
+                    b"mig-worker: stopped by signal; exit via libc::_exit(0)\n"
+                }
                 orchestrator::RunOutcome::Fenced => {
                     b"mig-worker: fenced run; exit via libc::_exit(3)\n"
                 }

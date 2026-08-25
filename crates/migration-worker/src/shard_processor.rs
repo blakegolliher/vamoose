@@ -42,6 +42,15 @@
 //! the shard runs to completion and the orchestrator's claim loop
 //! stops claiming, so no partial shard is ever left for replay.
 //!
+//! ## Process stop (SIGTERM / SIGINT)
+//!
+//! Also checked between batches only. A stop request finishes the
+//! batch in flight and returns with `ProcessOutcome::interrupted`
+//! set; the orchestrator then releases the claim so a peer can pick
+//! the shard up at once. Rows already committed are durable and are
+//! recognized on replay, so the batch boundary is the cheapest safe
+//! point to stop — no row is ever interrupted mid-copy.
+//!
 //! ## Fence checks (R3)
 //!
 //! - Between batches (in `process`).
@@ -60,6 +69,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 /// Hardlink-map key. `None` for fsid means the source row didn't carry
 /// one; the worker falls back to inode-only grouping (with a one-time
@@ -96,6 +106,10 @@ pub struct ShardProcessor {
     /// Coord-driven run control, consulted between batches for
     /// `Pause`. `None` in S3-only mode (no `[coord]`).
     pub run_control: Option<crate::run_control::RunControlReader>,
+    /// Process stop request (SIGTERM / SIGINT), consulted between
+    /// batches. Cancelled → finish the batch in hand and return with
+    /// `interrupted` set. See the module docs.
+    pub stop: CancellationToken,
 }
 
 impl ShardProcessor {
@@ -114,6 +128,12 @@ impl ShardProcessor {
             ..Default::default()
         };
 
+        // A stop that arrived before the first batch: nothing has been
+        // copied from this shard, hand it straight back.
+        if self.stop.is_cancelled() {
+            return Ok(outcome.with_interrupted(true));
+        }
+
         for row_result in reader.into_rows()? {
             if !self.fence.is_valid() {
                 return Ok(outcome.with_fenced(true));
@@ -130,6 +150,16 @@ impl ShardProcessor {
                 // The fence may have tripped during a long hold.
                 if !self.fence.is_valid() {
                     return Ok(outcome.with_fenced(true));
+                }
+                // Batch boundary: the only point a process stop is
+                // honored. Everything before it is committed.
+                if self.stop.is_cancelled() {
+                    tracing::info!(
+                        rows_done = outcome.files_ok + outcome.files_failed,
+                        rows_total = total,
+                        "stop requested; leaving shard at batch boundary",
+                    );
+                    return Ok(outcome.with_interrupted(true));
                 }
             }
             current.push(row);
@@ -207,8 +237,16 @@ impl ShardProcessor {
             return;
         }
         tracing::info!("coord requested pause; holding at batch boundary");
-        let after = rc.wait_while_paused().await;
-        tracing::info!(?after, "pause released; resuming shard");
+        // A process stop ends the hold early; the caller's stop check
+        // right after this returns then hands the shard back.
+        tokio::select! {
+            after = rc.wait_while_paused() => {
+                tracing::info!(?after, "pause released; resuming shard");
+            }
+            _ = self.stop.cancelled() => {
+                tracing::info!("stop requested while paused; leaving hold");
+            }
+        }
     }
 
     async fn run_batch(
@@ -496,11 +534,21 @@ pub struct ProcessOutcome {
     pub files_torn: u64,
     pub bytes_moved: u64,
     pub fenced: bool,
+    /// The shard was left at a batch boundary because the process was
+    /// asked to stop (SIGTERM / SIGINT). Counters above cover only the
+    /// batches that ran; the orchestrator releases the claim so a
+    /// peer finishes the rest.
+    pub interrupted: bool,
 }
 
 impl ProcessOutcome {
     pub fn with_fenced(mut self, v: bool) -> Self {
         self.fenced = v;
+        self
+    }
+
+    pub fn with_interrupted(mut self, v: bool) -> Self {
+        self.interrupted = v;
         self
     }
 }
