@@ -564,6 +564,16 @@ impl Config {
         self.nfs.as_ref()
     }
 
+    /// The canonical `[mover]` table (source and destination URLs and
+    /// the libnfs tunables). `None` for the compatibility format or
+    /// when the table is absent.
+    pub(crate) fn mover(&self) -> Option<&wcfg::MoverCfg> {
+        match &self.worker {
+            WorkerInput::Canonical(input) => input.mover.as_ref(),
+            WorkerInput::Compatibility(_) => None,
+        }
+    }
+
     pub(crate) fn walker(&self) -> Option<&Walker> {
         self.walker.as_ref()
     }
