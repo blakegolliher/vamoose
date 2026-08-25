@@ -65,6 +65,21 @@ impl Fence {
         }
     }
 
+    /// Close the fence as part of an orderly shutdown. Same effect as
+    /// [`trip`](Self::trip) — the heartbeat wakes and writes its final
+    /// progress record, movers stop committing — but logged at `info`:
+    /// nothing was lost and no peer took anything, so the
+    /// "self-fencing" WARN would send an operator hunting for a
+    /// problem that does not exist. Idempotent; a real trip that
+    /// happened first keeps its reason.
+    pub fn close_for_shutdown(&self) {
+        if self.valid.swap(false, Ordering::AcqRel) {
+            tracing::info!("worker shutting down; fence closed");
+            *self.reason.lock().unwrap() = Some("worker shutting down".to_string());
+            self.cancel.cancel();
+        }
+    }
+
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
     }
@@ -77,5 +92,31 @@ impl Fence {
 impl Default for Fence {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Fence;
+
+    #[test]
+    fn close_for_shutdown_invalidates_and_cancels() {
+        let f = Fence::new();
+        assert!(f.is_valid());
+        f.close_for_shutdown();
+        assert!(!f.is_valid());
+        assert!(f.cancel_token().is_cancelled());
+        assert_eq!(f.reason().as_deref(), Some("worker shutting down"));
+    }
+
+    /// A real trip that happened first is not relabelled by the
+    /// shutdown close — the operator must still see why the worker
+    /// fenced.
+    #[test]
+    fn shutdown_close_keeps_an_earlier_trip_reason() {
+        let f = Fence::new();
+        f.trip("claim lost");
+        f.close_for_shutdown();
+        assert_eq!(f.reason().as_deref(), Some("claim lost"));
     }
 }
