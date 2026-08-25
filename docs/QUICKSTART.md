@@ -132,8 +132,9 @@ separate "start" command.
 Things worth knowing:
 
 - **It resumes.** Interrupt it and run it again: a finished scan is not
-  redone, converted shards are kept, uploaded shards are verified (size
-  plus a SHA256 stamped on the object) rather than re-sent. Use `--fresh`
+  redone, uploaded shards are verified (size plus a SHA256 stamped on
+  the object) rather than re-sent; shards the conversion had not
+  finished are converted again. Use `--fresh`
   to start a new run instead, or `--run-id NAME` to pick the run's name
   (it becomes the coordinator job id). Scan output and checkpoints live
   under `/var/lib/vamoose/prepare/<run_id>/`.
@@ -145,10 +146,11 @@ Things worth knowing:
 - **One run per bucket.** A bucket that already holds a different
   manifest is refused; use a fresh bucket for a second migration.
 - **Scratch space.** `[prepare] work_dir` (default
-  `/var/lib/vamoose/prepare`) holds the scan and the converted index
-  until the upload finishes: budget about 250 bytes per file, so a
-  600-million-file tree needs ~150 GB there. Point `work_dir` at a volume
-  that size before running `prepare` on a large tree.
+  `/var/lib/vamoose/prepare`) holds the scan plus the shard or two being
+  converted: each converted shard is uploaded as soon as it is written
+  and deleted locally once the bucket holds it. Budget about 70 bytes
+  per file for the scan (a 600-million-file tree needs ~45 GB) plus the
+  shard size. `--keep-index` keeps the converted shards on disk.
 - Runs as root because `nfs-walker` binds reserved NFS ports; it reads
   S3 credentials from `/etc/vamoose/vamoose.env` automatically.
 

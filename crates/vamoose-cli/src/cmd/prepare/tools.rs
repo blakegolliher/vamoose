@@ -155,15 +155,30 @@ impl RewriteInvocation {
 /// Run an external stage with inherited stdio so its own progress
 /// output reaches the operator's terminal. Fails on a non-zero exit.
 pub(crate) async fn run_stage(label: &str, bin: &Path, args: &[OsString]) -> Result<()> {
-    let status = tokio::process::Command::new(bin)
-        .args(args)
-        .status()
+    let status = spawn_stage(label, bin, args)?
+        .wait()
         .await
-        .with_context(|| format!("starting {label} ({})", bin.display()))?;
+        .with_context(|| format!("waiting for {label}"))?;
     if !status.success() {
         anyhow::bail!("{label} failed: {} exited with {status}", bin.display());
     }
     Ok(())
+}
+
+/// Start an external stage (inherited stdio) and hand back the child,
+/// for a caller that does work while it runs. The child is killed if
+/// dropped before it exits, so an interrupted `prepare` does not leave
+/// a rewrite running unattended.
+pub(crate) fn spawn_stage(
+    label: &str,
+    bin: &Path,
+    args: &[OsString],
+) -> Result<tokio::process::Child> {
+    tokio::process::Command::new(bin)
+        .args(args)
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("starting {label} ({})", bin.display()))
 }
 
 /// `nfs-walker --version`, trimmed (e.g. `nfs-walker 0.1.0`).

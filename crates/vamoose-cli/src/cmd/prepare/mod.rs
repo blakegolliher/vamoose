@@ -11,12 +11,18 @@
 //!   run.json          identity: run id, source, destination, bucket
 //!   scan/attempt-NNNN/walk.parquet   nfs-walker output (one dir per attempt)
 //!   scan.json         which attempt completed, walker version + digest
-//!   canonical/        canonical shards (mig-walker-rewrite, resumable)
+//!   canonical/        canonical shards in flight (mig-walker-rewrite,
+//!                     resumable); each is removed once the bucket holds it
 //!   rewrite.json      mig-walker-rewrite's own checkpoint
 //!   upload.json       per-shard upload checkpoint
 //!   manifest.json     the manifest as published
 //! <work_dir>/latest   run id of the most recent run, for implicit resume
 //! ```
+//!
+//! The rewrite and the upload overlap: shards are uploaded as the
+//! rewrite reports them and deleted locally once verified in the
+//! bucket, so `work_dir` holds the scan plus a shard or two, never the
+//! whole index (`--keep-index` keeps the shards).
 //!
 //! The moment `manifest.json` lands in the bucket, enabled workers start
 //! claiming shards and the coordinator seeds the job from it.
@@ -62,6 +68,12 @@ pub struct Args {
     /// Override `[prepare] work_dir`.
     #[arg(long)]
     pub work_dir: Option<PathBuf>,
+
+    /// Keep the canonical shards under `<work_dir>/<run_id>/canonical/`
+    /// after they are uploaded (default: remove each once the bucket
+    /// holds it).
+    #[arg(long)]
+    pub keep_index: bool,
 }
 
 /// Identity of one run, written first and compared on every resume so
@@ -296,8 +308,8 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
         scan.walker_version
     );
 
-    // ---- 2. rewrite ------------------------------------------------
-    println!("[2/3] canonical rewrite");
+    // ---- 2. rewrite, uploading shards as they finish ---------------
+    println!("[2/3] canonical rewrite + streaming upload");
     let rewrite_report = run_dir.join("rewrite.json");
     let rewrite = tools::RewriteInvocation {
         input: scan.scan_dir.clone(),
@@ -308,40 +320,73 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
         report: rewrite_report.clone(),
     };
     std::fs::create_dir_all(&rewrite.output)?;
+    let context = upload::UploadContext {
+        run_id: run_id.clone(),
+        bucket: storage.bucket.clone(),
+        endpoint: storage.endpoint.clone(),
+        rewrite_identity: upload::rewrite_identity(
+            &rewrite.input.to_string_lossy(),
+            &rewrite.source_root,
+            &rewrite.walker_version,
+        ),
+        source: spec.source.clone(),
+        dest: spec.dest.clone(),
+    };
+    // Opened before the rewrite starts: a checkpoint from another run
+    // or bucket is refused before any work, and the bucket's manifest
+    // (if this run's) is read once.
+    let mut session =
+        upload::UploadSession::open(&s3, context, &run_dir.join("upload.json")).await?;
     let rewrite_bin = tools::find_sibling("mig-walker-rewrite")?;
-    tools::run_stage("mig-walker-rewrite", &rewrite_bin, &rewrite.args()).await?;
-    let (report, plans) = upload::load_rewrite_plan(&rewrite_report)?;
+    let mut child = tools::spawn_stage("mig-walker-rewrite", &rewrite_bin, &rewrite.args())?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut streamed = 0usize;
+    let status = loop {
+        let exited = child.try_wait().context("waiting for mig-walker-rewrite")?;
+        streamed +=
+            upload::stream_uploads(&mut session, &rewrite_report, &mut seen, args.keep_index)
+                .await?;
+        if let Some(status) = exited {
+            break status;
+        }
+        tokio::time::sleep(STREAM_POLL).await;
+    };
+    if !status.success() {
+        anyhow::bail!(
+            "mig-walker-rewrite failed: {} exited with {status} ({streamed} shards were \
+             uploaded and are checkpointed; re-run to resume)",
+            rewrite_bin.display()
+        );
+    }
+    let (_report, plans) = upload::load_rewrite_plan(&rewrite_report, &session.uploaded())?;
     println!(
-        "  {} shards, {} rows\n",
+        "  {} shards, {} rows ({streamed} uploaded while the rewrite ran)\n",
         plans.len(),
         plans.iter().map(|p| p.rows).sum::<u64>()
     );
 
-    // ---- 3. upload + manifest --------------------------------------
-    println!("[3/3] upload index and publish manifest");
-    let manifest = upload::upload_index(
-        &s3,
-        upload::UploadInputs {
-            context: upload::UploadContext {
-                run_id: run_id.clone(),
-                bucket: storage.bucket.clone(),
-                endpoint: storage.endpoint.clone(),
-                rewrite_identity: upload::rewrite_identity(&report),
-                source: spec.source.clone(),
-                dest: spec.dest.clone(),
-            },
-            plans: &plans,
-            options: upload::CopyOptions {
+    // ---- 3. remaining shards + manifest ----------------------------
+    println!("[3/3] verify index and publish manifest");
+    for plan in &plans {
+        if plan.path.is_file() || !session.is_recorded(plan) {
+            session.ensure_shard(plan).await?;
+        }
+        if !args.keep_index && plan.path.is_file() {
+            std::fs::remove_file(&plan.path)
+                .with_context(|| format!("removing uploaded shard {}", plan.path.display()))?;
+        }
+    }
+    let manifest = session
+        .publish(
+            upload::CopyOptions {
                 preserve_owner: worker_cfg.copy.preserve_owner,
                 preserve_mode: worker_cfg.copy.preserve_mode,
                 preserve_times: worker_cfg.copy.preserve_times,
                 preserve_xattr: worker_cfg.copy.preserve_xattr,
             },
-            checkpoint_path: &run_dir.join("upload.json"),
-            manifest_path: &run_dir.join("manifest.json"),
-        },
-    )
-    .await?;
+            &run_dir.join("manifest.json"),
+        )
+        .await?;
 
     println!(
         "\nprepared: s3://{}/manifest.json ({} shards, {} rows)\n\
@@ -352,6 +397,11 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
     );
     Ok(())
 }
+
+/// How often the rewrite report is re-read for newly finished shards
+/// while `mig-walker-rewrite` runs. A shard takes seconds to minutes to
+/// produce; two seconds keeps at most one finished shard waiting.
+const STREAM_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The manifest currently in the bucket, if any.
 async fn published_manifest(
