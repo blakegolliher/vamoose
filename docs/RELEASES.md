@@ -25,10 +25,18 @@ make bundle \
   NFS_WALKER_BIN=/path/to/nfs-walker
 ```
 
-`NFS_WALKER_BIN` (also honored by `make rpm` / `make deb`) ships the
-scanner as `libexec/nfs-walker` so `vamoose prepare` works out of the box;
-its SHA256 is recorded in `share/doc/vamoose/NFS_WALKER_SOURCE.txt`. Without
-it, `prepare` falls back to `nfs-walker` on PATH or `[prepare] walker_bin`.
+`make rpm` / `make deb` take the same three variables. `LIBNFS_SO` does
+two things for every target: the package vendors the library under
+`/usr/lib/vamoose`, and the executables are linked against that exact file
+(staged under `target/release-input/libnfs`, checked against the lock)
+rather than the build host's pkg-config copy — a cross build that linked
+the host's libnfs would import its newer glibc symbol versions and refuse
+to load on the target, so `TARGET=` without `LIBNFS_SO` is refused.
+
+`NFS_WALKER_BIN` ships the scanner as `libexec/nfs-walker` so `vamoose
+prepare` works out of the box; its SHA256 is recorded in
+`share/doc/vamoose/NFS_WALKER_SOURCE.txt`. Without it, `prepare` falls
+back to `nfs-walker` on PATH or `[prepare] walker_bin`.
 
 The libnfs file must match `packaging/libnfs.lock.json`. Updating libnfs means
 updating its source commit and exact artifact digest in that reviewed lock.

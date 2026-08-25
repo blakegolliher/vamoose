@@ -10,6 +10,12 @@
 #   make install            install into DESTDIR (default /)
 #   make rpm                build an .rpm into dist/
 #   make deb                build a .deb into dist/
+#   make rpm TARGET=x86_64-unknown-linux-gnu.2.34 \
+#            LIBNFS_SO=/path/to/libnfs.so.16.2.0 \
+#            NFS_WALKER_BIN=/path/to/nfs-walker
+#                           the package the quickstart installs: cross
+#                           built, linked against the pinned libnfs it
+#                           vendors, with the scanner `prepare` runs
 #
 # Packages contain all four executables, example config and secrets
 # files under /etc/vamoose, the worker template unit and coord unit, the
@@ -31,8 +37,14 @@ ARCH        := x86_64
 # Cross target (cargo-zigbuild), e.g. x86_64-unknown-linux-gnu.2.34.
 TARGET      :=
 # Path to a built libnfs.so.16.* to vendor into the package. Empty =
-# the package depends on a system-provided libnfs instead.
+# the package depends on a system-provided libnfs instead. When set,
+# every build target links against this exact library (staged under
+# LIBNFS_STAGE, verified against packaging/libnfs.lock.json) instead of
+# whatever pkg-config finds on the build host — a cross build that
+# linked the host's libnfs would carry its newer glibc symbol versions
+# into the package and fail to load on the older target.
 LIBNFS_SO   :=
+LIBNFS_STAGE := target/release-input/libnfs
 # Path to a built nfs-walker executable to ship as
 # /usr/libexec/vamoose/nfs-walker (what `vamoose prepare` runs). Empty =
 # prepare falls back to nfs-walker on PATH or [prepare] walker_bin.
@@ -80,6 +92,7 @@ DIST        := dist
 STAGE       := $(DIST)/stage
 
 .PHONY: all build bundle verify-bundle check-cross-toolchain \
+        stage-libnfs refuse-unpinned-cross-build \
         install stage rpm deb clean version
 
 all: build
@@ -95,6 +108,28 @@ ifneq ($(TARGET),)
 build bundle: check-cross-toolchain
 endif
 
+# The build links the pinned libnfs whenever LIBNFS_SO is given, so
+# `rpm`/`deb` (via `stage: build`) get the same library as `bundle`.
+# A cross build without it (and without a caller-provided
+# VAMOOSE_LIBNFS_DIR) is refused: it would silently link the host's
+# libnfs, which is what every package installed on the target inherits.
+ifneq ($(LIBNFS_SO),)
+build: stage-libnfs
+build: export VAMOOSE_LIBNFS_DIR := $(CURDIR)/$(LIBNFS_STAGE)
+else ifneq ($(TARGET),)
+ifeq ($(VAMOOSE_LIBNFS_DIR),)
+build: refuse-unpinned-cross-build
+endif
+endif
+
+stage-libnfs:
+	scripts/stage-pinned-libnfs.sh "$(LIBNFS_SO)" "$(LIBNFS_STAGE)"
+
+refuse-unpinned-cross-build:
+	@echo "TARGET=$(TARGET) needs LIBNFS_SO=/path/to/libnfs.so.16.2.0 (or VAMOOSE_LIBNFS_DIR):" >&2
+	@echo "a cross build would otherwise link the build host's libnfs." >&2
+	@exit 1
+
 build:
 	$(CARGO) $(PACKAGES)
 
@@ -109,9 +144,8 @@ bundle:
 	@test -n "$(LIBNFS_SO)" || { \
 	    echo "LIBNFS_SO is required for a release bundle" >&2; exit 1; \
 	}
-	scripts/stage-pinned-libnfs.sh "$(LIBNFS_SO)" \
-	    "target/release-input/libnfs"
-	VAMOOSE_LIBNFS_DIR="$(CURDIR)/target/release-input/libnfs" \
+	scripts/stage-pinned-libnfs.sh "$(LIBNFS_SO)" "$(LIBNFS_STAGE)"
+	VAMOOSE_LIBNFS_DIR="$(CURDIR)/$(LIBNFS_STAGE)" \
 	    RUSTFLAGS='$(strip $(RUSTFLAGS) -C link-arg=-Wl,-rpath,$$ORIGIN/../lib)' \
 	    $(CARGO) $(PACKAGES)
 	ALLOW_DIRTY='$(ALLOW_DIRTY)' scripts/build-release.sh \
