@@ -17,6 +17,18 @@
 //! 6. Exit cleanly when every shard is Completed/Failed or the worker
 //!    is fenced.
 //!
+//! # Process stop (SIGTERM / SIGINT)
+//!
+//! `systemctl stop` sends SIGTERM. [`run`] installs a listener that
+//! flips a stop token; the claim loop stops claiming, the shard
+//! processor leaves the shard in hand at its next batch boundary, the
+//! claim is released (DELETE If-Match by the owner) so a peer can
+//! take the shard immediately instead of waiting out the lease, and
+//! the normal section-7 shutdown runs. The outcome is
+//! [`RunOutcome::Interrupted`], exit code 0 — a deliberate stop is
+//! not a failure. A second signal is logged and otherwise ignored:
+//! the batch in hand always finishes (SIGKILL is the escape hatch).
+//!
 //! # Shutdown diagnostics
 //!
 //! The step-by-step shutdown trace (section 7) is emitted at `debug`
@@ -66,12 +78,28 @@ use tokio_util::sync::CancellationToken;
 /// path and forcefully terminating a process that has not exited.
 pub const HARD_EXIT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Returns how the run ended ([`RunOutcome::Clean`] vs
-/// [`RunOutcome::Fenced`]); callers map it to the process exit code
-/// via [`exit_code_for_outcome`] so a fenced-but-clean shutdown is
-/// distinguishable from a completed migration at the supervisor
-/// level.
+/// Returns how the run ended ([`RunOutcome::Clean`] /
+/// [`RunOutcome::Interrupted`] / [`RunOutcome::Fenced`]); callers map
+/// it to the process exit code via [`exit_code_for_outcome`] so a
+/// fenced-but-clean shutdown is distinguishable from a completed
+/// migration at the supervisor level.
+///
+/// Installs the SIGTERM / SIGINT listener (see the module docs) and
+/// delegates to [`run_with_stop`].
 pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
+    let stop = CancellationToken::new();
+    spawn_signal_listener(stop.clone());
+    run_with_stop(cfg, host_id, stop).await
+}
+
+/// [`run`] with an injected stop token. Cancelling `stop` has the
+/// same effect as SIGTERM: no new claims, the shard in hand is left
+/// at its next batch boundary and released, orderly shutdown, exit 0.
+pub async fn run_with_stop(
+    cfg: Config,
+    host_id: String,
+    stop: CancellationToken,
+) -> anyhow::Result<RunOutcome> {
     // Worker-process start time. Captured before any awaits so the
     // value reflects the actual process boot, not the first config
     // I/O — coord-side register dedup pairs this with (host, pid)
@@ -478,6 +506,14 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
         // restarts the loop from the top so the fence check and the
         // run-control check both re-evaluate (fence may have tripped
         // during the wait; the new mode may be Cancel).
+        // Process stop (SIGTERM / SIGINT). Same shape as Drain: no
+        // new claim, straight to the orderly shutdown. Checked after
+        // the fence for the same reason run control is.
+        if stop.is_cancelled() {
+            tracing::info!("stop requested; not claiming another shard");
+            break;
+        }
+
         if let Some(rc) = run_control_reader.as_mut() {
             if rc.is_terminating() {
                 tracing::info!(mode = ?rc.mode(),
@@ -486,8 +522,15 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
             }
             if rc.is_paused() {
                 tracing::info!("coord requested pause; waiting for resume");
-                let after = rc.wait_while_paused().await;
-                tracing::info!(?after, "coord pause released");
+                // A stop ends the wait; the next pass breaks above.
+                tokio::select! {
+                    after = rc.wait_while_paused() => {
+                        tracing::info!(?after, "coord pause released");
+                    }
+                    _ = stop.cancelled() => {
+                        tracing::info!("stop requested while paused");
+                    }
+                }
                 continue;
             }
         }
@@ -537,7 +580,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
                     last_throughput_mb_s = backpressure.last_throughput_mb_s(),
                     "worker degraded; sleeping before next probe window",
                 );
-                tokio::time::sleep(Duration::from_secs(cfg.worker.heartbeat_sec)).await;
+                sleep_unless_stopped(&stop, Duration::from_secs(cfg.worker.heartbeat_sec)).await;
                 // Don't continue around — keep evaluating, but don't
                 // spin claims if still degraded after sleep.
                 continue;
@@ -615,7 +658,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
             // bit and re-scan; this is a soft backoff so we don't burn
             // S3 LIST quota.
             tracing::debug!("no claimable shards this pass; idling");
-            tokio::time::sleep(Duration::from_secs(cfg.worker.heartbeat_sec)).await;
+            sleep_unless_stopped(&stop, Duration::from_secs(cfg.worker.heartbeat_sec)).await;
             continue;
         };
 
@@ -791,6 +834,7 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
             fsid_fallback_warned: false,
             emitter: event_emitter.clone(),
             run_control: coord_handle.as_ref().map(|h| h.run_control.subscribe()),
+            stop: stop.clone(),
         };
         let outcome = match processor.process(&scratch).await {
             Ok(o) => o,
@@ -900,6 +944,33 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
             break;
         }
 
+        if outcome.interrupted {
+            // Process stop landed mid-shard. Everything the batches
+            // committed is durable; hand the shard back NOW (owner
+            // DELETE If-Match, same atom as the worker-local error
+            // path) so a peer claims it as Free instead of waiting
+            // for the lease / cross-check window. Same R4 ordering as
+            // complete(): clear the held-claim cell first so the
+            // heartbeat cannot mistake our own delete for a reclaim.
+            let held_etag = {
+                let mut g = current.lock().await;
+                let e = match g.as_ref() {
+                    Some(c) if c.shard == shard_filename => c.etag.clone(),
+                    _ => etag.clone(),
+                };
+                *g = None;
+                e
+            };
+            tracing::info!(
+                shard = %shard_filename,
+                rows_done = outcome.files_ok + outcome.files_failed,
+                rows_total = outcome.rows_total,
+                "stop requested; releasing the shard in hand for a peer",
+            );
+            release_claim_by_owner(&*s3, &shard_filename, &held_etag).await;
+            break;
+        }
+
         // R4 fix: snapshot the final etag/epoch AND clear the held-claim
         // cell in a single lock-held block, BEFORE calling complete().
         //
@@ -947,12 +1018,8 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
     // the unconditional `fence.trip()` below erases the distinction
     // between "fenced mid-run" and "fence tripped as part of a normal
     // shutdown".
-    let run_outcome = if fence.is_valid() {
-        RunOutcome::Clean
-    } else {
-        RunOutcome::Fenced
-    };
-    tracing::debug!(target: "shutdown", "section 7 entered");
+    let run_outcome = run_outcome_for(fence.is_valid(), stop.is_cancelled());
+    tracing::debug!(target: "shutdown", ?run_outcome, "section 7 entered");
     {
         tracing::debug!(target: "shutdown", "acquiring progress write lock");
         let mut p = progress.write().await;
@@ -1047,16 +1114,113 @@ pub async fn run(cfg: Config, host_id: String) -> anyhow::Result<RunOutcome> {
 /// watchdog-arm point). Error returns (`?`) bypass section 7 entirely
 /// — the process exit paths map them to code 1 — so the only
 /// non-error outcomes are "clean" (all shards terminal, or
-/// coord-requested drain/cancel) and "fenced". Was the internal
-/// `WatchdogRunOutcome`; promoted to the function's return value so
-/// callers (`main.rs`, `vamoose worker`) can map "fenced" to its
-/// dedicated process exit code via [`exit_code_for_outcome`].
+/// coord-requested drain/cancel), "interrupted" (SIGTERM / SIGINT)
+/// and "fenced". Was the internal `WatchdogRunOutcome`; promoted to
+/// the function's return value so callers (`main.rs`, `vamoose
+/// worker`) can map "fenced" to its dedicated process exit code via
+/// [`exit_code_for_outcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     /// Main loop exited without a fence trip.
     Clean,
+    /// A process stop (SIGTERM / SIGINT) ended the run: no fence
+    /// trip, the shard in hand (if any) was released for a peer.
+    Interrupted,
     /// Worker self-fenced mid-run (claim lost / heartbeat fence).
     Fenced,
+}
+
+/// Section-7 outcome from the two facts known there. A fence trip
+/// wins over a stop request: a worker that was fenced while stopping
+/// still needs the operator to notice.
+fn run_outcome_for(fence_valid: bool, stop_requested: bool) -> RunOutcome {
+    if !fence_valid {
+        RunOutcome::Fenced
+    } else if stop_requested {
+        RunOutcome::Interrupted
+    } else {
+        RunOutcome::Clean
+    }
+}
+
+/// Install the SIGTERM / SIGINT listener behind `stop`. The first
+/// signal cancels the token; later ones are logged only — the batch
+/// in hand always finishes (SIGKILL is the escape hatch, and systemd
+/// sends it at `TimeoutStopSec`). A listener that cannot be
+/// installed is logged and the worker runs without one, exactly as
+/// before.
+fn spawn_signal_listener(stop: CancellationToken) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (mut term, mut int) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(t), Ok(i)) => (t, i),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!(error = ?e, "signal listener not installed; a stop signal will kill the worker");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            let which = tokio::select! {
+                r = term.recv() => match r { Some(()) => "SIGTERM", None => break },
+                r = int.recv() => match r { Some(()) => "SIGINT", None => break },
+            };
+            if stop.is_cancelled() {
+                tracing::warn!(
+                    signal = which,
+                    "stop already in progress; the batch in hand still finishes (SIGKILL to abandon it)",
+                );
+                continue;
+            }
+            tracing::info!(
+                signal = which,
+                "stop requested; finishing the batch in hand, releasing the claim, then exiting",
+            );
+            stop.cancel();
+        }
+    });
+}
+
+/// `tokio::time::sleep` that returns early when `stop` is cancelled,
+/// so idle and backpressure waits do not delay a requested stop by a
+/// heartbeat interval.
+async fn sleep_unless_stopped(stop: &CancellationToken, dur: Duration) {
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => {}
+        _ = stop.cancelled() => {}
+    }
+}
+
+/// Hand a held claim back as Free via the owner's DELETE If-Match —
+/// the same atom `claim::complete` starts with, so this never
+/// creates a new terminal state. Outcomes are logged, never fatal:
+/// on an error the claim stays Active and a peer recovers it through
+/// the lease / progress cross-check path.
+async fn release_claim_by_owner(store: &dyn ClaimStore, shard: &str, held_etag: &str) {
+    let claim_key = layout::claim_key(shard);
+    match store.delete_if_match(&claim_key, held_etag).await {
+        Ok(DeleteOutcome::Deleted) => {
+            tracing::info!(shard = %shard, "claim released; shard is Free for peers");
+        }
+        Ok(DeleteOutcome::EtagMismatch | DeleteOutcome::NotFound) => {
+            // Someone already reclaimed or replaced the claim —
+            // nothing of ours left to release.
+            tracing::warn!(
+                shard = %shard,
+                "claim already replaced while releasing; nothing to do",
+            );
+        }
+        Err(release_err) => {
+            tracing::warn!(
+                error = ?release_err,
+                shard = %shard,
+                "claim release errored; shard stays Active until a \
+                 peer reclaims via lease/cross-check",
+            );
+        }
+    }
 }
 
 /// Process exit code for a [`run`] that returned `Ok(outcome)` — the
@@ -1068,10 +1232,13 @@ pub enum RunOutcome {
 /// completion, 1 = run error (the `Err` path in `main.rs` /
 /// anyhow-from-`vamoose`), 2 = shutdown wedged (`watchdog_exit_code`,
 /// also clap usage errors). Fenced therefore gets the dedicated
-/// code 3.
+/// code 3. An interrupted run (SIGTERM / SIGINT) exits 0: the stop
+/// was asked for, the shard was handed back, nothing needs an alert
+/// — and the unit's `SuccessExitStatus=0` / `Restart=on-failure`
+/// pairing relies on it.
 pub fn exit_code_for_outcome(outcome: RunOutcome) -> i32 {
     match outcome {
-        RunOutcome::Clean => 0,
+        RunOutcome::Clean | RunOutcome::Interrupted => 0,
         RunOutcome::Fenced => 3,
     }
 }
@@ -1089,8 +1256,7 @@ pub fn exit_code_for_outcome(outcome: RunOutcome) -> i32 {
 /// stderr line, not the code.
 pub(crate) fn watchdog_exit_code(outcome: RunOutcome) -> i32 {
     match outcome {
-        RunOutcome::Clean => 2,
-        RunOutcome::Fenced => 2,
+        RunOutcome::Clean | RunOutcome::Interrupted | RunOutcome::Fenced => 2,
     }
 }
 
@@ -2014,35 +2180,10 @@ pub async fn handle_process_error(
             );
             // Release via the existing delete-if-match atom. We own
             // `held_etag`, so this is spec-clean deletion by the
-            // owner — no new terminal state, no PUT If-Match.
-            let claim_key = layout::claim_key(ctx.shard_filename);
-            match ctx.store.delete_if_match(&claim_key, &held_etag).await {
-                Ok(DeleteOutcome::Deleted) => {
-                    tracing::warn!(
-                        shard = %ctx.shard_filename,
-                        "claim released; shard is Free for healthy peers",
-                    );
-                }
-                Ok(DeleteOutcome::EtagMismatch | DeleteOutcome::NotFound) => {
-                    // Someone already reclaimed or replaced the claim
-                    // — nothing of ours left to release.
-                    tracing::warn!(
-                        shard = %ctx.shard_filename,
-                        "claim already replaced while releasing; nothing to do",
-                    );
-                }
-                Err(release_err) => {
-                    // Leave the claim Active; a peer reclaims it via
-                    // the lease / progress-cross-check path (bounded
-                    // recovery). Never fall back to fail() here.
-                    tracing::warn!(
-                        error = ?release_err,
-                        shard = %ctx.shard_filename,
-                        "claim release errored; shard stays Active until a \
-                         peer reclaims via lease/cross-check",
-                    );
-                }
-            }
+            // owner — no new terminal state, no PUT If-Match. On an
+            // error the claim stays Active for lease / cross-check
+            // recovery; never fall back to fail() here.
+            release_claim_by_owner(ctx.store, ctx.shard_filename, &held_etag).await;
             // Per-run skip set: this worker never re-claims the shard,
             // so a persistent local fault (stale binary, sick scratch
             // disk) can't thrash claim/release cycles on it.
@@ -2860,6 +3001,8 @@ mod flush_sinks_tests {
 
         // Wedged after a clean run → 2 (was the F17 bug: _exit(0)).
         assert_eq!(watchdog_exit_code(RunOutcome::Clean), 2);
+        // A stop that then wedges is still a wedge.
+        assert_eq!(watchdog_exit_code(RunOutcome::Interrupted), 2);
         // Wedged after a fenced run → 2. Decision (doc allowed 2 or 1):
         // 2 for every wedge, so "exit 2" is a single unambiguous
         // supervisor signal for "shutdown wedged; watchdog fired"; the
@@ -2892,7 +3035,11 @@ mod flush_sinks_tests {
     fn clean_outcome_maps_to_exit_0_and_existing_codes_are_untouched() {
         use super::{exit_code_for_outcome, watchdog_exit_code, RunOutcome};
         assert_eq!(exit_code_for_outcome(RunOutcome::Clean), 0);
-        for outcome in [RunOutcome::Clean, RunOutcome::Fenced] {
+        for outcome in [
+            RunOutcome::Clean,
+            RunOutcome::Interrupted,
+            RunOutcome::Fenced,
+        ] {
             let code = exit_code_for_outcome(outcome);
             assert_ne!(code, 1, "1 stays reserved for run errors: {outcome:?}");
             assert_ne!(
@@ -2903,5 +3050,94 @@ mod flush_sinks_tests {
         // The watchdog mapping is untouched by the fenced-exit work.
         assert_eq!(watchdog_exit_code(RunOutcome::Clean), 2);
         assert_eq!(watchdog_exit_code(RunOutcome::Fenced), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Process stop (SIGTERM / SIGINT)
+    // ------------------------------------------------------------------
+
+    /// A deliberate stop is not a failure: exit 0, so
+    /// `Restart=on-failure` does not resurrect a worker the operator
+    /// just stopped and `SuccessExitStatus=0` reads as success.
+    #[test]
+    fn interrupted_outcome_maps_to_exit_0() {
+        use super::{exit_code_for_outcome, RunOutcome};
+        assert_eq!(exit_code_for_outcome(RunOutcome::Interrupted), 0);
+    }
+
+    /// Section-7 outcome: the fence wins over a stop request (a worker
+    /// fenced while stopping still exits 3), a stop without a fence is
+    /// `Interrupted`, and neither is `Clean`.
+    #[test]
+    fn run_outcome_prefers_fence_over_stop() {
+        use super::{run_outcome_for, RunOutcome};
+        assert_eq!(run_outcome_for(true, false), RunOutcome::Clean);
+        assert_eq!(run_outcome_for(true, true), RunOutcome::Interrupted);
+        assert_eq!(run_outcome_for(false, false), RunOutcome::Fenced);
+        assert_eq!(run_outcome_for(false, true), RunOutcome::Fenced);
+    }
+
+    /// The idle / backpressure sleeps return as soon as a stop is
+    /// requested instead of running out the heartbeat interval.
+    #[tokio::test(start_paused = true)]
+    async fn sleep_unless_stopped_wakes_on_stop() {
+        use super::sleep_unless_stopped;
+        use tokio_util::sync::CancellationToken;
+
+        let stop = CancellationToken::new();
+        let waiter = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                sleep_unless_stopped(&stop, std::time::Duration::from_secs(3600)).await;
+            })
+        };
+        tokio::task::yield_now().await;
+        stop.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sleep must end on stop, not after the full interval")
+            .unwrap();
+
+        // Without a stop, the full interval elapses (paused time).
+        let stop = CancellationToken::new();
+        let before = tokio::time::Instant::now();
+        sleep_unless_stopped(&stop, std::time::Duration::from_secs(30)).await;
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(before),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    /// An owner release deletes the claim so the shard reads as Free;
+    /// a claim that was already replaced is left alone.
+    #[tokio::test]
+    async fn release_claim_by_owner_frees_only_the_held_etag() {
+        use super::release_claim_by_owner;
+        use migration_core::claim::test_util::FakeStore;
+        use migration_core::claim::{self, AcquireOutcome, ClaimStore};
+        use migration_core::layout;
+
+        let store = FakeStore::new();
+        let AcquireOutcome::Acquired { etag, .. } =
+            claim::try_acquire(&store, "shard-0001.parquet", "host-a")
+                .await
+                .unwrap()
+        else {
+            panic!("fresh shard must be claimable");
+        };
+        // A stale etag does not touch the live claim.
+        release_claim_by_owner(&store, "shard-0001.parquet", "\"not-ours\"").await;
+        assert!(store
+            .get(&layout::claim_key("shard-0001.parquet"))
+            .await
+            .unwrap()
+            .is_some());
+        // The owner's etag frees it.
+        release_claim_by_owner(&store, "shard-0001.parquet", &etag).await;
+        assert!(store
+            .get(&layout::claim_key("shard-0001.parquet"))
+            .await
+            .unwrap()
+            .is_none());
     }
 }

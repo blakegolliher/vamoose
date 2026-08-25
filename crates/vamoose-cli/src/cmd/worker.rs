@@ -4,8 +4,9 @@
 //! # Exit codes
 //!
 //! See [`EXIT_CODES_HELP`] (rendered in `vamoose worker --help`):
-//! 0 clean completion, 1 run error, 2 wedged shutdown (hard-exit
-//! watchdog), 3 run ended because the worker fenced. The 0-vs-3
+//! 0 clean completion or a SIGTERM/SIGINT stop, 1 run error, 2 wedged
+//! shutdown (hard-exit watchdog), 3 run ended because the worker
+//! fenced. The 0-vs-3
 //! mapping is `migration_worker::orchestrator::exit_code_for_outcome`;
 //! [`run`] returns the semantic outcome and the process boundary
 //! applies its code after log shutdown.
@@ -19,7 +20,8 @@ use std::path::PathBuf;
 /// Exit-code contract, shown in `vamoose worker --help`. Codes 0/1/2
 /// predate the fenced code and must not be renumbered.
 const EXIT_CODES_HELP: &str = "Exit codes:
-  0  migration ran to clean completion (or a coord-requested drain/cancel)
+  0  migration ran to clean completion, a coord-requested drain/cancel, or a
+     SIGTERM/SIGINT stop (the shard in hand is released for a peer)
   1  run error (config, S3, or orchestrator failure)
   2  shutdown wedged past its deadline; the hard-exit watchdog fired
   3  run ended because the worker fenced (claim lost / clock jump / 412 storm)";

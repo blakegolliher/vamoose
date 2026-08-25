@@ -21,7 +21,11 @@ EnvironmentFile=-/etc/vamoose/workers/%i.env
 Restart=on-failure
 RestartPreventExitStatus=3
 RestartSec=10
-# Exit 0 means all shards terminal or an orderly coordinator stop.
+# Exit 0 means all shards terminal, an orderly coordinator stop, or a
+# `systemctl stop`: on SIGTERM the worker finishes the batch in hand,
+# releases its claim so a peer takes the shard at once, and exits 0.
+# TimeoutStopSec bounds a slow batch; past it systemd sends SIGKILL and
+# the shard is reclaimed after the lease instead.
 SuccessExitStatus=0
 KillSignal=SIGTERM
 TimeoutStopSec=300
