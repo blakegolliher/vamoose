@@ -249,47 +249,74 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Do
         }
     }
 
-    // 6. Layout keys. Missing layout is a WARN — operator can run
-    // `vamoose init` to materialize. Already-populated layout is the
-    // normal mid-run state.
-    let prefixes = [
+    // 6. Layout. What the bucket holds says where the migration is:
+    // nothing yet (prepare has not run), an index with no worker
+    // activity, or a run in flight. Only a lost manifest under a
+    // populated index is a problem. `failures/` is written only when
+    // a file fails, so an empty one is the good case, not a gap.
+    let mut present = Vec::new();
+    let mut layout_err = None;
+    for p in [
         layout::INDEX_PREFIX,
         layout::SHARDS_PREFIX,
         layout::PROGRESS_PREFIX,
-        layout::FAILURES_PREFIX,
-    ];
-    let mut missing = Vec::new();
-    for p in &prefixes {
+    ] {
         match s3.list(p).await {
-            Ok(entries) if entries.is_empty() => missing.push(*p),
+            Ok(entries) if !entries.is_empty() => present.push(p),
             Ok(_) => {}
             Err(e) => {
-                checks.record(Status::Fail, "s3 layout", format!("LIST {p}: {e}"));
-                missing.clear();
+                layout_err = Some(format!("LIST {p}: {e}"));
                 break;
             }
         }
     }
-    if missing.len() == prefixes.len() {
+    let manifest = match s3.head_object(layout::MANIFEST_KEY).await {
+        Ok(found) => found.is_some(),
+        Err(e) => {
+            layout_err.get_or_insert(format!("HEAD {}: {e}", layout::MANIFEST_KEY));
+            false
+        }
+    };
+    let has = |p: &str| present.contains(&p);
+    if let Some(err) = layout_err {
+        checks.record(Status::Fail, "s3 layout", err);
+    } else if !manifest && present.is_empty() {
+        checks.record(
+            Status::Pass,
+            "s3 layout",
+            "bucket has no run yet (`vamoose prepare` publishes the index and manifest)",
+        );
+    } else if !manifest {
         checks.record(
             Status::Warn,
             "s3 layout",
             format!(
-                "{} all empty (run `vamoose init` to create marker objects)",
-                missing.join(", "),
+                "{} present but no {} — an interrupted `vamoose prepare`? re-run it to finish",
+                present.join(", "),
+                layout::MANIFEST_KEY
             ),
         );
-    } else if !missing.is_empty() {
+    } else if !has(layout::INDEX_PREFIX) {
         checks.record(
-            Status::Warn,
+            Status::Fail,
             "s3 layout",
-            format!("partial layout: empty prefixes = {}", missing.join(", ")),
+            format!(
+                "{} present but {} is empty",
+                layout::MANIFEST_KEY,
+                layout::INDEX_PREFIX
+            ),
+        );
+    } else if !has(layout::SHARDS_PREFIX) && !has(layout::PROGRESS_PREFIX) {
+        checks.record(
+            Status::Pass,
+            "s3 layout",
+            "manifest and index published; no worker activity yet",
         );
     } else {
         checks.record(
             Status::Pass,
             "s3 layout",
-            "all expected prefixes have at least one object",
+            "manifest, index, and worker state present (run in flight or finished)",
         );
     }
 
