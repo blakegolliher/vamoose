@@ -36,6 +36,7 @@ pub mod errors;
 pub mod events;
 pub mod layout;
 pub mod lease;
+pub mod reconcile;
 pub mod runtime;
 pub mod schema;
 pub mod server;
