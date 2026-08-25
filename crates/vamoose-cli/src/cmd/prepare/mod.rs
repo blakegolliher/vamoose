@@ -136,11 +136,27 @@ fn default_run_id() -> String {
     format!("run-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"))
 }
 
-/// Which run id this invocation works on: explicit, else the latest
-/// unfinished one (unless `--fresh`), else a new one.
-fn choose_run_id(explicit: Option<&str>, fresh: bool, work_dir: &Path) -> Result<(String, bool)> {
+/// Which run id this invocation works on: explicit, else the run whose
+/// manifest the bucket already holds, else the latest unfinished local
+/// one (unless `--fresh`), else a new one.
+///
+/// One migration per bucket, so a published manifest *is* the run: a
+/// no-arg `prepare` on any node lands on it (already prepared, or
+/// verify/resume from local checkpoints) instead of minting an id that
+/// the manifest check below could only refuse. Found on the rig: after
+/// a finished run, `prepare` minted a fresh id, refused, and left
+/// `latest` pointing at that phantom so every later call refused too.
+fn choose_run_id(
+    explicit: Option<&str>,
+    fresh: bool,
+    published: Option<&str>,
+    work_dir: &Path,
+) -> Result<(String, bool)> {
     if let Some(id) = explicit {
         return Ok((id.to_string(), false));
+    }
+    if let Some(id) = published {
+        return Ok((id.to_string(), true));
     }
     if !fresh {
         if let Ok(latest) = std::fs::read_to_string(work_dir.join("latest")) {
@@ -173,10 +189,25 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
         tracing::warn!("vamoose prepare is not running as root; nfs-walker usually needs sudo");
     }
 
-    let (run_id, resumed) = choose_run_id(args.run_id.as_deref(), args.fresh, &settings.work_dir)?;
+    let s3 = migration_core::s3::S3Client::from_config(
+        &storage.endpoint,
+        &storage.region,
+        &storage.bucket,
+        storage.profile.as_deref(),
+        storage.verify_tls,
+    )
+    .await?;
+    let published = published_manifest(&s3).await?;
+    let (run_id, resumed) = choose_run_id(
+        args.run_id.as_deref(),
+        args.fresh,
+        published.as_ref().map(|m| m.run_id.as_str()),
+        &settings.work_dir,
+    )?;
     migration_coord::schema::JobId::new(run_id.clone())
         .map_err(|e| anyhow::anyhow!("run id {run_id:?} is not usable as a job id: {e}"))?;
     let run_dir = settings.work_dir.join(&run_id);
+    let created_now = !run_dir.exists();
     std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
 
     let spec = RunSpec {
@@ -194,11 +225,16 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
         },
     };
     let spec = ensure_run_spec(&run_dir.join("run.json"), spec)?;
-    write_json_atomic(
-        &settings.work_dir.join("latest.json"),
-        &serde_json::json!({"run_id": run_id}),
-    )?;
-    std::fs::write(settings.work_dir.join("latest"), format!("{run_id}\n"))?;
+    // `latest` is written only once the bucket agrees this is the run,
+    // so a refusal below never leaves a pointer at a dir nothing owns.
+    let remember_latest = || -> Result<()> {
+        write_json_atomic(
+            &settings.work_dir.join("latest.json"),
+            &serde_json::json!({"run_id": run_id}),
+        )?;
+        std::fs::write(settings.work_dir.join("latest"), format!("{run_id}\n"))?;
+        Ok(())
+    };
 
     println!(
         "vamoose prepare\n  run     {run_id}{}\n  source  {}\n  dest    {}\n  bucket  s3://{}\n  work    {}\n",
@@ -212,16 +248,9 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
     // Talk to the bucket before any long stage: bad credentials fail
     // here, and a bucket that already belongs to another run is refused
     // before a scan is wasted on it. One run per bucket.
-    let s3 = migration_core::s3::S3Client::from_config(
-        &storage.endpoint,
-        &storage.region,
-        &storage.bucket,
-        storage.profile.as_deref(),
-        storage.verify_tls,
-    )
-    .await?;
-    match published_manifest(&s3).await? {
+    match published {
         Some(existing) if existing.run_id == run_id => {
+            remember_latest()?;
             let done = read_json_opt::<upload::UploadCheckpoint>(&run_dir.join("upload.json"))?
                 .is_some_and(|cp| cp.complete);
             if done {
@@ -238,17 +267,24 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
                 "  bucket already holds this run's manifest; verifying the index against it\n"
             );
         }
-        Some(existing) => anyhow::bail!(
-            "bucket s3://{} already holds manifest.json for run {:?} ({} shards, {} rows). One \
-             migration per bucket: use a fresh bucket for a new run, or re-run with \
-             --run-id {:?} to verify or resume that one.",
-            spec.bucket,
-            existing.run_id,
-            existing.shards.len(),
-            existing.total_rows,
-            existing.run_id,
-        ),
-        None => {}
+        // Only reachable with an explicit --run-id that is not the
+        // bucket's; a no-arg call resolves to the published run above.
+        Some(existing) => {
+            if created_now {
+                let _ = std::fs::remove_dir_all(&run_dir);
+            }
+            anyhow::bail!(
+                "bucket s3://{} already holds manifest.json for run {:?} ({} shards, {} rows). \
+                 One migration per bucket: use a fresh bucket for a new run, or re-run with \
+                 --run-id {:?} (or no --run-id) to verify or resume that one.",
+                spec.bucket,
+                existing.run_id,
+                existing.shards.len(),
+                existing.total_rows,
+                existing.run_id,
+            )
+        }
+        None => remember_latest()?,
     }
 
     // ---- 1. scan ---------------------------------------------------
@@ -486,21 +522,27 @@ mod tests {
     fn choose_run_id_resumes_unfinished_latest_unless_fresh() {
         let dir = tempfile::tempdir().unwrap();
         // Nothing yet: a new id.
-        let (id, resumed) = choose_run_id(None, false, dir.path()).unwrap();
+        let (id, resumed) = choose_run_id(None, false, None, dir.path()).unwrap();
         assert!(id.starts_with("run-") && !resumed);
         // Explicit wins.
         assert_eq!(
-            choose_run_id(Some("mine"), false, dir.path()).unwrap(),
+            choose_run_id(Some("mine"), false, None, dir.path()).unwrap(),
             ("mine".to_string(), false)
+        );
+        // The bucket's manifest outranks everything but an explicit id,
+        // even --fresh: the id is taken, minting another only refuses.
+        assert_eq!(
+            choose_run_id(None, true, Some("run-pub"), dir.path()).unwrap(),
+            ("run-pub".to_string(), true)
         );
         // An unfinished latest is resumed…
         std::fs::write(dir.path().join("latest"), "run-x\n").unwrap();
         assert_eq!(
-            choose_run_id(None, false, dir.path()).unwrap(),
+            choose_run_id(None, false, None, dir.path()).unwrap(),
             ("run-x".to_string(), true)
         );
         // …unless --fresh.
-        let (id, resumed) = choose_run_id(None, true, dir.path()).unwrap();
+        let (id, resumed) = choose_run_id(None, true, None, dir.path()).unwrap();
         assert!(id != "run-x" && !resumed);
         // A finished latest is not resumed.
         let cp = upload::UploadCheckpoint {
@@ -527,7 +569,7 @@ mod tests {
             total_rows: 0,
         };
         write_json_atomic(&dir.path().join("run-x").join("upload.json"), &cp).unwrap();
-        let (id, resumed) = choose_run_id(None, false, dir.path()).unwrap();
+        let (id, resumed) = choose_run_id(None, false, None, dir.path()).unwrap();
         assert!(id != "run-x" && !resumed);
     }
 
