@@ -207,6 +207,112 @@ Exit code 3 from a worker means it fenced itself (it lost its claim
 authority — usually a clock jump or an S3 conflict). systemd deliberately
 does not restart it; read its journal, then `systemctl start` it again.
 
+## A second migration: another directory, a new bucket
+
+Nothing is scripted; this is the full sequence for a subtree. Substitute
+your hosts, exports, and paths. The package is already installed from
+step 1, so this is config + bucket + services + `prepare`.
+
+**Config** (on the coordinator host, then copy it to every host):
+
+```toml
+[run]
+bucket   = "vamoose-migration-2"                     # a NEW empty bucket; one migration per bucket
+endpoint = "https://s3.example.com"
+region   = "us-east-1"
+
+[mover]
+src_url = "nfs://source.example.com/source-export"
+dst_url = "nfs://destination.example.com/destination-export"
+
+[coord]
+url = "http://node1.example.com:8443"
+cluster_secret_env = "VAMOOSE_CLUSTER_SECRET"
+
+[shard]
+local_scratch = "/dev/shm/vamoose"
+
+[prepare]
+source_root = "/projects/beta"                       # path inside the source export
+dest_root   = "/beta"                                # path inside the destination export; workers create it
+work_dir    = "/var/lib/vamoose/prepare-beta"        # scan + in-flight shards only
+```
+
+**Bucket**, once:
+
+```bash
+aws --endpoint-url https://s3.example.com s3 mb s3://vamoose-migration-2
+aws --endpoint-url https://s3.example.com s3api get-bucket-versioning --bucket vamoose-migration-2   # prints nothing: versioning off
+```
+
+**On every host** — services read the config at start, so stop them first:
+
+```bash
+sudo systemctl stop vamoose-worker@main vamoose-coord
+sudo install -m 0644 /path/to/vamoose.toml /etc/vamoose/vamoose.toml
+cd / && sudo vamoose doctor          # PASS on every line; "dest_root absent (workers create it)" is fine
+```
+
+**Start** (coordinator on one host, a worker on each):
+
+```bash
+sudo systemctl start vamoose-coord vamoose-worker@main     # node1
+sudo systemctl start vamoose-worker@main                   # every other host
+```
+
+Workers log `no manifest.json in bucket yet; waiting for vamoose prepare`.
+
+**Prepare** — this starts the migration:
+
+```bash
+cd / && sudo vamoose prepare
+```
+
+It ends with `prepared: s3://vamoose-migration-2/manifest.json (N shards, R rows)`;
+workers pick it up within 15 seconds.
+
+**Watch; stop and start a worker if you want to see the hand-off:**
+
+```bash
+sudo vamoose tui                                   # or: sudo vamoose status --watch
+sudo systemctl stop vamoose-worker@main            # finishes the batch in hand, releases its shard, exits 0
+sudo journalctl -u vamoose-worker@main --since -5min -o cat | grep -E 'stop requested|claim released'
+sudo systemctl start vamoose-worker@main           # rejoins; a peer has already reclaimed the shard
+```
+
+**Confirm it ended:**
+
+```bash
+cd / && sudo vamoose status                        # Shards: N total | N completed … Terminal: all manifest shards completed
+sudo journalctl -u vamoose-coord --since -1h -o cat | grep 'job ended'
+systemctl show -p Result -p ExecMainStatus vamoose-worker@main    # Result=success, ExecMainStatus=0, on every host
+```
+
+**Verify the copy** (from a host with both exports mounted at `/mnt/source`
+and `/mnt/destination`):
+
+```bash
+sudo diff <(cd /mnt/source/projects/beta && find . | sort) <(cd /mnt/destination/beta && find . | sort) && echo same-tree
+sudo du -sb /mnt/source/projects/beta /mnt/destination/beta
+cd /mnt/source/projects/beta && sudo find . -type f | shuf -n 500 | while read f; do sudo cmp -s "$f" "/mnt/destination/beta/$f" || echo DIFF "$f"; done; echo cmp-done
+aws --endpoint-url https://s3.example.com s3 ls s3://vamoose-migration-2/failures/ | wc -l    # 0
+```
+
+Making a small test run last long enough to stop a worker mid-shard: a
+lone worker copies a few hundred small files per second, so a 10K-file
+tree is over in seconds. Two `[batch]` knobs slow it down — do not use
+them for a real migration:
+
+```toml
+[mover]
+nfs_connections = 2       # NFS connection pairs per worker (default 16)
+
+[batch]
+files_budget   = 100      # rows per batch; a stop finishes the batch in hand, so this bounds how far
+                          # past SIGTERM the worker copies (default 100000, or 8 GiB, whichever first)
+inflight_small = 4        # files under 1 MiB copied concurrently by one worker (default 256)
+```
+
 ## More than one worker per host
 
 Add a per-instance file and start a second instance; anything not set in
