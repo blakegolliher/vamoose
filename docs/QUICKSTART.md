@@ -141,6 +141,11 @@ Things worth knowing:
   uses an nfs-walker output you already have.
 - **One run per bucket.** A bucket that already holds a different
   manifest is refused; use a fresh bucket for a second migration.
+- **Scratch space.** `[prepare] work_dir` (default
+  `/var/lib/vamoose/prepare`) holds the scan and the converted index
+  until the upload finishes: budget about 250 bytes per file, so a
+  600-million-file tree needs ~150 GB there. Point `work_dir` at a volume
+  that size before running `prepare` on a large tree.
 - Runs as root because `nfs-walker` binds reserved NFS ports; it reads
   S3 credentials from `/etc/vamoose/vamoose.env` automatically.
 
