@@ -14,6 +14,13 @@ use migration_worker::config as wcfg;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Environment variable carrying the admin bearer token — set in
+/// `/etc/vamoose/vamoose.env` next to the S3 keys and the cluster
+/// secret. `vamoose coord` accepts it (in addition to any
+/// `admin_tokens_file`) and `vamoose tui` sends it, so the common
+/// single-token deployment needs no separate token file.
+pub(crate) const ADMIN_TOKEN_ENV: &str = "VAMOOSE_ADMIN_TOKEN";
+
 #[derive(Debug)]
 pub(crate) struct Config {
     source: SourceFormat,
@@ -104,6 +111,8 @@ pub(crate) struct CoordServer {
     pub(crate) no_tls: bool,
     /// Admin bearer tokens, one per line (`token<TAB>label`, label
     /// optional). The coord loads every line; the TUI uses the first.
+    /// Optional: the usual single token lives in `vamoose.env` as
+    /// [`ADMIN_TOKEN_ENV`], which both sides read without any file.
     #[serde(default)]
     pub(crate) admin_tokens_file: Option<PathBuf>,
     /// Permit dev mode (no tokens, no cluster secret) on a
@@ -915,8 +924,8 @@ mod tests {
             .expect("[coord] must yield server settings");
         assert!(server.no_tls);
         assert_eq!(
-            server.admin_tokens_file.as_deref(),
-            Some(std::path::Path::new("/etc/vamoose/admin-token"))
+            server.admin_tokens_file, None,
+            "the quickstart's admin token lives in vamoose.env, not a tokens file"
         );
         let client = config.coord().expect("[coord] must yield client wiring");
         assert_eq!(client.url, "http://node1.example.com:8443");

@@ -3,7 +3,7 @@
 This is the whole story for the common case: a full source export, an empty
 destination export, and a few Linux hosts that can reach both. No
 configuration management is needed; every host gets the same package and
-the same three files under `/etc/vamoose`.
+the same two files under `/etc/vamoose`.
 
 ## What you need
 
@@ -60,21 +60,25 @@ dst_url = "nfs://destination.example.com/destination-export"
 url = "http://node1.example.com:8443"                # the coordinator host
 ```
 
-Then the secrets file (mode 0600) and the TUI's admin token:
+Then the secrets file (mode 0600):
 
 ```bash
 sudo install -m 0600 /etc/vamoose/vamoose.env.example /etc/vamoose/vamoose.env
 sudo vi /etc/vamoose/vamoose.env        # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
                                         # VAMOOSE_CLUSTER_SECRET=$(openssl rand -hex 32)
-openssl rand -hex 32 | sudo tee /etc/vamoose/admin-token >/dev/null
-sudo chmod 0600 /etc/vamoose/admin-token
+                                        # VAMOOSE_ADMIN_TOKEN=$(openssl rand -hex 32)
 ```
 
-Copy the three files, unchanged, to the other hosts:
+`VAMOOSE_CLUSTER_SECRET` authenticates the workers to the coordinator;
+`VAMOOSE_ADMIN_TOKEN` authenticates `vamoose tui` (and anyone else
+driving the control API) to it. Both are just random strings that must be
+the same on every host.
+
+Copy the two files, unchanged, to the other hosts:
 
 ```bash
 for h in node2 node3; do
-  sudo scp -p /etc/vamoose/{vamoose.toml,vamoose.env,admin-token} root@$h:/etc/vamoose/
+  sudo scp -p /etc/vamoose/{vamoose.toml,vamoose.env} root@$h:/etc/vamoose/
 done
 ```
 
@@ -148,7 +152,8 @@ From any host:
 sudo vamoose tui
 ```
 
-The TUI reads `[coord] url` and the admin token from `/etc/vamoose` and
+The TUI reads `[coord] url` from `vamoose.toml` and the admin token from
+`vamoose.env` and
 shows files/s, throughput, bytes, errors, and every worker's state. `?`
 opens the key help; `:` opens the command palette.
 
