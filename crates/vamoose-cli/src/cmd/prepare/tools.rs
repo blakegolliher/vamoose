@@ -152,23 +152,11 @@ impl RewriteInvocation {
     }
 }
 
-/// Run an external stage with inherited stdio so its own progress
-/// output reaches the operator's terminal. Fails on a non-zero exit.
-pub(crate) async fn run_stage(label: &str, bin: &Path, args: &[OsString]) -> Result<()> {
-    let status = spawn_stage(label, bin, args)?
-        .wait()
-        .await
-        .with_context(|| format!("waiting for {label}"))?;
-    if !status.success() {
-        anyhow::bail!("{label} failed: {} exited with {status}", bin.display());
-    }
-    Ok(())
-}
-
-/// Start an external stage (inherited stdio) and hand back the child,
-/// for a caller that does work while it runs. The child is killed if
-/// dropped before it exits, so an interrupted `prepare` does not leave
-/// a rewrite running unattended.
+/// Start an external stage with inherited stdio, so its own progress
+/// output reaches the operator's terminal, and hand back the child:
+/// the caller polls it while relaying progress. The child is killed
+/// if dropped before it exits, so an interrupted `prepare` does not
+/// leave a scan or rewrite running unattended.
 pub(crate) fn spawn_stage(
     label: &str,
     bin: &Path,

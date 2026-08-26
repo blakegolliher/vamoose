@@ -100,6 +100,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/jobs/{id}/drain", post(command::drain))
         .route("/jobs/{id}/retry-failed", post(command::retry_failed))
         .route("/events", get(read::list_all_events))
+        .route("/prepare", get(read::get_prepare))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,

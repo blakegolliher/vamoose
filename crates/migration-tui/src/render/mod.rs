@@ -10,11 +10,13 @@ mod common;
 mod detail;
 mod jobs;
 mod modal;
+mod prepare;
 
 use chrome::{render_bottom_hints, render_top_banner};
 use detail::render_detail;
 use jobs::render_jobs_table;
 use modal::render_modal;
+use prepare::render_prepare_panel;
 
 use crate::state::{AppState, View};
 use chrono::{DateTime, Utc};
@@ -59,7 +61,13 @@ fn render_list(frame: &mut Frame, state: &AppState, now: DateTime<Utc>) {
         .split(frame.area());
 
     render_top_banner(frame, chunks[0], state, now);
-    render_jobs_table(frame, chunks[1], state, now);
+    if state.snapshot.jobs.is_empty() {
+        // Nothing to list yet: show what `vamoose prepare` is doing
+        // (or that nothing has started) instead of an empty table.
+        render_prepare_panel(frame, chunks[1], state, now);
+    } else {
+        render_jobs_table(frame, chunks[1], state, now);
+    }
     render_bottom_hints(frame, chunks[2], state, now);
 }
 

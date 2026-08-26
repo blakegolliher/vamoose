@@ -26,8 +26,14 @@
 //!
 //! The moment `manifest.json` lands in the bucket, enabled workers start
 //! claiming shards and the coordinator seeds the job from it.
+//!
+//! While it runs, `prepare/progress.json` in the bucket carries the
+//! current stage and counters ([`progress`]); the coord serves it to
+//! the TUI and `vamoose status` prints it, so the hour before the
+//! manifest exists is visible from any host.
 
 pub(crate) mod checkpoint;
+mod progress;
 pub(crate) mod tools;
 mod upload;
 
@@ -35,6 +41,7 @@ use crate::config::Config;
 use anyhow::{Context, Result};
 use checkpoint::{read_json_opt, sha256_file, utc_now, write_json_atomic};
 use clap::Args as ClapArgs;
+use migration_coord::schema::PreparePhase;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -100,6 +107,10 @@ struct ScanCheckpoint {
     walker_version: String,
     scan_url: String,
     finished_utc: String,
+    /// nfs-walker's JSON progress log for this scan, when it ran here;
+    /// re-read on resume so the reported counters are the real ones.
+    #[serde(default)]
+    progress_log: Option<PathBuf>,
 }
 
 /// Resolved settings for this invocation (flags over `[prepare]`).
@@ -299,17 +310,109 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
         None => remember_latest()?,
     }
 
+    // From here on the bucket carries this prepare's progress for the
+    // coord / TUI / `status`; a failure is recorded there too.
+    let mut reporter = progress::Reporter::new(
+        &s3,
+        &run_id,
+        tools::scan_url(&spec.source.url, &spec.source.root),
+        tools::scan_url(&spec.dest.url, &spec.dest.root),
+    );
+    let stages = Stages {
+        run_dir: &run_dir,
+        run_id: &run_id,
+        spec: &spec,
+        settings: &settings,
+        scan_dir_arg: args.scan_dir.as_deref(),
+        keep_index: args.keep_index,
+        storage: &storage,
+        copy_options: upload::CopyOptions {
+            preserve_owner: worker_cfg.copy.preserve_owner,
+            preserve_mode: worker_cfg.copy.preserve_mode,
+            preserve_times: worker_cfg.copy.preserve_times,
+            preserve_xattr: worker_cfg.copy.preserve_xattr,
+        },
+        s3: &s3,
+    };
+    let manifest = match run_stages(&stages, &mut reporter).await {
+        Ok(m) => m,
+        Err(e) => {
+            reporter.fail(format!("{e:#}")).await;
+            return Err(e);
+        }
+    };
+    reporter.set_phase(PreparePhase::Done).await;
+
+    println!(
+        "\nprepared: s3://{}/manifest.json ({} shards, {} rows)\n\
+         Workers claim shards from here on; watch with `vamoose tui` or `vamoose status --watch`.",
+        storage.bucket,
+        manifest.shards.len(),
+        manifest.total_rows
+    );
+    Ok(())
+}
+
+/// Everything the three stages need, resolved by [`run`].
+struct Stages<'a> {
+    run_dir: &'a Path,
+    run_id: &'a str,
+    spec: &'a RunSpec,
+    settings: &'a Settings,
+    scan_dir_arg: Option<&'a Path>,
+    keep_index: bool,
+    storage: &'a crate::config::StorageSettings,
+    copy_options: upload::CopyOptions,
+    s3: &'a migration_core::s3::S3Client,
+}
+
+/// Scan, rewrite + streaming upload, publish. Returns the manifest
+/// now in the bucket.
+async fn run_stages(
+    st: &Stages<'_>,
+    reporter: &mut progress::Reporter<'_>,
+) -> Result<migration_core::records::Manifest> {
+    let Stages {
+        run_dir,
+        run_id,
+        spec,
+        settings,
+        scan_dir_arg,
+        keep_index,
+        storage,
+        copy_options,
+        s3,
+    } = st;
+    let run_dir: &Path = run_dir;
+    let keep_index = *keep_index;
+
     // ---- 1. scan ---------------------------------------------------
     println!("[1/3] scan");
-    let scan = ensure_scan(&run_dir, &spec, &settings, args.scan_dir.as_deref()).await?;
+    reporter.set_phase(PreparePhase::Scan).await;
+    let scan = ensure_scan(run_dir, spec, settings, *scan_dir_arg, reporter).await?;
     println!(
         "  scan dir {}\n  walker   {}\n",
         scan.scan_dir.display(),
         scan.walker_version
     );
+    let shards_total = std::fs::read_dir(&scan.scan_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+                .count() as u64
+        })
+        .ok();
+    reporter
+        .update(|p| {
+            p.scan.complete = true;
+            p.index.shards_total = shards_total;
+        })
+        .await;
 
     // ---- 2. rewrite, uploading shards as they finish ---------------
     println!("[2/3] canonical rewrite + streaming upload");
+    reporter.set_phase(PreparePhase::Index).await;
     let rewrite_report = run_dir.join("rewrite.json");
     let rewrite = tools::RewriteInvocation {
         input: scan.scan_dir.clone(),
@@ -321,7 +424,7 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
     };
     std::fs::create_dir_all(&rewrite.output)?;
     let context = upload::UploadContext {
-        run_id: run_id.clone(),
+        run_id: run_id.to_string(),
         bucket: storage.bucket.clone(),
         endpoint: storage.endpoint.clone(),
         rewrite_identity: upload::rewrite_identity(
@@ -336,7 +439,7 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
     // or bucket is refused before any work, and the bucket's manifest
     // (if this run's) is read once.
     let mut session =
-        upload::UploadSession::open(&s3, context, &run_dir.join("upload.json")).await?;
+        upload::UploadSession::open(*s3, context, &run_dir.join("upload.json")).await?;
     let rewrite_bin = tools::find_sibling("mig-walker-rewrite")?;
     let mut child = tools::spawn_stage("mig-walker-rewrite", &rewrite_bin, &rewrite.args())?;
     let mut seen = std::collections::BTreeSet::new();
@@ -344,8 +447,17 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
     let status = loop {
         let exited = child.try_wait().context("waiting for mig-walker-rewrite")?;
         streamed +=
-            upload::stream_uploads(&mut session, &rewrite_report, &mut seen, args.keep_index)
-                .await?;
+            upload::stream_uploads(&mut session, &rewrite_report, &mut seen, keep_index).await?;
+        let rewritten = upload::reported_shard_count(&rewrite_report)?;
+        let uploaded = session.uploaded();
+        reporter
+            .update(|p| {
+                p.index.shards_rewritten = rewritten as u64;
+                p.index.shards_uploaded = uploaded.len() as u64;
+                p.index.rows_uploaded = uploaded.iter().map(|u| u.rows).sum();
+                p.index.bytes_uploaded = uploaded.iter().map(|u| u.bytes).sum();
+            })
+            .await;
         if let Some(status) = exited {
             break status;
         }
@@ -367,35 +479,19 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
 
     // ---- 3. remaining shards + manifest ----------------------------
     println!("[3/3] verify index and publish manifest");
+    reporter.set_phase(PreparePhase::Publish).await;
     for plan in &plans {
         if plan.path.is_file() || !session.is_recorded(plan) {
             session.ensure_shard(plan).await?;
         }
-        if !args.keep_index && plan.path.is_file() {
+        if !keep_index && plan.path.is_file() {
             std::fs::remove_file(&plan.path)
                 .with_context(|| format!("removing uploaded shard {}", plan.path.display()))?;
         }
     }
-    let manifest = session
-        .publish(
-            upload::CopyOptions {
-                preserve_owner: worker_cfg.copy.preserve_owner,
-                preserve_mode: worker_cfg.copy.preserve_mode,
-                preserve_times: worker_cfg.copy.preserve_times,
-                preserve_xattr: worker_cfg.copy.preserve_xattr,
-            },
-            &run_dir.join("manifest.json"),
-        )
-        .await?;
-
-    println!(
-        "\nprepared: s3://{}/manifest.json ({} shards, {} rows)\n\
-         Workers claim shards from here on; watch with `vamoose tui` or `vamoose status --watch`.",
-        storage.bucket,
-        manifest.shards.len(),
-        manifest.total_rows
-    );
-    Ok(())
+    session
+        .publish(*copy_options, &run_dir.join("manifest.json"))
+        .await
 }
 
 /// How often the rewrite report is re-read for newly finished shards
@@ -458,11 +554,19 @@ async fn ensure_scan(
     spec: &RunSpec,
     settings: &Settings,
     provided: Option<&Path>,
+    reporter: &mut progress::Reporter<'_>,
 ) -> Result<ScanCheckpoint> {
     let checkpoint_path = run_dir.join("scan.json");
     if let Some(cp) = read_json_opt::<ScanCheckpoint>(&checkpoint_path)? {
         if cp.complete && tools::resolve_scan_dir(&cp.scan_dir).is_ok() {
             println!("  scan checkpoint valid; not rescanning");
+            if let Some(scan) = cp
+                .progress_log
+                .as_deref()
+                .and_then(|log| progress::read_walker_progress(log).ok().flatten())
+            {
+                reporter.update(|p| p.scan = scan).await;
+            }
             return Ok(cp);
         }
     }
@@ -492,6 +596,7 @@ async fn ensure_scan(
         ),
     };
 
+    let mut progress_log = None;
     let scan_dir = match provided {
         Some(dir) => {
             // Absolute, so the checkpoint survives a resume from another
@@ -525,7 +630,26 @@ async fn ensure_scan(
                 invocation.output.display(),
                 invocation.workers
             );
-            tools::run_stage("nfs-walker", walker_bin, &invocation.args()).await?;
+            // Spawned rather than awaited so the walker's own progress
+            // log can be relayed to the bucket while it runs.
+            let mut child = tools::spawn_stage("nfs-walker", walker_bin, &invocation.args())?;
+            let status = loop {
+                let exited = child.try_wait().context("waiting for nfs-walker")?;
+                if let Some(scan) = progress::read_walker_progress(&invocation.log)? {
+                    reporter.update(|p| p.scan = scan).await;
+                }
+                if let Some(status) = exited {
+                    break status;
+                }
+                tokio::time::sleep(STREAM_POLL).await;
+            };
+            if !status.success() {
+                anyhow::bail!(
+                    "nfs-walker failed: {} exited with {status}",
+                    walker_bin.display()
+                );
+            }
+            progress_log = Some(invocation.log.clone());
             tools::resolve_scan_dir(&invocation.output)?
         }
     };
@@ -538,6 +662,7 @@ async fn ensure_scan(
         walker_version,
         scan_url,
         finished_utc: utc_now(),
+        progress_log,
     };
     write_json_atomic(&checkpoint_path, &cp)?;
     Ok(cp)

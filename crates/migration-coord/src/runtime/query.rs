@@ -37,6 +37,30 @@ impl CoordRuntime {
         self.inner.lock().await.state.clone()
     }
 
+    /// Remember the progress object `vamoose prepare` last wrote to
+    /// the bucket (`None` clears it), stamped with the coord's clock.
+    pub async fn set_prepare_progress(&self, progress: Option<crate::schema::PrepareProgress>) {
+        let now = self.clock.now();
+        self.inner.lock().await.prepare = progress.map(|p| (p, now));
+    }
+
+    /// `GET /prepare`: the latest prepare progress and its age by the
+    /// preparing host's own `updated_utc` against the coord's clock.
+    pub async fn prepare_view(&self) -> crate::schema::PrepareResponse {
+        let now = self.clock.now();
+        let guard = self.inner.lock().await;
+        match &guard.prepare {
+            Some((p, _read_at)) => crate::schema::PrepareResponse {
+                age_secs: Some((now - p.updated_utc).num_seconds().max(0) as u64),
+                progress: Some(p.clone()),
+            },
+            None => crate::schema::PrepareResponse {
+                progress: None,
+                age_secs: None,
+            },
+        }
+    }
+
     /// Highest seq ingested so far. `0` on a fresh bucket.
     pub async fn last_seq(&self) -> u64 {
         self.inner.lock().await.next_seq.saturating_sub(1)

@@ -28,6 +28,11 @@
 //! top-level `failures/`) to collect everything.
 
 pub const MANIFEST_KEY: &str = "manifest.json";
+/// `vamoose prepare` overwrites this with its progress (see
+/// `PrepareProgress` in the control protocol) so the coord, the TUI,
+/// and `vamoose status` can show the scan/index/publish stages before
+/// the manifest exists.
+pub const PREPARE_PROGRESS_KEY: &str = "prepare/progress.json";
 
 pub const INDEX_PREFIX: &str = "index/";
 pub const SHARDS_PREFIX: &str = "shards/";

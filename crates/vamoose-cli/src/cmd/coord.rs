@@ -459,6 +459,12 @@ async fn seed_job_from_manifest(
 ) -> Option<migration_coord::schema::JobId> {
     let mut announced_wait = false;
     loop {
+        // Whatever `vamoose prepare` last wrote about itself: the TUI
+        // and `status` show it while there is no job to show.
+        match load_prepare_progress(s3).await {
+            Ok(progress) => runtime.set_prepare_progress(progress).await,
+            Err(e) => tracing::warn!(error = %e, "coord: prepare progress read failed; ignoring"),
+        }
         let manifest = match load_manifest(s3).await {
             Ok(m) => m,
             Err(e) => {
@@ -505,6 +511,15 @@ async fn seed_job_from_manifest(
             _ = tokio::time::sleep(MANIFEST_POLL) => {}
         }
     }
+}
+
+async fn load_prepare_progress(
+    s3: &S3Client,
+) -> anyhow::Result<Option<migration_coord::schema::PrepareProgress>> {
+    let Some((body, _etag)) = s3.get(migration_core::layout::PREPARE_PROGRESS_KEY).await? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_slice(&body)?))
 }
 
 async fn load_manifest(s3: &S3Client) -> anyhow::Result<Option<migration_core::records::Manifest>> {

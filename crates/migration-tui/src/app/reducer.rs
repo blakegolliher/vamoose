@@ -25,6 +25,9 @@ pub enum Input {
     /// [`AppState::replace_snapshot`] so every state mutation stays
     /// on the reducer.
     Snapshot(Box<migration_control_protocol::schema::Snapshot>),
+    /// The coord's `GET /prepare` view, from the poll task that runs
+    /// while no job exists.
+    Prepare(Box<migration_control_protocol::schema::PrepareResponse>),
     /// Crossterm key event from the input task.
     Key(KeyEvent),
     /// Periodic render tick — used to advance elapsed-time labels
@@ -88,6 +91,10 @@ pub fn handle_input(state: &mut AppState, input: Input, now: DateTime<Utc>) -> A
             AppAction::Continue
         }
         Input::Key(key) => handle_key(state, key),
+        Input::Prepare(resp) => {
+            state.prepare = Some(*resp);
+            AppAction::Continue
+        }
         Input::Tick => AppAction::Continue,
     }
 }

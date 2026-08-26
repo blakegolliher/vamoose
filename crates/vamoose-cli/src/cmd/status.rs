@@ -7,6 +7,7 @@
 
 use crate::config::Config;
 use clap::Args as ClapArgs;
+use migration_coord::schema::{PrepareIndex, PreparePhase, PrepareProgress, PrepareScan};
 use migration_core::claim::ClaimStore;
 use migration_core::layout;
 use migration_core::records::{ClaimRecord, ClaimState, Manifest, ProgressRecord};
@@ -48,6 +49,39 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
 
     loop {
         let sample_time = Instant::now();
+        // Before the manifest exists there is no run to report on;
+        // show what `vamoose prepare` says about itself instead.
+        if store.get(layout::MANIFEST_KEY).await?.is_none() {
+            let prepare = store
+                .get(layout::PREPARE_PROGRESS_KEY)
+                .await?
+                .map(|(body, _)| serde_json::from_slice::<PrepareProgress>(&body))
+                .transpose()?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "when": chrono::Utc::now(),
+                        "manifest": false,
+                        "prepare": prepare,
+                    }))?
+                );
+            } else {
+                if args.watch {
+                    print!("\x1b[2J\x1b[H");
+                }
+                println!("{}", render_prepare(prepare.as_ref(), chrono::Utc::now()));
+            }
+            if !args.watch
+                || prepare
+                    .as_ref()
+                    .is_some_and(|p| p.phase == PreparePhase::Failed)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(args.interval)).await;
+            continue;
+        }
         let mut snap = collect_status(&store).await?;
         if let Some((previous_time, previous_rows)) = previous {
             let elapsed = sample_time.duration_since(previous_time).as_secs_f64();
@@ -306,6 +340,133 @@ async fn collect_status(store: &Arc<dyn ClaimStore>) -> anyhow::Result<Snapshot>
     })
 }
 
+/// The pre-manifest report: where `prepare` is, or that nothing has
+/// started.
+fn render_prepare(prepare: Option<&PrepareProgress>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let stamp = now.format("%Y-%m-%dT%H:%M:%SZ");
+    let Some(p) = prepare else {
+        return format!(
+            "vamoose status @ {stamp}\n\nNo run yet: the bucket has no manifest.json and no prepare \
+             in progress.\nStart one with `sudo vamoose prepare` on any host."
+        );
+    };
+    let age = (now - p.updated_utc).num_seconds().max(0);
+    let since_start = (now - p.started_utc).num_seconds().max(0);
+    let stale = if age > 60 && !matches!(p.phase, PreparePhase::Done | PreparePhase::Failed) {
+        format!(
+            " — NO UPDATE FOR {} (prepare may have died; re-run it to resume)",
+            hms(age as u64)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "vamoose status @ {stamp}\n\nPreparing {} on {} (pid {}) — {} elapsed, updated {}s ago{stale}\n  {}  ->  {}\n\n",
+        p.run_id,
+        p.host,
+        p.pid,
+        hms(since_start as u64),
+        age,
+        p.source,
+        p.dest
+    );
+    for line in prepare_steps(p) {
+        out.push_str("  ");
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if let Some(msg) = &p.message {
+        out.push_str(&format!("\n  {msg}\n"));
+    }
+    if p.phase == PreparePhase::Done {
+        out.push_str(
+            "\nmanifest.json is published; workers are claiming. Run again for the run's status.\n",
+        );
+    }
+    out
+}
+
+/// One line per stage, marked done / running / pending, shared by
+/// `status` and the TUI's wording.
+fn prepare_steps(p: &PrepareProgress) -> Vec<String> {
+    let mark = |stage: PreparePhase| -> &'static str {
+        let order = |ph: PreparePhase| match ph {
+            PreparePhase::Scan => 0,
+            PreparePhase::Index => 1,
+            PreparePhase::Publish => 2,
+            PreparePhase::Done => 3,
+            PreparePhase::Failed => 3,
+        };
+        match (order(stage), order(p.phase)) {
+            (s, c) if s < c => "[done]",
+            (s, c) if s == c && p.phase == PreparePhase::Failed => "[FAILED]",
+            (s, c) if s == c => "[ .. ]",
+            _ => "[    ]",
+        }
+    };
+    let PrepareScan {
+        files,
+        dirs,
+        errors,
+        rate_per_sec,
+        elapsed_secs,
+        ..
+    } = p.scan;
+    let PrepareIndex {
+        shards_total,
+        shards_rewritten,
+        shards_uploaded,
+        rows_uploaded,
+        bytes_uploaded,
+    } = p.index;
+    let total = shards_total.map_or("?".to_string(), |n| n.to_string());
+    vec![
+        format!(
+            "{} 1. scan     {} files, {} dirs, {} errors, {} ({}/s)",
+            mark(PreparePhase::Scan),
+            group(files),
+            group(dirs),
+            errors,
+            hms(elapsed_secs),
+            group(rate_per_sec)
+        ),
+        format!(
+            "{} 2. index    {shards_rewritten}/{total} shards rewritten, {shards_uploaded} uploaded ({} rows, {:.1} GB)",
+            mark(PreparePhase::Index),
+            group(rows_uploaded),
+            bytes_uploaded as f64 / 1e9
+        ),
+        format!(
+            "{} 3. publish  manifest.json (workers start claiming the moment it lands)",
+            mark(PreparePhase::Publish)
+        ),
+    ]
+}
+
+fn hms(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// `1234567` → `1,234,567`.
+fn group(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn render(snapshot: &Snapshot, interval: u64, watch: bool) {
     println!(
         "vamoose status @ {}\n",
@@ -465,6 +626,56 @@ mod tests {
     }
 
     /// Only the statuses the worker writes on its way out are
+    #[test]
+    fn prepare_report_marks_stages_and_flags_a_stale_object() {
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-08-26T00:02:17Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let p = PrepareProgress {
+            schema_version: 1,
+            run_id: "run-20260826T000217Z".into(),
+            host: "k8s-se-3".into(),
+            pid: 1,
+            source: "nfs://s/source".into(),
+            dest: "nfs://d/destination/v3".into(),
+            phase: PreparePhase::Index,
+            started_utc: t0,
+            updated_utc: t0 + chrono::Duration::seconds(3000),
+            scan: PrepareScan {
+                files: 603_266_804,
+                dirs: 4_208_101,
+                errors: 0,
+                rate_per_sec: 213_000,
+                elapsed_secs: 2829,
+                complete: true,
+            },
+            index: PrepareIndex {
+                shards_total: Some(320),
+                shards_rewritten: 129,
+                shards_uploaded: 128,
+                rows_uploaded: 246_528_665,
+                bytes_uploaded: 12_400_000_000,
+            },
+            message: None,
+        };
+        let text = render_prepare(Some(&p), t0 + chrono::Duration::seconds(3005));
+        assert!(text.contains("[done] 1. scan     603,266,804 files, 4,208,101 dirs, 0 errors, 47m09s (213,000/s)"), "{text}");
+        assert!(text.contains("[ .. ] 2. index    129/320 shards rewritten, 128 uploaded (246,528,665 rows, 12.4 GB)"), "{text}");
+        assert!(text.contains("[    ] 3. publish"), "{text}");
+        assert!(text.contains("updated 5s ago"), "{text}");
+        assert!(!text.contains("NO UPDATE"), "{text}");
+        // Nothing written for two minutes: say so.
+        let stale = render_prepare(Some(&p), t0 + chrono::Duration::seconds(3120));
+        assert!(stale.contains("NO UPDATE FOR 2m00s"), "{stale}");
+        // No object at all.
+        let none = render_prepare(None, t0);
+        assert!(none.contains("No run yet"), "{none}");
+        assert_eq!(group(0), "0");
+        assert_eq!(group(999), "999");
+        assert_eq!(group(1_000), "1,000");
+        assert_eq!(hms(3661), "1h01m");
+    }
+
     /// terminal; a worker that was `active` or `degraded` when it
     /// last wrote may really be gone and must still read as STALE.
     #[test]

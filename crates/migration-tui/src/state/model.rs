@@ -41,6 +41,9 @@ pub fn snapshot_from_rest(
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub snapshot: Snapshot,
+    /// What `vamoose prepare` last reported, via the coord's
+    /// `GET /prepare`; shown by the list view while there is no job.
+    pub prepare: Option<migration_control_protocol::schema::PrepareResponse>,
     pub connection: ConnectionStatus,
     pub ui: UiState,
     /// Highest seq observed from the SSE stream. Always >= the
@@ -101,6 +104,7 @@ impl AppState {
     pub fn empty(now: DateTime<Utc>) -> Self {
         Self {
             snapshot: Snapshot::empty(now),
+            prepare: None,
             connection: ConnectionStatus::Reconnecting {
                 since: now,
                 last_error: "not yet connected".into(),

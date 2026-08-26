@@ -1197,6 +1197,103 @@ pub enum AuditResult {
 // will see.
 // =============================================================================
 
+// =============================================================================
+// Prepare progress
+// =============================================================================
+
+/// Where `vamoose prepare` is, as published by the preparing host to
+/// `prepare/progress.json` in the bucket and served by the coord at
+/// `GET /prepare`. Not an event: it precedes the job (the manifest it
+/// ends with is what seeds the job) and is overwritten in place.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrepareProgress {
+    #[serde(default = "prepare_progress_schema_version")]
+    pub schema_version: u32,
+    pub run_id: String,
+    /// Host running `prepare`, and its pid, so a stale object from a
+    /// prepare that died is recognisable (`updated_utc` stops moving).
+    pub host: String,
+    pub pid: u32,
+    pub source: String,
+    pub dest: String,
+    pub phase: PreparePhase,
+    pub started_utc: DateTime<Utc>,
+    pub updated_utc: DateTime<Utc>,
+    pub scan: PrepareScan,
+    pub index: PrepareIndex,
+    /// Failure text when `phase == Failed`.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+pub const PREPARE_PROGRESS_SCHEMA_VERSION: u32 = 1;
+
+fn prepare_progress_schema_version() -> u32 {
+    PREPARE_PROGRESS_SCHEMA_VERSION
+}
+
+/// The three stages of `prepare`, then how it ended.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparePhase {
+    /// nfs-walker is scanning the source.
+    Scan,
+    /// The canonical rewrite is producing shards; each is uploaded as
+    /// it lands.
+    Index,
+    /// Verifying the index and creating `manifest.json`.
+    Publish,
+    /// `manifest.json` is in the bucket; the run has started.
+    Done,
+    /// `prepare` exited with an error; see `message`. Re-running it
+    /// resumes.
+    Failed,
+}
+
+impl PreparePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PreparePhase::Scan => "scan",
+            PreparePhase::Index => "index",
+            PreparePhase::Publish => "publish",
+            PreparePhase::Done => "done",
+            PreparePhase::Failed => "failed",
+        }
+    }
+}
+
+/// Scan counters, from nfs-walker's own progress log.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PrepareScan {
+    pub files: u64,
+    pub dirs: u64,
+    pub errors: u64,
+    pub rate_per_sec: u64,
+    pub elapsed_secs: u64,
+    pub complete: bool,
+}
+
+/// Index (rewrite + upload) counters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PrepareIndex {
+    /// Shards the scan produced (known once the scan is complete).
+    pub shards_total: Option<u64>,
+    pub shards_rewritten: u64,
+    pub shards_uploaded: u64,
+    /// Rows in the uploaded shards.
+    pub rows_uploaded: u64,
+    pub bytes_uploaded: u64,
+}
+
+/// `GET /prepare`: the latest progress the coord has read from the
+/// bucket, and how long ago the preparing host wrote it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrepareResponse {
+    pub progress: Option<PrepareProgress>,
+    /// Seconds since `progress.updated_utc`, by the coord's clock.
+    pub age_secs: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1623,6 +1720,46 @@ mod tests {
     /// Schema-version mismatch in either direction must be a hard
     /// signal — newer events refuse to load, older events get the
     /// default version applied silently.
+    #[test]
+    fn prepare_progress_round_trips_and_defaults_its_version() {
+        let p = PrepareProgress {
+            schema_version: PREPARE_PROGRESS_SCHEMA_VERSION,
+            run_id: "run-1".into(),
+            host: "h".into(),
+            pid: 7,
+            source: "nfs://s/x".into(),
+            dest: "nfs://d/y/v3".into(),
+            phase: PreparePhase::Index,
+            started_utc: at(),
+            updated_utc: at(),
+            scan: PrepareScan {
+                files: 10,
+                dirs: 2,
+                errors: 0,
+                rate_per_sec: 5,
+                elapsed_secs: 2,
+                complete: true,
+            },
+            index: PrepareIndex {
+                shards_total: Some(4),
+                shards_rewritten: 2,
+                shards_uploaded: 1,
+                rows_uploaded: 3,
+                bytes_uploaded: 100,
+            },
+            message: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"phase\":\"index\""), "{json}");
+        assert_eq!(serde_json::from_str::<PrepareProgress>(&json).unwrap(), p);
+        // An object written without the version field is version 1.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("schema_version");
+        let back: PrepareProgress = serde_json::from_value(v).unwrap();
+        assert_eq!(back.schema_version, 1);
+        assert_eq!(PreparePhase::Publish.as_str(), "publish");
+    }
+
     #[test]
     fn missing_schema_version_defaults_to_current() {
         let s = format!(
