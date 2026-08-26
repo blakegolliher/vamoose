@@ -27,6 +27,7 @@ use migration_control_protocol::schema::Job;
 use migration_control_protocol::schema::{CommandAccepted, ReasonBody};
 use migration_control_protocol::schema::{
     HealthzResponse, ListErrorsResponse, ListEventsResponse, ListJobsResponse, ListWorkersResponse,
+    PrepareResponse,
 };
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::pin::Pin;
@@ -138,6 +139,13 @@ impl Client {
     /// initial SSE resume cursor.
     pub async fn healthz(&self) -> Result<HealthzResponse> {
         let resp = self.http.get(self.url("/healthz")).send().await?;
+        check_status(resp).await?.json().await.map_err(Into::into)
+    }
+
+    /// `GET /prepare` — what `vamoose prepare` last reported to the
+    /// bucket, as read by the coord. Polled while there is no job.
+    pub async fn get_prepare(&self) -> Result<PrepareResponse> {
+        let resp = self.http.get(self.url("/prepare")).send().await?;
         check_status(resp).await?.json().await.map_err(Into::into)
     }
 

@@ -12,6 +12,8 @@
 //! - `GET /jobs/{id}/errors` → `{ buckets: [ErrorBucket, ...] }`
 //! - `GET /jobs/{id}/events?since=N&limit=M` →
 //!   `{ events: [EventEnvelope, ...], next_since: u64 }`
+//! - `GET /prepare` → `PrepareResponse` (`progress: null` until
+//!   `vamoose prepare` has written to the bucket)
 //!
 //! Unknown `{id}` → 404 with `ApiError { code: "job_not_found" }`.
 
@@ -19,7 +21,7 @@ use super::{ApiError, AppState};
 use crate::events::read_all_events_since;
 pub use crate::schema::{
     HealthzResponse, ListErrorsResponse, ListEventsParams, ListEventsResponse, ListJobsParams,
-    ListJobsResponse, ListWorkersResponse,
+    ListJobsResponse, ListWorkersResponse, PrepareResponse,
 };
 use crate::schema::{Job, JobId};
 use axum::extract::{Path, Query, State};
@@ -170,6 +172,17 @@ pub async fn list_all_events(
         events: all,
         next_since,
     }))
+}
+
+// =============================================================================
+// GET /prepare
+// =============================================================================
+
+/// The latest `prepare/progress.json` the coord read from the bucket
+/// while waiting for the manifest. Never 404s: `progress` is `null`
+/// when nothing has been prepared yet.
+pub async fn get_prepare(State(state): State<AppState>) -> Json<PrepareResponse> {
+    Json(state.runtime.prepare_view().await)
 }
 
 // =============================================================================

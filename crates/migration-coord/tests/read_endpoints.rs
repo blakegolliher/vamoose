@@ -375,3 +375,58 @@ async fn invalid_job_id_with_slash_in_path_404s_at_router() {
     // Could be 404 (no route) or 405; in either case it's not 200.
     assert_ne!(status, StatusCode::OK);
 }
+
+// =============================================================================
+// /prepare
+// =============================================================================
+
+/// `GET /prepare` never 404s: `progress` is null until `vamoose
+/// prepare` has written to the bucket, then it is what the coord last
+/// read, with its age by the coord's clock.
+#[tokio::test]
+async fn prepare_is_null_then_reflects_what_the_coord_read() {
+    let (router, rt) = fresh_app().await;
+    let (status, body) = get_json(router.clone(), "/prepare").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["progress"].is_null(), "{body}");
+    assert!(body["age_secs"].is_null(), "{body}");
+
+    let updated = chrono::DateTime::parse_from_rfc3339("2026-05-29T14:31:30Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    rt.set_prepare_progress(Some(migration_coord::schema::PrepareProgress {
+        schema_version: migration_coord::schema::PREPARE_PROGRESS_SCHEMA_VERSION,
+        run_id: "run-1".into(),
+        host: "node1".into(),
+        pid: 42,
+        source: "nfs://s/x".into(),
+        dest: "nfs://d/y/v3".into(),
+        phase: migration_coord::schema::PreparePhase::Index,
+        started_utc: updated,
+        updated_utc: updated,
+        scan: migration_coord::schema::PrepareScan {
+            files: 603_266_804,
+            dirs: 4_208_101,
+            errors: 0,
+            rate_per_sec: 213_000,
+            elapsed_secs: 2829,
+            complete: true,
+        },
+        index: migration_coord::schema::PrepareIndex {
+            shards_total: Some(320),
+            shards_rewritten: 129,
+            shards_uploaded: 128,
+            rows_uploaded: 246_528_665,
+            bytes_uploaded: 12_400_000_000,
+        },
+        message: None,
+    }))
+    .await;
+    let (status, body) = get_json(router, "/prepare").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["progress"]["phase"], "index");
+    assert_eq!(body["progress"]["scan"]["files"], 603_266_804u64);
+    assert_eq!(body["progress"]["index"]["shards_total"], 320);
+    // FixedClock is 14:32:00; the object says 14:31:30.
+    assert_eq!(body["age_secs"], 30);
+}

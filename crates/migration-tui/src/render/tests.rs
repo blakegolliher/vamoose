@@ -1204,3 +1204,114 @@ fn default_dark_theme_renders_at_least_one_colored_cell() {
         "dark theme must render at least one colored cell"
     );
 }
+
+// =============================================================================
+// Prepare panel (list view with no jobs)
+// =============================================================================
+
+fn prepare_state(
+    now: DateTime<Utc>,
+    phase: migration_control_protocol::schema::PreparePhase,
+) -> AppState {
+    use migration_control_protocol::schema::{
+        PrepareIndex, PrepareProgress, PrepareResponse, PrepareScan,
+    };
+    let mut s = AppState::empty(now);
+    s.prepare = Some(PrepareResponse {
+        progress: Some(PrepareProgress {
+            schema_version: 1,
+            run_id: "run-20260826T000217Z".into(),
+            host: "k8s-se-3".into(),
+            pid: 364254,
+            source: "nfs://s/source".into(),
+            dest: "nfs://d/destination/v3".into(),
+            phase,
+            started_utc: now - chrono::Duration::seconds(3000),
+            updated_utc: now - chrono::Duration::seconds(4),
+            scan: PrepareScan {
+                files: 603_266_804,
+                dirs: 4_208_101,
+                errors: 0,
+                rate_per_sec: 213_000,
+                elapsed_secs: 2829,
+                complete: true,
+            },
+            index: PrepareIndex {
+                shards_total: Some(320),
+                shards_rewritten: 129,
+                shards_uploaded: 128,
+                rows_uploaded: 246_528_665,
+                bytes_uploaded: 12_400_000_000,
+            },
+            message: None,
+        }),
+        age_secs: Some(4),
+    });
+    s
+}
+
+/// With no jobs and no prepare object the list view says how to start.
+#[test]
+fn empty_list_view_explains_how_to_start() {
+    let s = AppState::empty(at(1_000));
+    let text = buffer_text(&render_to_buffer(&s, at(1_000), 100, 12));
+    assert!(text.contains("No job yet."), "{text}");
+    assert!(text.contains("sudo vamoose prepare"), "{text}");
+}
+
+/// With no jobs and a prepare in its index stage, the list view shows
+/// the three stages with the scan done and the index running.
+#[test]
+fn empty_list_view_shows_prepare_progress() {
+    use migration_control_protocol::schema::PreparePhase;
+    let s = prepare_state(at(10_000), PreparePhase::Index);
+    let text = buffer_text(&render_to_buffer(&s, at(10_000), 110, 12));
+    assert!(
+        text.contains("Preparing run-20260826T000217Z on k8s-se-3 (pid 364254)"),
+        "{text}"
+    );
+    assert!(text.contains("✓ 1. scan"), "{text}");
+    assert!(
+        text.contains("▶ 2. index    129/320 shards rewritten · 128 uploaded"),
+        "{text}"
+    );
+    assert!(text.contains("  3. publish"), "{text}");
+    assert!(!text.contains("NO UPDATE"), "{text}");
+
+    // A failed prepare names the failure.
+    let mut f = prepare_state(at(10_000), PreparePhase::Failed);
+    f.prepare
+        .as_mut()
+        .unwrap()
+        .progress
+        .as_mut()
+        .unwrap()
+        .message = Some("mig-walker-rewrite failed: exit status 1".into());
+    let text = buffer_text(&render_to_buffer(&f, at(10_000), 110, 12));
+    assert!(text.contains("Prepare FAILED"), "{text}");
+    assert!(text.contains("mig-walker-rewrite failed"), "{text}");
+
+    // A stale object (no write for over a minute) is called out.
+    let mut stale = prepare_state(at(10_000), PreparePhase::Scan);
+    stale
+        .prepare
+        .as_mut()
+        .unwrap()
+        .progress
+        .as_mut()
+        .unwrap()
+        .updated_utc = at(10_000 - 120);
+    let text = buffer_text(&render_to_buffer(&stale, at(10_000), 120, 12));
+    assert!(text.contains("NO UPDATE"), "{text}");
+}
+
+/// Once a job exists the jobs table is back.
+#[test]
+fn list_view_prefers_jobs_over_prepare() {
+    use migration_control_protocol::schema::PreparePhase;
+    let mut s = prepare_state(at(10_000), PreparePhase::Done);
+    s.apply_envelope(&job_created_evt(1, 9_000, "alpha"));
+    let text = buffer_text(&render_to_buffer(&s, at(10_000), 100, 12));
+    assert!(text.contains("alpha"), "{text}");
+    assert!(!text.contains("Prepared run-"), "{text}");
+}

@@ -25,6 +25,7 @@ impl CoordRuntime {
         Ok(Self {
             inner: Arc::new(Mutex::new(RuntimeInner {
                 state: replay.state,
+                prepare: None,
                 next_seq: replay.next_seq,
                 writer,
                 lease,

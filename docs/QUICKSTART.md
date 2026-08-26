@@ -129,6 +129,13 @@ manifest lands, every enabled worker starts claiming shards and the
 coordinator seeds the job under the manifest's run id — there is no
 separate "start" command.
 
+While it runs it reports its stage and counters to the bucket
+(`prepare/progress.json`), so `sudo vamoose tui` and `vamoose status` on
+any host show the scan (files, rate, elapsed), the index (shards
+rewritten and uploaded), and the publish step before the job exists.
+A large tree spends an hour here; you do not have to watch the terminal
+`prepare` runs in.
+
 Things worth knowing:
 
 - **It resumes.** Interrupt it and run it again: a finished scan is not
@@ -163,15 +170,17 @@ sudo vamoose tui
 ```
 
 The TUI reads `[coord] url` from `vamoose.toml` and the admin token from
-`vamoose.env` and
-shows files/s, throughput, bytes, errors, and every worker's state. `?`
-opens the key help; `:` opens the command palette.
+`vamoose.env` and shows files/s, throughput, bytes, errors, and every
+worker's state. `?` opens the key help; `:` opens the command palette.
+Until `prepare` has published the manifest it shows `prepare`'s own
+progress instead (scan → index → publish), or how to start one.
 
 Without the coordinator (or from a host that only has S3 access):
 
 ```bash
 set -a; . /etc/vamoose/vamoose.env; set +a
 vamoose status --watch          # shard counts, MB/s, ETA, per-worker heartbeat age
+                                # (before the manifest exists: prepare's stage and counters)
 ```
 
 Logs are in the journal: `journalctl -u vamoose-worker@main -f` and

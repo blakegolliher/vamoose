@@ -592,6 +592,12 @@ impl<'a> UploadSession<'a> {
     }
 }
 
+/// How many shards the rewrite report lists right now (0 before the
+/// report exists) — the rewrite's own progress, for the operator.
+pub(crate) fn reported_shard_count(report_path: &Path) -> Result<usize> {
+    Ok(read_json_opt::<RewriteReport>(report_path)?.map_or(0, |r| r.shards.len()))
+}
+
 /// Upload the shards the rewrite report lists that this invocation has
 /// not handled yet, removing each local copy once the bucket holds it
 /// (unless `keep_local`). Safe to call while the rewrite is still

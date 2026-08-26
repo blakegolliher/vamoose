@@ -93,6 +93,16 @@ pub async fn run(client: Client, opts: RunOpts) -> anyhow::Result<()> {
         key_event_loop(key_tx, key_cancel).await;
     });
 
+    // Prepare-progress poll: while there is no job to show, ask the
+    // coord what `vamoose prepare` is doing.
+    let prep_client = client.clone();
+    let prep_state = Arc::clone(&app_state);
+    let prep_tx = tx.clone();
+    let prep_cancel = cancel.clone();
+    let prep_handle = tokio::spawn(async move {
+        prepare_poll_loop(prep_client, prep_state, prep_tx, prep_cancel).await;
+    });
+
     // Render tick.
     let mut tick = tokio::time::interval(opts.render_tick);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -155,5 +165,39 @@ pub async fn run(client: Client, opts: RunOpts) -> anyhow::Result<()> {
     drop(tx); // close the channel so any sender await wakes
     let _ = sse_handle.await;
     let _ = key_handle.await;
+    let _ = prep_handle.await;
     Ok(())
+}
+
+/// How often the list view re-asks the coord for `GET /prepare` while
+/// it has no job to show. The reporter writes every ~5 s; the coord
+/// re-reads the bucket every 15 s.
+const PREPARE_POLL: Duration = Duration::from_secs(5);
+
+/// Poll `GET /prepare` until cancelled, only while the snapshot has
+/// no jobs. A failed request (older coord without the route, a
+/// transport blip) keeps the last view rather than blanking it.
+async fn prepare_poll_loop(
+    client: Client,
+    state: Arc<Mutex<AppState>>,
+    tx: mpsc::Sender<Input>,
+    cancel: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(PREPARE_POLL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = interval.tick() => {}
+        }
+        if !state.lock().await.snapshot.jobs.is_empty() {
+            continue;
+        }
+        if let Ok(resp) = client.get_prepare().await {
+            if tx.send(Input::Prepare(Box::new(resp))).await.is_err() {
+                return;
+            }
+        }
+    }
 }

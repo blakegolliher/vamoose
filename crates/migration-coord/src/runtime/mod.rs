@@ -96,6 +96,13 @@ use tokio::sync::{broadcast, Mutex};
 
 struct RuntimeInner {
     state: Snapshot,
+    /// Latest `prepare/progress.json` read from the bucket, with the
+    /// coord-clock time it was read. Not an event and never persisted:
+    /// it describes the stage before the job exists.
+    prepare: Option<(
+        crate::schema::PrepareProgress,
+        chrono::DateTime<chrono::Utc>,
+    )>,
     next_seq: u64,
     writer: EventLogWriter,
     lease: LeaseHandle,
