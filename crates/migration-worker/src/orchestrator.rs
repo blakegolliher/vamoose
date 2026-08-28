@@ -53,7 +53,7 @@ use migration_core::claim::{
     ReclaimOutcome,
 };
 use migration_core::errors::Error as CoreError;
-use migration_core::fence::Fence;
+use migration_core::fence::{Fence, FenceCause};
 use migration_core::layout;
 use migration_core::overlap;
 use migration_core::records::{
@@ -1025,7 +1025,7 @@ pub async fn run_with_stop(
     // the unconditional `fence.trip()` below erases the distinction
     // between "fenced mid-run" and "fence tripped as part of a normal
     // shutdown".
-    let run_outcome = run_outcome_for(fence.is_valid(), stop.is_cancelled());
+    let run_outcome = run_outcome_for(fence.is_valid(), fence.cause(), stop.is_cancelled());
     tracing::debug!(target: "shutdown", ?run_outcome, "section 7 entered");
     {
         tracing::debug!(target: "shutdown", "acquiring progress write lock");
@@ -1136,16 +1136,30 @@ pub enum RunOutcome {
     /// A process stop (SIGTERM / SIGINT) ended the run: no fence
     /// trip, the shard in hand (if any) was released for a peer.
     Interrupted,
-    /// Worker self-fenced mid-run (claim lost / heartbeat fence).
+    /// Worker self-fenced mid-run because its claim was taken (or its
+    /// clock cannot be trusted). Needs an operator.
     Fenced,
+    /// Worker self-fenced mid-run because the store was unreachable
+    /// for a full lease window ([`FenceCause::StoreUnreachable`]).
+    /// The shard was surrendered defensively; once the store is back
+    /// a fresh worker simply rejoins, so this is restartable.
+    StoreUnreachable,
 }
 
-/// Section-7 outcome from the two facts known there. A fence trip
-/// wins over a stop request: a worker that was fenced while stopping
-/// still needs the operator to notice.
-fn run_outcome_for(fence_valid: bool, stop_requested: bool) -> RunOutcome {
+/// Section-7 outcome from the facts known there. A fence trip wins
+/// over a stop request: a worker that was fenced while stopping still
+/// needs the operator to notice — unless the fence was the defensive
+/// store-unreachable kind, which is a restart, not an alert.
+fn run_outcome_for(
+    fence_valid: bool,
+    fence_cause: Option<FenceCause>,
+    stop_requested: bool,
+) -> RunOutcome {
     if !fence_valid {
-        RunOutcome::Fenced
+        match fence_cause {
+            Some(FenceCause::StoreUnreachable) => RunOutcome::StoreUnreachable,
+            _ => RunOutcome::Fenced,
+        }
     } else if stop_requested {
         RunOutcome::Interrupted
     } else {
@@ -1246,10 +1260,19 @@ async fn release_claim_by_owner(store: &dyn ClaimStore, shard: &str, held_etag: 
 /// was asked for, the shard was handed back, nothing needs an alert
 /// — and the unit's `SuccessExitStatus=0` / `Restart=on-failure`
 /// pairing relies on it.
+///
+/// A store-unreachable fence exits 4: the worker gave its shard up
+/// because it could not reach S3 for a full lease window, not because
+/// anyone took it. The unit restarts on 4 (only 3 is in
+/// `RestartPreventExitStatus`), so a network outage costs one lease
+/// window plus `RestartSec` per worker instead of the rest of the
+/// migration — the 600M retest lost two of three workers for 18 h to
+/// exactly that.
 pub fn exit_code_for_outcome(outcome: RunOutcome) -> i32 {
     match outcome {
         RunOutcome::Clean | RunOutcome::Interrupted => 0,
         RunOutcome::Fenced => 3,
+        RunOutcome::StoreUnreachable => 4,
     }
 }
 
@@ -1266,7 +1289,10 @@ pub fn exit_code_for_outcome(outcome: RunOutcome) -> i32 {
 /// stderr line, not the code.
 pub(crate) fn watchdog_exit_code(outcome: RunOutcome) -> i32 {
     match outcome {
-        RunOutcome::Clean | RunOutcome::Interrupted | RunOutcome::Fenced => 2,
+        RunOutcome::Clean
+        | RunOutcome::Interrupted
+        | RunOutcome::Fenced
+        | RunOutcome::StoreUnreachable => 2,
     }
 }
 
@@ -3018,6 +3044,7 @@ mod flush_sinks_tests {
         // supervisor signal for "shutdown wedged; watchdog fired"; the
         // run outcome is carried in the watchdog's stderr line instead.
         assert_eq!(watchdog_exit_code(RunOutcome::Fenced), 2);
+        assert_eq!(watchdog_exit_code(RunOutcome::StoreUnreachable), 2);
     }
 
     // ------------------------------------------------------------------
@@ -3049,6 +3076,7 @@ mod flush_sinks_tests {
             RunOutcome::Clean,
             RunOutcome::Interrupted,
             RunOutcome::Fenced,
+            RunOutcome::StoreUnreachable,
         ] {
             let code = exit_code_for_outcome(outcome);
             assert_ne!(code, 1, "1 stays reserved for run errors: {outcome:?}");
@@ -3080,11 +3108,37 @@ mod flush_sinks_tests {
     /// `Interrupted`, and neither is `Clean`.
     #[test]
     fn run_outcome_prefers_fence_over_stop() {
-        use super::{run_outcome_for, RunOutcome};
-        assert_eq!(run_outcome_for(true, false), RunOutcome::Clean);
-        assert_eq!(run_outcome_for(true, true), RunOutcome::Interrupted);
-        assert_eq!(run_outcome_for(false, false), RunOutcome::Fenced);
-        assert_eq!(run_outcome_for(false, true), RunOutcome::Fenced);
+        use super::{run_outcome_for, FenceCause, RunOutcome};
+        assert_eq!(run_outcome_for(true, None, false), RunOutcome::Clean);
+        assert_eq!(run_outcome_for(true, None, true), RunOutcome::Interrupted);
+        let lost = Some(FenceCause::OwnershipLost);
+        assert_eq!(run_outcome_for(false, lost, false), RunOutcome::Fenced);
+        assert_eq!(run_outcome_for(false, lost, true), RunOutcome::Fenced);
+        // A tripped fence with no recorded cause is still a fence.
+        assert_eq!(run_outcome_for(false, None, false), RunOutcome::Fenced);
+    }
+
+    /// A fence tripped because the store was unreachable is its own
+    /// outcome with its own exit code (4): restartable, unlike a
+    /// genuinely lost claim (3), and still never 0.
+    #[test]
+    fn store_unreachable_fence_is_restartable_not_an_alert() {
+        use super::{exit_code_for_outcome, run_outcome_for, FenceCause, RunOutcome};
+        let gone = Some(FenceCause::StoreUnreachable);
+        assert_eq!(
+            run_outcome_for(false, gone, false),
+            RunOutcome::StoreUnreachable
+        );
+        assert_eq!(
+            run_outcome_for(false, gone, true),
+            RunOutcome::StoreUnreachable
+        );
+        assert_eq!(
+            run_outcome_for(false, Some(FenceCause::ClockJump), false),
+            RunOutcome::Fenced
+        );
+        assert_eq!(exit_code_for_outcome(RunOutcome::StoreUnreachable), 4);
+        assert_ne!(exit_code_for_outcome(RunOutcome::StoreUnreachable), 3);
     }
 
     /// The idle / backpressure sleeps return as soon as a stop is

@@ -1315,3 +1315,34 @@ fn list_view_prefers_jobs_over_prepare() {
     assert!(text.contains("alpha"), "{text}");
     assert!(!text.contains("Prepared run-"), "{text}");
 }
+
+/// The headline worker count is the connected workers: a worker the
+/// coord has marked Disconnected (liveness sweep, /leave, or
+/// supersede) drops out of the count but stays listed in the tab.
+#[test]
+fn overview_counts_connected_workers_not_history() {
+    let mut s = AppState::empty(at(0));
+    s.mark_connected(at(0));
+    s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+    let live = WorkerId::new();
+    let gone = WorkerId::new();
+    s.apply_envelope(&worker_joined_evt(2, 0, "alpha", live, "host-1"));
+    s.apply_envelope(&worker_joined_evt(3, 0, "alpha", gone, "host-2"));
+    s.apply_envelope(&env(
+        4,
+        0,
+        EventKind::WorkerLeft {
+            worker_id: gone,
+            reason: "no heartbeat for 100s".into(),
+        },
+    ));
+    assert_eq!(s.connected_worker_count(&jid("alpha")), 1);
+    assert_eq!(s.workers_for_job(&jid("alpha")).len(), 2);
+
+    enter_detail(&mut s, "alpha", Tab::Overview);
+    let text = buffer_text(&render_to_buffer(&s, at(0), 120, 30));
+    assert!(
+        text.contains("1 connected of 2 assigned"),
+        "expected connected/assigned count in:\n{text}"
+    );
+}

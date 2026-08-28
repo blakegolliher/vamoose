@@ -46,7 +46,7 @@
 use migration_control_protocol::schema::{EventEnvelope, JobId, WorkerId};
 use migration_control_protocol::schema::{
     EventsBatchBody, EventsBatchResponse, FenceBody, FenceResponse, HeartbeatBody,
-    HeartbeatResponse, RegisterBody, RegisterResponse, WorkerEventEntry,
+    HeartbeatResponse, LeaveBody, LeaveResponse, RegisterBody, RegisterResponse, WorkerEventEntry,
 };
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Client;
@@ -469,6 +469,26 @@ impl CoordClient {
         check_status(resp)
             .await?
             .json::<FenceResponse>()
+            .await
+            .map_err(Into::into)
+    }
+}
+
+impl CoordClient {
+    /// `POST /workers/{id}/leave`. Best-effort announcement of an
+    /// orderly exit so the coord marks us Disconnected now rather
+    /// than after its liveness timeout.
+    pub async fn leave(&self, worker_id: WorkerId, reason: String) -> Result<LeaveResponse> {
+        let body = LeaveBody { reason };
+        let resp = self
+            .http
+            .post(self.url(&format!("/workers/{worker_id}/leave")))
+            .json(&body)
+            .send()
+            .await?;
+        check_status(resp)
+            .await?
+            .json::<LeaveResponse>()
             .await
             .map_err(Into::into)
     }

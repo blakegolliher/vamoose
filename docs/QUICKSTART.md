@@ -212,9 +212,13 @@ Workers exit 0 when every shard in the manifest is terminal, and
 failures, if any, are JSONL objects under the bucket's `failures/` prefix
 and are counted in both the TUI and `status`.
 
-Exit code 3 from a worker means it fenced itself (it lost its claim
-authority — usually a clock jump or an S3 conflict). systemd deliberately
-does not restart it; read its journal, then `systemctl start` it again.
+Exit code 3 from a worker means it fenced itself because a peer took its
+claim or its clock jumped. systemd deliberately does not restart it; read
+its journal, then `systemctl start` it again. Exit code 4 means the worker
+could not reach S3 for a full lease window (a network or DNS outage) and
+gave its shard up defensively; systemd restarts it after `RestartSec`, and
+it rejoins on its own once the store is back. A peer reclaims the
+surrendered shard either way.
 
 ## A second migration: another directory, a new bucket
 

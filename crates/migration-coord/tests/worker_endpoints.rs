@@ -1698,3 +1698,127 @@ async fn replay_reconstructs_hwm_from_from_worker() {
         "durable log must be identical to the single pre-crash send",
     );
 }
+
+// =============================================================================
+// Worker liveness (600M retest follow-up): dead workers must stop
+// reading as Copying. Three paths: supersede on re-register from the
+// same machine (the default host id is `<hostname>-<pid>`, so the
+// literal host comparison never matched), an explicit /leave on
+// orderly exit, and the heartbeat-age sweep for everything else.
+// =============================================================================
+
+#[tokio::test]
+async fn reregister_from_same_machine_with_pid_suffixed_host_id_supersedes() {
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+
+    let (s1, b1) = post_json(
+        app.clone(),
+        "/workers/register",
+        serde_json::json!({
+            "job_id": "bobby",
+            "host": "k8s-se-2-1203425",
+            "pid": 1203425,
+            "start_time": "2026-05-29T14:00:00Z",
+            "version": "0.6.0",
+        }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    let first = WorkerId(Uuid::parse_str(b1["worker_id"].as_str().unwrap()).unwrap());
+
+    // The restarted worker on the same node carries its own pid in
+    // the host id.
+    let (s2, b2) = post_json(
+        app,
+        "/workers/register",
+        serde_json::json!({
+            "job_id": "bobby",
+            "host": "k8s-se-2-2620823",
+            "pid": 2620823,
+            "start_time": "2026-05-29T14:05:00Z",
+            "version": "0.6.0",
+        }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    let second = WorkerId(Uuid::parse_str(b2["worker_id"].as_str().unwrap()).unwrap());
+    let superseded: Vec<String> = b2["superseded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(superseded, vec![first.to_string()]);
+
+    let snap = rt.state().await;
+    assert_eq!(snap.workers[&first].state, WorkerState::Disconnected);
+    assert_eq!(
+        snap.workers[&first].last_error.as_deref(),
+        Some("reregister")
+    );
+    assert_eq!(snap.workers[&second].state, WorkerState::Idle);
+}
+
+#[tokio::test]
+async fn leave_marks_worker_disconnected_and_404s_for_unknown_worker() {
+    let (app, rt, _store) = fresh_app().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+    let wid = register_one(&app, "bobby").await;
+
+    let (status, body) = post_json(
+        app.clone(),
+        &format!("/workers/{wid}/leave"),
+        serde_json::json!({ "reason": "worker exiting" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["seq"].as_u64().unwrap() > 0);
+
+    let snap = rt.state().await;
+    let w = &snap.workers[&wid];
+    assert_eq!(w.state, WorkerState::Disconnected);
+    assert_eq!(w.last_error.as_deref(), Some("worker exiting"));
+
+    let (status, _) = post_json(
+        app,
+        &format!("/workers/{}/leave", Uuid::new_v4()),
+        serde_json::json!({ "reason": "worker exiting" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn liveness_sweep_disconnects_only_workers_past_the_timeout() {
+    let (app, rt, _mem, clock) = fresh_app_with_clock().await;
+    rt.ingest(job_created("bobby")).await.unwrap();
+
+    // `quiet` registers, then goes silent; `chatty` registers a
+    // minute later (registration counts as a heartbeat).
+    let quiet = register_with_host(&app, "bobby", "quiet-node").await;
+    clock.advance(chrono::Duration::seconds(60));
+    let chatty = register_with_host(&app, "bobby", "chatty-node").await;
+    clock.advance(chrono::Duration::seconds(40));
+
+    let swept = rt
+        .sweep_stale_workers(chrono::Duration::seconds(90))
+        .await
+        .unwrap();
+    assert_eq!(swept, vec![quiet]);
+
+    let snap = rt.state().await;
+    assert_eq!(snap.workers[&quiet].state, WorkerState::Disconnected);
+    assert_eq!(
+        snap.workers[&quiet].last_error.as_deref(),
+        Some("no heartbeat for 100s")
+    );
+    assert_eq!(snap.workers[&chatty].state, WorkerState::Idle);
+
+    // Already-Disconnected workers are not swept again.
+    let again = rt
+        .sweep_stale_workers(chrono::Duration::seconds(90))
+        .await
+        .unwrap();
+    assert!(again.is_empty());
+}

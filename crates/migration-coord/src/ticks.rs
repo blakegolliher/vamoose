@@ -25,7 +25,14 @@
 //!   keeps a long-tail per-job chunk from sitting in memory past
 //!   the documented `max_chunk_age`.
 //!
-//! All three are joined under one [`CancellationToken`] so a
+//! - **Worker liveness** ([`liveness_loop`]) — on
+//!   `cfg.worker_liveness_check_interval` calls
+//!   [`CoordRuntime::sweep_stale_workers`] with
+//!   `cfg.worker_liveness_timeout`, so a worker that stopped
+//!   heartbeating without saying goodbye reads as `Disconnected`
+//!   instead of `Copying` forever.
+//!
+//! All loops are joined under one [`CancellationToken`] so a
 //! shutdown request from the caller (or a `LeaseLost` from the
 //! lease loop) cleanly stops every loop.
 
@@ -48,6 +55,13 @@ pub struct TickerConfig {
     pub snapshot_events: u64,
     pub history_keep: usize,
     pub flush_check_interval: Duration,
+    /// How often the liveness sweep runs.
+    pub worker_liveness_check_interval: Duration,
+    /// A worker with no heartbeat for longer than this is marked
+    /// Disconnected. Workers heartbeat every `coord_heartbeat_sec`
+    /// (default 5 s) and back off to 30 s while the coord is
+    /// unreachable, so 90 s is three missed backed-off ticks.
+    pub worker_liveness_timeout: Duration,
     /// Inherited from the runtime — the lease loop needs the same
     /// TTL the runtime opened the lease with.
     pub lease: LeaseConfig,
@@ -69,6 +83,8 @@ impl TickerConfig {
             // memory scan against a 5-minute threshold — ticking it
             // 60× more often costs microseconds.
             flush_check_interval: Duration::from_secs(1),
+            worker_liveness_check_interval: Duration::from_secs(10),
+            worker_liveness_timeout: Duration::from_secs(90),
             lease: LeaseConfig::default_for_prod(),
         }
     }
@@ -84,15 +100,50 @@ pub async fn run_all(
 ) -> Result<()> {
     let lease_handle = tokio::spawn(lease_loop(rt.clone(), cfg.clone(), shutdown.clone()));
     let snapshot_handle = tokio::spawn(snapshot_loop(rt.clone(), cfg.clone(), shutdown.clone()));
-    let flush_handle = tokio::spawn(flush_aged_loop(rt, cfg, shutdown));
+    let flush_handle = tokio::spawn(flush_aged_loop(rt.clone(), cfg.clone(), shutdown.clone()));
+    let liveness_handle = tokio::spawn(liveness_loop(rt, cfg, shutdown));
 
     // Join everything and surface the first error.
-    let (lease_res, snapshot_res, flush_res) =
-        tokio::join!(lease_handle, snapshot_handle, flush_handle);
+    let (lease_res, snapshot_res, flush_res, liveness_res) =
+        tokio::join!(lease_handle, snapshot_handle, flush_handle, liveness_handle);
     lease_res.map_err(|e| Error::Other(anyhow::anyhow!("lease tick panic: {e}")))??;
     snapshot_res.map_err(|e| Error::Other(anyhow::anyhow!("snapshot tick panic: {e}")))??;
     flush_res.map_err(|e| Error::Other(anyhow::anyhow!("flush tick panic: {e}")))??;
+    liveness_res.map_err(|e| Error::Other(anyhow::anyhow!("liveness tick panic: {e}")))??;
     Ok(())
+}
+
+/// Worker liveness loop. Each tick sweeps workers whose last
+/// heartbeat is older than `cfg.worker_liveness_timeout`. A
+/// `LeaseLost` from the sweep ends the loop (the lease loop is
+/// already shutting everything down); any other error is logged and
+/// retried next tick.
+pub async fn liveness_loop(
+    rt: CoordRuntime,
+    cfg: TickerConfig,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let mut tick = interval(cfg.worker_liveness_check_interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick.tick().await;
+    let timeout = chrono::Duration::from_std(cfg.worker_liveness_timeout)
+        .unwrap_or_else(|_| chrono::Duration::seconds(90));
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = tick.tick() => {
+                match rt.sweep_stale_workers(timeout).await {
+                    Ok(swept) if !swept.is_empty() => {
+                        tracing::info!(count = swept.len(), "liveness sweep marked workers Disconnected");
+                    }
+                    Ok(_) => {}
+                    Err(Error::LeaseLost) => return Ok(()),
+                    Err(e) => tracing::warn!(error = %e, "liveness sweep failed; retry next tick"),
+                }
+            }
+        }
+    }
 }
 
 /// Lease refresh loop. On `LeaseLost`, marks the runtime and
@@ -296,6 +347,8 @@ mod tests {
             snapshot_events: 1000,                        // disabled by default
             history_keep: 3,
             flush_check_interval: Duration::from_millis(20),
+            worker_liveness_check_interval: Duration::from_millis(20),
+            worker_liveness_timeout: Duration::from_secs(90),
             lease: LeaseConfig {
                 ttl: chrono::Duration::seconds(30),
                 grace: chrono::Duration::seconds(5),

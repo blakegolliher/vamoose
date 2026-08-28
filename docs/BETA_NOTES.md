@@ -61,9 +61,18 @@ Run vamoose on a trusted network for beta. Concretely:
 
 - **Worker exit codes** (also in `vamoose worker --help`): `0` clean
   completion; `1` error; `2` watchdog wedge (shutdown hung); `3`
-  **fenced** — the run ended because the worker lost or ceded its
-  claim authority. Supervisors: treat 3 as alert/investigate, not
-  restart-into-the-same-condition.
+  **fenced** — the run ended because a peer took the worker's claim
+  or its clock jumped. Supervisors: treat 3 as alert/investigate, not
+  restart-into-the-same-condition. `4` **store unreachable** — the
+  worker could not confirm its claim for a full lease window (S3
+  endpoint, DNS, or network outage), surrendered the shard, and
+  should simply be restarted; the shipped unit does so.
+- **Worker liveness**: the coord marks a worker `Disconnected` when it
+  has not heartbeated for 90 s, when a replacement registers from the
+  same machine, or when the worker announces an orderly exit
+  (`POST /workers/{id}/leave`). The TUI's headline worker count is the
+  connected workers; the Workers tab still lists the disconnected
+  ones with their last state.
 - **Durability**: file data is COMMITted (whole-file NFS COMMIT)
   before the rename publishes it, on both copy paths; every data-
   plane RPC carries a deadline (`[mover] rpc_timeout_ms`, default

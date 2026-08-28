@@ -328,6 +328,53 @@ impl CoordRuntime {
         }
     }
 
+    /// Is this WorkerId known to the coord at all (any state)?
+    pub async fn worker_is_registered(&self, worker_id: &crate::schema::WorkerId) -> bool {
+        let guard = self.inner.lock().await;
+        guard.state.workers.contains_key(worker_id)
+    }
+
+    /// Liveness sweep: every worker still in a live state whose last
+    /// heartbeat is older than `timeout` gets a
+    /// `WorkerLeft{reason: "no heartbeat for Ns"}`. Heartbeats are
+    /// the only liveness signal — a worker that died hard (SIGKILL,
+    /// node loss, self-fence that could not reach the coord) never
+    /// says goodbye, and before this sweep it stayed `Copying` in
+    /// every view forever. Returns the ids swept.
+    pub async fn sweep_stale_workers(
+        &self,
+        timeout: chrono::Duration,
+    ) -> Result<Vec<crate::schema::WorkerId>> {
+        let now = self.clock.now();
+        let stale: Vec<(crate::schema::WorkerId, i64)> = {
+            let guard = self.inner.lock().await;
+            if guard.lease_lost {
+                return Err(Error::LeaseLost);
+            }
+            guard
+                .state
+                .workers
+                .values()
+                .filter(|w| w.state != crate::schema::WorkerState::Disconnected)
+                .filter_map(|w| {
+                    let age = now.signed_duration_since(w.last_heartbeat);
+                    (age > timeout).then_some((w.id, age.num_seconds()))
+                })
+                .collect()
+        };
+        let mut swept = Vec::with_capacity(stale.len());
+        for (worker_id, secs) in stale {
+            tracing::warn!(%worker_id, no_heartbeat_secs = secs, "worker missed its liveness timeout; marking Disconnected");
+            self.ingest(EventKind::WorkerLeft {
+                worker_id,
+                reason: format!("no heartbeat for {secs}s"),
+            })
+            .await?;
+            swept.push(worker_id);
+        }
+        Ok(swept)
+    }
+
     /// Trailing-edge flush for the ProgressDelta wire cap (ledger
     /// F24 residue, item 3a): re-broadcast the latest SUPPRESSED
     /// delta per (job, worker) once the cap interval has passed

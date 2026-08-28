@@ -6,7 +6,7 @@ use super::{
 use crate::theme::Theme;
 use chrono::{DateTime, Utc};
 use migration_control_protocol::schema::{
-    ErrorBucket, EventEnvelope, EventKind, Job, JobId, Snapshot, Worker, WorkerId,
+    ErrorBucket, EventEnvelope, EventKind, Job, JobId, Snapshot, Worker, WorkerId, WorkerState,
 };
 use std::collections::HashMap;
 
@@ -475,6 +475,17 @@ impl AppState {
             .iter()
             .filter_map(|wid| self.snapshot.workers.get(wid))
             .collect()
+    }
+
+    /// Workers assigned to the job that are still talking to the
+    /// coord. `assigned_workers` is a history — every worker that
+    /// ever registered — so the headline count excludes the
+    /// Disconnected ones.
+    pub fn connected_worker_count(&self, id: &JobId) -> usize {
+        self.workers_for_job(id)
+            .into_iter()
+            .filter(|w| w.state != WorkerState::Disconnected)
+            .count()
     }
 
     pub fn worker(&self, id: &WorkerId) -> Option<&Worker> {

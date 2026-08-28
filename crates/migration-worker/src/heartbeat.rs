@@ -19,7 +19,7 @@
 
 use crate::throughput::ThroughputCounter;
 use migration_core::claim::{self, ClaimStore, RefreshOutcome};
-use migration_core::fence::Fence;
+use migration_core::fence::{Fence, FenceCause};
 use migration_core::layout;
 use migration_core::records::ProgressRecord;
 use migration_core::time::UtcTime;
@@ -250,7 +250,7 @@ impl HeartbeatTask {
                     "clock jump detected: wall-mono drift {drift_secs}s > lease/2 ({max_drift_secs}s); self-fencing"
                 );
                 self.notify_coord_fence(&reason);
-                self.fence.trip(reason);
+                self.fence.trip_with_cause(FenceCause::ClockJump, reason);
                 self.write_progress_bounded("fenced", None).await;
                 break;
             }
@@ -366,7 +366,8 @@ impl HeartbeatTask {
                                 "heartbeat HEAD failing for {consec_failures} consecutive ticks (>= lease window); self-fencing"
                             );
                             self.notify_coord_fence(&reason);
-                            self.fence.trip(reason);
+                            self.fence
+                                .trip_with_cause(FenceCause::StoreUnreachable, reason);
                             self.write_progress_bounded("fenced", None).await;
                             break;
                         }

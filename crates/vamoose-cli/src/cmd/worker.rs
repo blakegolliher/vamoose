@@ -24,7 +24,9 @@ const EXIT_CODES_HELP: &str = "Exit codes:
      SIGTERM/SIGINT stop (the shard in hand is released for a peer)
   1  run error (config, S3, or orchestrator failure)
   2  shutdown wedged past its deadline; the hard-exit watchdog fired
-  3  run ended because the worker fenced (claim lost / clock jump / 412 storm)";
+  3  run ended because the worker fenced (claim lost / clock jump / 412 storm)
+  4  run ended because the store was unreachable for a full lease window; the
+     shard was surrendered and the unit restarts the worker (only 3 is held)";
 
 #[derive(ClapArgs)]
 #[command(after_help = EXIT_CODES_HELP, after_long_help = EXIT_CODES_HELP)]
@@ -66,7 +68,7 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Run
         tracing::warn!(
             ?outcome,
             code = exit_code,
-            "worker run ended fenced; exiting non-zero"
+            "worker run ended without completing; exiting non-zero"
         );
     }
     Ok(outcome)
