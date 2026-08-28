@@ -220,7 +220,15 @@ gave its shard up defensively; systemd restarts it after `RestartSec`, and
 it rejoins on its own once the store is back. A peer reclaims the
 surrendered shard either way.
 
-## A second migration: another directory, a new bucket
+## A second migration: another directory, a new bucket (or a new prefix)
+
+One bucket holds one migration per key prefix. Instead of a new bucket you
+can set `[run] prefix = "run-2"` on every host: `manifest.json`, `shards/`,
+`index/`, the coord's `state/` and everything else then live under
+`run-2/`, and the finished run's objects stay where they are. The prefix is
+part of the run's identity — `prepare` refuses to resume a run whose prefix
+changed — and `doctor` reports `LIST s3://bucket/run-2/`.
+
 
 Nothing is scripted; this is the full sequence for a subtree. Substitute
 your hosts, exports, and paths. The package is already installed from

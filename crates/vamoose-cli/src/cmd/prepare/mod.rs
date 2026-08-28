@@ -90,6 +90,11 @@ struct RunSpec {
     run_id: String,
     created_utc: String,
     bucket: String,
+    /// Key prefix inside the bucket (`""` = root). Part of the run's
+    /// identity: the same bucket under a different prefix is a
+    /// different migration.
+    #[serde(default)]
+    prefix: String,
     endpoint: String,
     source: upload::EndpointSpec,
     dest: upload::EndpointSpec,
@@ -219,7 +224,8 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
         storage.profile.as_deref(),
         storage.verify_tls,
     )
-    .await?;
+    .await?
+    .with_prefix(&storage.prefix);
     let published = published_manifest(&s3).await?;
     let (run_id, resumed) = choose_run_id(
         args.run_id.as_deref(),
@@ -237,6 +243,7 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
         run_id: run_id.clone(),
         created_utc: utc_now(),
         bucket: storage.bucket.clone(),
+        prefix: migration_core::s3::normalize_prefix(&storage.prefix),
         endpoint: storage.endpoint.clone(),
         source: upload::EndpointSpec {
             url: worker_cfg.mover.src_url.clone(),
@@ -297,10 +304,11 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<()> {
                 let _ = std::fs::remove_dir_all(&run_dir);
             }
             anyhow::bail!(
-                "bucket s3://{} already holds manifest.json for run {:?} ({} shards, {} rows). \
-                 One migration per bucket: use a fresh bucket for a new run, or re-run with \
-                 --run-id {:?} (or no --run-id) to verify or resume that one.",
-                spec.bucket,
+                "{} already holds manifest.json for run {:?} ({} shards, {} rows). \
+                 One migration per bucket prefix: use a fresh bucket or a new `[run] prefix` \
+                 for a new run, or re-run with --run-id {:?} (or no --run-id) to verify or \
+                 resume that one.",
+                s3.location(),
                 existing.run_id,
                 existing.shards.len(),
                 existing.total_rows,
@@ -517,21 +525,24 @@ fn ensure_run_spec(path: &Path, fresh: RunSpec) -> Result<RunSpec> {
         Some(existing) => {
             let same = existing.run_id == fresh.run_id
                 && existing.bucket == fresh.bucket
+                && existing.prefix == fresh.prefix
                 && existing.endpoint == fresh.endpoint
                 && existing.source == fresh.source
                 && existing.dest == fresh.dest;
             if !same {
                 anyhow::bail!(
-                    "run {} was created for s3://{} {}{} -> {}{}; the configuration now says \
-                     s3://{} {}{} -> {}{}. Restore the configuration or start a new run with \
+                    "run {} was created for s3://{}/{} {}{} -> {}{}; the configuration now says \
+                     s3://{}/{} {}{} -> {}{}. Restore the configuration or start a new run with \
                      --fresh.",
                     existing.run_id,
                     existing.bucket,
+                    existing.prefix,
                     existing.source.url,
                     existing.source.root,
                     existing.dest.url,
                     existing.dest.root,
                     fresh.bucket,
+                    fresh.prefix,
                     fresh.source.url,
                     fresh.source.root,
                     fresh.dest.url,
@@ -764,6 +775,7 @@ mod tests {
             run_id: "r".into(),
             created_utc: utc_now(),
             bucket: "b".into(),
+            prefix: String::new(),
             endpoint: "e".into(),
             source: upload::EndpointSpec {
                 url: "nfs://s/x".into(),

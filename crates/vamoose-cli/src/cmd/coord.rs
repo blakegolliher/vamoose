@@ -338,7 +338,8 @@ async fn build_s3(storage: &crate::config::StorageSettings) -> anyhow::Result<S3
         storage.profile.as_deref(),
         storage.verify_tls,
     )
-    .await?;
+    .await?
+    .with_prefix(&storage.prefix);
     Ok(client)
 }
 

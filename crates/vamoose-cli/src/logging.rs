@@ -334,6 +334,7 @@ fn spawn_uploader(logging: &Logging, storage: &StorageSettings) -> Result<Upload
     let profile = storage.profile.clone();
     let verify_tls = storage.verify_tls;
     let bucket = storage.bucket.clone();
+    let run_prefix = storage.prefix.clone();
     let poll = Duration::from_secs(logging.poll_secs.max(1));
 
     let handle = tokio::spawn(async move {
@@ -346,7 +347,7 @@ fn spawn_uploader(logging: &Logging, storage: &StorageSettings) -> Result<Upload
         )
         .await
         {
-            Ok(c) => c,
+            Ok(c) => c.with_prefix(&run_prefix),
             Err(e) => {
                 let _ = writeln!(
                     io::stderr(),
@@ -548,6 +549,7 @@ mod tests {
     fn storage_stub() -> StorageSettings {
         StorageSettings {
             bucket: "bucket".into(),
+            prefix: String::new(),
             endpoint: "http://127.0.0.1:1".into(),
             region: "us-east-1".into(),
             profile: None,

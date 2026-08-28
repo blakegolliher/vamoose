@@ -42,6 +42,25 @@ pub struct ObjectHead {
 pub struct S3Client {
     inner: Client,
     bucket: String,
+    /// Key prefix every logical key is placed under — `""` or
+    /// `"<path>/"` (see [`normalize_prefix`]). Lets several runs share
+    /// one bucket: `[run] prefix = "v4"` puts this run's
+    /// `manifest.json`, `shards/`, `index/`, `state/`… under `v4/`
+    /// and nothing above the client ever sees the prefix.
+    prefix: String,
+}
+
+/// Canonical form of a configured key prefix: no leading slash, one
+/// trailing slash, empty stays empty. `"v4"`, `"/v4/"`, `"v4//"` all
+/// become `"v4/"`; `"a/b"` becomes `"a/b/"`.
+pub fn normalize_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        let parts: Vec<&str> = trimmed.split('/').filter(|p| !p.is_empty()).collect();
+        format!("{}/", parts.join("/"))
+    }
 }
 
 impl S3Client {
@@ -49,11 +68,35 @@ impl S3Client {
         Self {
             inner,
             bucket: bucket.into(),
+            prefix: String::new(),
         }
+    }
+
+    /// Place every key under `prefix` (normalized). An empty prefix
+    /// is the bucket root, as before.
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.prefix = normalize_prefix(prefix);
+        self
     }
 
     pub fn bucket(&self) -> &str {
         &self.bucket
+    }
+
+    /// The configured prefix in canonical form (`""` or `"x/"`).
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// `s3://bucket/prefix` — what to print where the bucket alone
+    /// used to be shown.
+    pub fn location(&self) -> String {
+        format!("s3://{}/{}", self.bucket, self.prefix)
+    }
+
+    /// The wire key for a logical key.
+    fn object_key(&self, key: &str) -> String {
+        format!("{}{}", self.prefix, key)
     }
 
     /// Build an `S3Client` from environment + endpoint URL. The
@@ -251,7 +294,7 @@ impl ClaimStore for S3Client {
             .inner
             .put_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(self.object_key(key))
             .if_none_match("*")
             .body(body.into())
             .send()
@@ -274,7 +317,7 @@ impl ClaimStore for S3Client {
             .inner
             .get_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(self.object_key(key))
             .send()
             .await
         {
@@ -307,7 +350,7 @@ impl ClaimStore for S3Client {
             .inner
             .delete_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(self.object_key(key))
             .if_match(&etag_quoted)
             .send()
             .await;
@@ -333,7 +376,7 @@ impl ClaimStore for S3Client {
             .inner
             .get_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(self.object_key(key))
             .send()
             .await
         {
@@ -361,7 +404,7 @@ impl ClaimStore for S3Client {
                 .inner
                 .list_objects_v2()
                 .bucket(&self.bucket)
-                .prefix(prefix);
+                .prefix(self.object_key(prefix));
             if let Some(t) = cont.take() {
                 req = req.continuation_token(t);
             }
@@ -370,7 +413,13 @@ impl ClaimStore for S3Client {
                 .await
                 .map_err(|e| Error::Other(anyhow::anyhow!("S3 LIST {prefix}: {e}")))?;
             for o in resp.contents() {
-                let key = o.key().unwrap_or_default().to_string();
+                // Callers reason in logical keys (`shards/x.claim`);
+                // strip the run prefix the wire key carries.
+                let wire = o.key().unwrap_or_default();
+                let key = wire
+                    .strip_prefix(self.prefix.as_str())
+                    .unwrap_or(wire)
+                    .to_string();
                 let etag = unquote_etag(o.e_tag().unwrap_or_default());
                 let size = o.size().unwrap_or(0) as u64;
                 out.push(ListEntry { key, etag, size });
@@ -466,7 +515,7 @@ impl S3Client {
             .inner
             .delete_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(self.object_key(key))
             .send()
             .await
         {
@@ -488,7 +537,7 @@ impl S3Client {
             .inner
             .put_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(self.object_key(key))
             .body(body.into())
             .send()
             .await
@@ -505,7 +554,7 @@ impl S3Client {
             .inner
             .head_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(self.object_key(key))
             .send()
             .await
         {
@@ -547,7 +596,7 @@ impl S3Client {
             .inner
             .put_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(self.object_key(key))
             .set_metadata(Some(metadata))
             .body(body)
             .send()
@@ -570,7 +619,7 @@ impl S3Client {
             .inner
             .get_object()
             .bucket(&self.bucket)
-            .key(key)
+            .key(self.object_key(key))
             .send()
             .await
             .map_err(|e| Error::S3(e.into()))?;
@@ -709,6 +758,41 @@ mod tests {
         assert_eq!(quote_etag("\"abc123\""), "\"abc123\"");
         // Round trip: unquote then requote recovers the wire form.
         assert_eq!(quote_etag(&unquote_etag("\"abc123\"")), "\"abc123\"");
+    }
+
+    // -------------------------------------------------------------------------
+    // Run prefix: one bucket, many runs.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn prefix_normalizes_to_empty_or_path_with_one_trailing_slash() {
+        assert_eq!(normalize_prefix(""), "");
+        assert_eq!(normalize_prefix("  "), "");
+        assert_eq!(normalize_prefix("/"), "");
+        assert_eq!(normalize_prefix("v4"), "v4/");
+        assert_eq!(normalize_prefix("/v4/"), "v4/");
+        assert_eq!(normalize_prefix("v4//"), "v4/");
+        assert_eq!(normalize_prefix("runs//aug/v4"), "runs/aug/v4/");
+    }
+
+    #[test]
+    fn prefixed_client_places_every_key_under_the_prefix() {
+        use aws_sdk_s3::config::{Credentials, Region};
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url("http://127.0.0.1:1")
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .force_path_style(true)
+            .build();
+        let plain = S3Client::new(Client::from_conf(conf.clone()), "b");
+        assert_eq!(plain.object_key("manifest.json"), "manifest.json");
+        assert_eq!(plain.location(), "s3://b/");
+        let run = S3Client::new(Client::from_conf(conf), "b").with_prefix("/v4/");
+        assert_eq!(run.prefix(), "v4/");
+        assert_eq!(run.object_key("manifest.json"), "v4/manifest.json");
+        assert_eq!(run.object_key("shards/"), "v4/shards/");
+        assert_eq!(run.location(), "s3://b/v4/");
     }
 
     // -------------------------------------------------------------------------
