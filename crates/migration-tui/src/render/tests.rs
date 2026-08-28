@@ -1265,7 +1265,7 @@ fn empty_list_view_explains_how_to_start() {
 fn empty_list_view_shows_prepare_progress() {
     use migration_control_protocol::schema::PreparePhase;
     let s = prepare_state(at(10_000), PreparePhase::Index);
-    let text = buffer_text(&render_to_buffer(&s, at(10_000), 110, 12));
+    let text = buffer_text(&render_to_buffer(&s, at(10_000), 110, 20));
     assert!(
         text.contains("Preparing run-20260826T000217Z on k8s-se-3 (pid 364254)"),
         "{text}"
@@ -1275,8 +1275,15 @@ fn empty_list_view_shows_prepare_progress() {
         text.contains("▶ 2. index    129/320 shards rewritten · 128 uploaded"),
         "{text}"
     );
+    // 128 shards in (2996 − 2829) s → 192 left ≈ 250 s.
+    assert!(text.contains("· ~4m10s left"), "{text}");
     assert!(text.contains("  3. publish"), "{text}");
     assert!(!text.contains("NO UPDATE"), "{text}");
+    // The panel is bordered and sized to its content; the rest of the
+    // screen carries the waiting notes instead of blank rows.
+    assert!(text.contains(" prepare "), "{text}");
+    assert!(text.contains(" while you wait "), "{text}");
+    assert!(text.contains("polling the"), "{text}");
 
     // A failed prepare names the failure.
     let mut f = prepare_state(at(10_000), PreparePhase::Failed);
