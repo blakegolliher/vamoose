@@ -5,10 +5,10 @@ use crate::format::{format_bytes, format_count, format_elapsed};
 use crate::state::AppState;
 use chrono::{DateTime, Utc};
 use migration_control_protocol::schema::{PreparePhase, PrepareProgress};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 /// Age after which a non-terminal progress object is called out as
@@ -40,7 +40,63 @@ pub(super) fn render_prepare_panel(
         ],
         Some(p) => prepare_lines(p, now, theme),
     };
-    frame.render_widget(Paragraph::new(lines), area);
+    // Size the panel to its content and give the rest of the screen a
+    // purpose: an unbordered paragraph over the whole job-table area
+    // read as "the TUI stopped drawing" below the last stage line.
+    let border = Style::default().fg(theme.accent);
+    let panel_h = (lines.len() as u16).saturating_add(2).min(area.height);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(panel_h), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" prepare ")
+                .border_style(border),
+        ),
+        chunks[0],
+    );
+    if chunks[1].height >= 3 {
+        frame.render_widget(
+            Paragraph::new(while_you_wait_lines(state))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" while you wait ")
+                        .border_style(border),
+                )
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            chunks[1],
+        );
+    }
+}
+
+/// What the rest of the screen says before a job exists. Facts only:
+/// where the workers are, what happens when the manifest lands, and
+/// how to read the rates above.
+fn while_you_wait_lines(state: &AppState) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(state.theme.muted);
+    vec![
+        Line::from(
+            "Workers cannot register with the coord until the job exists; they are polling the \
+             bucket for manifest.json. `systemctl is-active vamoose-worker@main` (and @b) on each \
+             host is the liveness check until then.",
+        ),
+        Line::from(""),
+        Line::from(
+            "When manifest.json lands the coord seeds the job within ~15 s, every waiting worker \
+             claims a shard, and this screen becomes the job list (Enter opens the job; the \
+             Workers tab shows who is copying).",
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "The scan rate is the source cluster's READDIRPLUS rate and the index stage is local \
+             CPU plus S3 PUTs — neither predicts copy throughput.",
+            dim,
+        )),
+    ]
 }
 
 fn prepare_lines<'a>(
@@ -109,6 +165,18 @@ fn prepare_lines<'a>(
         .index
         .shards_total
         .map_or("?".to_string(), |n| n.to_string());
+    // Index ETA from the upload rate so far. The progress object has
+    // no index start time; it began when the scan finished, so its
+    // elapsed time is (updated - started) minus the scan's own.
+    let index_eta = match (p.phase, p.index.shards_total, p.index.shards_uploaded) {
+        (PreparePhase::Index, Some(total), done) if done > 0 && total > done => {
+            let run_secs = (p.updated_utc - p.started_utc).num_seconds().max(0) as u64;
+            let index_secs = run_secs.saturating_sub(p.scan.elapsed_secs).max(1);
+            let left = (total - done) * index_secs / done;
+            format!(" · ~{} left", hms(left))
+        }
+        _ => String::new(),
+    };
 
     let mut lines = vec![
         Line::from(head),
@@ -130,12 +198,13 @@ fn prepare_lines<'a>(
             Span::styled(m2, s2),
             Span::styled("2. index    ", bold),
             Span::raw(format!(
-                "{}/{} shards rewritten · {} uploaded · {} rows · {}",
+                "{}/{} shards rewritten · {} uploaded · {} rows · {}{}",
                 p.index.shards_rewritten,
                 total,
                 p.index.shards_uploaded,
                 format_count(p.index.rows_uploaded),
-                format_bytes(p.index.bytes_uploaded)
+                format_bytes(p.index.bytes_uploaded),
+                index_eta
             )),
         ]),
         Line::from(vec![
