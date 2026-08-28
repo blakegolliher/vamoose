@@ -34,11 +34,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// Why a fence tripped. Decides what the worker process does after
+/// the orderly fenced shutdown: a claim that was actually taken from
+/// under us (or a clock we cannot trust) needs an operator, while a
+/// store that merely went away for a full lease window is a network
+/// blip the supervisor should simply restart through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceCause {
+    /// The claim object changed under us — a peer reclaimed the shard.
+    OwnershipLost,
+    /// The claim could not be confirmed for a full lease window
+    /// because the store was unreachable (DNS, connect timeouts, 5xx
+    /// storms). Ownership was surrendered defensively, not lost.
+    StoreUnreachable,
+    /// Wall clock jumped against the monotonic clock by more than
+    /// half a lease; lease arithmetic can no longer be trusted.
+    ClockJump,
+}
+
 #[derive(Clone)]
 pub struct Fence {
     valid: Arc<AtomicBool>,
     cancel: CancellationToken,
-    reason: Arc<std::sync::Mutex<Option<String>>>,
+    reason: Arc<std::sync::Mutex<Option<(FenceCause, String)>>>,
 }
 
 impl Fence {
@@ -55,12 +73,21 @@ impl Fence {
         self.valid.load(Ordering::Acquire)
     }
 
-    /// Trip the fence. Idempotent — first caller wins on `reason`.
+    /// Trip the fence for a lost claim. Idempotent — first caller
+    /// wins on `reason`. Shorthand for
+    /// [`trip_with_cause`](Self::trip_with_cause) with
+    /// [`FenceCause::OwnershipLost`].
     pub fn trip(&self, reason: impl Into<String>) {
+        self.trip_with_cause(FenceCause::OwnershipLost, reason);
+    }
+
+    /// Trip the fence, recording why. Idempotent — the first trip
+    /// keeps its cause and reason.
+    pub fn trip_with_cause(&self, cause: FenceCause, reason: impl Into<String>) {
         let r = reason.into();
         if self.valid.swap(false, Ordering::AcqRel) {
-            tracing::warn!(reason = %r, "fence tripped; self-fencing worker");
-            *self.reason.lock().unwrap() = Some(r);
+            tracing::warn!(reason = %r, ?cause, "fence tripped; self-fencing worker");
+            *self.reason.lock().unwrap() = Some((cause, r));
             self.cancel.cancel();
         }
     }
@@ -75,7 +102,10 @@ impl Fence {
     pub fn close_for_shutdown(&self) {
         if self.valid.swap(false, Ordering::AcqRel) {
             tracing::info!("worker shutting down; fence closed");
-            *self.reason.lock().unwrap() = Some("worker shutting down".to_string());
+            *self.reason.lock().unwrap() = Some((
+                FenceCause::OwnershipLost,
+                "worker shutting down".to_string(),
+            ));
             self.cancel.cancel();
         }
     }
@@ -85,7 +115,13 @@ impl Fence {
     }
 
     pub fn reason(&self) -> Option<String> {
-        self.reason.lock().unwrap().clone()
+        self.reason.lock().unwrap().as_ref().map(|(_, r)| r.clone())
+    }
+
+    /// Why the fence tripped, if it has. `None` while the fence is
+    /// still valid.
+    pub fn cause(&self) -> Option<FenceCause> {
+        self.reason.lock().unwrap().as_ref().map(|(c, _)| *c)
     }
 }
 
@@ -97,7 +133,7 @@ impl Default for Fence {
 
 #[cfg(test)]
 mod tests {
-    use super::Fence;
+    use super::{Fence, FenceCause};
 
     #[test]
     fn close_for_shutdown_invalidates_and_cancels() {
@@ -118,5 +154,23 @@ mod tests {
         f.trip("claim lost");
         f.close_for_shutdown();
         assert_eq!(f.reason().as_deref(), Some("claim lost"));
+    }
+
+    /// The cause travels with the reason: a store-unreachable trip
+    /// is reported as such, and a later trip (or shutdown close)
+    /// does not relabel it.
+    #[test]
+    fn first_trip_keeps_its_cause() {
+        let f = Fence::new();
+        assert_eq!(f.cause(), None);
+        f.trip_with_cause(FenceCause::StoreUnreachable, "HEAD failing");
+        f.trip("claim lost");
+        f.close_for_shutdown();
+        assert_eq!(f.cause(), Some(FenceCause::StoreUnreachable));
+        assert_eq!(f.reason().as_deref(), Some("HEAD failing"));
+        // Plain `trip` is a lost claim.
+        let g = Fence::new();
+        g.trip("etag changed");
+        assert_eq!(g.cause(), Some(FenceCause::OwnershipLost));
     }
 }

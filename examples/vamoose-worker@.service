@@ -3,8 +3,13 @@ Description=vamoose migration worker (%i)
 Documentation=https://github.com/blakegolliher/vamoose
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=3
+# A worker that loses the store (S3 endpoint / DNS / coord) for a full
+# lease window surrenders its shard and exits 4; the unit restarts it.
+# While the outage lasts each restart burns its startup retry budget
+# and exits 1 within a few minutes, so allow enough starts to ride out
+# a ten-minute outage instead of tripping the start limit part-way.
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -24,6 +29,9 @@ RestartSec=10
 # Exit 0 means all shards terminal, an orderly coordinator stop, or a
 # `systemctl stop`: on SIGTERM the worker finishes the batch in hand,
 # releases its claim so a peer takes the shard at once, and exits 0.
+# Exit 3 (claim taken by a peer / clock jump) is the one code that is
+# NOT restarted — an operator has to look. Exit 4 (store unreachable
+# for a lease window) and 1 (run error) are restarted after RestartSec.
 # TimeoutStopSec bounds a slow batch; past it systemd sends SIGKILL and
 # the shard is reclaimed after the lease instead.
 SuccessExitStatus=0

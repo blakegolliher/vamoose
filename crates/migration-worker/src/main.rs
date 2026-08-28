@@ -59,6 +59,9 @@ async fn main() -> anyhow::Result<()> {
                 orchestrator::RunOutcome::Fenced => {
                     b"mig-worker: fenced run; exit via libc::_exit(3)\n"
                 }
+                orchestrator::RunOutcome::StoreUnreachable => {
+                    b"mig-worker: store unreachable for a lease window; exit via libc::_exit(4)\n"
+                }
             };
             unsafe {
                 libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
