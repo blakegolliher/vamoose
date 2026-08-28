@@ -78,6 +78,8 @@ fn ticker_cfg(snapshot_events: u64) -> TickerConfig {
         snapshot_events,
         history_keep: 3,
         flush_check_interval: Duration::from_millis(20),
+        worker_liveness_check_interval: Duration::from_millis(20),
+        worker_liveness_timeout: Duration::from_secs(90),
         lease: LeaseConfig {
             ttl: chrono::Duration::seconds(30),
             grace: chrono::Duration::seconds(5),

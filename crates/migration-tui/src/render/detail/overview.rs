@@ -119,7 +119,11 @@ pub(super) fn render_overview_tab(
     lines.push(section_header("Activity"));
     lines.push(kv_line(
         "Workers",
-        format!("{} assigned (see Workers tab)", job.assigned_workers.len()),
+        format!(
+            "{} connected of {} assigned (see Workers tab)",
+            state.connected_worker_count(&job.id),
+            job.assigned_workers.len()
+        ),
     ));
     let err_buckets = state.errors_for_job(&job.id);
     lines.push(kv_line(

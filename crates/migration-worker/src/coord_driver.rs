@@ -349,6 +349,19 @@ async fn heartbeat_loop(
             biased;
             _ = cancel.cancelled() => {
                 tracing::info!("coord_driver: cancelled; exiting heartbeat loop");
+                // Orderly exit: tell the coord so we read as
+                // Disconnected at once. Bounded and best-effort — the
+                // liveness sweep covers us if this never lands.
+                match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    client.leave(worker_id, "worker exiting".into()),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => tracing::info!(seq = resp.seq, "coord_driver: /leave accepted"),
+                    Ok(Err(e)) => tracing::warn!(error = %e, "coord_driver: /leave POST failed (non-fatal)"),
+                    Err(_) => tracing::warn!("coord_driver: /leave POST timed out (non-fatal)"),
+                }
                 return Ok(());
             }
             reason_opt = fence_fut => {

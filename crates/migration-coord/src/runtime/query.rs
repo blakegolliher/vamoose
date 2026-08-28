@@ -173,7 +173,7 @@ impl CoordRuntime {
             .iter()
             .filter_map(|wid| {
                 let w = guard.state.workers.get(wid)?;
-                if w.host != host {
+                if !same_machine(&w.host, w.pid, host, pid) {
                     return None;
                 }
                 if w.pid == pid && w.start_time == start_time {
@@ -268,5 +268,52 @@ impl EventTailReader {
 impl std::fmt::Debug for EventTailReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventTailReader").finish_non_exhaustive()
+    }
+}
+
+/// Do two registrations come from the same machine? The worker's
+/// default host id is `<hostname>-<pid>`, so a restarted worker
+/// never carries the same host string as the one it replaces; a
+/// literal comparison made the supersede path dead on every real
+/// deployment (the 600M retest ended with eleven dead workers still
+/// "Copying"). Strip a trailing `-<pid>` when it matches the
+/// registration's own pid, then compare what's left — a custom host
+/// id without the suffix still compares literally.
+pub(crate) fn same_machine(host_a: &str, pid_a: u32, host_b: &str, pid_b: u32) -> bool {
+    machine_name(host_a, pid_a) == machine_name(host_b, pid_b)
+}
+
+fn machine_name(host: &str, pid: u32) -> &str {
+    let suffix = format!("-{pid}");
+    host.strip_suffix(suffix.as_str()).unwrap_or(host)
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::same_machine;
+
+    #[test]
+    fn pid_suffixed_host_ids_from_one_machine_match() {
+        assert!(same_machine(
+            "k8s-se-2-1203425",
+            1203425,
+            "k8s-se-2-2620823",
+            2620823
+        ));
+        assert!(same_machine("k8s-se-2", 7, "k8s-se-2", 8));
+        assert!(same_machine("k8s-se-2-1203425", 1203425, "k8s-se-2", 8));
+    }
+
+    #[test]
+    fn different_machines_or_unrelated_suffixes_do_not_match() {
+        assert!(!same_machine(
+            "k8s-se-2-1203425",
+            1203425,
+            "k8s-se-1-214989",
+            214989
+        ));
+        // A suffix that is not this registration's pid is part of the name.
+        assert!(!same_machine("host-a-100", 5, "host-a", 5));
+        assert!(!same_machine("host-a", 1, "host-b", 1));
     }
 }

@@ -111,6 +111,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/workers/{id}/heartbeat", post(worker::heartbeat))
         .route("/workers/{id}/events", post(worker::events_batch))
         .route("/workers/{id}/fence", post(worker::fence))
+        .route("/workers/{id}/leave", post(worker::leave))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_cluster_secret,

@@ -78,7 +78,7 @@
 use super::{ApiError, AppState};
 pub use crate::schema::{
     ControlEnvelope, EventsBatchBody, EventsBatchResponse, FenceBody, FenceResponse, HeartbeatBody,
-    HeartbeatResponse, RegisterBody, RegisterResponse, WorkerEventEntry,
+    HeartbeatResponse, LeaveBody, LeaveResponse, RegisterBody, RegisterResponse, WorkerEventEntry,
 };
 use crate::schema::{EventKind, JobId, WorkerCounters, WorkerId};
 use axum::extract::{Path, State};
@@ -396,4 +396,36 @@ pub async fn fence(
     // must not evaporate in a coord crash after the worker saw 200.
     state.runtime.flush_log().await.map_err(ApiError::storage)?;
     Ok(Json(FenceResponse { seq }))
+}
+
+// =============================================================================
+// POST /workers/{id}/leave
+// =============================================================================
+
+/// An orderly exit. The worker has already released or completed its
+/// shard; all the coord has to do is stop counting it. Without this
+/// a cleanly finished worker sat in `Idle`/`Copying` until the
+/// liveness sweep noticed the missing heartbeats.
+pub async fn leave(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<LeaveBody>,
+) -> Result<Json<LeaveResponse>, ApiError> {
+    let worker_id = parse_worker_id(id)?;
+    if !state.runtime.worker_is_registered(&worker_id).await {
+        return Err(ApiError::not_found(
+            "worker_not_found",
+            format!("no such worker: {worker_id}"),
+        ));
+    }
+    let seq = state
+        .runtime
+        .ingest(EventKind::WorkerLeft {
+            worker_id,
+            reason: body.reason,
+        })
+        .await
+        .map_err(ApiError::storage)?;
+    state.runtime.flush_log().await.map_err(ApiError::storage)?;
+    Ok(Json(LeaveResponse { seq }))
 }

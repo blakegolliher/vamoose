@@ -350,12 +350,12 @@ async fn worker_restart_dedups_prior_worker() {
         assert_eq!(w.state, WorkerState::Idle);
     }
 
-    // Cancel A and wait for its task to finish.
-    cancel_a.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle_a.task)
-        .await
-        .expect("A exits")
-        .expect("A ran");
+    // Kill A without a goodbye — an orderly cancel would POST
+    // /leave and mark A Disconnected itself, leaving nothing for the
+    // re-register dedup to do. The gate is the crash-restart case.
+    handle_a.task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle_a.task).await;
+    drop(cancel_a);
     drop(events_tx_a);
 
     // Spawn driver B from the SAME host (different pid + start_time).

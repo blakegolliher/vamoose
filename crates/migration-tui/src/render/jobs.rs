@@ -71,7 +71,7 @@ fn job_row<'a>(job: &'a Job, state: &AppState, now: DateTime<Utc>) -> Row<'a> {
     } else {
         Style::default()
     };
-    let workers = job.assigned_workers.len();
+    let workers = state.connected_worker_count(&job.id);
     // Derive a "last update" time: most recent phase transition if
     // any, otherwise creation. The coord doesn't currently maintain
     // an explicit `updated_at` field on Job; if/when it does, this

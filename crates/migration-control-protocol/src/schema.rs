@@ -1090,6 +1090,20 @@ pub struct FenceResponse {
     pub seq: u64,
 }
 
+/// `POST /workers/{id}/leave` — a worker announcing an orderly exit
+/// (all shards terminal, `systemctl stop`, coord-requested drain).
+/// The coord emits `WorkerLeft{reason}` so the worker reads as
+/// Disconnected at once instead of after the liveness timeout.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LeaveBody {
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LeaveResponse {
+    pub seq: u64,
+}
+
 /// Query parameters for `GET /stream`.
 #[derive(Debug, Deserialize)]
 pub struct StreamParams {
