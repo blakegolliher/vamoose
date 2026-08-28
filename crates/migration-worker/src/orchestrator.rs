@@ -115,7 +115,8 @@ pub async fn run_with_stop(
         cfg.run.profile.as_deref(),
         cfg.run.verify_tls,
     )
-    .await?;
+    .await?
+    .with_prefix(&cfg.run.prefix);
     let s3 = Arc::new(s3);
 
     // Bucket-versioning guard. The v2 claim protocol depends on

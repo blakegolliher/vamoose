@@ -48,7 +48,8 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> anyhow::Result<()>
             storage.profile.as_deref(),
             storage.verify_tls,
         )
-        .await?,
+        .await?
+        .with_prefix(&storage.prefix),
     );
     let store: Arc<dyn ClaimStore> = s3.clone();
 

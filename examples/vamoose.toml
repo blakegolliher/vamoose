@@ -11,6 +11,8 @@
 # Coordination bucket. Must be empty (or created for this migration) and
 # must have object versioning OFF. All hosts point at the same bucket.
 bucket   = "vamoose-migration-1"
+# prefix = "run-1"          # key prefix inside the bucket: one bucket can hold several
+                            # migrations, one per prefix; every host of a run uses the same value
 endpoint = "https://s3.example.com"
 region   = "us-east-1"
 # verify_tls = false        # only for lab S3 endpoints with self-signed certs

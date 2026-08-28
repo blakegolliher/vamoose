@@ -7,6 +7,7 @@
 
 [run]
 bucket     = "vamoose"
+# prefix   = "run-1"        # key prefix inside the bucket ("" = root); one migration per prefix
 endpoint   = "https://s3.example.com"
 region     = "us-east-1"
 # profile  = "vamoose"      # named ~/.aws/credentials profile; omit to use the default chain

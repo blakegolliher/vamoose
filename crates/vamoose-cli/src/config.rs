@@ -130,6 +130,8 @@ enum SourceFormat {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StorageSettings {
     pub(crate) bucket: String,
+    /// Key prefix inside the bucket; `""` = root. See `RunCfg::prefix`.
+    pub(crate) prefix: String,
     pub(crate) endpoint: String,
     pub(crate) region: String,
     pub(crate) profile: Option<String>,
@@ -514,6 +516,7 @@ impl Config {
     fn from_canonical(input: CanonicalInput, coord_server: Option<CoordServer>) -> Self {
         let storage = StorageSettings {
             bucket: input.run.bucket.clone(),
+            prefix: input.run.prefix.clone(),
             endpoint: input.run.endpoint.clone(),
             region: input.run.region.clone(),
             profile: input.run.profile.clone(),
@@ -544,6 +547,7 @@ impl Config {
     fn from_compatibility(input: CompatibilityInput) -> Self {
         let storage = StorageSettings {
             bucket: input.global.bucket,
+            prefix: String::new(),
             endpoint: input.s3.endpoint,
             region: input.s3.region,
             profile: input.s3.profile,
@@ -676,6 +680,7 @@ fn compatibility_worker_config(
         wcfg::Config {
             run: wcfg::RunCfg {
                 bucket: storage.bucket,
+                prefix: storage.prefix,
                 endpoint: storage.endpoint,
                 region: storage.region,
                 profile: storage.profile,

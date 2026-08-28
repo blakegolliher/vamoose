@@ -33,6 +33,11 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 pub struct RunCfg {
     pub bucket: String,
+    /// Key prefix inside the bucket (`"v4"` → every object under
+    /// `v4/`). Empty = bucket root. Lets one bucket hold several runs;
+    /// every host of a run must use the same value.
+    #[serde(default)]
+    pub prefix: String,
     pub endpoint: String,
     pub region: String,
     /// Optional AWS credentials profile name. If omitted, the SDK uses

@@ -153,7 +153,7 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Do
             checks.record(
                 Status::Pass,
                 "s3 reach",
-                format!("LIST s3://{}/ → 200", cfg.storage().bucket),
+                format!("LIST {} → 200", s3_client.location()),
             );
             checks.record(
                 Status::Pass,
@@ -172,7 +172,18 @@ pub async fn run(_args: Args, config_path: Option<PathBuf>) -> anyhow::Result<Do
     // claim protocol depends on. Probe key is namespaced under the
     // sentinel doctor/ prefix so it can't collide with claim/index
     // objects.
-    let probe = "doctor/precondition-probe";
+    // Per-host, per-process name: two doctors on one bucket at the
+    // same time (three nodes being set up by hand) otherwise delete
+    // each other's probe and both report the endpoint as broken.
+    let probe = format!(
+        "doctor/precondition-probe-{}-{}",
+        hostname::get()
+            .ok()
+            .and_then(|s| s.into_string().ok())
+            .unwrap_or_else(|| "unknown".to_string()),
+        std::process::id()
+    );
+    let probe = probe.as_str();
     // Best-effort: clear any leftover from a prior doctor run.
     if let Ok(Some((etag, _))) = s3.head_object(probe).await {
         let _ = s3.delete_if_match(probe, &etag).await;
@@ -381,7 +392,8 @@ async fn build_s3(storage: &crate::config::StorageSettings) -> anyhow::Result<Ar
         storage.profile.as_deref(),
         storage.verify_tls,
     )
-    .await?;
+    .await?
+    .with_prefix(&storage.prefix);
     Ok(Arc::new(client))
 }
 
