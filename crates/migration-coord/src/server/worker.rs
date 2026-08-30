@@ -173,6 +173,7 @@ pub async fn heartbeat(
             body.state,
             body.inflight_ops,
             body.queue_depth,
+            body.latency,
         )
         .await
         .map_err(ApiError::storage)?;

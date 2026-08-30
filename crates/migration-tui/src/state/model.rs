@@ -6,7 +6,8 @@ use super::{
 use crate::theme::Theme;
 use chrono::{DateTime, Utc};
 use migration_control_protocol::schema::{
-    ErrorBucket, EventEnvelope, EventKind, Job, JobId, Snapshot, Worker, WorkerId, WorkerState,
+    ErrorBucket, EventEnvelope, EventKind, Job, JobId, OpLatency, Snapshot, Worker, WorkerId,
+    WorkerState,
 };
 use std::collections::HashMap;
 
@@ -492,6 +493,78 @@ impl AppState {
         self.snapshot.workers.get(id)
     }
 
+    /// Roll the connected workers' latest latency windows up into one
+    /// fleet picture. Per op: counts and wall time sum (so the mean is
+    /// exact), and the *worst* p50/p95/p99/max across workers — the
+    /// slow worker is the one the operator needs to see, and
+    /// percentiles do not average. Busy shares are pair-weighted
+    /// means. `None` until any connected worker has reported a
+    /// window.
+    pub fn fleet_latency(&self, id: &JobId) -> Option<FleetLatency> {
+        let mut per_op: std::collections::BTreeMap<(u8, String), OpLatency> =
+            std::collections::BTreeMap::new();
+        let mut pairs_total = 0u64;
+        let mut src_busy = 0.0f64;
+        let mut dst_busy = 0.0f64;
+        let mut s3_wait = 0.0f64;
+        let mut reporting = 0usize;
+        for w in self.workers_for_job(id) {
+            if w.state == WorkerState::Disconnected {
+                continue;
+            }
+            let Some(l) = &w.latency else { continue };
+            reporting += 1;
+            let pairs = l.pairs.max(1) as u64;
+            pairs_total += pairs;
+            src_busy += l.src_busy_pct * pairs as f64;
+            dst_busy += l.dst_busy_pct * pairs as f64;
+            s3_wait += l.s3_wait_pct;
+            for o in &l.ops {
+                let rank = match o.side.as_str() {
+                    "src" => 0,
+                    "dst" => 1,
+                    _ => 2,
+                };
+                let e = per_op
+                    .entry((rank, o.op.clone()))
+                    .or_insert_with(|| OpLatency {
+                        side: o.side.clone(),
+                        op: o.op.clone(),
+                        count: 0,
+                        mean_us: 0,
+                        p50_us: 0,
+                        p95_us: 0,
+                        p99_us: 0,
+                        max_us: 0,
+                        total_us: 0,
+                    });
+                e.count += o.count;
+                e.total_us += o.total_us;
+                e.p50_us = e.p50_us.max(o.p50_us);
+                e.p95_us = e.p95_us.max(o.p95_us);
+                e.p99_us = e.p99_us.max(o.p99_us);
+                e.max_us = e.max_us.max(o.max_us);
+            }
+        }
+        if reporting == 0 {
+            return None;
+        }
+        let ops: Vec<OpLatency> = per_op
+            .into_values()
+            .map(|mut o| {
+                o.mean_us = o.total_us.checked_div(o.count).unwrap_or(0);
+                o
+            })
+            .collect();
+        Some(FleetLatency {
+            workers: reporting,
+            src_busy_pct: src_busy / pairs_total.max(1) as f64,
+            dst_busy_pct: dst_busy / pairs_total.max(1) as f64,
+            s3_wait_pct: s3_wait / reporting as f64,
+            ops,
+        })
+    }
+
     pub fn errors_for_job(&self, id: &JobId) -> &[ErrorBucket] {
         self.snapshot
             .error_buckets
@@ -502,5 +575,46 @@ impl AppState {
 
     pub fn last_seq(&self) -> u64 {
         self.last_seen_seq
+    }
+}
+
+/// Fleet roll-up of the workers' latency windows — see
+/// [`AppState::fleet_latency`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FleetLatency {
+    /// Connected workers that have reported a window.
+    pub workers: usize,
+    pub src_busy_pct: f64,
+    pub dst_busy_pct: f64,
+    pub s3_wait_pct: f64,
+    /// Sorted src → dst → s3, then by op name.
+    pub ops: Vec<OpLatency>,
+}
+
+impl FleetLatency {
+    /// The one-line answer to "who is slow?". Thresholds: a side the
+    /// connection pairs spend ≥ 85 % of their time waiting on is the
+    /// bottleneck; when neither side reaches 60 % the servers have
+    /// headroom and the client (CPU, scheduling, S3 gaps between
+    /// shards) is what limits the rate.
+    pub fn verdict(&self) -> String {
+        let src = self.src_busy_pct;
+        let dst = self.dst_busy_pct;
+        let s3 = self.s3_wait_pct;
+        if dst >= 85.0 && dst >= src {
+            format!(
+                "destination-bound (pairs wait on dest {dst:.0}% of the time, source {src:.0}%)"
+            )
+        } else if src >= 85.0 {
+            format!("source-bound (pairs wait on source {src:.0}% of the time, dest {dst:.0}%)")
+        } else if s3 >= 50.0 {
+            format!(
+                "S3-bound (in S3 calls {s3:.0}% of the window; source {src:.0}%, dest {dst:.0}%)"
+            )
+        } else if src.max(dst) < 60.0 {
+            format!("client-bound (source {src:.0}%, dest {dst:.0}% — both servers have headroom)")
+        } else {
+            format!("mixed (source {src:.0}%, dest {dst:.0}%, S3 {s3:.0}%)")
+        }
     }
 }

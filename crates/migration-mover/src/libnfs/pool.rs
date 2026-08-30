@@ -164,10 +164,12 @@ impl MultiPool {
         }
         let (sender, receiver) = mpsc::unbounded_channel();
         for i in 0..n {
-            let src = NfsContext::mount_url(src_url, rpc_timeout_ms)
+            let mut src = NfsContext::mount_url(src_url, rpc_timeout_ms)
                 .map_err(|e| anyhow::anyhow!("mount source {src_url} (#{i}): {e}"))?;
-            let dst = NfsContext::mount_url(dst_url, rpc_timeout_ms)
+            src.set_side(migration_core::latency::Side::Src);
+            let mut dst = NfsContext::mount_url(dst_url, rpc_timeout_ms)
                 .map_err(|e| anyhow::anyhow!("mount dest {dst_url} (#{i}): {e}"))?;
+            dst.set_side(migration_core::latency::Side::Dst);
             sender
                 .send((src, dst))
                 .map_err(|_| anyhow::anyhow!("seed send failed (receiver dropped)"))?;

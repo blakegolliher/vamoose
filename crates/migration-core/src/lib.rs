@@ -27,6 +27,7 @@ pub mod claim;
 mod contract_drift_tests;
 pub mod errors;
 pub mod fence;
+pub mod latency;
 pub mod layout;
 pub mod overlap;
 pub mod records;

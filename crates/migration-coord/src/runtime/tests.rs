@@ -684,6 +684,7 @@ async fn worker_heartbeat_never_streams() {
             crate::schema::WorkerState::Copying,
             3,
             4,
+            None,
         )
         .await
         .unwrap();

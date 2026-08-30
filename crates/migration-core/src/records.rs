@@ -146,6 +146,12 @@ pub struct ProgressRecord {
     pub throughput_mb_s_1m: f64,
     /// "active", "degraded", "draining", "exiting".
     pub status: String,
+    /// Per-RPC latency over the last heartbeat window (source NFS,
+    /// destination NFS, S3) with the derived busy shares — the
+    /// "who is slow" answer, kept in the bucket so a run can be
+    /// read back after the fact. `None` on older writers.
+    #[serde(default)]
+    pub latency: Option<crate::latency::Summary>,
     /// Etag of the claim object this worker currently holds, if any.
     /// `None` means the worker is between shards (idle/scanning) or
     /// has self-fenced. `Some(etag)` is the proof-of-ownership that
@@ -381,6 +387,7 @@ mod tests {
             status: "active".into(),
             held_etag: Some("etag-abc".into()),
             heartbeat_sec: 30,
+            latency: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         let decoded: ProgressRecord = serde_json::from_str(&json).unwrap();

@@ -1,5 +1,5 @@
 use super::super::common::{
-    bytes_summary, files_summary, kv_key, kv_line, phase_span, section_header,
+    bytes_summary, files_summary, kv_key, kv_line, latency_side_lines, phase_span, section_header,
 };
 use crate::format::{format_bytes, format_elapsed};
 use crate::state::AppState;
@@ -182,6 +182,35 @@ pub(super) fn render_overview_tab(
         "Error classes",
         format!("{} (see Errors tab)", err_buckets.len()),
     ));
+
+    // ---- Latency (who is slow?) --------------------------------------
+    // Fleet roll-up of each connected worker's last heartbeat window:
+    // per-op worst percentiles across workers, pair-weighted busy
+    // share per server, and the verdict those shares imply.
+    lines.push(Line::raw(""));
+    lines.push(section_header("Latency"));
+    match state.fleet_latency(&job.id) {
+        Some(fleet) => {
+            lines.extend(latency_side_lines(
+                &fleet.ops,
+                fleet.src_busy_pct,
+                fleet.dst_busy_pct,
+                fleet.s3_wait_pct,
+            ));
+            lines.push(kv_line(
+                "Verdict",
+                format!(
+                    "{} — {} worker(s) reporting",
+                    fleet.verdict(),
+                    fleet.workers
+                ),
+            ));
+        }
+        None => lines.push(kv_line(
+            "Verdict",
+            "no latency window reported yet (workers send one per heartbeat)".to_string(),
+        )),
+    }
 
     let para = Paragraph::new(Text::from(lines));
     frame.render_widget(para, area);

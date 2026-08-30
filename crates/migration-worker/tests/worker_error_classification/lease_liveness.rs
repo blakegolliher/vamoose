@@ -92,6 +92,7 @@ async fn seed_progress(store: &FakeStore, held_etag: &str, heartbeat_age_sec: i6
         status: "active".into(),
         held_etag: Some(held_etag.into()),
         heartbeat_sec: HB_SEC,
+        latency: None,
     };
     store
         .put_unconditional(

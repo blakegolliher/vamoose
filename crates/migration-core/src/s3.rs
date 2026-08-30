@@ -331,6 +331,7 @@ fn classify_delete_response(status: u16, code: &str) -> DeleteErrorClass {
 #[async_trait]
 impl ClaimStore for S3Client {
     async fn put_if_absent(&self, key: &str, body: Vec<u8>) -> Result<String> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::PutIfAbsent);
         let resp = self
             .inner
             .put_object()
@@ -347,10 +348,12 @@ impl ClaimStore for S3Client {
     }
 
     async fn put_unconditional(&self, key: &str, body: Vec<u8>) -> Result<String> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::Put);
         self.put(key, body).await
     }
 
     async fn head_object(&self, key: &str) -> Result<Option<(String, Vec<u8>)>> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::Head);
         // Claim objects are a few hundred bytes; GET-once is cheaper
         // than HEAD-then-GET when the body is needed (it always is in
         // v2 reclaim — caller parses claimed_utc).
@@ -383,6 +386,7 @@ impl ClaimStore for S3Client {
     }
 
     async fn delete_if_match(&self, key: &str, etag: &str) -> Result<DeleteOutcome> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::DeleteIfMatch);
         // S3 etags are quoted on the wire. The SDK's `if_match` builder
         // takes the value verbatim; pass it pre-quoted to match
         // exactly what the server sees in HEAD/GET responses.
@@ -413,6 +417,7 @@ impl ClaimStore for S3Client {
     }
 
     async fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::Get);
         match self
             .inner
             .get_object()
@@ -438,6 +443,7 @@ impl ClaimStore for S3Client {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<ListEntry>> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::List);
         let mut out = Vec::new();
         let mut cont: Option<String> = None;
         loop {
@@ -526,6 +532,7 @@ impl S3Client {
     /// by the worker: a vamoose bucket must have versioning off.
     /// See `BucketVersioning` for why.
     pub async fn get_bucket_versioning(&self) -> Result<BucketVersioning> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::Versioning);
         use aws_sdk_s3::types::BucketVersioningStatus;
         let out = self
             .inner
@@ -552,6 +559,7 @@ impl S3Client {
     /// already-deleted key is harmless and the caller (archive)
     /// should not have to special-case it.
     pub async fn delete(&self, key: &str) -> Result<()> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::Delete);
         match self
             .inner
             .delete_object()
@@ -574,6 +582,7 @@ impl S3Client {
     /// Upload an object unconditionally. Used for progress, batches,
     /// failures — anything that isn't a claim.
     pub async fn put(&self, key: &str, body: Vec<u8>) -> Result<String> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::Put);
         let resp = self
             .inner
             .put_object()
@@ -591,6 +600,7 @@ impl S3Client {
     /// index shard already in the bucket is byte-for-byte the one it
     /// would upload.
     pub async fn head_meta(&self, key: &str) -> Result<Option<ObjectHead>> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::Head);
         match self
             .inner
             .head_object()
@@ -630,6 +640,7 @@ impl S3Client {
         path: &std::path::Path,
         metadata: std::collections::HashMap<String, String>,
     ) -> Result<String> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::Upload);
         let body = aws_sdk_s3::primitives::ByteStream::from_path(path)
             .await
             .map_err(|e| Error::Io(std::io::Error::other(format!("{}: {e}", path.display()))))?;
@@ -656,6 +667,7 @@ impl S3Client {
     /// `Error::Other`, which classifies Fatal and would terminal-fail
     /// a shard on a transient transport blip.
     pub async fn download_to(&self, key: &str, dest: &std::path::Path) -> Result<String> {
+        let _timer = crate::latency::S3Timer::start(crate::latency::S3Op::Download);
         let mut resp = self
             .inner
             .get_object()

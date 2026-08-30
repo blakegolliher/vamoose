@@ -17,7 +17,7 @@ pub use activity::{
     ProgressDeltaHistory, RecentError, RecentErrors, RecentVerifyMismatch, RecentVerifyMismatches,
     VerifyStatus, RECENT_ERRORS_PER_JOB, RECENT_VERIFY_MISMATCHES_PER_JOB,
 };
-pub use model::{snapshot_from_rest, AppState};
+pub use model::{snapshot_from_rest, AppState, FleetLatency};
 pub use ui::{
     CommandStatus, CommandStatusKind, ConnectionStatus, InputMode, JobSort, Modal, Tab, UiState,
     View, WorkerSort, COMMAND_STATUS_TTL_SECS,
