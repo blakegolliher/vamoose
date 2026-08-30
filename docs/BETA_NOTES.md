@@ -73,6 +73,18 @@ Run vamoose on a trusted network for beta. Concretely:
   (`POST /workers/{id}/leave`). The TUI's headline worker count is the
   connected workers; the Workers tab still lists the disconnected
   ones with their last state.
+- **S3 request deadlines**: every control-plane S3 call carries
+  connect / first-byte / per-attempt / whole-operation bounds (5 s /
+  30 s / 60 s / 180 s), and the heartbeat, lease-refresh, and shard-
+  download loops bound their own waits on top. A request the endpoint
+  never answers now fails like any other transient error — it counts
+  against the worker's retry budget (exit `4` after a lease window)
+  and forfeits the coord's lease after one TTL — instead of parking
+  the loop while the rest of the process carries on.
+- **Finished jobs in the TUI**: the Overview closes the run window at
+  the terminal transition and reports "took" and the average over
+  the manifest's files; rows re-copied after reclaims are shown on a
+  separate `Replayed` line rather than inflating the average.
 - **Durability**: file data is COMMITted (whole-file NFS COMMIT)
   before the rename publishes it, on both copy paths; every data-
   plane RPC carries a deadline (`[mover] rpc_timeout_ms`, default

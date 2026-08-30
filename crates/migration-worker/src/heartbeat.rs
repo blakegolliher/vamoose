@@ -276,8 +276,21 @@ impl HeartbeatTask {
             // Step 2: write progress unconditionally. This is the
             // per-host liveness signal aggregators + reclaimers observe;
             // it must land before any HEAD round-trip can stall the loop.
-            if let Err(e) = self.write_progress("active", held.as_ref()).await {
-                tracing::warn!(error = ?e, "progress write failed (transient)");
+            // Bounded by one tick: the SDK has its own timeouts, but
+            // this loop is the worker's liveness — it must never
+            // depend on a client implementation detail to keep
+            // ticking. (2026-08-28: this PUT hung for 19 h on a
+            // black-holed connection; the fence never tripped and the
+            // worker copied duplicates of every shard it claimed.)
+            match tokio::time::timeout(self.interval, self.write_progress("active", held.as_ref()))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(error = ?e, "progress write failed (transient)"),
+                Err(_) => tracing::warn!(
+                    timeout_secs = self.interval.as_secs(),
+                    "progress write timed out (transient)"
+                ),
             }
 
             // Step 3: HEAD-and-compare to detect ownership loss. The
@@ -285,7 +298,22 @@ impl HeartbeatTask {
             // only advances on reclaim/complete, which the orchestrator
             // drives.
             if let Some(held) = held {
-                match claim::refresh(&*self.store, &held.shard, &held.etag).await {
+                // Same bound as the progress write: a HEAD that never
+                // returns is a failed HEAD for retry-budget purposes,
+                // not a paused loop.
+                let refreshed = match tokio::time::timeout(
+                    self.interval,
+                    claim::refresh(&*self.store, &held.shard, &held.etag),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(migration_core::errors::Error::Other(anyhow::anyhow!(
+                        "claim HEAD timed out after {}s",
+                        self.interval.as_secs()
+                    ))),
+                };
+                match refreshed {
                     Ok(RefreshOutcome::StillHeld { etag }) => {
                         consec_failures = 0;
                         // Invariant: `claim::refresh` returns `StillHeld`

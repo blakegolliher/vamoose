@@ -1353,3 +1353,52 @@ fn overview_counts_connected_workers_not_history() {
         "expected connected/assigned count in:\n{text}"
     );
 }
+
+/// A finished job reports its run over the copy window — start to
+/// the terminal transition, never to "now" — and the average over the
+/// manifest's files, not `files_done` (which includes every row
+/// replayed after a reclaim). The replay is shown on its own line and
+/// the ETA line is gone.
+#[test]
+fn overview_of_a_completed_job_reports_the_run_not_the_clock() {
+    use migration_control_protocol::schema::Phase;
+    let mut s = AppState::empty(at(0));
+    s.mark_connected(at(0));
+    s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+    s.apply_envelope(&env(
+        2,
+        100,
+        EventKind::JobPhaseChanged {
+            job_id: jid("alpha"),
+            from: Phase::Planned,
+            to: Phase::Copying,
+            reason: "first progress delta".into(),
+        },
+    ));
+    s.apply_envelope(&env(
+        3,
+        100 + 3600,
+        EventKind::JobPhaseChanged {
+            job_id: jid("alpha"),
+            from: Phase::Copying,
+            to: Phase::Completed,
+            reason: "ok".into(),
+        },
+    ));
+    // 3,600,000 files in one hour = 1000 files/s; 400,000 rows of
+    // replay must not inflate that.
+    set_progress(&mut s, "alpha", 3_600_000, 4_000_000, 0);
+
+    enter_detail(&mut s, "alpha", Tab::Overview);
+    // Render a day later: the average must not have decayed.
+    let text = buffer_text(&render_to_buffer(&s, at(100 + 3600 + 86_400), 120, 30));
+    assert!(text.contains("Finished"), "{text}");
+    assert!(text.contains("took 1h00m"), "{text}");
+    assert!(text.contains("avg 1000 files/s over the run"), "{text}");
+    assert!(
+        text.contains("400000 rows re-copied after reclaims (11.1% of the run)"),
+        "{text}"
+    );
+    assert!(!text.contains("ETA"), "{text}");
+    assert!(!text.contains("since start"), "{text}");
+}
