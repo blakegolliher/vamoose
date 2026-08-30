@@ -144,7 +144,9 @@ impl S3Client {
 
         let aws_cfg = loader.load().await;
 
-        let mut s3_cfg = aws_sdk_s3::config::Builder::from(&aws_cfg).force_path_style(true);
+        let mut s3_cfg = aws_sdk_s3::config::Builder::from(&aws_cfg)
+            .force_path_style(true)
+            .timeout_config(client_timeouts());
 
         if !verify_tls {
             tracing::warn!(
@@ -157,6 +159,45 @@ impl S3Client {
         let client = Client::from_conf(s3_cfg.build());
         Ok(Self::new(client, bucket.to_string()))
     }
+}
+
+/// Connect timeout: a socket that cannot be opened in this long is
+/// not going to open.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Read timeout: request sent → first byte of the response. Covers
+/// the black-holed-connection case (request acknowledged, server
+/// side gone, no RST, no keepalive) that no retransmit timer ever
+/// resolves.
+pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Bound on one attempt of one operation, body transfer included.
+/// Sized for the largest single PUT in the system (a ~150 MB index
+/// shard from `prepare`) at a few MB/s; every control-plane call
+/// (claims, heartbeats, lease, progress, events) is bytes and
+/// finishes in milliseconds.
+pub const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bound on the whole operation across the SDK's retries.
+pub const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+/// Bound on waiting for one body chunk in [`S3Client::download_to`].
+/// The SDK's operation timeouts end when the response headers are
+/// deserialized; the streamed body is read afterwards and needs its
+/// own bound.
+pub const BODY_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The SDK ships with a connect timeout only — no read, attempt, or
+/// operation bound — so one request on a black-holed connection hangs
+/// its caller forever. The 600M run of 2026-08-28 lost the coord's
+/// lease-refresh loop for 30 h and a worker's heartbeat loop for 19 h
+/// to exactly that: one PUT that never returned, while every other
+/// connection in the pool kept working. Every S3 call in the system
+/// now carries these bounds; loops that must keep ticking add their
+/// own `tokio::time::timeout` on top (heartbeat, lease refresh).
+pub fn client_timeouts() -> aws_sdk_s3::config::timeout::TimeoutConfig {
+    aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .operation_attempt_timeout(ATTEMPT_TIMEOUT)
+        .operation_timeout(OPERATION_TIMEOUT)
+        .build()
 }
 
 /// Build a `SharedHttpClient` whose TLS layer accepts any server
@@ -630,12 +671,31 @@ impl S3Client {
             tokio::fs::create_dir_all(parent).await?;
         }
         let mut out = tokio::fs::File::create(dest).await?;
-        while let Some(chunk) = resp.body.try_next().await.map_err(|e| {
-            // ByteStream errors have no aws_sdk_s3::Error conversion;
-            // a mid-stream failure is read-side I/O (host/network) —
-            // Io also classifies WorkerLocal.
-            Error::Io(std::io::Error::other(format!("S3 GET {key} body: {e}")))
-        })? {
+        loop {
+            // The SDK's timeouts stop at the response headers; a body
+            // chunk that never arrives would otherwise hang the shard
+            // download forever. Io classifies WorkerLocal like a
+            // mid-stream failure.
+            let next = tokio::time::timeout(BODY_CHUNK_TIMEOUT, resp.body.try_next())
+                .await
+                .map_err(|_| {
+                    Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "S3 GET {key} body: no data for {}s",
+                            BODY_CHUNK_TIMEOUT.as_secs()
+                        ),
+                    ))
+                })?;
+            let Some(chunk) = next.map_err(|e| {
+                // ByteStream errors have no aws_sdk_s3::Error conversion;
+                // a mid-stream failure is read-side I/O (host/network) —
+                // Io also classifies WorkerLocal.
+                Error::Io(std::io::Error::other(format!("S3 GET {key} body: {e}")))
+            })?
+            else {
+                break;
+            };
             out.write_all(&chunk).await?;
         }
         out.flush().await?;
@@ -652,6 +712,27 @@ impl S3Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------------------
+    // Client timeouts — every bound set, none left at the SDK default.
+    // -------------------------------------------------------------------------
+
+    /// Regression pin for the 2026-08-28 hang: the SDK default config
+    /// has a connect timeout only. A client built without a read,
+    /// attempt, and operation bound can park a caller forever on one
+    /// black-holed request.
+    #[test]
+    fn client_timeouts_bound_every_phase_of_a_request() {
+        let t = client_timeouts();
+        assert_eq!(t.connect_timeout(), Some(CONNECT_TIMEOUT));
+        assert_eq!(t.read_timeout(), Some(READ_TIMEOUT));
+        assert_eq!(t.operation_attempt_timeout(), Some(ATTEMPT_TIMEOUT));
+        assert_eq!(t.operation_timeout(), Some(OPERATION_TIMEOUT));
+        assert!(
+            ATTEMPT_TIMEOUT < OPERATION_TIMEOUT,
+            "the operation bound must leave room for at least one retry",
+        );
+    }
 
     // -------------------------------------------------------------------------
     // Conditional PUT (If-None-Match: *) — the acquire/complete atom.
