@@ -240,6 +240,7 @@ pub async fn run_with_stop(
     // ~111 pairs is the observed per-host ceiling) and the async pool
     // needs that headroom for its small-bucket pairs.
     let pool_size = cfg.mover.nfs_connections.max(1) as usize;
+    migration_core::latency::set_pairs(pool_size as u32);
     let pool_size = if cfg.mover.use_bucketed_pool {
         pool_size.min(16)
     } else {
@@ -2326,6 +2327,7 @@ mod tests {
             status: "active".into(),
             held_etag: held_etag.map(str::to_string),
             heartbeat_sec: HB_SEC,
+            latency: None,
         }
     }
 

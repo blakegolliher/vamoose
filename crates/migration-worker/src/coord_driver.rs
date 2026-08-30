@@ -695,6 +695,36 @@ async fn sample_heartbeat(inputs: &DriverInputs, run_control: &RunControl) -> He
         // straight into the inflight window. Reported as 0 honestly
         // rather than inventing a number.
         queue_depth: 0,
+        latency: migration_core::latency::latest().map(latency_to_wire),
+    }
+}
+
+/// `migration_core::latency::Summary` → the control-protocol mirror
+/// (field for field; the protocol crate does not depend on core).
+fn latency_to_wire(
+    s: migration_core::latency::Summary,
+) -> migration_control_protocol::schema::LatencySummary {
+    migration_control_protocol::schema::LatencySummary {
+        window_secs: s.window_secs,
+        pairs: s.pairs,
+        src_busy_pct: s.src_busy_pct,
+        dst_busy_pct: s.dst_busy_pct,
+        s3_wait_pct: s.s3_wait_pct,
+        ops: s
+            .ops
+            .into_iter()
+            .map(|o| migration_control_protocol::schema::OpLatency {
+                side: o.side,
+                op: o.op,
+                count: o.count,
+                mean_us: o.mean_us,
+                p50_us: o.p50_us,
+                p95_us: o.p95_us,
+                p99_us: o.p99_us,
+                max_us: o.max_us,
+                total_us: o.total_us,
+            })
+            .collect(),
     }
 }
 

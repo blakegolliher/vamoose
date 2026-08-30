@@ -300,6 +300,9 @@ pub fn last_error<'a>(ctx: *mut nfs_context) -> &'a str {
 /// Single-threaded use is enforced by callers taking `&mut NfsContext`.
 pub struct NfsContext {
     raw: *mut nfs_context,
+    /// Which server this context is mounted against — tags every raw
+    /// RPC's latency sample. Defaults to `Src`; the pool sets it.
+    side: migration_core::latency::Side,
 }
 
 unsafe impl Send for NfsContext {}
@@ -324,7 +327,10 @@ impl NfsContext {
         if raw.is_null() {
             anyhow::bail!("nfs_init_context returned null for {url}");
         }
-        let me = Self { raw };
+        let me = Self {
+            raw,
+            side: migration_core::latency::Side::Src,
+        };
         // F12: bound every RPC on this context (including the mount).
         apply_rpc_timeout(me.raw, rpc_timeout_ms);
         let rc = unsafe { nfs_set_version(me.raw, 3) };
@@ -347,6 +353,16 @@ impl NfsContext {
     /// Raw pointer for FFI calls. Caller must not call concurrently
     /// from another thread.
     #[inline]
+    /// Tag this context as the source or destination side for latency
+    /// accounting.
+    pub fn set_side(&mut self, side: migration_core::latency::Side) {
+        self.side = side;
+    }
+
+    pub fn side(&self) -> migration_core::latency::Side {
+        self.side
+    }
+
     pub fn raw(&mut self) -> *mut nfs_context {
         self.raw
     }

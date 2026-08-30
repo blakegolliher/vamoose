@@ -207,6 +207,7 @@ impl Snapshot {
                         counters: WorkerCounters::default(),
                         last_error: None,
                         fence_reason: None,
+                        latency: None,
                     },
                 );
                 if let Some(j) = self.jobs.get_mut(job_id) {

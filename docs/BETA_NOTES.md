@@ -81,6 +81,21 @@ Run vamoose on a trusted network for beta. Concretely:
   against the worker's retry budget (exit `4` after a lease window)
   and forfeits the coord's lease after one TTL — instead of parking
   the loop while the rest of the process carries on.
+- **Latency telemetry — "who is slow?"**: every raw NFS RPC (tagged
+  source or destination) and every S3 call is timed into lock-free
+  histograms. Each heartbeat the worker rolls the last window up into
+  per-op count / mean / p50 / p95 / p99 / max plus the **busy share**
+  per server — the fraction of `pairs × window` its connection pairs
+  spent waiting on that server — and the share of the window spent
+  inside S3 calls. It lands in three places: the journal (`heartbeat:
+  latency window …` every tick), the worker's `progress/<host>.json`
+  in the bucket (`latency`), and the coord heartbeat, which the TUI
+  renders as the Overview's `Latency` section (fleet roll-up: worst
+  percentiles across workers, pair-weighted busy shares, and a
+  verdict — destination-bound / source-bound / S3-bound / client-
+  bound) and per worker in the worker modal. A side ≥ 85 % busy is
+  the bottleneck; both under 60 % means the servers have headroom and
+  the client is the limit.
 - **Finished jobs in the TUI**: the Overview closes the run window at
   the terminal transition and reports "took" and the average over
   the manifest's files; rows re-copied after reclaims are shown on a

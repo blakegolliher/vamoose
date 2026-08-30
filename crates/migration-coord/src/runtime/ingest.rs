@@ -309,6 +309,7 @@ impl CoordRuntime {
         state: crate::schema::WorkerState,
         inflight_ops: u32,
         queue_depth: u32,
+        latency: Option<crate::schema::LatencySummary>,
     ) -> Result<bool> {
         let now = self.clock.now();
         let mut guard = self.inner.lock().await;
@@ -321,6 +322,11 @@ impl CoordRuntime {
                 w.state = state;
                 w.inflight_ops = inflight_ops;
                 w.queue_depth = queue_depth;
+                // A heartbeat without a window (older worker, or the
+                // first tick) keeps the last one it sent.
+                if latency.is_some() {
+                    w.latency = latency;
+                }
                 w.last_heartbeat = now;
                 Ok(true)
             }

@@ -1,4 +1,4 @@
-use super::common::{kv_key, kv_line, section_header, worker_state_span};
+use super::common::{kv_key, kv_line, latency_side_lines, section_header, worker_state_span};
 use crate::format::{format_bytes, format_elapsed};
 use crate::state::{AppState, Modal};
 use crate::theme::Theme;
@@ -236,6 +236,24 @@ fn render_worker_modal(
         "Errs/min",
         format!("{:.2}", w.counters.errors_per_min),
     ));
+
+    lines.push(Line::raw(""));
+    lines.push(section_header("Latency (last heartbeat window)"));
+    match &w.latency {
+        Some(l) => {
+            lines.push(kv_line(
+                "Window",
+                format!("{:.0}s over {} connection pairs", l.window_secs, l.pairs),
+            ));
+            lines.extend(latency_side_lines(
+                &l.ops,
+                l.src_busy_pct,
+                l.dst_busy_pct,
+                l.s3_wait_pct,
+            ));
+        }
+        None => lines.push(kv_line("Window", "not reported yet".to_string())),
+    }
 
     if w.last_error.is_some() || w.fence_reason.is_some() {
         lines.push(Line::raw(""));

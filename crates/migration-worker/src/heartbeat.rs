@@ -213,6 +213,12 @@ impl HeartbeatTask {
         let max_drift_secs = (self.lease_timeout.as_secs() / 2).max(1) as i64;
 
         let cancel = self.fence.cancel_token();
+        // Latency window: this task owns it (see
+        // `migration_core::latency`) — one snapshot per tick, diffed
+        // against the previous, published for the coord heartbeat
+        // and written into the progress record.
+        let mut latency_prev = migration_core::latency::global().snapshot();
+        let mut latency_prev_at = std::time::Instant::now();
         loop {
             tokio::select! {
                 _ = ticker.tick() => {}
@@ -228,6 +234,27 @@ impl HeartbeatTask {
                 interval_ms = self.interval.as_millis() as u64,
                 "heartbeat: tick"
             );
+
+            {
+                let now_mono = std::time::Instant::now();
+                let snap = migration_core::latency::global().snapshot();
+                let summary = snap.since(&latency_prev).summarize(
+                    now_mono.saturating_duration_since(latency_prev_at),
+                    migration_core::latency::pairs(),
+                );
+                latency_prev = snap;
+                latency_prev_at = now_mono;
+                if !summary.ops.is_empty() {
+                    tracing::info!(
+                        src_busy_pct = format_args!("{:.0}", summary.src_busy_pct),
+                        dst_busy_pct = format_args!("{:.0}", summary.dst_busy_pct),
+                        s3_wait_pct = format_args!("{:.0}", summary.s3_wait_pct),
+                        detail = %summary.one_line(),
+                        "heartbeat: latency window"
+                    );
+                }
+                migration_core::latency::publish(summary);
+            }
 
             // R7: check wall-vs-monotonic drift on every tick. Both
             // clocks advance together in normal operation; if they
@@ -466,6 +493,7 @@ impl HeartbeatTask {
                 .saturating_add(live.files_fenced.load(Relaxed)),
             throughput_mb_s_1m: throughput_mb_s,
             status: status.to_string(),
+            latency: migration_core::latency::latest(),
             // Cross-check fields (PROGRESS_LIVENESS_CROSS_CHECK.md):
             // peers compare `held_etag` to the live claim etag and
             // use `heartbeat_sec` to set the freshness threshold

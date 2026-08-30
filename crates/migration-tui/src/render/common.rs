@@ -98,3 +98,56 @@ pub(super) fn key_hint(key: &str, label: &str) -> Span<'static> {
     // invisibly on dark terminals).
     Span::raw(format!("{key} {label}"))
 }
+
+/// `0.4ms`, `14ms`, `1.2s` — a latency the way an operator reads it.
+pub(crate) fn fmt_us(us: u64) -> String {
+    if us >= 1_000_000 {
+        format!("{:.1}s", us as f64 / 1e6)
+    } else if us >= 10_000 {
+        format!("{}ms", us / 1000)
+    } else if us >= 1000 {
+        format!("{:.1}ms", us as f64 / 1000.0)
+    } else {
+        format!("{us}µs")
+    }
+}
+
+/// One line per side of a latency window: `LOOKUP p50 0.4ms p95
+/// 2.1ms · READ p50 …`, prefixed with the side's busy share. Shared
+/// by the Overview (fleet roll-up) and the worker modal.
+pub(crate) fn latency_side_lines(
+    ops: &[migration_control_protocol::schema::OpLatency],
+    src_busy_pct: f64,
+    dst_busy_pct: f64,
+    s3_wait_pct: f64,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (side, label, share, share_label) in [
+        ("src", "Source NFS", src_busy_pct, "busy"),
+        ("dst", "Dest NFS", dst_busy_pct, "busy"),
+        ("s3", "S3", s3_wait_pct, "wait"),
+    ] {
+        let detail: Vec<String> = ops
+            .iter()
+            .filter(|o| o.side == side)
+            .map(|o| {
+                format!(
+                    "{} p50 {} p95 {} max {} ×{}",
+                    o.op,
+                    fmt_us(o.p50_us),
+                    fmt_us(o.p95_us),
+                    fmt_us(o.max_us),
+                    format_count(o.count)
+                )
+            })
+            .collect();
+        if detail.is_empty() {
+            continue;
+        }
+        lines.push(kv_line(
+            label,
+            format!("{share_label} {share:.0}%  ·  {}", detail.join("  ·  ")),
+        ));
+    }
+    lines
+}

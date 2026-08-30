@@ -546,6 +546,44 @@ pub struct Worker {
     pub last_error: Option<String>,
     #[serde(default)]
     pub fence_reason: Option<String>,
+    /// Latest per-RPC latency window the worker reported in its
+    /// heartbeat (source NFS, destination NFS, S3). Heartbeat-only —
+    /// never enters the event log; `None` until the first heartbeat
+    /// that carries one.
+    #[serde(default)]
+    pub latency: Option<LatencySummary>,
+}
+
+/// One op's latency over a heartbeat window. `side` is `"src"`,
+/// `"dst"`, or `"s3"`; `op` is the NFS procedure or S3 call name.
+/// Mirrors `migration_core::latency::OpLatency` field for field — the
+/// worker converts; this crate stays free of the core dependency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpLatency {
+    pub side: String,
+    pub op: String,
+    pub count: u64,
+    pub mean_us: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+    pub total_us: u64,
+}
+
+/// A worker's latency window: per-op statistics plus the derived
+/// busy share per side — the fraction of `pairs × window` its NFS
+/// connection pairs spent waiting on that server — and the share of
+/// the window spent inside S3 calls. A side near 100 % is the
+/// bottleneck; both low means the client is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LatencySummary {
+    pub window_secs: f64,
+    pub pairs: u32,
+    pub src_busy_pct: f64,
+    pub dst_busy_pct: f64,
+    pub s3_wait_pct: f64,
+    pub ops: Vec<OpLatency>,
 }
 
 // =============================================================================
@@ -1025,6 +1063,10 @@ pub struct HeartbeatBody {
     pub inflight_ops: u32,
     #[serde(default)]
     pub queue_depth: u32,
+    /// Per-RPC latency over the worker's last heartbeat window.
+    /// Optional on the wire so older workers keep heartbeating.
+    #[serde(default)]
+    pub latency: Option<LatencySummary>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1727,6 +1769,7 @@ mod tests {
             },
             last_error: Some("EACCES".into()),
             fence_reason: None,
+            latency: None,
         };
         round_trip(w);
     }

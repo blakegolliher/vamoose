@@ -1402,3 +1402,150 @@ fn overview_of_a_completed_job_reports_the_run_not_the_clock() {
     assert!(!text.contains("ETA"), "{text}");
     assert!(!text.contains("since start"), "{text}");
 }
+
+fn latency_window(
+    pairs: u32,
+    src_busy: f64,
+    dst_busy: f64,
+    s3_wait: f64,
+    ops: &[(&str, &str, u64, u64, u64)],
+) -> migration_control_protocol::schema::LatencySummary {
+    use migration_control_protocol::schema::{LatencySummary, OpLatency};
+    LatencySummary {
+        window_secs: 30.0,
+        pairs,
+        src_busy_pct: src_busy,
+        dst_busy_pct: dst_busy,
+        s3_wait_pct: s3_wait,
+        ops: ops
+            .iter()
+            .map(|(side, op, count, p50, p95)| OpLatency {
+                side: side.to_string(),
+                op: op.to_string(),
+                count: *count,
+                mean_us: *p50,
+                p50_us: *p50,
+                p95_us: *p95,
+                p99_us: *p95,
+                max_us: *p95,
+                total_us: p50 * count,
+            })
+            .collect(),
+    }
+}
+
+/// The Overview answers "who is slow?" from the workers' heartbeat
+/// windows: worst percentiles across workers per op, pair-weighted
+/// busy shares, and a verdict. A disconnected worker's stale window
+/// is left out. The worker modal shows its own window.
+#[test]
+fn overview_latency_section_rolls_up_workers_and_names_the_bottleneck() {
+    let mut s = AppState::empty(at(0));
+    s.mark_connected(at(0));
+    s.apply_envelope(&job_created_evt(1, 0, "alpha"));
+    let a = WorkerId::new();
+    let b = WorkerId::new();
+    let gone = WorkerId::new();
+    s.apply_envelope(&worker_joined_evt(2, 0, "alpha", a, "host-1"));
+    s.apply_envelope(&worker_joined_evt(3, 0, "alpha", b, "host-2"));
+    s.apply_envelope(&worker_joined_evt(4, 0, "alpha", gone, "host-3"));
+    s.apply_envelope(&env(
+        5,
+        0,
+        EventKind::WorkerLeft {
+            worker_id: gone,
+            reason: "worker exiting".into(),
+        },
+    ));
+    // Before any window: the section says so.
+    enter_detail(&mut s, "alpha", Tab::Overview);
+    let text = buffer_text(&render_to_buffer(&s, at(0), 140, 40));
+    assert!(text.contains("no latency window reported yet"), "{text}");
+
+    // a: 110 pairs, dest saturated; b: 70 pairs, less so; gone: a
+    // stale window claiming the source is the problem.
+    s.snapshot.workers.get_mut(&a).unwrap().latency = Some(latency_window(
+        110,
+        40.0,
+        97.0,
+        2.0,
+        &[
+            ("src", "LOOKUP", 1000, 400, 2100),
+            ("dst", "CREATE", 1000, 1200, 14_000),
+            ("s3", "HEAD", 10, 8000, 9000),
+        ],
+    ));
+    s.snapshot.workers.get_mut(&b).unwrap().latency = Some(latency_window(
+        70,
+        50.0,
+        88.0,
+        3.0,
+        &[
+            ("src", "LOOKUP", 500, 500, 1900),
+            ("dst", "CREATE", 500, 1100, 20_000),
+        ],
+    ));
+    s.snapshot.workers.get_mut(&gone).unwrap().latency = Some(latency_window(
+        110,
+        99.0,
+        10.0,
+        0.0,
+        &[("src", "READ", 9, 50_000, 90_000)],
+    ));
+
+    let fleet = s.fleet_latency(&jid("alpha")).expect("two workers report");
+    assert_eq!(fleet.workers, 2);
+    // Pair-weighted: (97*110 + 88*70) / 180 = 93.5
+    assert!(
+        (fleet.dst_busy_pct - 93.5).abs() < 0.01,
+        "{}",
+        fleet.dst_busy_pct
+    );
+    let create = fleet.ops.iter().find(|o| o.op == "CREATE").unwrap();
+    assert_eq!(create.count, 1500);
+    assert_eq!(create.p95_us, 20_000, "worst p95 across workers");
+    assert_eq!(create.mean_us, (1200 * 1000 + 1100 * 500) / 1500);
+    assert!(
+        fleet.ops.iter().all(|o| o.op != "READ"),
+        "the disconnected worker's window must not be rolled up"
+    );
+    assert!(
+        fleet.verdict().starts_with("destination-bound"),
+        "{}",
+        fleet.verdict()
+    );
+
+    let text = buffer_text(&render_to_buffer(&s, at(0), 160, 40));
+    assert!(text.contains("Dest NFS"), "{text}");
+    assert!(text.contains("busy 94%"), "{text}");
+    assert!(text.contains("CREATE p50 1.2ms p95 20ms"), "{text}");
+    assert!(text.contains("destination-bound"), "{text}");
+    assert!(text.contains("2 worker(s) reporting"), "{text}");
+
+    // Worker modal shows b's own window, not the fleet's.
+    s.ui.modal = Some(crate::state::Modal::WorkerDetail { worker_id: b });
+    let text = buffer_text(&render_to_buffer(&s, at(0), 160, 44));
+    assert!(text.contains("30s over 70 connection pairs"), "{text}");
+    assert!(text.contains("busy 88%"), "{text}");
+}
+
+/// Verdict thresholds: the side the pairs wait on ≥ 85 % of the time
+/// is named; neither reaching 60 % means the client is the limit.
+#[test]
+fn fleet_latency_verdict_thresholds() {
+    use crate::state::FleetLatency;
+    let f = |src, dst, s3| FleetLatency {
+        workers: 1,
+        src_busy_pct: src,
+        dst_busy_pct: dst,
+        s3_wait_pct: s3,
+        ops: Vec::new(),
+    };
+    assert!(f(40.0, 97.0, 2.0)
+        .verdict()
+        .starts_with("destination-bound"));
+    assert!(f(90.0, 30.0, 2.0).verdict().starts_with("source-bound"));
+    assert!(f(20.0, 30.0, 70.0).verdict().starts_with("S3-bound"));
+    assert!(f(30.0, 35.0, 5.0).verdict().starts_with("client-bound"));
+    assert!(f(70.0, 75.0, 5.0).verdict().starts_with("mixed"));
+}

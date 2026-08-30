@@ -158,6 +158,7 @@ async fn register_heartbeat_events_fence_end_to_end() {
                 errors_per_min: 0.0,
                 inflight_ops: 2,
                 queue_depth: 10,
+                latency: None,
             },
         )
         .await
@@ -256,6 +257,7 @@ async fn heartbeat_control_mode_flips_when_job_pauses() {
         errors_per_min: 0.0,
         inflight_ops: 0,
         queue_depth: 0,
+        latency: None,
     };
 
     let hb1 = client.heartbeat(reg.worker_id, body()).await.unwrap();
@@ -390,6 +392,7 @@ async fn unknown_worker_heartbeat_returns_404() {
                 errors_per_min: 0.0,
                 inflight_ops: 0,
                 queue_depth: 0,
+                latency: None,
             },
         )
         .await

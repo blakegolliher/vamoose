@@ -323,11 +323,20 @@ pub fn root_fh(nfs: &mut NfsContext) -> Result<Fh, RawError> {
 
 macro_rules! issue {
     ($nfs:expr, $slot:expr, $op:literal, $call:expr) => {{
+        // Wall time from issue to reply (or failure) is the RPC's
+        // latency sample, tagged with the side this context serves.
+        let started = std::time::Instant::now();
         let pdu = unsafe { $call };
         if pdu.is_null() {
             return Err(RawError::transport($op, 1, "task queue failed".into()));
         }
-        pump($nfs, $slot as *const Slot, $op)?;
+        let pumped = pump($nfs, $slot as *const Slot, $op);
+        migration_core::latency::global().record_nfs(
+            $nfs.side(),
+            migration_core::latency::NfsOp::from_tag($op),
+            started.elapsed(),
+        );
+        pumped?;
     }};
 }
 
