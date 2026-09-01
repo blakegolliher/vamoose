@@ -7,6 +7,10 @@ license     = { workspace = true }
 description = "Resumable nfs-walker Parquet → canonical migration schema converter"
 publish     = false
 
+[lib]
+name = "mig_walker_rewrite"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mig-walker-rewrite"
 path = "src/main.rs"

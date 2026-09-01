@@ -30,6 +30,7 @@ pub mod fence;
 pub mod latency;
 pub mod layout;
 pub mod overlap;
+pub mod prepare_tools;
 pub mod records;
 pub mod s3;
 pub mod schema;

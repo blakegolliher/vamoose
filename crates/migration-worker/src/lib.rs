@@ -15,6 +15,7 @@ pub mod config;
 pub mod coord_client;
 pub mod coord_driver;
 pub mod heartbeat;
+pub mod mover_factory;
 pub mod orchestrator;
 pub mod run_control;
 pub mod shard_processor;

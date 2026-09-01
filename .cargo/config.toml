@@ -1,0 +1,9 @@
+# gxhash (via the nfs-walker library compiled into mongoose) needs AES +
+# SSE2 intrinsics at compile time and has no portable fallback. sse2 is
+# x86-64 baseline; aes (AES-NI) has shipped in every mainstream x86-64
+# server CPU since ~2010. The cfg form (not a literal triple) so
+# glibc-versioned zigbuild targets like x86_64-unknown-linux-gnu.2.34
+# match too. NOTE: an env RUSTFLAGS overrides (does not merge with)
+# this — carry the flags along if you set one.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+aes,+sse2"]

@@ -37,7 +37,7 @@ pub struct ShardEntry {
     pub etag: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Endpoint {
     pub kind: EndpointKind,
     /// libnfs URL, e.g. `nfs://host/export`.

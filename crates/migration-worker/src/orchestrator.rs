@@ -63,10 +63,7 @@ use migration_core::records::{
 use migration_core::s3::S3Client;
 use migration_core::time::UtcTime;
 use migration_mover::batch::{BatchBudget, InflightLimiter, InflightProfile};
-use migration_mover::{
-    AsyncBucketedFileMover, BucketedAsyncPool, DowngradeSink, FailureSink, FileMover,
-    LibnfsContextPool, Mover, MoverConfig, MultiPool,
-};
+use migration_mover::{DowngradeSink, FailureSink};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -234,59 +231,8 @@ pub async fn run_with_stop(
     // ---- 3. Mount libnfs pool + build mover -----------------------
     // M3: pre-mount cfg.mover.nfs_connections context pairs so
     // concurrent shard dispatch has distinct contexts to draw from.
-    // In bucketed-async mode the sync pool only serves fallback rows
-    // (symlink/hardlink/dir/empty), so cap it — every context pair
-    // costs two reserved ports (libnfs as root binds ports < 1024;
-    // ~111 pairs is the observed per-host ceiling) and the async pool
-    // needs that headroom for its small-bucket pairs.
-    let pool_size = cfg.mover.nfs_connections.max(1) as usize;
-    migration_core::latency::set_pairs(pool_size as u32);
-    let pool_size = if cfg.mover.use_bucketed_pool {
-        pool_size.min(16)
-    } else {
-        pool_size
-    };
-    let pool: Arc<dyn LibnfsContextPool> = MultiPool::build(
-        &manifest.source.url,
-        &manifest.dest.url,
-        pool_size,
-        // F12: explicit per-RPC timeout at every context creation;
-        // 0 = leave the libnfs default untouched.
-        cfg.mover.rpc_timeout_ms,
-    )?;
-    // Keep a clone for the end-of-run root-mtime restore (slice 3 of
-    // MTIME_PARITY_FIX). `pool` itself is moved into Mover::new below.
-    let pool_for_root_mtime = Arc::clone(&pool);
-    tracing::info!(
-        pool_size,
-        src = %manifest.source.url,
-        dst = %manifest.dest.url,
-        "libnfs pool mounted",
-    );
-
-    let mut mover_cfg = MoverConfig::from_options(
-        manifest.source.url.clone(),
-        manifest.dest.url.clone(),
-        manifest.source.root.clone(),
-        manifest.dest.root.clone(),
-        &opts,
-    );
-    mover_cfg.require_chown = require_chown && cap_chown;
-    mover_cfg.require_unchanged_size = cfg.copy.require_unchanged_size;
-    mover_cfg.use_raw_fh = cfg.mover.use_raw_fh;
-    mover_cfg.direct_commit = cfg.mover.direct_commit;
-    // F12: [mover] rpc_timeout_ms flows config → MoverConfig →
-    // MountOpts (both pools read it from here / from cfg.mover).
-    mover_cfg.rpc_timeout_ms = cfg.mover.rpc_timeout_ms;
-    // Apply the [batch].inflight_* profile so the mover and the
-    // shard processor share the same view of size-class concurrency.
-    mover_cfg.inflight = InflightProfile {
-        small: cfg.batch.inflight_small,
-        medium: cfg.batch.inflight_medium,
-        large: cfg.batch.inflight_large,
-        large_stripe_size: parse_size(&cfg.batch.large_stripe_size).unwrap_or(4 * 1024 * 1024),
-        large_stripe_depth: cfg.batch.large_stripe_depth,
-    };
+    // Pool sizing, MoverConfig projection, and the sync-vs-bucketed
+    // wiring live in `mover_factory` (shared with mongoose).
     let downgrades = DowngradeSink::new();
     let failures = FailureSink::new();
 
@@ -296,52 +242,38 @@ pub async fn run_with_stop(
     let current = Arc::new(Mutex::new(None::<HeldClaim>));
     let fence = Fence::new();
 
-    // Build the file mover behind the FileMover trait so we can swap
-    // between the sync path and the bucketed-async path at startup.
-    // The async path additionally mounts a BucketedAsyncPool (six
-    // contexts: src+dst × small/medium/large) and wraps a sync Mover
-    // for the non-regular-file fallback rows (symlinks / hardlinks /
-    // dirs / empty / skip).
-    let mover: Arc<dyn FileMover> = if cfg.mover.use_bucketed_pool {
-        let async_pool = Arc::new(
-            BucketedAsyncPool::new(
-                &manifest.source.url,
-                &manifest.dest.url,
-                mover_cfg.rpc_timeout_ms,
-                cfg.mover.nfs_connections.max(1) as usize,
-            )
-            .await?,
-        );
-        tracing::info!(
-            src = %manifest.source.url,
-            dst = %manifest.dest.url,
-            small_pairs = async_pool.small_pairs(),
-            "bucketed async libnfs pool mounted",
-        );
-        let sync_mover = Mover::new(
-            mover_cfg.clone(),
-            pool,
-            host_id.clone(),
-            downgrades.clone(),
-            fence.clone(),
-        );
-        Arc::new(AsyncBucketedFileMover::new(
-            async_pool,
-            sync_mover,
-            Arc::new(mover_cfg),
-            fence.clone(),
-            host_id.clone(),
-            downgrades.clone(),
-        ))
-    } else {
-        Arc::new(Mover::new(
-            mover_cfg,
-            pool,
-            host_id.clone(),
-            downgrades.clone(),
-            fence.clone(),
-        ))
+    let mover_params = crate::mover_factory::MoverParams {
+        source_url: manifest.source.url.clone(),
+        dest_url: manifest.dest.url.clone(),
+        source_root: manifest.source.root.clone(),
+        dest_root: manifest.dest.root.clone(),
+        options: opts.clone(),
+        nfs_connections: cfg.mover.nfs_connections.max(1) as usize,
+        use_bucketed_pool: cfg.mover.use_bucketed_pool,
+        use_raw_fh: cfg.mover.use_raw_fh,
+        direct_commit: cfg.mover.direct_commit,
+        // F12: [mover] rpc_timeout_ms flows config → MoverConfig →
+        // MountOpts (both pools read it from here / from cfg.mover).
+        rpc_timeout_ms: cfg.mover.rpc_timeout_ms,
+        require_chown: require_chown && cap_chown,
+        require_unchanged_size: cfg.copy.require_unchanged_size,
+        // Apply the [batch].inflight_* profile so the mover and the
+        // shard processor share the same view of size-class concurrency.
+        inflight: InflightProfile {
+            small: cfg.batch.inflight_small,
+            medium: cfg.batch.inflight_medium,
+            large: cfg.batch.inflight_large,
+            large_stripe_size: parse_size(&cfg.batch.large_stripe_size).unwrap_or(4 * 1024 * 1024),
+            large_stripe_depth: cfg.batch.large_stripe_depth,
+        },
+        host_id: host_id.clone(),
     };
+    let built =
+        crate::mover_factory::build(&mover_params, downgrades.clone(), fence.clone()).await?;
+    let mover = built.mover;
+    // Kept for the end-of-run root-mtime restore (slice 3 of
+    // MTIME_PARITY_FIX).
+    let pool_for_root_mtime = built.pool;
     let throughput = ThroughputCounter::new();
     let inflight = InflightLimiter::new(&InflightProfile {
         small: cfg.batch.inflight_small,
