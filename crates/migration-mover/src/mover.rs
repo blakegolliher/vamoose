@@ -69,6 +69,9 @@ const DIR_CHILDREN_CACHE_FH_CAPACITY: usize = 1_000_000;
 /// Disabled sentinels have no child filehandles, so retain a separate directory
 /// bound to keep failed/oversized prefetches from accumulating indefinitely.
 const DIR_CHILDREN_CACHE_DIR_CAPACITY: usize = 4_096;
+/// Bound on the evicted-dirs set (see `DirChildrenState::evicted`).
+/// ~60 bytes per remembered path: full at ~60 MB.
+const DIR_CHILDREN_EVICTED_CAP: usize = 1_000_000;
 
 /// Outcome of attempting to move one file.
 #[derive(Debug, Clone)]
@@ -263,6 +266,17 @@ struct DirChildrenState {
     entries: std::collections::HashMap<Vec<u8>, CachedDirChildren>,
     lru: std::collections::VecDeque<Vec<u8>>,
     cached_child_fhs: usize,
+    /// Dirs that were prefetched and then evicted. A dir in this set is
+    /// never prefetched again — its children resolve via per-name
+    /// LOOKUP. Without this, a working set larger than the cache
+    /// thrashes: every row re-prefetches its whole directory (canonical
+    /// shards interleave rows across dirs, so eviction happens between
+    /// two rows of the same dir), turning the one-RPC LOOKUP the
+    /// prefetch was meant to save into a full multi-page READDIRPLUS
+    /// per file. Bounded by [`DIR_CHILDREN_EVICTED_CAP`]; past the cap
+    /// new evictions go unrecorded and those dirs fall back to the old
+    /// re-prefetch behavior.
+    evicted: std::collections::HashSet<Vec<u8>>,
 }
 
 /// Bounded source-directory child-FH cache with per-directory single-flight.
@@ -343,6 +357,9 @@ impl DirChildren {
             }
             if let Some(evicted) = state.entries.remove(oldest.as_slice()) {
                 state.cached_child_fhs -= evicted.entry.child_fh_count();
+                if state.evicted.len() < DIR_CHILDREN_EVICTED_CAP {
+                    state.evicted.insert(oldest);
+                }
             }
         }
         state.cached_child_fhs += child_fh_count;
@@ -361,6 +378,12 @@ impl DirChildren {
 
     fn disable(&self, dir: &[u8]) {
         self.insert(dir.to_vec(), DirChildrenEntry::Disabled);
+    }
+
+    /// True when `dir` was prefetched once and then evicted — the
+    /// caller must resolve via LOOKUP instead of re-prefetching.
+    fn was_evicted(&self, dir: &[u8]) -> bool {
+        self.state.lock().unwrap().evicted.contains(dir)
     }
 
     fn flight(&self, dir: &[u8]) -> Arc<std::sync::Mutex<()>> {
@@ -424,6 +447,9 @@ impl Mover {
                 return raw::lookup(ctx, dir_fh, name).map(|fh| (Arc::new(fh), false));
             }
             DirChildLookup::Uncached => {}
+        }
+        if self.src_dir_children.was_evicted(dir_path) {
+            return raw::lookup(ctx, dir_fh, name).map(|fh| (Arc::new(fh), false));
         }
 
         let flight = self.src_dir_children.flight(dir_path);
@@ -1920,6 +1946,23 @@ mod tests {
         let state = cache.state.lock().unwrap();
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.cached_child_fhs, 2);
+    }
+
+    #[test]
+    fn dir_children_eviction_is_sticky_so_thrashing_dirs_stop_prefetching() {
+        let cache = DirChildren::with_limits(10, 3);
+        cache.insert(b"/dir-a".to_vec(), child_entries(2));
+        assert!(!cache.was_evicted(b"/dir-a"));
+
+        // /dir-b's insert pushes /dir-a out; a working set larger than
+        // the cache must not re-prefetch /dir-a for every row.
+        cache.insert(b"/dir-b".to_vec(), child_entries(2));
+        assert!(matches!(
+            cache.lookup(b"/dir-a", b"file-0"),
+            DirChildLookup::Uncached
+        ));
+        assert!(cache.was_evicted(b"/dir-a"));
+        assert!(!cache.was_evicted(b"/dir-b"));
     }
 
     #[test]

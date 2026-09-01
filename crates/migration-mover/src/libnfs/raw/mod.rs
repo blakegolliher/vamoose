@@ -427,9 +427,18 @@ unsafe extern "C" fn cb_readdirplus(
 
 /// Page through `dir_fh` with READDIRPLUS, copying child names and
 /// optional filehandles out of each callback before libnfs frees the
-/// decoded reply. The 64 KiB `dircount` and 1 MiB `maxcount` keep the
-/// common case to one page without asking the server for an unbounded
-/// response.
+/// decoded reply.
+///
+/// `maxcount` (the total-reply byte budget) must keep every reply
+/// inside a single RPC record-marking fragment: VAST streams READDIRPLUS
+/// replies larger than ~14 KiB as multi-fragment records (observed on
+/// VAST 5.x, 14,476-byte fragments), and the pinned libnfs cannot
+/// reassemble those ("Fragment support not yet working") — it drops the
+/// connection, auto-reconnects, and retransmits the same request, which
+/// the server answers identically: an infinite reconnect storm that
+/// wedges the context until the pump deadline. 8 KiB plus RPC overhead
+/// stays safely under the fragment threshold; a large directory costs a
+/// few dozen extra round trips, amortized over one prefetch per dir.
 ///
 /// At most `entry_cap` entries are retained. If the server indicates
 /// more entries exist, all partial results are dropped and `TooMany`
@@ -439,8 +448,8 @@ pub fn readdirplus(
     dir_fh: &[u8],
     entry_cap: usize,
 ) -> Result<ReaddirplusResult, RawError> {
-    const DIRCOUNT: u32 = 64 * 1024;
-    const MAXCOUNT: u32 = 1024 * 1024;
+    const DIRCOUNT: u32 = 8 * 1024;
+    const MAXCOUNT: u32 = 8 * 1024;
 
     let mut cookie = 0;
     let mut cookieverf: b::cookieverf3 = [0; 8];
