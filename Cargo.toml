@@ -10,6 +10,8 @@ members = [
     "crates/migration-tui",
     "crates/mig-walker-rewrite",
     "crates/vamoose-cli",
+    "crates/mongoose",
+    "crates/migration-resync",
 ]
 
 [workspace.package]

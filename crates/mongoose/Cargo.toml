@@ -1,0 +1,54 @@
+[package]
+name        = "mongoose"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "Single-host NFS-to-NFS data mover built from the vamoose engine (no S3, no coordinator, no fleet)"
+publish     = false
+
+[lib]
+name = "mongoose"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mongoose"
+path = "src/main.rs"
+
+[dependencies]
+migration-core     = { workspace = true }
+migration-mover    = { workspace = true }
+migration-worker   = { path = "../migration-worker" }
+mig-walker-rewrite = { path = "../mig-walker-rewrite" }
+migration-resync   = { path = "../migration-resync" }
+arrow              = { workspace = true }
+parquet            = { workspace = true }
+base64             = { workspace = true }
+
+# The scanner, compiled in so mongoose ships as one binary. Pinned to
+# branch embed-libnfs-override = the SAME commit
+# packaging/nfs-walker.lock.json pins for the vamoose subprocess build
+# (source_git_sha e7181feb) plus one build.rs-only commit adding the
+# NFS_WALKER_LIBNFS_DIR override (needed to cross-link for glibc 2.34
+# without picking up the build host's /usr/local libnfs). Walker
+# *code* is identical to the lock; bump the lock and this rev
+# together. default-features = false drops the optional analytics
+# dashboard (datafusion/axum/rust-embed) — mongoose only needs the
+# walk engine.
+nfs-walker = { git = "https://github.com/blakegolliher/nfs-walker", rev = "64e7dfba6186ceb99bb473e1fd4757a5d8aa1983", default-features = false }
+
+tokio              = { workspace = true }
+tokio-util         = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap               = { workspace = true }
+chrono             = { workspace = true }
+hex                = { workspace = true }
+libc               = { workspace = true }
+sha2               = "0.10.9"
+
+[dev-dependencies]
+tempfile = "3"

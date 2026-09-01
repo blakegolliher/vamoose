@@ -28,6 +28,16 @@ claim authority out of the data plane.
 - `mig-walker-rewrite` — resumable converter from legacy walker Parquet to the
   canonical schema, with atomic shard activation and JSON checkpoints.
 - `vamoose-cli` — the unified `vamoose` entry point and lifecycle boundary.
+- `migration-resync` — scan-vs-scan change classifier for converging
+  delta passes: hash-partitioned merge over two canonical indexes on
+  the `(file_type, size, mtime, ctime)` tuple. Used by `mongoose sync`;
+  built to be reusable by a future fleet pass driver.
+- `mongoose` — single-host NFS-to-NFS mover built from the same engine
+  (walker scan, canonical shards, libnfs mover, shard processor) with S3,
+  claims, the coordinator, and the TUI removed. Ships as one binary: the
+  nfs-walker scanner (pinned to the locked commit) and mig-walker-rewrite
+  are compiled in as libraries. Everything lives in one local work
+  directory. See `crates/mongoose/README.md`.
 
 There is no implemented custom io_uring mover, NFSv4.2 server-side COPY, or
 kernel `copy_file_range` strategy. `Strategy::LibnfsIoUring` remains only as a

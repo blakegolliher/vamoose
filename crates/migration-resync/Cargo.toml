@@ -1,0 +1,22 @@
+[package]
+name        = "migration-resync"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "Scan-vs-scan change classifier for converging delta passes (mongoose sync; future fleet pass driver)"
+publish     = false
+
+[dependencies]
+migration-core = { workspace = true }
+arrow          = { workspace = true }
+parquet        = { workspace = true }
+anyhow         = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+tracing        = { workspace = true }
+base64         = { workspace = true }
+chrono         = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
