@@ -6,6 +6,7 @@
 //! outcomes as proof.
 
 mod artifact;
+mod content;
 mod model;
 mod risk;
 mod sample;
@@ -27,12 +28,13 @@ pub use risk::{
 use anyhow::{Context, Result};
 use artifact::{create_temp, digest_file, ensure_parent, publish_existing_temp, publish_json};
 use base64::Engine;
+use content::{ContentOutcome, ContentPhaseConfig, ReaderFactory, SideResult};
 use migration_core::records::{EndpointKind, MigrationOptions};
 use sample::Ranker;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::os::fd::AsRawFd;
@@ -40,6 +42,15 @@ use std::path::{Path, PathBuf};
 use store::{Entry, ObservationIssue, Side, Store};
 
 pub fn verify(request: VerificationRequest) -> Result<VerificationResult> {
+    verify_with_readers(request, None)
+}
+
+/// `verify` with an injectable content reader factory. `None` reads through
+/// fresh libnfs contexts; tests supply an in-memory reader.
+fn verify_with_readers(
+    request: VerificationRequest,
+    factory: Option<&dyn ReaderFactory>,
+) -> Result<VerificationResult> {
     validate_request(&request)?;
     let request_fingerprint = request_fingerprint(&request)?;
     if let Some(report) = load_terminal_report(&request, &request_fingerprint)? {
@@ -82,8 +93,31 @@ pub fn verify(request: VerificationRequest) -> Result<VerificationResult> {
         &exclusions,
     )?;
     store.materialize_hardlinks()?;
+    let mut content_error = None;
     if let Some(sample) = request.sample.as_ref() {
         prepare_selection(&mut store, &request, sample)?;
+        let libnfs;
+        let factory: &dyn ReaderFactory = match factory {
+            Some(factory) => factory,
+            None => {
+                libnfs = content::LibnfsReaderFactory {
+                    source_url: request.source.url.clone(),
+                    destination_url: request.destination.url.clone(),
+                    rpc_timeout_ms: request.rpc_timeout_ms,
+                };
+                &libnfs
+            }
+        };
+        content_error = content::run_content_phase(
+            &mut store,
+            &ContentPhaseConfig {
+                content_workers: sample.content_workers,
+                content_read_size: sample.content_read_size,
+                source_root: request.source.root.clone(),
+                destination_root: request.destination.root.clone(),
+            },
+            factory,
+        )?;
     }
 
     // Mismatch rows must be byte-for-byte reproducible after a crash between
@@ -119,8 +153,25 @@ pub fn verify(request: VerificationRequest) -> Result<VerificationResult> {
         emit_entry_differences(&request, &mut emitter, source, destination, &observed_utc)
             .map(|_| ())
     })?;
+    if request.sample.is_some() {
+        store.for_each_content_outcome(|path, outcome, source, destination| {
+            emit_content_records(
+                &request,
+                &mut emitter,
+                path,
+                outcome,
+                source,
+                destination,
+                &observed_utc,
+            )
+        })?;
+    }
     let (mismatch_artifact, mismatch_count, mismatches_by_kind) = emitter.finish()?;
     let counts = store.counts()?;
+    let totals = store.content_totals()?;
+    let content_complete = store.pending_job_count()? == 0;
+    let unreadable_entries = store.unreadable_unique()?;
+    let unstable_entries = store.unstable_unique()?;
     let mut operational_errors: Vec<String> = issues
         .iter()
         .take(100)
@@ -134,31 +185,26 @@ pub fn verify(request: VerificationRequest) -> Result<VerificationResult> {
             )
         })
         .collect();
-    let (sample_policy, content_complete) = match request.sample.as_ref() {
-        Some(sample) => {
-            operational_errors
-                .push("sampled content hashing is not available in this build".to_string());
-            (
-                Some(sample_policy_report(sample, &store.selection_summary()?)),
-                false,
-            )
-        }
-        None => (None, true),
+    if let Some(error) = content_error.as_ref() {
+        operational_errors.push(error.clone());
+    }
+    let sample_policy = match request.sample.as_ref() {
+        Some(sample) => Some(sample_policy_report(sample, &store.selection_summary()?)),
+        None => None,
     };
-    let status = if !issues.is_empty() || !content_complete {
+    let status = if !issues.is_empty()
+        || totals.unreadable_sides > 0
+        || !content_complete
+        || content_error.is_some()
+    {
         VerificationStatus::Failed
-    } else if !unstable.is_empty() {
+    } else if !unstable.is_empty() || totals.unstable_sides > 0 {
         VerificationStatus::Inconclusive
     } else if mismatch_count != 0 {
         VerificationStatus::Mismatched
     } else {
         VerificationStatus::Passed
     };
-    let unreadable_entries = issues
-        .iter()
-        .map(|issue| (issue.side as u8, issue.path.as_slice()))
-        .collect::<BTreeSet<_>>()
-        .len() as u64;
     let report = VerificationReport {
         schema_version: REPORT_SCHEMA_VERSION,
         verification_id: request.verification_id.clone(),
@@ -179,7 +225,7 @@ pub fn verify(request: VerificationRequest) -> Result<VerificationResult> {
             mtime_microsecond_precision: request.options.preserve_times,
             symlink_target: true,
             hardlink_equivalence: true,
-            content: false,
+            content: request.sample.is_some(),
             xattrs: false,
             acls: false,
             sparse_extents: false,
@@ -190,16 +236,16 @@ pub fn verify(request: VerificationRequest) -> Result<VerificationResult> {
         resumed,
         counts,
         content_complete,
-        source_files_hashed: 0,
-        source_logical_bytes_hashed: 0,
-        destination_files_hashed: 0,
-        destination_logical_bytes_hashed: 0,
-        content_matches: 0,
-        content_mismatches: 0,
+        source_files_hashed: totals.source_files_hashed,
+        source_logical_bytes_hashed: totals.source_bytes,
+        destination_files_hashed: totals.destination_files_hashed,
+        destination_logical_bytes_hashed: totals.destination_bytes,
+        content_matches: totals.matches,
+        content_mismatches: totals.mismatches,
         mismatch_count,
         mismatches_by_kind,
         unreadable_entries,
-        unstable_entries: unstable.len() as u64,
+        unstable_entries,
         operational_errors,
         mismatch_artifact,
         status,
@@ -641,6 +687,68 @@ fn emit_entry_differences(
     Ok(any)
 }
 
+/// Emits the content-phase records for one job: per-side unreadable or
+/// unstable evidence, then a `content` record only when both sides produced
+/// stable, complete digests that differ.
+fn emit_content_records(
+    request: &VerificationRequest,
+    emitter: &mut MismatchEmitter,
+    path: &[u8],
+    outcome: &ContentOutcome,
+    source: &Entry,
+    destination: &Entry,
+    observed_utc: &str,
+) -> Result<()> {
+    let mut emit = |kind: MismatchKind, expected: Value, observed: Value| {
+        emitter.emit(MismatchRecord {
+            schema_version: REPORT_SCHEMA_VERSION,
+            verification_id: request.verification_id.clone(),
+            run_id: request.run_id.clone(),
+            path_b64: path_b64(path),
+            kind,
+            expected,
+            observed,
+            source_observation: Some(source.observed()),
+            destination_observation: Some(destination.observed()),
+            worker_id: None,
+            shard_id: "content-v2".to_string(),
+            observed_utc: observed_utc.to_string(),
+        })
+    };
+    for (side, result) in [
+        (Side::Source, &outcome.source),
+        (Side::Destination, &outcome.destination),
+    ] {
+        match result {
+            SideResult::Unreadable { operation, error } => emit(
+                match side {
+                    Side::Source => MismatchKind::UnreadableSource,
+                    Side::Destination => MismatchKind::UnreadableDestination,
+                },
+                json!("readable regular file content"),
+                json!({"operation": operation, "error": error}),
+            )?,
+            SideResult::Unstable { detail } => emit(
+                match side {
+                    Side::Source => MismatchKind::UnstableSource,
+                    Side::Destination => MismatchKind::UnstableDestination,
+                },
+                json!("stable regular file during content read"),
+                json!(detail),
+            )?,
+            SideResult::Hashed { .. } => {}
+        }
+    }
+    if let Some((source_digest, destination_digest)) = outcome.content_mismatch() {
+        emit(
+            MismatchKind::Content,
+            json!({"sha256": source_digest.sha256, "bytes": source_digest.bytes}),
+            json!({"sha256": destination_digest.sha256, "bytes": destination_digest.bytes}),
+        )?;
+    }
+    Ok(())
+}
+
 struct MismatchEmitter {
     writer: BufWriter<File>,
     temp_path: PathBuf,
@@ -730,6 +838,7 @@ fn display_path(path: &[u8]) -> String {
 mod tests {
     use super::*;
     use migration_core::records::{Endpoint, ServerSideCopy};
+    use std::collections::BTreeSet;
 
     fn entry(path: &[u8], file_type: FileType) -> Entry {
         Entry {
@@ -843,6 +952,69 @@ mod tests {
 
     fn reasons_of(reasons: sample::ReasonSet) -> Vec<RiskReason> {
         reasons.iter().collect()
+    }
+
+    use content::fake::{self, FakeFactory, FakeFile, SharedState};
+    use std::sync::{Arc, Mutex};
+
+    /// One regular file present on both sides with the given bytes; the scan
+    /// baseline sizes follow the data. `None` on a side means the fake has
+    /// no such file (unreadable after a scan that saw it).
+    struct Fixture<'a> {
+        path: &'a [u8],
+        source: FakeFile,
+        destination: FakeFile,
+    }
+
+    fn fixture<'a>(path: &'a [u8], source: &[u8], destination: &[u8]) -> Fixture<'a> {
+        Fixture {
+            path,
+            source: fake::file(source),
+            destination: fake::file(destination),
+        }
+    }
+
+    /// Populates the observation database as if both scans had completed and
+    /// installs the fake files. Returns the factory the content phase uses.
+    fn scanned(request: &VerificationRequest, fixtures: &[Fixture<'_>]) -> FakeFactory {
+        let mut store = open_store(request);
+        let source_state: SharedState = Arc::new(Mutex::new(fake::FakeState::default()));
+        let destination_state: SharedState = Arc::new(Mutex::new(fake::FakeState::default()));
+        for fixture in fixtures {
+            let mut source = regular(fixture.path, fixture.source.snapshot.size);
+            source.ino = fixture.source.snapshot.ino;
+            let mut destination = regular(fixture.path, fixture.destination.snapshot.size);
+            destination.ino = fixture.destination.snapshot.ino;
+            store.insert_test_entry(Side::Source, &source).unwrap();
+            store
+                .insert_test_entry(Side::Destination, &destination)
+                .unwrap();
+            let mut full = b"/".to_vec();
+            full.extend_from_slice(fixture.path);
+            source_state
+                .lock()
+                .unwrap()
+                .insert(&full, fixture.source.clone());
+            destination_state
+                .lock()
+                .unwrap()
+                .insert(&full, fixture.destination.clone());
+        }
+        store.mark_scan_complete(Side::Source).unwrap();
+        store.mark_scan_complete(Side::Destination).unwrap();
+        store.materialize_hardlinks().unwrap();
+        FakeFactory {
+            source: source_state,
+            destination: destination_state,
+        }
+    }
+
+    fn records(request: &VerificationRequest) -> Vec<MismatchRecord> {
+        std::fs::read_to_string(&request.mismatch_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     fn kinds_for(source: Option<Entry>, destination: Option<Entry>) -> Vec<MismatchKind> {
@@ -1598,5 +1770,367 @@ mod tests {
         assert_eq!(summary.eligible_files, 1);
         assert_eq!(summary.risk_selected_files, 1);
         assert_eq!(summary.risk_ineligible_files, 4);
+    }
+
+    #[test]
+    fn sampled_verification_passes_and_replays_the_terminal_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = sample_request(dir.path(), 10, 0);
+        let factory = scanned(
+            &request,
+            &[
+                fixture(b"a", b"alpha", b"alpha"),
+                fixture(b"bad-\xff/name", b"", b""),
+                fixture(b"c", &[7u8; 100], &[7u8; 100]),
+            ],
+        );
+        let result = verify_with_readers(request.clone(), Some(&factory)).unwrap();
+        let report = &result.report;
+        assert_eq!(report.status, VerificationStatus::Passed);
+        assert_eq!(report.schema_version, 2);
+        assert_eq!(report.mode, VerificationMode::Sample);
+        assert!(report.comparison_policy.content);
+        assert!(report.content_complete);
+        assert_eq!(report.source_files_hashed, 3);
+        assert_eq!(report.destination_files_hashed, 3);
+        assert_eq!(report.source_logical_bytes_hashed, 105);
+        assert_eq!(report.destination_logical_bytes_hashed, 105);
+        assert_eq!(report.content_matches, 3);
+        assert_eq!(report.content_mismatches, 0);
+        assert_eq!(report.mismatch_count, 0);
+        assert_eq!(report.mismatch_artifact.bytes, 0);
+        let policy = report.sample_policy.as_ref().unwrap();
+        assert_eq!(policy.algorithm, SAMPLE_ALGORITHM);
+        assert_eq!(policy.eligible_files, 3);
+        assert_eq!(policy.selected_files, 3);
+        assert_eq!(policy.seeded_selected_files, 3);
+        assert_eq!(policy.risk_candidates, 0);
+        assert!(policy.risk_history_asserted_empty);
+        assert_eq!(
+            policy.risk_evidence_artifact,
+            request.sample.as_ref().unwrap().risk_evidence
+        );
+
+        // Replay returns the terminal report without reopening anything.
+        let opens_before: usize = factory.source.lock().unwrap().opens.values().sum();
+        let replay = verify_with_readers(request.clone(), Some(&factory)).unwrap();
+        assert_eq!(replay.report, result.report);
+        let opens_after: usize = factory.source.lock().unwrap().opens.values().sum();
+        assert_eq!(opens_before, opens_after);
+        assert!(factory
+            .source
+            .lock()
+            .unwrap()
+            .opens
+            .contains_key(&b"/bad-\xff/name"[..]));
+    }
+
+    #[test]
+    fn metadata_mode_reports_no_content_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = request(dir.path());
+        let factory = scanned(&request, &[fixture(b"a", b"x", b"x")]);
+        let report = verify_with_readers(request, Some(&factory)).unwrap().report;
+        assert_eq!(report.status, VerificationStatus::Passed);
+        assert_eq!(report.mode, VerificationMode::Metadata);
+        assert!(report.sample_policy.is_none());
+        assert!(report.content_complete);
+        assert!(!report.comparison_policy.content);
+        assert_eq!(report.source_files_hashed, 0);
+        assert_eq!(factory.source.lock().unwrap().opens.len(), 0);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("sample_policy"));
+    }
+
+    #[test]
+    fn status_priority_is_failed_then_inconclusive_then_mismatched() {
+        let corrupt = || fixture(b"corrupt", b"hello world", b"hello_world");
+        let unstable = || {
+            let mut f = fixture(b"unstable", b"0123456789", b"0123456789");
+            f.destination.data.truncate(4);
+            f
+        };
+        let unreadable = || {
+            let mut f = fixture(b"unreadable", b"abc", b"abc");
+            f.source.faults.open_error = Some("EACCES");
+            f
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let request = sample_request(dir.path(), 10, 0);
+        let factory = scanned(&request, &[corrupt()]);
+        let report = verify_with_readers(request.clone(), Some(&factory))
+            .unwrap()
+            .report;
+        assert_eq!(report.status, VerificationStatus::Mismatched);
+        assert_eq!(report.content_mismatches, 1);
+        assert_eq!(report.mismatch_count, 1);
+        assert_eq!(report.mismatches_by_kind[&MismatchKind::Content], 1);
+        let record = &records(&request)[0];
+        assert_eq!(record.kind, MismatchKind::Content);
+        assert_eq!(record.shard_id, "content-v2");
+        assert_eq!(record.expected["bytes"], 11);
+        assert_eq!(
+            record.expected["sha256"],
+            hex::encode(Sha256::digest(b"hello world"))
+        );
+        assert_eq!(
+            record.observed["sha256"],
+            hex::encode(Sha256::digest(b"hello_world"))
+        );
+        assert!(record.source_observation.is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        let request = sample_request(dir.path(), 10, 0);
+        let factory = scanned(&request, &[corrupt(), unstable()]);
+        let report = verify_with_readers(request.clone(), Some(&factory))
+            .unwrap()
+            .report;
+        assert_eq!(report.status, VerificationStatus::Inconclusive);
+        assert_eq!(report.unstable_entries, 1);
+        assert_eq!(report.mismatch_count, 2);
+        assert_eq!(
+            report.mismatches_by_kind[&MismatchKind::UnstableDestination],
+            1
+        );
+        assert_eq!(report.destination_files_hashed, 1);
+        assert_eq!(report.source_files_hashed, 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let request = sample_request(dir.path(), 10, 0);
+        let factory = scanned(&request, &[corrupt(), unstable(), unreadable()]);
+        let report = verify_with_readers(request.clone(), Some(&factory))
+            .unwrap()
+            .report;
+        assert_eq!(report.status, VerificationStatus::Failed);
+        assert!(report.content_complete);
+        assert_eq!(report.unreadable_entries, 1);
+        assert_eq!(report.unstable_entries, 1);
+        assert_eq!(report.mismatch_count, 3);
+        assert_eq!(
+            report.mismatches_by_kind[&MismatchKind::UnreadableSource],
+            1
+        );
+        let record = records(&request)
+            .into_iter()
+            .find(|r| r.kind == MismatchKind::UnreadableSource)
+            .unwrap();
+        assert_eq!(record.observed["operation"], "open");
+        assert_eq!(record.observed["error"], "EACCES");
+        assert!(report.operational_errors.is_empty());
+    }
+
+    #[test]
+    fn content_records_follow_metadata_records_in_raw_path_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = sample_request(dir.path(), 10, 0);
+        let factory = scanned(
+            &request,
+            &[
+                fixture(b"a", b"same", b"diff"),
+                fixture(b"z", b"same", b"same"),
+            ],
+        );
+        // Metadata drift on `z` is mandatory risk and a V1 record.
+        {
+            let mut store = open_store(&request);
+            let mut drifted = regular(b"z", 4);
+            drifted.mode = 0o100600;
+            store
+                .insert_test_entry(Side::Destination, &drifted)
+                .unwrap();
+        }
+        let report = verify_with_readers(request.clone(), Some(&factory))
+            .unwrap()
+            .report;
+        assert_eq!(report.status, VerificationStatus::Mismatched);
+        let records = records(&request);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.shard_id.as_str(), r.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("metadata-v1", MismatchKind::Mode),
+                ("content-v2", MismatchKind::Content)
+            ]
+        );
+        let policy = report.sample_policy.unwrap();
+        assert_eq!(policy.risk_selected_files, 1);
+        assert_eq!(policy.selection_reasons[&RiskReason::MetadataMismatch], 1);
+        assert_eq!(policy.selection_reasons[&RiskReason::Seeded], 1);
+    }
+
+    #[test]
+    fn resume_rereads_only_pending_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = sample_request(dir.path(), 10, 0);
+        let fixtures: Vec<Fixture<'_>> = [&b"a"[..], b"b", b"c", b"d", b"e"]
+            .into_iter()
+            .map(|path| fixture(path, b"payload", b"payload"))
+            .collect();
+        let factory = scanned(&request, &fixtures);
+        // Simulate a crash after two jobs completed: selection and the two
+        // outcomes are already durable.
+        {
+            let mut store = open_store(&request);
+            prepare_selection(&mut store, &request, request.sample.as_ref().unwrap()).unwrap();
+            let hashed = SideResult::Hashed {
+                sha256: hex::encode(Sha256::digest(b"payload")),
+                bytes: 7,
+            };
+            store
+                .complete_jobs(&[
+                    (
+                        b"a".to_vec(),
+                        ContentOutcome {
+                            source: hashed.clone(),
+                            destination: hashed.clone(),
+                        },
+                    ),
+                    (
+                        b"d".to_vec(),
+                        ContentOutcome {
+                            source: hashed.clone(),
+                            destination: hashed,
+                        },
+                    ),
+                ])
+                .unwrap();
+            assert_eq!(store.pending_job_count().unwrap(), 3);
+        }
+        let report = verify_with_readers(request.clone(), Some(&factory))
+            .unwrap()
+            .report;
+        assert_eq!(report.status, VerificationStatus::Passed);
+        assert!(report.resumed);
+        assert_eq!(report.source_files_hashed, 5);
+        assert_eq!(report.content_matches, 5);
+        let opens = factory.source.lock().unwrap().opens.clone();
+        let mut opened: Vec<&[u8]> = opens.keys().map(Vec::as_slice).collect();
+        opened.sort();
+        assert_eq!(opened, vec![&b"/b"[..], b"/c", b"/e"]);
+        assert!(opens.values().all(|count| *count == 1));
+    }
+
+    #[test]
+    fn completion_order_does_not_change_the_mismatch_artifact() {
+        let build = |dir: &Path, workers: u32| {
+            let mut request = sample_request(dir, 40, 0);
+            request.sample.as_mut().unwrap().content_workers = workers;
+            let fixtures: Vec<Fixture<'_>> = (0..12u8)
+                .map(|i| {
+                    let path: &'static [u8] =
+                        Box::leak(format!("f{i:02}").into_bytes().into_boxed_slice());
+                    let mut f = if i % 3 == 0 {
+                        fixture(path, b"source bytes", b"destin bytes")
+                    } else {
+                        fixture(path, b"source bytes", b"source bytes")
+                    };
+                    let delay = std::time::Duration::from_millis(u64::from((i * 7) % 5));
+                    f.source.faults.read_delay = Some(delay);
+                    f.destination.faults.read_delay = Some(delay);
+                    f
+                })
+                .collect();
+            let factory = scanned(&request, &fixtures);
+            let report = verify_with_readers(request.clone(), Some(&factory))
+                .unwrap()
+                .report;
+            (std::fs::read(&request.mismatch_path).unwrap(), report)
+        };
+        let dir_a = tempfile::tempdir().unwrap();
+        let (bytes_a, report_a) = build(dir_a.path(), 1);
+        let dir_b = tempfile::tempdir().unwrap();
+        let (bytes_b, report_b) = build(dir_b.path(), 4);
+        assert_eq!(report_a.status, VerificationStatus::Mismatched);
+        assert_eq!(report_a.content_mismatches, 4);
+        assert_eq!(bytes_a, bytes_b);
+        assert_eq!(
+            report_a.mismatch_artifact.sha256,
+            report_b.mismatch_artifact.sha256
+        );
+        assert_ne!(
+            report_a.request_fingerprint_sha256,
+            report_b.request_fingerprint_sha256
+        );
+    }
+
+    #[test]
+    fn terminal_replay_detects_tampered_mismatch_and_risk_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = sample_request(dir.path(), 10, 0);
+        let factory = scanned(&request, &[fixture(b"a", b"x", b"y")]);
+        let report = verify_with_readers(request.clone(), Some(&factory))
+            .unwrap()
+            .report;
+        assert_eq!(report.status, VerificationStatus::Mismatched);
+        verify_with_readers(request.clone(), Some(&factory)).unwrap();
+
+        let original = std::fs::read(&request.mismatch_path).unwrap();
+        let mut tampered = original.clone();
+        tampered.extend_from_slice(b"\n");
+        std::fs::write(&request.mismatch_path, &tampered).unwrap();
+        let error = verify_with_readers(request.clone(), Some(&factory))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mismatch artifact"), "{error}");
+        std::fs::write(&request.mismatch_path, &original).unwrap();
+        verify_with_readers(request.clone(), Some(&factory)).unwrap();
+
+        let risk_path = &request.sample.as_ref().unwrap().risk_evidence.path;
+        std::fs::write(risk_path, b"{}\n").unwrap();
+        let error = verify_with_readers(request.clone(), Some(&factory))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("risk-evidence"), "{error}");
+    }
+
+    #[test]
+    fn worker_context_failure_is_an_operational_failure_not_reduced_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = sample_request(dir.path(), 10, 0);
+        let factory = scanned(&request, &[fixture(b"a", b"x", b"x")]);
+        factory.destination.lock().unwrap().refuse_side = Some(Side::Destination);
+        let report = verify_with_readers(request.clone(), Some(&factory))
+            .unwrap()
+            .report;
+        assert_eq!(report.status, VerificationStatus::Failed);
+        assert!(!report.content_complete);
+        assert_eq!(report.source_files_hashed, 0);
+        assert!(report
+            .operational_errors
+            .iter()
+            .any(|e| e.contains("content worker") && e.contains("destination")));
+        assert!(report.sample_policy.is_some());
+        assert_eq!(report.mismatch_count, 0);
+        // The failed report is terminal: a rerun replays it rather than
+        // pretending the depth was met.
+        let replay = verify_with_readers(request, Some(&factory)).unwrap().report;
+        assert_eq!(replay, report);
+    }
+
+    #[test]
+    fn workers_read_sequentially_through_a_bounded_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = sample_request(dir.path(), 40, 0);
+        request.sample.as_mut().unwrap().content_workers = 3;
+        let paths: Vec<Vec<u8>> = (0..24).map(|i| format!("f{i:02}").into_bytes()).collect();
+        let fixtures: Vec<Fixture<'_>> = paths
+            .iter()
+            .map(|path| {
+                let mut f = fixture(path, b"payload", b"payload");
+                f.source.faults.read_delay = Some(std::time::Duration::from_millis(2));
+                f.destination.faults.read_delay = Some(std::time::Duration::from_millis(2));
+                f
+            })
+            .collect();
+        let factory = scanned(&request, &fixtures);
+        let report = verify_with_readers(request, Some(&factory)).unwrap().report;
+        assert_eq!(report.status, VerificationStatus::Passed);
+        assert_eq!(report.content_matches, 24);
+        assert!(factory.source.lock().unwrap().max_open <= 3);
+        assert!(factory.destination.lock().unwrap().max_open <= 3);
+        assert_eq!(content::queue_capacity(3), 6);
     }
 }

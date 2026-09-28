@@ -232,6 +232,33 @@ extern "C" {
     pub fn nfs_fsync(nfs: *mut nfs_context, nfsfh: *mut nfsfh) -> c_int;
 }
 
+// =============================================================================
+// SAMPLED_CONTENT_VERIFICATION addition. Signature verified 2026-09-28 as
+// byte-identical between the pinned source tree (~/projects/libnfs,
+// libnfs-6.0.2-150-g6073b69, the commit CI builds), the installed header
+// (/usr/local/include/nfsc/libnfs.h), and exported by both installed
+// libraries (/usr/local/lib/libnfs.so.16.0.2 and libnfs.so.16.2.0;
+// pkg-config resolves 16.2.0):
+//
+//   grep -n "nfs_fstat64(" /usr/local/include/nfsc/libnfs.h \
+//       ~/projects/libnfs/include/nfsc/libnfs.h | grep -v async
+//   nm -D /usr/local/lib/libnfs.so.16.0.2 | grep -w nfs_fstat64
+//   nm -D /usr/local/lib/libnfs.so.16.2.0 | grep -w nfs_fstat64
+//
+// Own block so the blocks above stay textually untouched.
+// =============================================================================
+
+extern "C" {
+    /// Sync fstat on an open handle: fills `nfs_stat_64` from a GETATTR
+    /// on the handle's filehandle (`lib/nfs_v3.c:nfs3_fstat64_async`),
+    /// so the observation is bound to the file that was actually read
+    /// rather than to a path that may have been replaced meanwhile.
+    /// Returns 0 on success, negative `-errno` on failure. Consumed by
+    /// the verifier's `stat/open/fstat/read/fstat/stat` stability
+    /// bracket through [`ops::fstat_snapshot`].
+    pub fn nfs_fstat64(nfs: *mut nfs_context, nfsfh: *mut nfsfh, st: *mut nfs_stat_64) -> c_int;
+}
+
 /// F12 default per-RPC timeout, in milliseconds. Matches the pinned
 /// libnfs's implicit default (`lib/init.c`), now explicit at every
 /// context-creation point and configurable via

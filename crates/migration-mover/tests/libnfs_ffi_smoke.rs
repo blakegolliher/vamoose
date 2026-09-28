@@ -23,6 +23,7 @@
 //!   VAMOOSE_TEST_NFS_PATH=/path/to/known-good-file
 //!   VAMOOSE_TEST_NFS_EXPECTED_SIZE=<bytes>
 
+use migration_core::records::FailurePhase;
 use migration_mover::libnfs::ops;
 use migration_mover::{LibnfsContextPool, SimplePool};
 use std::env;
@@ -74,4 +75,52 @@ async fn nfs_pread_returns_actual_bytes() {
         n,
         expected_size,
     );
+}
+
+/// The verifier's content bracket: `stat64 / open / fstat64 / read /
+/// fstat64 / stat64 / close`. Guards the audited `nfs_fstat64` binding
+/// the same way `nfs_pread_returns_actual_bytes` guards `nfs_pread`: a
+/// signature mismatch against the linked library would surface as a
+/// zeroed or garbage snapshot, which the identity assertions below catch.
+/// Same environment and root requirement as the case above.
+#[tokio::test]
+#[ignore]
+async fn stat_open_fstat_read_fstat_stat_bracket_is_stable() {
+    let url = env::var("VAMOOSE_TEST_NFS_URL").expect("VAMOOSE_TEST_NFS_URL not set");
+    let path = env::var("VAMOOSE_TEST_NFS_PATH").expect("VAMOOSE_TEST_NFS_PATH not set");
+    let expected_size: u64 = env::var("VAMOOSE_TEST_NFS_EXPECTED_SIZE")
+        .expect("VAMOOSE_TEST_NFS_EXPECTED_SIZE not set")
+        .parse()
+        .expect("VAMOOSE_TEST_NFS_EXPECTED_SIZE not a number");
+
+    let pool = SimplePool::build(&url, &url, migration_mover::DEFAULT_RPC_TIMEOUT_MS)
+        .expect("SimplePool::build");
+    let mut pair = pool.acquire().await.expect("acquire pair");
+    let ctx = pair.src();
+    let path_bytes = path.as_bytes();
+
+    let before_path = ops::stat_snapshot(ctx, path_bytes).expect("nfs_stat64 before open");
+    assert_eq!(before_path.size, expected_size, "path stat size");
+    assert_ne!(before_path.ino, 0, "path stat fileid must be populated");
+
+    let fh = ops::open_read(ctx, path_bytes).expect("nfs_open");
+    let before = ops::fstat_snapshot(ctx, &fh).expect("nfs_fstat64 before read");
+    assert_eq!(
+        before, before_path,
+        "handle and path observations must agree"
+    );
+
+    let mut buf = vec![0u8; 1024];
+    let n = ops::pread(ctx, &fh, 0, &mut buf).expect("nfs_pread");
+    assert!(n > 0 || expected_size == 0, "read returned no data");
+
+    let after = ops::fstat_snapshot(ctx, &fh).expect("nfs_fstat64 after read");
+    assert_eq!(after, before, "handle identity changed across the read");
+    let after_path = ops::stat_snapshot(ctx, path_bytes).expect("nfs_stat64 after read");
+    assert_eq!(
+        after_path, before,
+        "path no longer names the file that was read"
+    );
+
+    ops::close_fh(ctx, fh, FailurePhase::Read).expect("nfs_close");
 }

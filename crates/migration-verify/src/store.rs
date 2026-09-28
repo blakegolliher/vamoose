@@ -1,3 +1,4 @@
+use crate::content::{ContentOutcome, SideResult};
 use crate::model::{FileType, ObservationCounts, ObservedMetadata, RiskReason};
 use crate::risk;
 use crate::sample::{is_bucket_boundary, Ranker, ReasonSet, SeededHeap};
@@ -19,6 +20,55 @@ fn eligible_sql(path_expr: &str) -> String {
     format!(
         "(EXISTS (SELECT 1 FROM entries es WHERE es.side=0 AND es.path={path_expr} AND es.file_type=1)
           AND EXISTS (SELECT 1 FROM entries ed WHERE ed.side=1 AND ed.path={path_expr} AND ed.file_type=1))"
+    )
+}
+
+/// A selected regular-file pair with both scan baselines.
+#[derive(Debug, Clone)]
+pub(crate) struct ContentJob {
+    pub path: Vec<u8>,
+    pub source: Entry,
+    pub destination: Entry,
+}
+
+/// Aggregates over terminal content jobs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ContentTotals {
+    pub source_files_hashed: u64,
+    pub source_bytes: u64,
+    pub destination_files_hashed: u64,
+    pub destination_bytes: u64,
+    pub matches: u64,
+    pub mismatches: u64,
+    pub unreadable_sides: u64,
+    pub unstable_sides: u64,
+}
+
+/// Column list for one side of a content job, in `entry_at` order.
+fn entry_select(alias: &str, hardlink_alias: &str) -> String {
+    format!(
+        "{a}.path,{a}.file_type,{a}.size,{a}.mode,{a}.uid,{a}.gid,{a}.mtime_sec,{a}.mtime_nsec,
+         {a}.ctime_sec,{a}.ctime_nsec,{a}.dev,{a}.ino,{a}.nlink,{a}.rdev,{a}.symlink_target,
+         {h}.group_root",
+        a = alias,
+        h = hardlink_alias
+    )
+}
+
+/// Content jobs with both baselines, in raw-path order. Columns: 0 = path,
+/// 1..17 = source entry, 17..33 = destination entry, 33/34 = side detail.
+fn job_query(where_clause: &str) -> String {
+    format!(
+        "SELECT c.path,{source},{destination},c.source_detail,c.destination_detail
+           FROM content_jobs c
+           JOIN entries s ON s.side=0 AND s.path=c.path
+           JOIN entries d ON d.side=1 AND d.path=c.path
+           LEFT JOIN hardlinks hs ON hs.side=0 AND hs.path=c.path
+           LEFT JOIN hardlinks hd ON hd.side=1 AND hd.path=c.path
+          WHERE {where_clause}
+          ORDER BY c.path",
+        source = entry_select("s", "hs"),
+        destination = entry_select("d", "hd"),
     )
 }
 
@@ -479,6 +529,189 @@ impl Store {
         )?)
         .context("negative SQLite ineligible count")?;
         Ok(summary)
+    }
+
+    pub(crate) fn pending_job_count(&self) -> Result<u64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM content_jobs WHERE state='pending'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        u64::try_from(count).context("negative SQLite pending count")
+    }
+
+    /// Next batch of pending jobs strictly after `after`, in raw-path order.
+    pub(crate) fn pending_jobs_after(
+        &self,
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<ContentJob>> {
+        let mut jobs = Vec::new();
+        let mut visit = |row: &Row<'_>| -> rusqlite::Result<()> {
+            jobs.push(ContentJob {
+                path: row.get(0)?,
+                source: entry_at(row, 1)?,
+                destination: entry_at(row, 17)?,
+            });
+            Ok(())
+        };
+        match after {
+            Some(after) => {
+                let sql = format!("{} LIMIT ?2", job_query("c.state='pending' AND c.path>?1"));
+                let mut stmt = self.conn.prepare(&sql)?;
+                let mut rows = stmt.query(params![after, i64::from(limit)])?;
+                while let Some(row) = rows.next()? {
+                    visit(row)?;
+                }
+            }
+            None => {
+                let sql = format!("{} LIMIT ?1", job_query("c.state='pending'"));
+                let mut stmt = self.conn.prepare(&sql)?;
+                let mut rows = stmt.query([i64::from(limit)])?;
+                while let Some(row) = rows.next()? {
+                    visit(row)?;
+                }
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// Persists terminal outcomes in one transaction. A job becomes
+    /// `complete` with both sides at once; a pending job that is no longer
+    /// pending is left untouched.
+    pub(crate) fn complete_jobs(&mut self, results: &[(Vec<u8>, ContentOutcome)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE content_jobs
+                    SET state='complete',
+                        source_status=?2,source_sha256=?3,source_bytes=?4,source_detail=?5,
+                        destination_status=?6,destination_sha256=?7,destination_bytes=?8,
+                        destination_detail=?9,outcome_kind=?10
+                  WHERE path=?1 AND state='pending'",
+            )?;
+            for (path, outcome) in results {
+                let (source_sha256, source_bytes) = digest_columns(&outcome.source);
+                let (destination_sha256, destination_bytes) = digest_columns(&outcome.destination);
+                stmt.execute(params![
+                    path,
+                    outcome.source.status(),
+                    source_sha256,
+                    source_bytes,
+                    serde_json::to_string(&outcome.source)?,
+                    outcome.destination.status(),
+                    destination_sha256,
+                    destination_bytes,
+                    serde_json::to_string(&outcome.destination)?,
+                    outcome.kind().as_str(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Terminal content outcomes with both baselines, in raw-path order, so
+    /// the mismatch artifact never depends on worker completion order.
+    pub(crate) fn for_each_content_outcome(
+        &self,
+        mut visit: impl FnMut(&[u8], &ContentOutcome, &Entry, &Entry) -> Result<()>,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(&job_query("c.state='complete'"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: Vec<u8> = row.get(0)?;
+            let source = entry_at(row, 1)?;
+            let destination = entry_at(row, 17)?;
+            let source_detail: String = row.get(33)?;
+            let destination_detail: String = row.get(34)?;
+            let outcome = ContentOutcome {
+                source: serde_json::from_str(&source_detail)
+                    .context("persisted source content outcome")?,
+                destination: serde_json::from_str(&destination_detail)
+                    .context("persisted destination content outcome")?,
+            };
+            visit(&path, &outcome, &source, &destination)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn content_totals(&self) -> Result<ContentTotals> {
+        let row = self.conn.query_row(
+            "SELECT
+               COUNT(CASE WHEN source_status='hashed' THEN 1 END),
+               COALESCE(SUM(CASE WHEN source_status='hashed' THEN source_bytes END),0),
+               COUNT(CASE WHEN destination_status='hashed' THEN 1 END),
+               COALESCE(SUM(CASE WHEN destination_status='hashed' THEN destination_bytes END),0),
+               COUNT(CASE WHEN outcome_kind='match' THEN 1 END),
+               COUNT(CASE WHEN outcome_kind='content' THEN 1 END),
+               COUNT(CASE WHEN source_status='unreadable' THEN 1 END)
+                 + COUNT(CASE WHEN destination_status='unreadable' THEN 1 END),
+               COUNT(CASE WHEN source_status='unstable' THEN 1 END)
+                 + COUNT(CASE WHEN destination_status='unstable' THEN 1 END)
+             FROM content_jobs WHERE state='complete'",
+            [],
+            |r| {
+                Ok([
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                ])
+            },
+        )?;
+        let unsigned = |value: i64| u64::try_from(value).context("negative SQLite content total");
+        Ok(ContentTotals {
+            source_files_hashed: unsigned(row[0])?,
+            source_bytes: unsigned(row[1])?,
+            destination_files_hashed: unsigned(row[2])?,
+            destination_bytes: unsigned(row[3])?,
+            matches: unsigned(row[4])?,
+            mismatches: unsigned(row[5])?,
+            unreadable_sides: unsigned(row[6])?,
+            unstable_sides: unsigned(row[7])?,
+        })
+    }
+
+    /// Unique `(side, path)` pairs that were unreadable during the scan or
+    /// the content phase.
+    pub(crate) fn unreadable_unique(&self) -> Result<u64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM (
+               SELECT COALESCE(side,0) AS side,path FROM issues
+               UNION SELECT 0,path FROM content_jobs WHERE source_status='unreadable'
+               UNION SELECT 1,path FROM content_jobs WHERE destination_status='unreadable')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        u64::try_from(count).context("negative SQLite unreadable count")
+    }
+
+    /// Unique `(side, path)` pairs that were unstable during the scan or the
+    /// content phase.
+    pub(crate) fn unstable_unique(&self) -> Result<u64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM (
+               SELECT side,path FROM unstable
+               UNION SELECT 0,path FROM content_jobs WHERE source_status='unstable'
+               UNION SELECT 1,path FROM content_jobs WHERE destination_status='unstable')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        u64::try_from(count).context("negative SQLite unstable count")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_scan_complete(&mut self, side: Side) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scan_state(side,complete) VALUES(?1,1)",
+            [side as i64],
+        )?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -995,24 +1228,36 @@ fn next_entry(rows: &mut rusqlite::Rows<'_>) -> Result<Option<Entry>> {
 }
 
 fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<Entry> {
+    entry_at(row, 0)
+}
+
+/// Decodes the sixteen entry columns starting at `base`.
+fn entry_at(row: &Row<'_>, base: usize) -> rusqlite::Result<Entry> {
     Ok(Entry {
-        path: row.get(0)?,
-        file_type: FileType::from_i64(row.get(1)?),
-        size: decode_u64(row.get(2)?),
-        mode: row.get::<_, i64>(3)? as u32,
-        uid: row.get::<_, i64>(4)? as u32,
-        gid: row.get::<_, i64>(5)? as u32,
-        mtime_sec: row.get(6)?,
-        mtime_nsec: row.get::<_, i64>(7)? as u32,
-        ctime_sec: row.get(8)?,
-        ctime_nsec: row.get::<_, i64>(9)? as u32,
-        dev: decode_u64(row.get(10)?),
-        ino: decode_u64(row.get(11)?),
-        nlink: row.get::<_, i64>(12)? as u32,
-        rdev: decode_u64(row.get(13)?),
-        symlink_target: row.get(14)?,
-        hardlink_group: row.get(15)?,
+        path: row.get(base)?,
+        file_type: FileType::from_i64(row.get(base + 1)?),
+        size: decode_u64(row.get(base + 2)?),
+        mode: row.get::<_, i64>(base + 3)? as u32,
+        uid: row.get::<_, i64>(base + 4)? as u32,
+        gid: row.get::<_, i64>(base + 5)? as u32,
+        mtime_sec: row.get(base + 6)?,
+        mtime_nsec: row.get::<_, i64>(base + 7)? as u32,
+        ctime_sec: row.get(base + 8)?,
+        ctime_nsec: row.get::<_, i64>(base + 9)? as u32,
+        dev: decode_u64(row.get(base + 10)?),
+        ino: decode_u64(row.get(base + 11)?),
+        nlink: row.get::<_, i64>(base + 12)? as u32,
+        rdev: decode_u64(row.get(base + 13)?),
+        symlink_target: row.get(base + 14)?,
+        hardlink_group: row.get(base + 15)?,
     })
+}
+
+fn digest_columns(side: &SideResult) -> (Option<&str>, Option<i64>) {
+    match side {
+        SideResult::Hashed { sha256, bytes } => (Some(sha256.as_str()), Some(encode_u64(*bytes))),
+        _ => (None, None),
+    }
 }
 
 fn directory_changed(before: &Entry, after: &Entry) -> bool {
