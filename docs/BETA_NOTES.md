@@ -38,11 +38,16 @@ posture (2026-07-31) — not an unknown. Source of truth for status:
   from `manifest.json` (id = run id); a worker whose `[coord] job_id` names a
   job the coordinator never seeds waits forever, logging
   `job not found on coord` at every retry.
-- **Product verification is metadata-only in V1.** `vamoose verify` performs
-  fresh, resumable scans of both exports and verifies namespace, type, size,
-  configured POSIX metadata, symlink targets, and hardlink membership. It does
-  not yet verify content, xattrs, ACLs, or sparse extents and does not yet gate
-  coordinator finalization. `sample` and `full` fail closed as unimplemented.
+- **Product verification is metadata plus sampled content.** `vamoose verify`
+  performs fresh, resumable scans of both exports and verifies namespace,
+  type, size, configured POSIX metadata, symlink targets, and hardlink
+  membership. `--mode sample` adds bracketed SHA-256 reads of a deterministic
+  sample and every mandatory-risk file through fresh libnfs contexts. It does
+  not yet verify every file, xattrs, ACLs, or sparse extents, does not emit
+  coordinator verification events, and does not gate finalization. `full`
+  fails closed as unimplemented. The content bracket has unit coverage
+  through an in-memory reader and an ignored libnfs smoke case; the
+  hardware pass for it has not run yet.
 
 ## Security posture (trusted-network beta)
 

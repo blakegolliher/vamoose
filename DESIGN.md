@@ -216,22 +216,37 @@ cooldown up to its cap.
 `vamoose verify` loads the immutable manifest, applies the same exclusion
 regexes, and scans both configured NFS roots through separate libnfs contexts.
 It does not accept worker progress, mover hashes, or the migration index as
-proof of destination state. The current metadata mode compares raw path bytes,
-type, regular-file size, enabled mode/owner/mtime policy, symlink target bytes,
-and complete-tree hardlink equivalence classes.
+proof of destination state. Every mode compares raw path bytes, type,
+regular-file size, enabled mode/owner/mtime policy, symlink target bytes, and
+complete-tree hardlink equivalence classes.
 
 Each scan checkpoints opaque READDIRPLUS cookies, directory filehandles,
 observations, and errors into a local SQLite database. Comparison is a
 disk-backed merge over raw-path order. The mismatch JSONL and terminal report
 are immutable local artifacts; the report records the mismatch digest and a
 fingerprint of the complete request. Resume refuses changed inputs and terminal
-replay revalidates the mismatch artifact.
+replay revalidates every recorded artifact.
+
+`--mode sample` adds independent content evidence. Before the verifier starts,
+the CLI stages the run's risk history (failure and downgrade sink records plus
+the regular files of every shard whose terminal claim was reclaimed) into an
+immutable `risk-evidence.jsonl` whose digest is part of the request identity.
+Selection is deterministic from `(run_id, seed, raw path)`: every eligible
+regular-file pair with metadata drift, a mover bucket boundary size, the
+smallest eligible member of each source hardlink group, and every risk-history
+path is mandatory; the seeded remainder fills to the requested count through a
+bounded heap. Each selected file is hashed on both sides through fresh
+verifier-owned libnfs contexts with a `stat/open/fstat/read/fstat/stat/close`
+bracket; any identity change is unstable and the run inconclusive. Jobs and
+digests checkpoint in the same SQLite database, so a restart never rereads a
+completed file or changes the selected set.
 
 Verification requires an explicit stopped-writer assertion or paired immutable
-snapshot identifiers. Exit status distinguishes a clean metadata pass,
-operational failure, observed mismatch, and detected instability. Content,
-xattr, ACL, sparse-extent, distributed-shard, and finalization-gate support are
-not implemented yet; see [docs/VERIFICATION.md](docs/VERIFICATION.md).
+snapshot identifiers. Exit status distinguishes a clean pass, operational
+failure, observed mismatch, and detected instability. Full-content, xattr, ACL,
+sparse-extent, distributed-shard, coordinator-event, and finalization-gate
+support are not implemented yet; see
+[docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 ## Optional control plane
 
@@ -344,8 +359,8 @@ boundaries include:
   implemented;
 - walker/rewrite/run composition and most aggregation commands remain stubs;
 - walker-side xattr capture is not yet available;
-- verification content modes and automatic finalization gating are not yet
-  available;
+- full-content verification, coordinator verification events, and automatic
+  finalization gating are not yet available;
 - the S3 data-plane layout represents one run at the bucket root;
 - archive restore, scoped control-plane credentials, and an atomic coordinator
   snapshot boundary for TUI bootstrap are deferred;

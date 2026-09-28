@@ -217,14 +217,18 @@ roots), then produce independent metadata evidence:
 
 ```bash
 sudo vamoose verify --writers-stopped
+sudo vamoose verify --writers-stopped --mode sample
 ```
 
 The command rescans both exports instead of trusting the migration index. Exit
-`0` is a metadata pass, `1` is an incomplete operational failure, `2` means
-mismatches, and `3` means mutation made the result inconclusive. The default
-artifacts are under `/var/lib/vamoose/verify/<verification-id>/`. V1 does not
-verify file content, xattrs, ACLs, or sparse extents; retain the content spot
-checks below until sampled/full content modes land.
+`0` is a pass, `1` is an incomplete operational failure, `2` means mismatches,
+and `3` means mutation made the result inconclusive. The default artifacts are
+under `/var/lib/vamoose/verify/<verification-id>/`. `--mode sample` keeps the
+complete metadata comparison and additionally hashes 10,000 seeded files
+(`--sample-files`) plus every file the run's own failure, downgrade, and retry
+history or the metadata comparison flags as risky; it refuses to start until
+every manifest shard is terminal. Neither mode verifies xattrs, ACLs, or sparse
+extents, and full-content verification is not implemented yet.
 
 Exit code 3 from a worker means it fenced itself because a peer took its
 claim or its clock jumped. systemd deliberately does not restart it; read

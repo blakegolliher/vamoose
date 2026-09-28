@@ -70,7 +70,7 @@ Binaries land in `target/release/`. The unified entry point is
 | `vamoose doctor` | Implemented configuration, S3, NFS, and permission checks |
 | `vamoose init` | Implemented S3 layout marker initialization |
 | `vamoose prepare` | Implemented scan (bundled `nfs-walker`) → canonical index → verified upload → `manifest.json` |
-| `vamoose verify` | Implemented independent metadata verification; sampled/full content modes are reserved |
+| `vamoose verify` | Implemented independent metadata verification and sampled SHA-256 content verification; full content mode is reserved |
 | `vamoose coord` | Implemented optional REST/SSE coordinator |
 | `vamoose tui` | Implemented terminal dashboard and controls |
 | `vamoose walker` | Stub; `vamoose prepare` runs the scan |
@@ -116,12 +116,17 @@ sites that want that level of control.
 
 `vamoose verify` reads the same manifest, scans both NFS trees independently,
 and resumes through a local SQLite checkpoint under
-`/var/lib/vamoose/verify`. V1 verifies namespace, type, size, configured POSIX
-metadata, symlink targets, and hardlink membership. It requires stopped writers
-or paired immutable snapshot identifiers and emits a JSON report plus mismatch
-JSONL. Exit codes distinguish operational failure (`1`), mismatches (`2`), and
-an unstable/inconclusive scan (`3`). Content, xattr, ACL, and sparse verification
-are not yet claimed.
+`/var/lib/vamoose/verify`. Metadata mode verifies namespace, type, size,
+configured POSIX metadata, symlink targets, and hardlink membership.
+`--mode sample` adds independent SHA-256 reads of a deterministic seeded
+sample plus every mandatory-risk file (metadata drift, mover bucket boundary
+sizes, one member per hardlink group, and every path with migration failure,
+downgrade, or retried-shard history), each bracketed by stat/fstat checks so a
+file that changes during the read makes the run inconclusive. It requires
+stopped writers or paired immutable snapshot identifiers and emits a JSON
+report plus mismatch JSONL. Exit codes distinguish operational failure (`1`),
+mismatches (`2`), and an unstable/inconclusive result (`3`). Full-content,
+xattr, ACL, and sparse verification are not yet claimed.
 
 The TUI exposes pause (`:stop`), resume, cancel (`:abort`), drain, and
 retry-failed through its command palette. Pause takes effect at the next batch

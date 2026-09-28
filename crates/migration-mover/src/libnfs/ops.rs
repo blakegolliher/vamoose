@@ -294,6 +294,68 @@ pub fn stat_fileid(ctx: &mut NfsContext, path: &[u8]) -> Result<u64, MoveError> 
     Ok(st.nfs_ino)
 }
 
+/// Attributes from one GETATTR, as observed through a path (`stat64`) or
+/// an open handle (`fstat64`). Carries exactly the identity and size
+/// fields a stability bracket compares; atime is deliberately absent
+/// because reading a file may update it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatSnapshot {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u64,
+    pub nlink: u64,
+    pub uid: u64,
+    pub gid: u64,
+    pub size: u64,
+    pub mtime_sec: u64,
+    pub mtime_nsec: u64,
+    pub ctime_sec: u64,
+    pub ctime_nsec: u64,
+}
+
+impl From<nfs_stat_64> for StatSnapshot {
+    fn from(st: nfs_stat_64) -> Self {
+        Self {
+            dev: st.nfs_dev,
+            ino: st.nfs_ino,
+            mode: st.nfs_mode,
+            nlink: st.nfs_nlink,
+            uid: st.nfs_uid,
+            gid: st.nfs_gid,
+            size: st.nfs_size,
+            mtime_sec: st.nfs_mtime,
+            mtime_nsec: st.nfs_mtime_nsec,
+            ctime_sec: st.nfs_ctime,
+            ctime_nsec: st.nfs_ctime_nsec,
+        }
+    }
+}
+
+/// Path stat (follows symlinks, like `nfs_open`) returning the full
+/// snapshot. Verification's bracket uses this before opening and after
+/// reading; failures carry the `Read` phase because they are part of a
+/// read bracket, not an attribute-setting operation.
+pub fn stat_snapshot(ctx: &mut NfsContext, path: &[u8]) -> Result<StatSnapshot, MoveError> {
+    let c = cstr_from_bytes(path)?;
+    let mut st: nfs_stat_64 = nfs_stat_64::default();
+    let rc = unsafe { super::nfs_stat64(ctx.raw(), c.as_ptr(), &mut st as *mut _) };
+    if rc < 0 {
+        return Err(err_from_rc(ctx, rc, FailurePhase::Read));
+    }
+    Ok(st.into())
+}
+
+/// Handle stat through the audited `nfs_fstat64` binding. Observes the
+/// file the handle names, independent of the path.
+pub fn fstat_snapshot(ctx: &mut NfsContext, fh: &NfsFh) -> Result<StatSnapshot, MoveError> {
+    let mut st: nfs_stat_64 = nfs_stat_64::default();
+    let rc = unsafe { super::nfs_fstat64(ctx.raw(), fh.raw(), &mut st as *mut _) };
+    if rc < 0 {
+        return Err(err_from_rc(ctx, rc, FailurePhase::Read));
+    }
+    Ok(st.into())
+}
+
 pub fn rename(ctx: &mut NfsContext, old: &[u8], new: &[u8]) -> Result<(), MoveError> {
     let oc = cstr_from_bytes(old)?;
     let nc = cstr_from_bytes(new)?;
@@ -447,6 +509,8 @@ mod tests {
             ("open_read", FailurePhase::Open),
             ("create_write", FailurePhase::Write),
             ("pread", FailurePhase::Read),
+            ("stat_snapshot", FailurePhase::Read),
+            ("fstat_snapshot", FailurePhase::Read),
             ("pwrite", FailurePhase::Write),
             ("chmod", FailurePhase::Setattr),
             ("chown", FailurePhase::Setattr),

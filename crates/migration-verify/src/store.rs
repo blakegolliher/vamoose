@@ -1,10 +1,87 @@
-use crate::model::{FileType, ObservationCounts, ObservedMetadata};
+use crate::content::{ContentOutcome, SideResult};
+use crate::model::{FileType, ObservationCounts, ObservedMetadata, RiskReason};
+use crate::risk;
+use crate::sample::{is_bucket_boundary, Ranker, ReasonSet, SeededHeap};
 use anyhow::{Context, Result};
 use base64::Engine;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+
+/// Layout version of the verification database. V1 (metadata-only)
+/// databases carry no version key and are rejected rather than upgraded in
+/// place under the same verification id.
+pub(crate) const SCHEMA_VERSION: u32 = 2;
+
+/// SQL predicate: `path_expr` names a regular file on both sides of the
+/// independent scans, i.e. it is content-eligible.
+fn eligible_sql(path_expr: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM entries es WHERE es.side=0 AND es.path={path_expr} AND es.file_type=1)
+          AND EXISTS (SELECT 1 FROM entries ed WHERE ed.side=1 AND ed.path={path_expr} AND ed.file_type=1))"
+    )
+}
+
+/// A selected regular-file pair with both scan baselines.
+#[derive(Debug, Clone)]
+pub(crate) struct ContentJob {
+    pub path: Vec<u8>,
+    pub source: Entry,
+    pub destination: Entry,
+}
+
+/// Aggregates over terminal content jobs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ContentTotals {
+    pub source_files_hashed: u64,
+    pub source_bytes: u64,
+    pub destination_files_hashed: u64,
+    pub destination_bytes: u64,
+    pub matches: u64,
+    pub mismatches: u64,
+    pub unreadable_sides: u64,
+    pub unstable_sides: u64,
+}
+
+/// Column list for one side of a content job, in `entry_at` order.
+fn entry_select(alias: &str, hardlink_alias: &str) -> String {
+    format!(
+        "{a}.path,{a}.file_type,{a}.size,{a}.mode,{a}.uid,{a}.gid,{a}.mtime_sec,{a}.mtime_nsec,
+         {a}.ctime_sec,{a}.ctime_nsec,{a}.dev,{a}.ino,{a}.nlink,{a}.rdev,{a}.symlink_target,
+         {h}.group_root",
+        a = alias,
+        h = hardlink_alias
+    )
+}
+
+/// Content jobs with both baselines, in raw-path order. Columns: 0 = path,
+/// 1..17 = source entry, 17..33 = destination entry, 33/34 = side detail.
+fn job_query(where_clause: &str) -> String {
+    format!(
+        "SELECT c.path,{source},{destination},c.source_detail,c.destination_detail
+           FROM content_jobs c
+           JOIN entries s ON s.side=0 AND s.path=c.path
+           JOIN entries d ON d.side=1 AND d.path=c.path
+           LEFT JOIN hardlinks hs ON hs.side=0 AND hs.path=c.path
+           LEFT JOIN hardlinks hd ON hd.side=1 AND hd.path=c.path
+          WHERE {where_clause}
+          ORDER BY c.path",
+        source = entry_select("s", "hs"),
+        destination = entry_select("d", "hd"),
+    )
+}
+
+/// Unique-path selection counters derived from the persisted selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SelectionSummary {
+    pub eligible_files: u64,
+    pub selected_files: u64,
+    pub risk_selected_files: u64,
+    pub risk_ineligible_files: u64,
+    pub seeded_selected_files: u64,
+    pub reasons: BTreeMap<RiskReason, u64>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Side {
@@ -104,8 +181,11 @@ impl Store {
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
              PRAGMA temp_store=FILE;
-             PRAGMA foreign_keys=ON;
-             CREATE TABLE IF NOT EXISTS meta (
+             PRAGMA foreign_keys=ON;",
+        )?;
+        check_schema_version(&conn, path)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
              );
@@ -171,7 +251,32 @@ impl Store {
                path BLOB NOT NULL,
                group_root BLOB NOT NULL,
                PRIMARY KEY(side, path)
-             ) WITHOUT ROWID;",
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS risk_paths (
+               path BLOB NOT NULL,
+               reason TEXT NOT NULL,
+               PRIMARY KEY(path, reason)
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS risk_ineligible (
+               path BLOB PRIMARY KEY
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS content_jobs (
+               path BLOB PRIMARY KEY,
+               reasons INTEGER NOT NULL,
+               rank BLOB NOT NULL,
+               state TEXT NOT NULL,
+               source_status TEXT,
+               source_sha256 TEXT,
+               source_bytes INTEGER,
+               source_detail TEXT,
+               destination_status TEXT,
+               destination_sha256 TEXT,
+               destination_bytes INTEGER,
+               destination_detail TEXT,
+               outcome_kind TEXT
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS content_jobs_state
+               ON content_jobs(state, path);",
         )?;
 
         let existing_identity: Option<String> = conn
@@ -194,10 +299,451 @@ impl Store {
                     "INSERT INTO meta(key,value) VALUES('started_utc',?1)",
                     [started_utc],
                 )?;
+                tx.execute(
+                    "INSERT INTO meta(key,value) VALUES('schema_version',?1)",
+                    [SCHEMA_VERSION.to_string()],
+                )?;
                 tx.commit()?;
             }
         }
         Ok((Self { conn }, existed))
+    }
+
+    fn meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub(crate) fn selection_complete(&self) -> Result<bool> {
+        Ok(self.meta("selection_complete")?.as_deref() == Some("1"))
+    }
+
+    /// Imports the canonical risk-evidence artifact into `risk_paths`.
+    /// Idempotent; every line must parse.
+    pub(crate) fn import_risk_paths(&mut self, artifact: &Path) -> Result<u64> {
+        let tx = self.conn.transaction()?;
+        let mut imported = 0;
+        {
+            let mut stmt =
+                tx.prepare("INSERT OR IGNORE INTO risk_paths(path,reason) VALUES(?1,?2)")?;
+            risk::for_each_record(artifact, |record| {
+                stmt.execute(params![&record.path, record.reason.as_str()])?;
+                imported += 1;
+                Ok(())
+            })?;
+        }
+        tx.commit()?;
+        Ok(imported)
+    }
+
+    /// Builds the complete content selection in one transaction and commits
+    /// the `selection_complete` marker with it, so a crash can never leave a
+    /// partial selection behind. Any prior selection is discarded first.
+    ///
+    /// Mandatory reasons that depend only on the scans and the risk evidence
+    /// (`hardlink_group`, `migration_*`, `retried_shard`) are materialized by
+    /// SQL into a temporary hint table keyed by path. The single raw-path
+    /// ordered pass over the joined entries then merges those hints, adds
+    /// `metadata_mismatch` and `bucket_boundary`, computes the seeded rank,
+    /// and feeds the bounded heap. Memory is `O(target)`.
+    pub(crate) fn build_selection(
+        &mut self,
+        target: u64,
+        ranker: &Ranker,
+        mut is_metadata_mismatch: impl FnMut(&Entry, &Entry) -> bool,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "DELETE FROM content_jobs;
+             DELETE FROM risk_ineligible;
+             DELETE FROM meta WHERE key IN ('selection_complete','eligible_files');
+             DROP TABLE IF EXISTS temp.mandatory_hints;
+             CREATE TEMP TABLE mandatory_hints (
+               path BLOB PRIMARY KEY,
+               reasons INTEGER NOT NULL
+             ) WITHOUT ROWID;",
+        )?;
+        for reason in [
+            RiskReason::MigrationFailure,
+            RiskReason::MigrationDowngrade,
+            RiskReason::RetriedShard,
+        ] {
+            tx.execute(
+                &format!(
+                    "INSERT INTO temp.mandatory_hints(path,reasons)
+                     SELECT r.path,?2 FROM risk_paths r
+                      WHERE r.reason=?1 AND {eligible}
+                     ON CONFLICT(path) DO UPDATE SET reasons=reasons|excluded.reasons",
+                    eligible = eligible_sql("r.path")
+                ),
+                params![reason.as_str(), i64::from(reason.bit())],
+            )?;
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO temp.mandatory_hints(path,reasons)
+                 SELECT MIN(h.path),?1 FROM hardlinks h
+                  WHERE h.side=0 AND {eligible}
+                  GROUP BY h.group_root
+                 ON CONFLICT(path) DO UPDATE SET reasons=reasons|excluded.reasons",
+                eligible = eligible_sql("h.path")
+            ),
+            [i64::from(RiskReason::HardlinkGroup.bit())],
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO risk_ineligible(path)
+                 SELECT DISTINCT r.path FROM risk_paths r WHERE NOT {eligible}",
+                eligible = eligible_sql("r.path")
+            ),
+            [],
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO risk_ineligible(path)
+                 SELECT h.group_root FROM hardlinks h
+                  WHERE h.side=0
+                  GROUP BY h.group_root
+                 HAVING SUM(CASE WHEN {eligible} THEN 1 ELSE 0 END)=0",
+                eligible = eligible_sql("h.path")
+            ),
+            [],
+        )?;
+
+        let mut eligible_files = 0u64;
+        let mut heap = SeededHeap::new(target);
+        {
+            let mut hint_stmt =
+                tx.prepare("SELECT path,reasons FROM temp.mandatory_hints ORDER BY path")?;
+            let mut hints = hint_stmt.query([])?;
+            let mut next_hint = next_hint(&mut hints)?;
+            let mut insert = tx.prepare(
+                "INSERT INTO content_jobs(path,reasons,rank,state) VALUES(?1,?2,?3,'pending')",
+            )?;
+            self.for_each_joined(|source, destination| {
+                let (Some(source), Some(destination)) = (source, destination) else {
+                    return Ok(());
+                };
+                if source.file_type != FileType::Regular
+                    || destination.file_type != FileType::Regular
+                {
+                    return Ok(());
+                }
+                eligible_files += 1;
+                let mut reasons = ReasonSet::EMPTY;
+                while let Some((hint_path, hint_reasons)) = next_hint.as_ref() {
+                    match hint_path.as_slice().cmp(source.path.as_slice()) {
+                        std::cmp::Ordering::Less => next_hint = self::next_hint(&mut hints)?,
+                        std::cmp::Ordering::Equal => {
+                            reasons = reasons.union(*hint_reasons);
+                            next_hint = self::next_hint(&mut hints)?;
+                            break;
+                        }
+                        std::cmp::Ordering::Greater => break,
+                    }
+                }
+                if is_metadata_mismatch(&source, &destination) {
+                    reasons.insert(RiskReason::MetadataMismatch);
+                }
+                if is_bucket_boundary(source.size) {
+                    reasons.insert(RiskReason::BucketBoundary);
+                }
+                let rank = ranker.rank(&source.path);
+                if !reasons.is_empty() {
+                    insert.execute(params![
+                        &source.path,
+                        i64::from(reasons.bits()),
+                        rank.as_slice()
+                    ])?;
+                }
+                heap.push(rank, &source.path);
+                Ok(())
+            })?;
+        }
+
+        let mut selected =
+            u64::try_from(tx.query_row("SELECT COUNT(*) FROM content_jobs", [], |r| {
+                r.get::<_, i64>(0)
+            })?)
+            .context("negative SQLite job count")?;
+        if selected < target {
+            let mut insert = tx.prepare(
+                "INSERT OR IGNORE INTO content_jobs(path,reasons,rank,state)
+                 VALUES(?1,?2,?3,'pending')",
+            )?;
+            for candidate in heap.into_ascending() {
+                if selected >= target {
+                    break;
+                }
+                let changed = insert.execute(params![
+                    &candidate.path,
+                    i64::from(ReasonSet::only(RiskReason::Seeded).bits()),
+                    candidate.rank.as_slice()
+                ])?;
+                selected += changed as u64;
+            }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('eligible_files',?1)",
+            [eligible_files.to_string()],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('selection_complete','1')",
+            [],
+        )?;
+        tx.execute_batch("DROP TABLE temp.mandatory_hints;")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn selection_summary(&self) -> Result<SelectionSummary> {
+        let mut summary = SelectionSummary {
+            eligible_files: self
+                .meta("eligible_files")?
+                .ok_or_else(|| anyhow::anyhow!("selection has not been built"))?
+                .parse()
+                .context("eligible_files metadata is not a number")?,
+            ..SelectionSummary::default()
+        };
+        let mut stmt = self.conn.prepare("SELECT reasons FROM content_jobs")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let bits = u32::try_from(row.get::<_, i64>(0)?).context("invalid reason bits")?;
+            let reasons = ReasonSet::from_bits(bits);
+            summary.selected_files += 1;
+            if reasons.is_risk() {
+                summary.risk_selected_files += 1;
+            } else {
+                summary.seeded_selected_files += 1;
+            }
+            for reason in reasons.iter() {
+                *summary.reasons.entry(reason).or_insert(0) += 1;
+            }
+        }
+        summary.risk_ineligible_files = u64::try_from(self.conn.query_row(
+            "SELECT COUNT(*) FROM risk_ineligible",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?)
+        .context("negative SQLite ineligible count")?;
+        Ok(summary)
+    }
+
+    pub(crate) fn pending_job_count(&self) -> Result<u64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM content_jobs WHERE state='pending'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        u64::try_from(count).context("negative SQLite pending count")
+    }
+
+    /// Next batch of pending jobs strictly after `after`, in raw-path order.
+    pub(crate) fn pending_jobs_after(
+        &self,
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<ContentJob>> {
+        let mut jobs = Vec::new();
+        let mut visit = |row: &Row<'_>| -> rusqlite::Result<()> {
+            jobs.push(ContentJob {
+                path: row.get(0)?,
+                source: entry_at(row, 1)?,
+                destination: entry_at(row, 17)?,
+            });
+            Ok(())
+        };
+        match after {
+            Some(after) => {
+                let sql = format!("{} LIMIT ?2", job_query("c.state='pending' AND c.path>?1"));
+                let mut stmt = self.conn.prepare(&sql)?;
+                let mut rows = stmt.query(params![after, i64::from(limit)])?;
+                while let Some(row) = rows.next()? {
+                    visit(row)?;
+                }
+            }
+            None => {
+                let sql = format!("{} LIMIT ?1", job_query("c.state='pending'"));
+                let mut stmt = self.conn.prepare(&sql)?;
+                let mut rows = stmt.query([i64::from(limit)])?;
+                while let Some(row) = rows.next()? {
+                    visit(row)?;
+                }
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// Persists terminal outcomes in one transaction. A job becomes
+    /// `complete` with both sides at once; a pending job that is no longer
+    /// pending is left untouched.
+    pub(crate) fn complete_jobs(&mut self, results: &[(Vec<u8>, ContentOutcome)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE content_jobs
+                    SET state='complete',
+                        source_status=?2,source_sha256=?3,source_bytes=?4,source_detail=?5,
+                        destination_status=?6,destination_sha256=?7,destination_bytes=?8,
+                        destination_detail=?9,outcome_kind=?10
+                  WHERE path=?1 AND state='pending'",
+            )?;
+            for (path, outcome) in results {
+                let (source_sha256, source_bytes) = digest_columns(&outcome.source);
+                let (destination_sha256, destination_bytes) = digest_columns(&outcome.destination);
+                stmt.execute(params![
+                    path,
+                    outcome.source.status(),
+                    source_sha256,
+                    source_bytes,
+                    serde_json::to_string(&outcome.source)?,
+                    outcome.destination.status(),
+                    destination_sha256,
+                    destination_bytes,
+                    serde_json::to_string(&outcome.destination)?,
+                    outcome.kind().as_str(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Terminal content outcomes with both baselines, in raw-path order, so
+    /// the mismatch artifact never depends on worker completion order.
+    pub(crate) fn for_each_content_outcome(
+        &self,
+        mut visit: impl FnMut(&[u8], &ContentOutcome, &Entry, &Entry) -> Result<()>,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(&job_query("c.state='complete'"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: Vec<u8> = row.get(0)?;
+            let source = entry_at(row, 1)?;
+            let destination = entry_at(row, 17)?;
+            let source_detail: String = row.get(33)?;
+            let destination_detail: String = row.get(34)?;
+            let outcome = ContentOutcome {
+                source: serde_json::from_str(&source_detail)
+                    .context("persisted source content outcome")?,
+                destination: serde_json::from_str(&destination_detail)
+                    .context("persisted destination content outcome")?,
+            };
+            visit(&path, &outcome, &source, &destination)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn content_totals(&self) -> Result<ContentTotals> {
+        let row = self.conn.query_row(
+            "SELECT
+               COUNT(CASE WHEN source_status='hashed' THEN 1 END),
+               COALESCE(SUM(CASE WHEN source_status='hashed' THEN source_bytes END),0),
+               COUNT(CASE WHEN destination_status='hashed' THEN 1 END),
+               COALESCE(SUM(CASE WHEN destination_status='hashed' THEN destination_bytes END),0),
+               COUNT(CASE WHEN outcome_kind='match' THEN 1 END),
+               COUNT(CASE WHEN outcome_kind='content' THEN 1 END),
+               COUNT(CASE WHEN source_status='unreadable' THEN 1 END)
+                 + COUNT(CASE WHEN destination_status='unreadable' THEN 1 END),
+               COUNT(CASE WHEN source_status='unstable' THEN 1 END)
+                 + COUNT(CASE WHEN destination_status='unstable' THEN 1 END)
+             FROM content_jobs WHERE state='complete'",
+            [],
+            |r| {
+                Ok([
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                ])
+            },
+        )?;
+        let unsigned = |value: i64| u64::try_from(value).context("negative SQLite content total");
+        Ok(ContentTotals {
+            source_files_hashed: unsigned(row[0])?,
+            source_bytes: unsigned(row[1])?,
+            destination_files_hashed: unsigned(row[2])?,
+            destination_bytes: unsigned(row[3])?,
+            matches: unsigned(row[4])?,
+            mismatches: unsigned(row[5])?,
+            unreadable_sides: unsigned(row[6])?,
+            unstable_sides: unsigned(row[7])?,
+        })
+    }
+
+    /// Unique `(side, path)` pairs that were unreadable during the scan or
+    /// the content phase.
+    pub(crate) fn unreadable_unique(&self) -> Result<u64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM (
+               SELECT COALESCE(side,0) AS side,path FROM issues
+               UNION SELECT 0,path FROM content_jobs WHERE source_status='unreadable'
+               UNION SELECT 1,path FROM content_jobs WHERE destination_status='unreadable')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        u64::try_from(count).context("negative SQLite unreadable count")
+    }
+
+    /// Unique `(side, path)` pairs that were unstable during the scan or the
+    /// content phase.
+    pub(crate) fn unstable_unique(&self) -> Result<u64> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM (
+               SELECT side,path FROM unstable
+               UNION SELECT 0,path FROM content_jobs WHERE source_status='unstable'
+               UNION SELECT 1,path FROM content_jobs WHERE destination_status='unstable')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        u64::try_from(count).context("negative SQLite unstable count")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_scan_complete(&mut self, side: Side) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scan_state(side,complete) VALUES(?1,1)",
+            [side as i64],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_jobs(&self) -> Result<Vec<(Vec<u8>, ReasonSet)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path,reasons FROM content_jobs ORDER BY path")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                ReasonSet::from_bits(row.get::<_, i64>(1)? as u32),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn risk_ineligible_paths(&self) -> Result<Vec<Vec<u8>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM risk_ineligible ORDER BY path")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_selection_marker(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key='selection_complete'", [])?;
+        Ok(())
     }
 
     pub(crate) fn started_utc(&self) -> Result<String> {
@@ -562,6 +1108,56 @@ impl Store {
     }
 }
 
+fn check_schema_version(conn: &Connection, path: &Path) -> Result<()> {
+    let has_meta = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? > 0;
+    if !has_meta {
+        return Ok(());
+    }
+    let version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match version {
+        Some(version) if version == SCHEMA_VERSION.to_string() => Ok(()),
+        Some(version) => anyhow::bail!(
+            "verification database {} uses schema version {version}; this verifier requires \
+             schema version {SCHEMA_VERSION}. Choose a new verification id.",
+            path.display()
+        ),
+        None => {
+            let has_identity =
+                conn.query_row("SELECT COUNT(*) FROM meta WHERE key='identity'", [], |r| {
+                    r.get::<_, i64>(0)
+                })? > 0;
+            if has_identity {
+                anyhow::bail!(
+                    "verification database {} uses schema version 1 (metadata-only verifier) \
+                     and cannot be upgraded in place; choose a new verification id",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn next_hint(rows: &mut rusqlite::Rows<'_>) -> Result<Option<(Vec<u8>, ReasonSet)>> {
+    Ok(match rows.next()? {
+        Some(row) => {
+            let bits = u32::try_from(row.get::<_, i64>(1)?).context("invalid hint bits")?;
+            Some((row.get::<_, Vec<u8>>(0)?, ReasonSet::from_bits(bits)))
+        }
+        None => None,
+    })
+}
+
 fn insert_entry(tx: &Transaction<'_>, side: Side, entry: &Entry) -> Result<()> {
     tx.execute(
         "INSERT OR REPLACE INTO entries(
@@ -632,24 +1228,36 @@ fn next_entry(rows: &mut rusqlite::Rows<'_>) -> Result<Option<Entry>> {
 }
 
 fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<Entry> {
+    entry_at(row, 0)
+}
+
+/// Decodes the sixteen entry columns starting at `base`.
+fn entry_at(row: &Row<'_>, base: usize) -> rusqlite::Result<Entry> {
     Ok(Entry {
-        path: row.get(0)?,
-        file_type: FileType::from_i64(row.get(1)?),
-        size: decode_u64(row.get(2)?),
-        mode: row.get::<_, i64>(3)? as u32,
-        uid: row.get::<_, i64>(4)? as u32,
-        gid: row.get::<_, i64>(5)? as u32,
-        mtime_sec: row.get(6)?,
-        mtime_nsec: row.get::<_, i64>(7)? as u32,
-        ctime_sec: row.get(8)?,
-        ctime_nsec: row.get::<_, i64>(9)? as u32,
-        dev: decode_u64(row.get(10)?),
-        ino: decode_u64(row.get(11)?),
-        nlink: row.get::<_, i64>(12)? as u32,
-        rdev: decode_u64(row.get(13)?),
-        symlink_target: row.get(14)?,
-        hardlink_group: row.get(15)?,
+        path: row.get(base)?,
+        file_type: FileType::from_i64(row.get(base + 1)?),
+        size: decode_u64(row.get(base + 2)?),
+        mode: row.get::<_, i64>(base + 3)? as u32,
+        uid: row.get::<_, i64>(base + 4)? as u32,
+        gid: row.get::<_, i64>(base + 5)? as u32,
+        mtime_sec: row.get(base + 6)?,
+        mtime_nsec: row.get::<_, i64>(base + 7)? as u32,
+        ctime_sec: row.get(base + 8)?,
+        ctime_nsec: row.get::<_, i64>(base + 9)? as u32,
+        dev: decode_u64(row.get(base + 10)?),
+        ino: decode_u64(row.get(base + 11)?),
+        nlink: row.get::<_, i64>(base + 12)? as u32,
+        rdev: decode_u64(row.get(base + 13)?),
+        symlink_target: row.get(base + 14)?,
+        hardlink_group: row.get(base + 15)?,
     })
+}
+
+fn digest_columns(side: &SideResult) -> (Option<&str>, Option<i64>) {
+    match side {
+        SideResult::Hashed { sha256, bytes } => (Some(sha256.as_str()), Some(encode_u64(*bytes))),
+        _ => (None, None),
+    }
 }
 
 fn directory_changed(before: &Entry, after: &Entry) -> bool {

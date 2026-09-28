@@ -318,7 +318,7 @@ fn decode_error(
     }
 }
 
-fn file_type_from_mode(mode: u32) -> FileType {
+pub(crate) fn file_type_from_mode(mode: u32) -> FileType {
     match (mode as libc::mode_t) & libc::S_IFMT {
         libc::S_IFREG => FileType::Regular,
         libc::S_IFDIR => FileType::Directory,
@@ -355,7 +355,7 @@ fn child_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
     path
 }
 
-fn full_path(root: &str, relative: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn full_path(root: &str, relative: &[u8]) -> Result<Vec<u8>> {
     if !root.starts_with('/') {
         anyhow::bail!("endpoint root must be absolute, got {root:?}");
     }
