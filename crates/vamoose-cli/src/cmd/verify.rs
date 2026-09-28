@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
 use migration_core::claim::ClaimStore;
 use migration_core::records::{Manifest, RUN_FORMAT_VERSION};
-use migration_verify::{ConsistencyBoundary, VerificationRequest, VerificationStatus};
+use migration_verify::{
+    ConsistencyBoundary, VerificationMode, VerificationRequest, VerificationStatus,
+};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -139,6 +141,8 @@ pub async fn run(args: Args, config_path: Option<PathBuf>) -> Result<Verificatio
         mismatch_path,
         rpc_timeout_ms,
         directory_batch_size: args.directory_batch_size,
+        mode: VerificationMode::Metadata,
+        sample: None,
     };
     let result = tokio::task::spawn_blocking(move || migration_verify::verify(request))
         .await
