@@ -3,6 +3,8 @@
 //! checkpoint and terminal artifacts are inputs to the later distributed
 //! verifier rather than throwaway output.
 
+mod risk_history;
+
 use crate::config::Config;
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
