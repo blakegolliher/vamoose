@@ -318,6 +318,7 @@ mod tests {
                     etag: "e".into(),
                 })
                 .collect(),
+            exclusions: vec![],
             total_rows: shards.iter().map(|(_, rows, _)| rows).sum(),
             source: Endpoint {
                 kind: EndpointKind::Nfs,

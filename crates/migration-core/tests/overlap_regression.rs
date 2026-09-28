@@ -24,6 +24,7 @@ fn synthetic_manifest(src: Endpoint, dst: Endpoint) -> Manifest {
         run_id: "test-run".into(),
         created_utc: UtcTime::now(),
         shards: Vec::new(),
+        exclusions: vec![],
         total_rows: 0,
         source: src,
         dest: dst,

@@ -1,6 +1,8 @@
 # Verification product contract
 
-Status: implementation contract; no production verifier is shipped yet.
+Status: V1 metadata verification is implemented. Sampled and full content
+verification, distributed verification, and automatic finalization gates remain
+future milestones.
 
 Vamoose must prove that a migration produced the requested destination tree.
 Worker success, terminal shard claims, and mover-computed hashes are useful
@@ -15,15 +17,20 @@ ad-hoc operator script.
 
 ## Customer-visible contract
 
-The product command will be:
+The current command is:
 
 ```text
 vamoose verify [--mode metadata|sample|full]
-               [--sample-files N] [--seed SEED]
-               [--report PATH] [--json]
+               [--manifest PATH]
+               (--writers-stopped |
+                 --source-snapshot-id ID --destination-snapshot-id ID)
+               [--verification-id ID] [--work-dir PATH]
+               [--report PATH] [--mismatches PATH] [--json]
 ```
 
-`full` is the default. Operators must deliberately choose a weaker mode.
+V1 defaults to `metadata`. `sample` and `full` are visible reservations and
+fail closed as unimplemented; they do not silently degrade to metadata. `full`
+will become the default only when V3 lands.
 
 - `metadata` compares the complete namespace and supported metadata for every
   entry, but does not read regular-file content.
@@ -58,8 +65,12 @@ A change in size, mtime, ctime, file identity, or type marks the entry unstable
 and the run inconclusive. It must never be silently retried until it happens to
 match.
 
-Verification against a live tree is allowed as a diagnostic mode, but its report
-is explicitly `inconclusive` and cannot complete a migration job.
+V1 refuses to start without paired snapshot identifiers or the explicit
+`--writers-stopped` assertion. Snapshot identifiers are evidence recorded in
+the report; V1 does not create snapshots or rewrite endpoint roots on the
+operator's behalf. It detects directory mutation across enumeration and marks
+the result `inconclusive`. Per-file before/after content-read stability checks
+arrive with V2.
 
 ## Independent evidence
 
@@ -117,7 +128,9 @@ and risk-selected count so the sample can be reproduced exactly.
 
 ## Mismatch records
 
-Mismatch JSONL is append-only and partitioned by verification shard. Each record
+Mismatch JSONL is the high-cardinality evidence format. V1 writes one
+deterministic, immutable file with shard id `metadata-v1`; V3 will partition
+that format into independently published verification shards. Each record
 contains:
 
 ```text
@@ -138,24 +151,51 @@ unstable_source, unstable_destination
 High-cardinality details stay in JSONL. Coordinator events carry bounded samples
 and aggregate counts only.
 
-## Durable report
+## V1 implementation
+
+V1 performs fresh source and destination scans over the pinned raw NFSv3
+READDIRPLUS interface. Attributes returned with directory entries avoid a
+separate GETATTR in the common case. Opaque NFS cookies, cookie verifiers, raw
+path bytes, directory filehandles, observations, issues, and scan completion
+are transactionally checkpointed in a local SQLite database. Restarting with
+the same verification id resumes incomplete directory batches; a request
+fingerprint rejects reuse with changed endpoints, policy, exclusions, or
+consistency evidence.
+
+The comparison is a merge join over SQLite's raw-path ordering, so memory is
+bounded independently of tree size. Hardlink equivalence classes are
+materialized across the complete observed namespace, rather than inferred per
+migration micro-batch. V1 is intentionally a single-node verifier; distributed
+partitioning remains V3 work.
+
+Mismatch JSONL and the report are written beside their final paths, fsynced,
+and published without replacement. Reports contain SHA-256 and byte length for
+the mismatch artifact and validate that artifact on terminal replay. A local
+advisory lock prevents concurrent writers to one verification work directory.
+
+V1 returns `mismatched` for namespace or supported metadata differences,
+`failed` for unreadable/operational observations, and `inconclusive` for a
+detected mutation. Unsupported special file types are explicit
+`unsupported_feature` mismatches. Content, xattrs, ACLs, and sparse extents are
+recorded as disabled in the comparison policy and are not claimed as verified.
+
+## Durable report contract
 
 The terminal report contains at least:
 
-- schema version, verification id, run id, and software/build provenance;
+- schema version, verification id, run id, and software version;
 - source and destination endpoints, roots, and snapshot identifiers;
-- mode, sample policy, seed, and comparison policy;
+- request fingerprint, exclusions, mode, and comparison policy (with sample
+  policy and seed added in V2);
 - start/end time and whether the stability precondition was satisfied;
 - entries scanned and compared by type;
-- regular files and logical bytes hashed on each side;
+- regular files and logical bytes hashed on each side once content modes land;
 - mismatches by kind, unreadable entries, unstable entries, and approved
   fidelity exceptions;
 - references and SHA-256 digests for every mismatch JSONL object; and
-- final `passed`, `failed`, or `inconclusive` status.
+- final `passed`, `mismatched`, `failed`, or `inconclusive` status.
 
-Report and mismatch publication use temporary objects/files, fsync where local,
-and conditional creation of the terminal report. Resume checkpoints cannot
-overwrite a prior terminal result.
+Resume checkpoints cannot overwrite a prior terminal result.
 
 ## Scale architecture
 
@@ -180,7 +220,7 @@ telemetry used by migration is reported for both sides.
 
 ## Implementation sequence
 
-### V1: complete metadata verifier
+### V1: complete metadata verifier — implemented
 
 - Add a `migration-verify` library with versioned report and mismatch schemas.
 - Add independent source and destination scans and the bounded path join.
@@ -189,6 +229,9 @@ telemetry used by migration is reported for both sides.
 - Add `vamoose verify --mode metadata`, resume checkpoints, JSON output, and the
   documented exit codes.
 - Treat source/destination mutation and unsupported features as non-success.
+
+The remaining V1 release qualification is hardware-backed NFS fault injection
+and scale/performance evidence, not another in-process verifier design.
 
 ### V2: sampled content verification
 
@@ -216,13 +259,16 @@ telemetry used by migration is reported for both sides.
 
 ## Required test gates
 
-The verifier does not ship until automated tests prove that it detects injected:
+Automated V1 tests currently inject and detect missing/extra paths, type and
+size drift, mode/owner/mtime drift, symlink-target drift, hardlink membership
+drift, unsupported special types, non-UTF-8 paths, invalid consistency
+boundaries, and full-width NFS identifiers in SQLite. They also compile/link
+the verifier through the workspace's pinned libnfs surface.
 
-- missing, extra, truncated, same-size-corrupted, and zero-length files;
-- mode, uid, gid, and mtime drift;
-- symlink-target and hardlink-group drift;
-- non-UTF-8 path mismatches;
-- read permission and mid-read mutation failures;
+Content modes and production qualification still require tests that inject:
+
+- truncated, same-size-corrupted, and zero-length content errors;
+- read permission and mid-read mutation failures across content reads;
 - verifier crash/restart and claim-reclaim races; and
 - tampered or partially published checkpoints and reports.
 

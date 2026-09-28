@@ -62,6 +62,7 @@ fn manifest_with_shards(n: usize) -> Manifest {
                 etag: fixture_etag(i),
             })
             .collect(),
+        exclusions: vec![],
         total_rows: (n as u64) * 10,
         source: Endpoint {
             kind: EndpointKind::Nfs,

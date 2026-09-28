@@ -24,6 +24,10 @@ pub struct Manifest {
     pub total_rows: u64,
     pub source: Endpoint,
     pub dest: Endpoint,
+    /// Root-relative regular expressions passed to the scanner. Matched paths
+    /// are outside the migration and verification namespace.
+    #[serde(default)]
+    pub exclusions: Vec<String>,
     pub options: MigrationOptions,
 }
 
@@ -327,6 +331,33 @@ pub enum DowngradeKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_parses_pre_verifier_schema_without_exclusions() {
+        let manifest = Manifest {
+            format_version: RUN_FORMAT_VERSION,
+            run_id: "run-old".into(),
+            created_utc: UtcTime::now(),
+            shards: vec![],
+            total_rows: 0,
+            source: Endpoint {
+                kind: EndpointKind::Nfs,
+                url: "nfs://source/export".into(),
+                root: "/".into(),
+            },
+            dest: Endpoint {
+                kind: EndpointKind::Nfs,
+                url: "nfs://destination/export".into(),
+                root: "/".into(),
+            },
+            exclusions: vec!["temporary".into()],
+            options: MigrationOptions::default(),
+        };
+        let mut value = serde_json::to_value(manifest).unwrap();
+        value.as_object_mut().unwrap().remove("exclusions");
+        let decoded: Manifest = serde_json::from_value(value).unwrap();
+        assert!(decoded.exclusions.is_empty());
+    }
 
     // R8: pin the wire form for FailurePhase::Fenced so a future
     // rename_all change doesn't silently shift the on-disk JSON

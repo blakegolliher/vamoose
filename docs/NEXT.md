@@ -68,11 +68,11 @@ and pass criteria are in [CORRECTNESS_RULES.md](CORRECTNESS_RULES.md).
 - **Archived control history restore:** the coordinator writes
   `archivelogs/`, but replay does not restore from it and no restore command is
   implemented.
-- **Production verification:** implement the independent, libnfs-based
-  metadata/sample/full verifier specified in [VERIFICATION.md](VERIFICATION.md).
-  A passing configured verification policy must eventually gate successful
-  finalization; the kernel-mount/SSH `ops/finalize-run.sh` path remains an
-  advanced harness, not the product verifier.
+- **Verification after V1:** the independent, resumable metadata verifier and
+  `vamoose verify` command are implemented. Next add deterministic sampled
+  content reads, then distributed full-content shards and a configured passing
+  verification gate for successful finalization. The kernel-mount/SSH
+  `ops/finalize-run.sh` path remains an advanced harness, not product evidence.
 
 ## 4. Focused follow-ups
 

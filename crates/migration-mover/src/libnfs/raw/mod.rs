@@ -71,7 +71,71 @@ pub type Fh = Vec<u8>;
 #[derive(Debug)]
 pub struct ReaddirplusEntry {
     pub name: Vec<u8>,
+    pub cookie: u64,
     pub fh: Option<Fh>,
+    pub attrs: Option<NfsAttributes>,
+}
+
+/// NFSv3 attributes copied out of a READDIRPLUS reply before libnfs frees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NfsAttributes {
+    pub file_type: NfsFileType,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub fsid: u64,
+    pub fileid: u64,
+    pub rdev_major: u32,
+    pub rdev_minor: u32,
+    pub mtime_sec: u32,
+    pub mtime_nsec: u32,
+    pub ctime_sec: u32,
+    pub ctime_nsec: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NfsFileType {
+    Regular,
+    Directory,
+    BlockDevice,
+    CharacterDevice,
+    Symlink,
+    Socket,
+    Fifo,
+    Unknown,
+}
+
+impl From<&b::fattr3> for NfsAttributes {
+    fn from(value: &b::fattr3) -> Self {
+        let file_type = match value.type_ {
+            b::NF3REG => NfsFileType::Regular,
+            b::NF3DIR => NfsFileType::Directory,
+            b::NF3BLK => NfsFileType::BlockDevice,
+            b::NF3CHR => NfsFileType::CharacterDevice,
+            b::NF3LNK => NfsFileType::Symlink,
+            b::NF3SOCK => NfsFileType::Socket,
+            b::NF3FIFO => NfsFileType::Fifo,
+            _ => NfsFileType::Unknown,
+        };
+        Self {
+            file_type,
+            mode: value.mode,
+            nlink: value.nlink,
+            uid: value.uid,
+            gid: value.gid,
+            size: value.size,
+            fsid: value.fsid,
+            fileid: value.fileid,
+            rdev_major: value.rdev.specdata1,
+            rdev_minor: value.rdev.specdata2,
+            mtime_sec: value.mtime.seconds,
+            mtime_nsec: value.mtime.nseconds,
+            ctime_sec: value.ctime.seconds,
+            ctime_nsec: value.ctime.nseconds,
+        }
+    }
 }
 
 /// Result of a bounded, fully paged READDIRPLUS scan.
@@ -83,11 +147,12 @@ pub enum ReaddirplusResult {
     TooMany,
 }
 
-struct ReaddirplusPage {
-    entries: Vec<ReaddirplusEntry>,
-    last_cookie: Option<u64>,
-    cookieverf: b::cookieverf3,
-    eof: bool,
+#[derive(Debug)]
+pub struct ReaddirplusPage {
+    pub entries: Vec<ReaddirplusEntry>,
+    pub next_cookie: Option<u64>,
+    pub cookie_verifier: [u8; 8],
+    pub eof: bool,
 }
 
 /// Error from one raw op: the NFS3 status name (errno-style, e.g.
@@ -411,14 +476,26 @@ unsafe extern "C" fn cb_readdirplus(
                     } else {
                         None
                     };
-                    entries.push(ReaddirplusEntry { name, fh });
+                    let attrs = if entry.name_attributes.attributes_follow != 0 {
+                        Some(NfsAttributes::from(
+                            &entry.name_attributes.post_op_attr_u.attributes,
+                        ))
+                    } else {
+                        None
+                    };
+                    entries.push(ReaddirplusEntry {
+                        name,
+                        cookie: entry.cookie,
+                        fh,
+                        attrs,
+                    });
                 }
                 cur = entry.nextentry;
             }
             slot.out = Some(Out::Readdirplus(ReaddirplusPage {
                 entries,
-                last_cookie,
-                cookieverf: ok.cookieverf,
+                next_cookie: last_cookie,
+                cookie_verifier: ok.cookieverf.map(|byte| byte as u8),
                 eof: ok.reply.eof != 0,
             }));
         }
@@ -448,33 +525,11 @@ pub fn readdirplus(
     dir_fh: &[u8],
     entry_cap: usize,
 ) -> Result<ReaddirplusResult, RawError> {
-    const DIRCOUNT: u32 = 8 * 1024;
-    const MAXCOUNT: u32 = 8 * 1024;
-
     let mut cookie = 0;
-    let mut cookieverf: b::cookieverf3 = [0; 8];
+    let mut cookie_verifier = [0; 8];
     let mut all = Vec::new();
     loop {
-        let mut slot = Slot::new();
-        let mut args = b::READDIRPLUS3args {
-            dir: fh3(dir_fh),
-            cookie,
-            cookieverf,
-            dircount: DIRCOUNT,
-            maxcount: MAXCOUNT,
-        };
-        issue!(nfs, &slot, "READDIRPLUS", {
-            b::rpc_nfs3_readdirplus_task(
-                rpc_of(nfs),
-                Some(cb_readdirplus),
-                &mut args,
-                &mut slot as *mut Slot as *mut c_void,
-            )
-        });
-        let page = match slot.finish("READDIRPLUS")? {
-            Out::Readdirplus(page) => page,
-            _ => unreachable!("READDIRPLUS slot holds Readdirplus"),
-        };
+        let page = readdirplus_page(nfs, dir_fh, cookie, cookie_verifier)?;
 
         let total = all.len().saturating_add(page.entries.len());
         if total > entry_cap || (total == entry_cap && !page.eof) {
@@ -485,7 +540,7 @@ pub fn readdirplus(
             return Ok(ReaddirplusResult::Complete(all));
         }
 
-        let next_cookie = page.last_cookie.ok_or_else(|| {
+        let next_cookie = page.next_cookie.ok_or_else(|| {
             RawError::transport(
                 "READDIRPLUS",
                 RPC_STATUS_SUCCESS,
@@ -500,7 +555,43 @@ pub fn readdirplus(
             ));
         }
         cookie = next_cookie;
-        cookieverf = page.cookieverf;
+        cookie_verifier = page.cookie_verifier;
+    }
+}
+
+/// Fetch one bounded READDIRPLUS page starting at an opaque NFS cookie.
+/// This is the verifier's resumable namespace primitive; unlike
+/// [`readdirplus`], it never accumulates a whole directory in memory.
+pub fn readdirplus_page(
+    nfs: &mut NfsContext,
+    dir_fh: &[u8],
+    cookie: u64,
+    cookie_verifier: [u8; 8],
+) -> Result<ReaddirplusPage, RawError> {
+    // Keep every reply within one RPC record-marking fragment. See the
+    // `readdirplus` documentation above for the VAST/libnfs failure mode.
+    const DIRCOUNT: u32 = 8 * 1024;
+    const MAXCOUNT: u32 = 8 * 1024;
+
+    let mut slot = Slot::new();
+    let mut args = b::READDIRPLUS3args {
+        dir: fh3(dir_fh),
+        cookie,
+        cookieverf: cookie_verifier.map(|byte| byte as c_char),
+        dircount: DIRCOUNT,
+        maxcount: MAXCOUNT,
+    };
+    issue!(nfs, &slot, "READDIRPLUS", {
+        b::rpc_nfs3_readdirplus_task(
+            rpc_of(nfs),
+            Some(cb_readdirplus),
+            &mut args,
+            &mut slot as *mut Slot as *mut c_void,
+        )
+    });
+    match slot.finish("READDIRPLUS")? {
+        Out::Readdirplus(page) => Ok(page),
+        _ => unreachable!("READDIRPLUS slot holds Readdirplus"),
     }
 }
 

@@ -42,6 +42,7 @@ pub mod asyncio;
 pub mod ops;
 pub mod pool;
 pub mod raw;
+pub mod scan;
 
 pub use pool::{ContextPair, LibnfsContextPool, MultiPool, SimplePool};
 

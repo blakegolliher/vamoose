@@ -42,6 +42,7 @@ fn manifest_one_shard() -> Manifest {
             bytes: 1024,
             etag: "shard-etag".into(),
         }],
+        exclusions: vec![],
         total_rows: 10,
         source: Endpoint {
             kind: EndpointKind::Nfs,

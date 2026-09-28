@@ -12,6 +12,7 @@ pub(crate) enum CommandOutcome {
     Success,
     DoctorChecksFailed,
     DoctorUnableToComplete,
+    Verification(migration_verify::VerificationStatus),
     WorkerCompleted(RunOutcome),
 }
 
@@ -74,6 +75,7 @@ impl CommandOutcome {
             Self::Success => 0,
             Self::DoctorChecksFailed => 1,
             Self::DoctorUnableToComplete => 2,
+            Self::Verification(status) => status.exit_code(),
             Self::WorkerCompleted(outcome) => exit_code_for_outcome(outcome),
         }
     }
@@ -129,6 +131,10 @@ pub(crate) async fn run(
         Command::Tui(args) => crate::cmd::tui::run(args, config_path)
             .await
             .map(|()| CommandCompletion::ordinary(CommandOutcome::Success)),
+        Command::Verify(args) => crate::cmd::verify::run(args, config_path)
+            .await
+            .map(CommandOutcome::Verification)
+            .map(CommandCompletion::ordinary),
     }
 }
 
@@ -176,6 +182,20 @@ mod tests {
 
         for (doctor_outcome, expected) in cases {
             assert_eq!(CommandOutcome::from(doctor_outcome).exit_code(), expected);
+        }
+    }
+
+    #[test]
+    fn verifier_statuses_keep_the_documented_exit_codes() {
+        use migration_verify::VerificationStatus;
+
+        for (status, expected) in [
+            (VerificationStatus::Passed, 0),
+            (VerificationStatus::Failed, 1),
+            (VerificationStatus::Mismatched, 2),
+            (VerificationStatus::Inconclusive, 3),
+        ] {
+            assert_eq!(CommandOutcome::Verification(status).exit_code(), expected);
         }
     }
 
