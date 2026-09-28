@@ -48,6 +48,8 @@ pub(crate) enum Command {
     Coord(cmd::coord::Args),
     /// Operator dashboard (terminal UI). Connects to a running coord.
     Tui(cmd::tui::Args),
+    /// Independently verify source and destination migration metadata.
+    Verify(cmd::verify::Args),
 }
 
 /// Pick the logging mode by subcommand (F39, COORD_PLAN §3.7): the

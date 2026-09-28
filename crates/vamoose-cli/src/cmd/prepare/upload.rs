@@ -243,6 +243,8 @@ pub(crate) struct UploadContext {
     pub(crate) rewrite_identity: String,
     pub(crate) source: EndpointSpec,
     pub(crate) dest: EndpointSpec,
+    #[serde(default)]
+    pub(crate) exclusions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +335,7 @@ fn build_manifest(
             url: ctx.dest.url.clone(),
             root: ctx.dest.root.clone(),
         },
+        exclusions: ctx.exclusions.clone(),
         options: MigrationOptions {
             preserve_owner: options.preserve_owner,
             preserve_mode: options.preserve_mode,
@@ -795,6 +798,7 @@ pub(crate) mod tests {
                 url: "nfs://dst/export".into(),
                 root: "/".into(),
             },
+            exclusions: vec![],
         }
     }
 

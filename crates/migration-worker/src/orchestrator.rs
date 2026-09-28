@@ -2605,6 +2605,7 @@ mod verify_shard_etag_tests {
                 bytes: 4096,
                 etag: etag.to_string(),
             }],
+            exclusions: vec![],
             total_rows: 10,
             source: Endpoint {
                 kind: EndpointKind::Nfs,
