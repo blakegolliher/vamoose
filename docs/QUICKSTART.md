@@ -212,6 +212,20 @@ Workers exit 0 when every shard in the manifest is terminal, and
 failures, if any, are JSONL objects under the bucket's `failures/` prefix
 and are counted in both the TUI and `status`.
 
+Stop application writers (or use immutable source and destination snapshot
+roots), then produce independent metadata evidence:
+
+```bash
+sudo vamoose verify --writers-stopped
+```
+
+The command rescans both exports instead of trusting the migration index. Exit
+`0` is a metadata pass, `1` is an incomplete operational failure, `2` means
+mismatches, and `3` means mutation made the result inconclusive. The default
+artifacts are under `/var/lib/vamoose/verify/<verification-id>/`. V1 does not
+verify file content, xattrs, ACLs, or sparse extents; retain the content spot
+checks below until sampled/full content modes land.
+
 Exit code 3 from a worker means it fenced itself because a peer took its
 claim or its clock jumped. systemd deliberately does not restart it; read
 its journal, then `systemctl start` it again. Exit code 4 means the worker
@@ -309,8 +323,14 @@ sudo journalctl -u vamoose-coord --since -1h -o cat | grep 'job ended'
 systemctl show -p Result -p ExecMainStatus vamoose-worker@main    # Result=success, ExecMainStatus=0, on every host
 ```
 
-**Verify the copy** (from a host with both exports mounted at `/mnt/source`
-and `/mnt/destination`):
+**Verify metadata with Vamoose** after stopping writers:
+
+```bash
+cd / && sudo vamoose verify --writers-stopped
+```
+
+**Add V1 content spot checks** from a host with both exports mounted at
+`/mnt/source` and `/mnt/destination`:
 
 ```bash
 sudo diff <(cd /mnt/source/projects/beta && find . | sort) <(cd /mnt/destination/beta && find . | sort) && echo same-tree

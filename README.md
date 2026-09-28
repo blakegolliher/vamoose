@@ -17,6 +17,8 @@ claim authority out of the data plane.
   through async libnfs. Special file types keep their dedicated sync paths.
 - `migration-worker` — claim/reclaim lifecycle, heartbeat and self-fencing,
   shard processing, progress, and optional coordinator reporting.
+- `migration-verify` — independent, resumable source/destination metadata
+  scans, disk-backed raw-path comparison, and immutable evidence artifacts.
 - `migration-control-protocol` — versioned control-plane wire schema and pure
   snapshot reducer. It is independent of the coordinator runtime and the data
   plane.
@@ -68,6 +70,7 @@ Binaries land in `target/release/`. The unified entry point is
 | `vamoose doctor` | Implemented configuration, S3, NFS, and permission checks |
 | `vamoose init` | Implemented S3 layout marker initialization |
 | `vamoose prepare` | Implemented scan (bundled `nfs-walker`) → canonical index → verified upload → `manifest.json` |
+| `vamoose verify` | Implemented independent metadata verification; sampled/full content modes are reserved |
 | `vamoose coord` | Implemented optional REST/SSE coordinator |
 | `vamoose tui` | Implemented terminal dashboard and controls |
 | `vamoose walker` | Stub; `vamoose prepare` runs the scan |
@@ -100,6 +103,7 @@ sudo systemctl enable --now vamoose-coord             # one host
 sudo systemctl enable --now vamoose-worker@main       # every host; idles until the index exists
 sudo vamoose prepare                                  # one host: scan -> index -> manifest; the run starts
 sudo vamoose tui                                      # any host: watch, :stop, :resume, :abort
+sudo vamoose verify --writers-stopped                 # after copy: independent metadata certificate
 ```
 
 `vamoose prepare` runs the bundled `nfs-walker` (packages built with
@@ -109,6 +113,15 @@ re-run. The tracked [`ops/`](ops/README.md) harness remains the advanced,
 fully scripted lifecycle (validated run specification, provenance-checked
 bundle deployment over SSH, timing, reset, and sampled verification) for
 sites that want that level of control.
+
+`vamoose verify` reads the same manifest, scans both NFS trees independently,
+and resumes through a local SQLite checkpoint under
+`/var/lib/vamoose/verify`. V1 verifies namespace, type, size, configured POSIX
+metadata, symlink targets, and hardlink membership. It requires stopped writers
+or paired immutable snapshot identifiers and emits a JSON report plus mismatch
+JSONL. Exit codes distinguish operational failure (`1`), mismatches (`2`), and
+an unstable/inconclusive scan (`3`). Content, xattr, ACL, and sparse verification
+are not yet claimed.
 
 The TUI exposes pause (`:stop`), resume, cancel (`:abort`), drain, and
 retry-failed through its command palette. Pause takes effect at the next batch

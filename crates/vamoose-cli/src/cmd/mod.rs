@@ -7,5 +7,6 @@ pub mod rewrite;
 pub mod run;
 pub mod status;
 pub mod tui;
+pub mod verify;
 pub mod walker;
 pub mod worker;

@@ -8,6 +8,7 @@ members = [
     "crates/migration-aggr",
     "crates/migration-coord",
     "crates/migration-tui",
+    "crates/migration-verify",
     "crates/mig-walker-rewrite",
     "crates/vamoose-cli",
 ]
@@ -34,6 +35,7 @@ migration-control-protocol = { path = "crates/migration-control-protocol" }
 migration-mover            = { path = "crates/migration-mover" }
 migration-coord            = { path = "crates/migration-coord" }
 migration-tui              = { path = "crates/migration-tui" }
+migration-verify           = { path = "crates/migration-verify" }
 
 # AWS / S3
 aws-sdk-s3   = "1"
@@ -85,6 +87,8 @@ hostname   = "0.4"
 getrandom  = "0.2"
 futures    = "0.3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+regex       = "1"
+rusqlite    = { version = "0.40.2", features = ["bundled"] }
 
 # Concurrency primitives (same as nfs-walker)
 crossbeam-channel = "0.5"

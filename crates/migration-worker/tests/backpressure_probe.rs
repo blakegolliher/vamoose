@@ -49,6 +49,7 @@ fn manifest_with_shards(n: usize) -> Manifest {
                 etag: format!("etag-fixture-{i:04}"),
             })
             .collect(),
+        exclusions: vec![],
         total_rows: (n as u64) * 10,
         source: Endpoint {
             kind: EndpointKind::Nfs,
