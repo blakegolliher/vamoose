@@ -748,6 +748,7 @@ mod tests {
                     etag: "b".into(),
                 },
             ],
+            exclusions: vec![],
             total_rows: 15,
             source: Endpoint {
                 kind: EndpointKind::Nfs,

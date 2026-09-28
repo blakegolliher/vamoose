@@ -1,0 +1,27 @@
+[package]
+name        = "migration-verify"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "Independent, disk-backed NFS metadata verification for Vamoose"
+publish     = false
+
+[dependencies]
+migration-core  = { workspace = true }
+migration-mover = { workspace = true }
+
+anyhow      = { workspace = true }
+base64      = { workspace = true }
+chrono      = { workspace = true }
+hex         = { workspace = true }
+libc        = { workspace = true }
+regex       = { workspace = true }
+rusqlite    = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+sha2        = "0.10.9"
+thiserror   = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

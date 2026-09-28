@@ -38,6 +38,11 @@ posture (2026-07-31) — not an unknown. Source of truth for status:
   from `manifest.json` (id = run id); a worker whose `[coord] job_id` names a
   job the coordinator never seeds waits forever, logging
   `job not found on coord` at every retry.
+- **Product verification is metadata-only in V1.** `vamoose verify` performs
+  fresh, resumable scans of both exports and verifies namespace, type, size,
+  configured POSIX metadata, symlink targets, and hardlink membership. It does
+  not yet verify content, xattrs, ACLs, or sparse extents and does not yet gate
+  coordinator finalization. `sample` and `full` fail closed as unimplemented.
 
 ## Security posture (trusted-network beta)
 
@@ -67,6 +72,10 @@ Run vamoose on a trusted network for beta. Concretely:
   worker could not confirm its claim for a full lease window (S3
   endpoint, DNS, or network outage), surrendered the shard, and
   should simply be restarted; the shipped unit does so.
+- **Verifier exit codes:** `0` metadata pass; `1` operationally incomplete;
+  `2` completed with mismatches; `3` detected mutation/inconclusive. It refuses
+  to start without `--writers-stopped` or paired source/destination snapshot
+  identifiers. A report is not content evidence in V1.
 - **Worker liveness**: the coord marks a worker `Disconnected` when it
   has not heartbeated for 90 s, when a replacement registers from the
   same machine, or when the worker announces an orderly exit

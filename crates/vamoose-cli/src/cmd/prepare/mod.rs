@@ -442,6 +442,7 @@ async fn run_stages(
         ),
         source: spec.source.clone(),
         dest: spec.dest.clone(),
+        exclusions: settings.exclude.clone(),
     };
     // Opened before the rewrite starts: a checkpoint from another run
     // or bucket is refused before any work, and the bucket's manifest
@@ -756,6 +757,7 @@ mod tests {
                     url: "v".into(),
                     root: "/".into(),
                 },
+                exclusions: vec![],
             },
             manifest_created_utc: utc_now(),
             shards: vec![],

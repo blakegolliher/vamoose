@@ -13,7 +13,7 @@ becoming part of the data-plane ownership protocol.
 
 ## Responsibilities
 
-The implementation separates four concerns:
+The implementation separates five concerns:
 
 - **Data plane:** `migration-core`, `migration-mover`, and
   `migration-worker` read immutable Parquet shards, acquire S3 claims, and copy
@@ -24,6 +24,9 @@ The implementation separates four concerns:
   `migration-coord`, and `migration-tui` provide an optional REST/SSE view,
   commands, durable event history, and a terminal UI. They do not replace S3
   claims.
+- **Independent verification:** `migration-verify` performs fresh source and
+  destination observations and emits durable evidence without trusting worker
+  success or the migration index as proof.
 - **Observability and operations:** worker progress/failure/downgrade objects,
   coordinator snapshots/events/audit records, unified-CLI logging, and the
   limited `migration-aggr` utility expose different views of the same run.
@@ -37,6 +40,8 @@ At a high level:
                         shard claims, progress, records <------>|
                                                                  |
  source NFS <---------------- libnfs copy --------------------> dest NFS
+      ^                 independent metadata scan                  ^
+      +------------------- vamoose verify ------------------------+
 
                          optional operator plane
  worker HTTP reporting ---> vamoose coord <--- REST/SSE ---> vamoose tui
@@ -51,6 +56,7 @@ At a high level:
 | `migration-core` | Run manifest and record formats, Parquet schema/reader, S3 run layout and client, claim protocol, fencing primitives |
 | `migration-mover` | NFSv3/libnfs copy execution, file-kind selection, POSIX attribute application, partial-file commit, sync and bucketed-async paths |
 | `migration-worker` | Configuration for the worker runtime, claim/reclaim lifecycle, heartbeat and self-fencing, shard processing, backpressure, optional coordinator client |
+| `migration-verify` | Independent NFS metadata scans, SQLite checkpoints, raw-path merge comparison, mismatch JSONL, and terminal reports |
 | `migration-control-protocol` | Versioned control-plane wire types, REST/SSE bodies, snapshots, events, commands, validation, and the pure `Snapshot::apply` reducer |
 | `migration-coord` | Coordinator store, S3 layout, event chunks, snapshots, replay, audit, lease, archival, HTTP/SSE, authentication, and runtime lifecycle |
 | `migration-tui` | REST bootstrap, SSE reconnect/resume, client-side state and histories, input handling, terminal lifecycle, and deterministic ratatui views |
@@ -92,8 +98,8 @@ refused.
 
 Each run bucket contains an immutable `manifest.json` and immutable objects
 under `index/`. The manifest identifies the format version, run, source and
-destination endpoints (including logical roots), copy options, shard keys,
-row/byte counts, and each uploaded shard's ETag. A worker:
+destination endpoints (including logical roots), scanner exclusions, copy
+options, shard keys, row/byte counts, and each uploaded shard's ETag. A worker:
 
 1. loads the manifest and rejects an unsupported format version;
 2. rejects overlapping source and destination endpoints before any write;
@@ -205,6 +211,28 @@ result stops ordinary new claims; after a cooldown, one probe claim is allowed.
 A healthy probe reopens the gate, while another unhealthy result extends the
 cooldown up to its cap.
 
+## Independent verification
+
+`vamoose verify` loads the immutable manifest, applies the same exclusion
+regexes, and scans both configured NFS roots through separate libnfs contexts.
+It does not accept worker progress, mover hashes, or the migration index as
+proof of destination state. The current metadata mode compares raw path bytes,
+type, regular-file size, enabled mode/owner/mtime policy, symlink target bytes,
+and complete-tree hardlink equivalence classes.
+
+Each scan checkpoints opaque READDIRPLUS cookies, directory filehandles,
+observations, and errors into a local SQLite database. Comparison is a
+disk-backed merge over raw-path order. The mismatch JSONL and terminal report
+are immutable local artifacts; the report records the mismatch digest and a
+fingerprint of the complete request. Resume refuses changed inputs and terminal
+replay revalidates the mismatch artifact.
+
+Verification requires an explicit stopped-writer assertion or paired immutable
+snapshot identifiers. Exit status distinguishes a clean metadata pass,
+operational failure, observed mismatch, and detected instability. Content,
+xattr, ACL, sparse-extent, distributed-shard, and finalization-gate support are
+not implemented yet; see [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
 ## Optional control plane
 
 `migration-control-protocol` is the canonical control-plane contract. Version
@@ -285,10 +313,10 @@ logging shutdown, and final exit status.
 ## Command and aggregation status
 
 The unified CLI currently implements `worker`, `status`, `doctor`, `init`,
-`coord`, and `tui`. Its `walker`, `rewrite`, `aggr`, and end-to-end `run`
-subcommands retain their command-line shapes but fail safely with actionable
-messages. Operators invoke `nfs-walker` and `mig-walker-rewrite` directly for
-index preparation.
+`prepare`, metadata `verify`, `coord`, and `tui`. Its `walker`, `rewrite`,
+`aggr`, and end-to-end `run` subcommands retain their command-line shapes but
+fail safely with actionable messages. `prepare` composes the bundled scanner,
+canonical rewrite, and manifest publication.
 
 The standalone `mig-aggr` binary is not a complete observability sidecar.
 `clean-partials` is implemented: it scans a locally mounted destination for
@@ -316,6 +344,8 @@ boundaries include:
   implemented;
 - walker/rewrite/run composition and most aggregation commands remain stubs;
 - walker-side xattr capture is not yet available;
+- verification content modes and automatic finalization gating are not yet
+  available;
 - the S3 data-plane layout represents one run at the bucket root;
 - archive restore, scoped control-plane credentials, and an atomic coordinator
   snapshot boundary for TUI bootstrap are deferred;
