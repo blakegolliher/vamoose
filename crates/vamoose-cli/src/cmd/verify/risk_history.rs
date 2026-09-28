@@ -7,8 +7,6 @@
 //! object, or an index shard whose ETag drifted from the manifest is an
 //! operational failure, never a silently smaller sample.
 
-#![allow(dead_code)] // Wired into `vamoose verify --mode sample` by the CLI slice.
-
 use anyhow::{Context, Result};
 use migration_core::claim::ClaimStore;
 use migration_core::layout;

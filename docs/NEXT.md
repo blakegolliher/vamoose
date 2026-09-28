@@ -68,11 +68,16 @@ and pass criteria are in [CORRECTNESS_RULES.md](CORRECTNESS_RULES.md).
 - **Archived control history restore:** the coordinator writes
   `archivelogs/`, but replay does not restore from it and no restore command is
   implemented.
-- **Verification after V1:** the independent, resumable metadata verifier and
-  `vamoose verify` command are implemented. Next add deterministic sampled
-  content reads, then distributed full-content shards and a configured passing
-  verification gate for successful finalization. The kernel-mount/SSH
-  `ops/finalize-run.sh` path remains an advanced harness, not product evidence.
+- **Verification after V2:** the independent, resumable metadata verifier and
+  sampled content verification (`vamoose verify --mode sample`) are
+  implemented. Next: run the hardware pass for the content bracket
+  (`libnfs_ffi_smoke.rs` ignored case and `scripts/manual-verify.sh inject`),
+  add an authenticated verifier ingest API so `VerifyStarted` /
+  `VerifyCompleted` and bounded mismatch samples reach the coordinator without
+  weakening the worker event trust boundary, then distributed full-content
+  shards and a configured passing verification gate for successful
+  finalization. The kernel-mount/SSH `ops/finalize-run.sh` path remains an
+  advanced harness, not product evidence.
 
 ## 4. Focused follow-ups
 
