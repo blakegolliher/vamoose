@@ -64,7 +64,7 @@ pub struct MigrationOptions {
     pub preserve_owner: bool,
     pub preserve_mode: bool,
     pub preserve_times: bool,
-    /// Honored when the walker emits `xattr_blob`. No-op until then.
+    /// Honored when the canonical index emits `xattr_blob`. No-op until then.
     pub preserve_xattr: bool,
     /// Compatibility-reserved policy field. The current NFSv3 mover does not
     /// select a server-side COPY strategy.

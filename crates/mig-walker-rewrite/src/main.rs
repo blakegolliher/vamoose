@@ -1,6 +1,4 @@
-//! `mig-walker-rewrite` binary — thin CLI over the library. The
-//! translation itself lives in `lib.rs` so `mongoose` can run it
-//! in-process.
+//! `mig-walker-rewrite` binary — thin CLI over the reusable library.
 
 use anyhow::Result;
 use clap::Parser;

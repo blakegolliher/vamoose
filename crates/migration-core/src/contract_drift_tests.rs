@@ -1,14 +1,10 @@
-//! Local half of the F43 schema-contract drift check.
+//! Schema-contract drift check.
 //!
-//! `SCHEMA_CONTRACT.md` (repo root, vendored byte-identical in
-//! `nfs-walker`) is the single source of truth for the canonical
-//! parquet schema. The cross-repo byte-diff runs in CI when the
-//! upstream repo is reachable (see `.github/workflows/ci.yml`,
-//! `contract-drift` job); THIS test is the always-on half: it parses
-//! the contract's canonical column tables out of the markdown and
+//! `SCHEMA_CONTRACT.md` at the repository root is the source of truth for the
+//! canonical parquet schema. This test parses the contract's canonical column
+//! tables out of the markdown and
 //! asserts `schema::canonical_schema()` and `schema::REQUIRED_COLUMNS`
-//! agree with them, so code-vs-contract drift fails `cargo test` with
-//! no network or token required.
+//! agree with them, so code-vs-contract drift fails `cargo test`.
 //!
 //! Parsing is deliberately dumb (line-oriented markdown table scrape):
 //! if the contract's table format changes, this test fails loudly and

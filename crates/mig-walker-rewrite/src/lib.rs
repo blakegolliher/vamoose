@@ -3,11 +3,9 @@
 //! checkpoints. See `README.md` and `docs/work-items/SHIM_PLAN.md` for
 //! the schema translation and file-type synthesis constraints.
 //!
-//! Usable two ways: the `mig-walker-rewrite` binary (a thin `main.rs`
-//! over [`run_rewrite`], used by `vamoose prepare` as a subprocess),
-//! and in-process via this library (used by `mongoose prepare`, which
-//! ships as a single binary). [`Cli`] doubles as the programmatic
-//! argument struct.
+//! Usable through the `mig-walker-rewrite` binary (a thin `main.rs` over
+//! [`run_rewrite`], used by `vamoose prepare` as a subprocess) or through the
+//! library API. [`Cli`] doubles as the programmatic argument struct.
 
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{

@@ -81,9 +81,9 @@ and durability invariants.
 ## Immutable migration input
 
 An `nfs-walker` scan produces sharded Parquet. Until the walker emits the
-canonical schema directly, `mig-walker-rewrite` converts its output. The
-canonical column and metadata contract is mirrored with the walker repository
-in [SCHEMA_CONTRACT.md](SCHEMA_CONTRACT.md). `vamoose prepare` drives the
+canonical schema directly, `mig-walker-rewrite` converts its output. Vamoose's
+canonical column and metadata contract is [SCHEMA_CONTRACT.md](SCHEMA_CONTRACT.md).
+`vamoose prepare` drives the
 three stages — scan (bundled walker), rewrite, and verified upload with a
 conditional-create `manifest.json` — with per-stage checkpoints under
 `[prepare] work_dir`, so an interrupted preparation resumes rather than
@@ -332,7 +332,8 @@ reviewed implementation rather than treating those names as existing support.
 - [docs/CLAIM_PROTOCOL.md](docs/CLAIM_PROTOCOL.md): detailed S3 claim protocol
 - [docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md): control-plane architecture and invariants
 - [docs/CORRECTNESS_RULES.md](docs/CORRECTNESS_RULES.md): cross-cutting correctness rules
-- [SCHEMA_CONTRACT.md](SCHEMA_CONTRACT.md): mirrored Parquet schema contract
+- [docs/VERIFICATION.md](docs/VERIFICATION.md): source-to-destination verification contract and delivery plan
+- [SCHEMA_CONTRACT.md](SCHEMA_CONTRACT.md): canonical Parquet schema contract
 - [docs/BETA_NOTES.md](docs/BETA_NOTES.md): operator limitations and security posture
 - [docs/NEXT.md](docs/NEXT.md): remaining work
 - [docs/COORD_PLAN.md](docs/COORD_PLAN.md): historical coordinator delivery plan

@@ -190,9 +190,9 @@ Current Rust source and tests are the executable truth; manifests define the
 dependency graph. Bring current documentation forward when it drifts rather
 than implementing an older plan implicitly.
 
-- `SCHEMA_CONTRACT.md` — mirrored column names, types, null semantics, path
+- `SCHEMA_CONTRACT.md` — canonical column names, types, null semantics, path
   encoding, fsid grouping, Parquet KV footer keys, downgrade semantics, and
-  version policy. Coordinate edits with the `nfs-walker` repository.
+  version policy. Update the producer, reader, and rewrite bridge together.
 - `DESIGN.md` — concise current system architecture.
 - `docs/CONTROL_PLANE.md` — current control-plane ownership and runtime
   invariants.

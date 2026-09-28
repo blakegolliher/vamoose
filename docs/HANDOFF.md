@@ -81,9 +81,9 @@ setuid/setgid preservation, bounded RPC timeout, drain-before-close, NFS
 COMMIT/readback, and crash behavior. Do not replace those tests with simulated
 unit claims or mark ledger rows verified without the rig evidence.
 
-The mirrored [../SCHEMA_CONTRACT.md](../SCHEMA_CONTRACT.md) must remain
-byte-identical with the `nfs-walker` repository. Its known prose tensions are
-tracked in [NEXT.md](NEXT.md) and require a paired change.
+The canonical [../SCHEMA_CONTRACT.md](../SCHEMA_CONTRACT.md) is owned by
+Vamoose. The pinned scanner emits legacy input; `mig-walker-rewrite` and the
+local contract-drift tests enforce the translation boundary.
 
 ## Starting new work
 

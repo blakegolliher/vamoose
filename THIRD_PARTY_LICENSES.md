@@ -5198,7 +5198,7 @@ limitations under the License.
 - [`rustix`](https://crates.io/crates/rustix) v1.1.4
 - [`rustls-native-certs`](https://crates.io/crates/rustls-native-certs) v0.8.3
 - [`rustls`](https://crates.io/crates/rustls) v0.21.12
-- [`rustls`](https://crates.io/crates/rustls) v0.23.40
+- [`rustls`](https://crates.io/crates/rustls) v0.23.45
 - [`scopeguard`](https://crates.io/crates/scopeguard) v1.2.0
 - [`sct`](https://crates.io/crates/sct) v0.7.1
 - [`security-framework-sys`](https://crates.io/crates/security-framework-sys) v2.17.0
@@ -7226,7 +7226,7 @@ limitations under the License.
 - [`async-trait`](https://crates.io/crates/async-trait) v0.1.89
 - [`aws-config`](https://crates.io/crates/aws-config) v1.8.16
 - [`aws-credential-types`](https://crates.io/crates/aws-credential-types) v1.2.14
-- [`aws-lc-sys`](https://crates.io/crates/aws-lc-sys) v0.40.0
+- [`aws-lc-sys`](https://crates.io/crates/aws-lc-sys) v0.45.0
 - [`aws-runtime`](https://crates.io/crates/aws-runtime) v1.7.3
 - [`aws-sigv4`](https://crates.io/crates/aws-sigv4) v1.4.3
 - [`aws-smithy-async`](https://crates.io/crates/aws-smithy-async) v1.2.14
@@ -7725,7 +7725,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 > SPDX identifier: `BSD-3-Clause`
 > Crates using this license: 1
 
-- [`aws-lc-sys`](https://crates.io/crates/aws-lc-sys) v0.40.0
+- [`aws-lc-sys`](https://crates.io/crates/aws-lc-sys) v0.45.0
 
 <details>
 <summary>License text</summary>
@@ -8115,7 +8115,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 > SPDX identifier: `ISC`
 > Crates using this license: 1
 
-- [`rustls-webpki`](https://crates.io/crates/rustls-webpki) v0.103.13
+- [`rustls-webpki`](https://crates.io/crates/rustls-webpki) v0.103.15
 
 <details>
 <summary>License text</summary>
@@ -8152,8 +8152,8 @@ third-party/chromium/LICENSE.
 > SPDX identifier: `ISC`
 > Crates using this license: 2
 
-- [`aws-lc-rs`](https://crates.io/crates/aws-lc-rs) v1.16.3
-- [`aws-lc-sys`](https://crates.io/crates/aws-lc-sys) v0.40.0
+- [`aws-lc-rs`](https://crates.io/crates/aws-lc-rs) v1.18.1
+- [`aws-lc-sys`](https://crates.io/crates/aws-lc-sys) v0.45.0
 
 <details>
 <summary>License text</summary>
@@ -10023,7 +10023,7 @@ SOFTWARE.
 > SPDX identifier: `MIT`
 > Crates using this license: 1
 
-- [`aws-lc-sys`](https://crates.io/crates/aws-lc-sys) v0.40.0
+- [`aws-lc-sys`](https://crates.io/crates/aws-lc-sys) v0.45.0
 
 <details>
 <summary>License text</summary>
