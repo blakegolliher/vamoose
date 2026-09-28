@@ -68,9 +68,11 @@ and pass criteria are in [CORRECTNESS_RULES.md](CORRECTNESS_RULES.md).
 - **Archived control history restore:** the coordinator writes
   `archivelogs/`, but replay does not restore from it and no restore command is
   implemented.
-- **`vamoose verify --sample N`:** a Rust, libnfs-based sampled verifier so
-  the quickstart does not need the kernel-mount/SSH `ops/finalize-run.sh`
-  path to confirm a run.
+- **Production verification:** implement the independent, libnfs-based
+  metadata/sample/full verifier specified in [VERIFICATION.md](VERIFICATION.md).
+  A passing configured verification policy must eventually gate successful
+  finalization; the kernel-mount/SSH `ops/finalize-run.sh` path remains an
+  advanced harness, not the product verifier.
 
 ## 4. Focused follow-ups
 
@@ -101,11 +103,11 @@ and pass criteria are in [CORRECTNESS_RULES.md](CORRECTNESS_RULES.md).
 - Remove the unused `Unicode-DFS-2016` allowance from `deny.toml` in a focused
   supply-chain cleanup after rechecking the dependency tree.
 
-## 5. Cross-repository schema contract
+## 5. Canonical schema contract
 
-`SCHEMA_CONTRACT.md` is mirrored with `nfs-walker` and must not be edited in
-only this repository. Two wording corrections remain queued for a coordinated,
-byte-identical update:
+`SCHEMA_CONTRACT.md` is Vamoose's canonical output contract. The pinned
+`nfs-walker` emits legacy input which `mig-walker-rewrite` converts and tests
+locally. Two wording corrections remain:
 
 - file type `Unknown = 0` currently produces `CorruptRow`, while the contract
   calls that outcome `ShardCorrupt`; and
@@ -113,8 +115,6 @@ byte-identical update:
   the current reader enforces the five non-nullable columns and handles other
   canonical columns according to their null/default semantics.
 
-Set the `NFS_WALKER_REPO` repository variable (and `NFS_WALKER_TOKEN` when the
-target is private) to enable the cross-repository drift check.
 
 ## Completed architecture sequence
 

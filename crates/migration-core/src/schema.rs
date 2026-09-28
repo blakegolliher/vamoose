@@ -1,13 +1,11 @@
 //! Parquet index schema.
 //!
 //! This module is the single source of truth for the column names,
-//! types, and ordering the mover expects to find in an index parquet
-//! shard. The walker (`nfs-walker`) writes shards conforming to this
-//! schema; the mover reads them.
+//! types, and ordering the mover expects to find in a canonical index parquet
+//! shard. `mig-walker-rewrite` currently normalizes the pinned scanner's legacy
+//! output into this schema; the mover reads it.
 //!
-//! Authoritative spec lives in `SCHEMA_CONTRACT.md` at the workspace
-//! root — vendored byte-identical in `nfs-walker`. When code disagrees
-//! with the contract, the contract wins.
+//! The authoritative spec lives in `SCHEMA_CONTRACT.md` at the workspace root.
 
 use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
@@ -63,7 +61,7 @@ pub const COL_FILE_TYPE: &str = "file_type";
 pub const REQUIRED_COLUMNS: &[&str] = &[COL_ROW_ID, COL_PATH, COL_SIZE, COL_MODE, COL_FILE_TYPE];
 
 // =============================================================================
-// File-type tag values — must match what the walker emits.
+// File-type tag values — must match what the canonical producer emits.
 // =============================================================================
 //
 // These mirror POSIX d_type / S_IFMT values but as a small enum so the
@@ -131,7 +129,7 @@ pub fn canonical_schema() -> Arc<Schema> {
         // an export. Nullable per contract; mover falls back to
         // grouping by inode alone with a one-time WARN.
         Field::new(COL_FSID, DataType::UInt64, true),
-        // Reserved for future xattr support; NULL until walker emits it.
+        // Reserved for future xattr support; NULL until the producer emits it.
         Field::new(COL_XATTR_BLOB, DataType::Binary, true),
         Field::new(COL_SYMLINK_TARGET, DataType::Binary, true),
         Field::new(COL_FILE_TYPE, DataType::UInt8, false),

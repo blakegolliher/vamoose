@@ -2,10 +2,8 @@
 //! (the scanner, shipped alongside vamoose) and `mig-walker-rewrite`
 //! (the canonical-schema converter from this workspace).
 //!
-//! Shared by `vamoose prepare` (distributed, S3-backed) and `mongoose
-//! prepare` (single-host, local-only) so the two front-ends drive the
-//! same scanner and rewriter with the same argument shapes, discovery
-//! rules, and version/flag checks.
+//! Used by `vamoose prepare` for the distributed, S3-backed product. The
+//! standalone Mongoose product has its own repository and release lifecycle.
 
 use anyhow::{Context, Result};
 use std::ffi::OsString;

@@ -1,11 +1,10 @@
 //! Building the configured libnfs file mover.
 //!
-//! Extracted from the orchestrator so the single-host `mongoose` CLI
-//! and the distributed worker construct the mover identically: the
-//! same pool sizing rules (bucketed-async caps the sync pool at 16
-//! pairs because every context pair costs two reserved ports), the
-//! same `MoverConfig` projection, and the same sync-vs-bucketed-async
-//! wiring behind the [`FileMover`] trait.
+//! Kept outside the orchestrator so mover construction has one testable
+//! implementation: pool sizing rules (bucketed-async caps the sync pool at
+//! 16 pairs because every context pair costs two reserved ports),
+//! `MoverConfig` projection, and sync-vs-bucketed-async wiring behind the
+//! [`FileMover`] trait.
 
 use migration_core::fence::Fence;
 use migration_core::records::MigrationOptions;
@@ -16,8 +15,7 @@ use migration_mover::{
 };
 use std::sync::Arc;
 
-/// Everything that shapes the mover, resolved by the caller (worker
-/// config + manifest, or mongoose CLI + local manifest).
+/// Everything that shapes the mover, resolved by the caller.
 #[derive(Debug, Clone)]
 pub struct MoverParams {
     pub source_url: String,
@@ -36,8 +34,8 @@ pub struct MoverParams {
     /// Per-RPC timeout in ms; 0 = leave the libnfs default untouched.
     pub rpc_timeout_ms: u32,
     /// Whether chown EPERM is a per-file failure (true) or a recorded
-    /// degradation (false). Callers pass `require_chown_capability &&
-    /// has_cap_chown` (worker) or `has_cap_chown` (mongoose).
+    /// degradation (false). The worker passes
+    /// `require_chown_capability && has_cap_chown`.
     pub require_chown: bool,
     pub require_unchanged_size: bool,
     pub inflight: InflightProfile,

@@ -232,7 +232,7 @@ pub async fn run_with_stop(
     // M3: pre-mount cfg.mover.nfs_connections context pairs so
     // concurrent shard dispatch has distinct contexts to draw from.
     // Pool sizing, MoverConfig projection, and the sync-vs-bucketed
-    // wiring live in `mover_factory` (shared with mongoose).
+    // wiring live in `mover_factory`.
     let downgrades = DowngradeSink::new();
     let failures = FailureSink::new();
 

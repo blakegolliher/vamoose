@@ -28,16 +28,14 @@ claim authority out of the data plane.
 - `mig-walker-rewrite` — resumable converter from legacy walker Parquet to the
   canonical schema, with atomic shard activation and JSON checkpoints.
 - `vamoose-cli` — the unified `vamoose` entry point and lifecycle boundary.
-- `migration-resync` — scan-vs-scan change classifier for converging
-  delta passes: hash-partitioned merge over two canonical indexes on
-  the `(file_type, size, mtime, ctime)` tuple. Used by `mongoose sync`;
-  built to be reusable by a future fleet pass driver.
-- `mongoose` — single-host NFS-to-NFS mover built from the same engine
-  (walker scan, canonical shards, libnfs mover, shard processor) with S3,
-  claims, the coordinator, and the TUI removed. Ships as one binary: the
-  nfs-walker scanner (pinned to the locked commit) and mig-walker-rewrite
-  are compiled in as libraries. Everything lives in one local work
-  directory. See `crates/mongoose/README.md`.
+
+## Related product: Mongoose
+
+[Mongoose](https://github.com/blakegolliher/mongoose) is the standalone,
+single-node edition of the mover. It has its own repository, release lifecycle,
+license, packaging, and CI; it is not built or shipped from this workspace.
+Vamoose remains the distributed product, with S3-backed coordination and a
+worker fleet.
 
 There is no implemented custom io_uring mover, NFSv4.2 server-side COPY, or
 kernel `copy_file_range` strategy. `Strategy::LibnfsIoUring` remains only as a
@@ -157,7 +155,8 @@ comments in [examples/worker.toml](examples/worker.toml) for current semantics.
 - [docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md) — current control-plane ownership and invariants
 - [docs/CLAIM_PROTOCOL.md](docs/CLAIM_PROTOCOL.md) — authoritative S3 claim protocol
 - [docs/CORRECTNESS_RULES.md](docs/CORRECTNESS_RULES.md) — cross-cutting correctness rules
-- [SCHEMA_CONTRACT.md](SCHEMA_CONTRACT.md) — mirrored Parquet schema contract
+- [docs/VERIFICATION.md](docs/VERIFICATION.md) — source-to-destination verification contract and delivery plan
+- [SCHEMA_CONTRACT.md](SCHEMA_CONTRACT.md) — canonical Parquet schema contract
 - [docs/BETA_NOTES.md](docs/BETA_NOTES.md) — operator limitations and security posture
 - [docs/NEXT.md](docs/NEXT.md) — current follow-up work
 - [docs/HANDOFF.md](docs/HANDOFF.md) — stable handoff and document map

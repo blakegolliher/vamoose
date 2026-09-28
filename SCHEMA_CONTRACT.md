@@ -2,15 +2,12 @@
 
 **Version:** 1
 **Status:** Authoritative
-**Vendored in:** `nfs-walker/SCHEMA_CONTRACT.md`, `migration/SCHEMA_CONTRACT.md`
+**Owned by:** Vamoose
 
-This document defines the parquet index schema that `nfs-walker` produces
-and the migration system (`mig-worker` and friends) consumes. It is the
-single source of truth. When walker and mover disagree, this document is
-right and one of them is wrong.
-
-The two repos vendor identical copies of this file. CI in either repo
-should fail if its copy diverges from the other.
+This document defines the canonical parquet index schema that Vamoose produces
+and consumes. The currently pinned `nfs-walker` emits a legacy scan schema;
+`mig-walker-rewrite` normalizes that input into this canonical form. The local
+schema implementation and tests must agree with this contract.
 
 ---
 
@@ -29,50 +26,38 @@ bump `contract_version` without touching `format_version`.
 This document describes **`format_version = 1`, `contract_version = 1`**.
 
 Breaking schema changes (renames, type changes, removed columns)
-require bumping `format_version` and updating both repos in lockstep.
+require bumping `format_version` and updating the producer, reader, and rewrite
+bridge in lockstep.
 Additive schema changes (new optional columns) do not require a version
-bump. Both walker and mover must continue to operate against parquet
-files that omit additive-but-not-yet-emitted columns.
+bump. Readers must continue to operate against parquet files that omit
+additive-but-not-yet-emitted columns.
 
 Versions live in two places:
 
-1. **Parquet KV file metadata** (footer key-value pairs). Walker writes
-   them; mover validates at shard open. Specific keys defined below.
+1. **Parquet KV file metadata** (footer key-value pairs). The canonical index
+   producer writes them; the mover validates them at shard open.
 2. **`manifest.json`** (`format_version` field). Manifest-level checks
    happen first; shard-level checks catch drift.
 
 ---
 
-## Migration strategy: additive
+## Migration strategy: normalized canonical output
 
-Walker emits **both** legacy columns (for the analytics dashboard and
-existing DataFusion queries) and canonical columns (for the migration
-mover). Readers pick the columns they need:
+The pinned scanner writes its legacy analytics schema. During `vamoose
+prepare`, `mig-walker-rewrite` adds the canonical columns required by the mover
+and passes compatible legacy fields through for existing consumers. New
+Vamoose code reads canonical columns only.
 
-- **Walker dashboard / analytics consumers** read legacy columns:
-  `permissions`, `file_type_mime`, `mtime_us`, `path_legacy`,
-  `parent_path`, `filename`, `extension`. Their code is updated in the
-  walker PR that introduces this contract — see "Renames in the walker
-  PR" below.
-- **Migration mover** reads canonical columns: `mode`, `file_type`,
-  `mtime_sec` + `mtime_nsec`, `path`. Sees no legacy columns.
-- **New consumers** read canonical columns only. Legacy columns are
-  not for new code.
-
-Storage cost is a few redundant integer/string columns per row.
-Acceptable at billion-row scale.
-
-### Renames in the walker PR
-
-Two columns are renamed to resolve same-name collisions between legacy
-and canonical:
+Two input columns are renamed in canonical output to avoid collisions:
 
 | Old name | New name | Reason |
 |---|---|---|
 | `path` (Utf8) | `path_legacy` (Utf8) | Canonical `path` (Binary) takes the simple name. |
 | `file_type` (Utf8) | `file_type_mime` (Utf8) | Canonical `file_type` (UInt8) takes the simple name. |
 
-Dashboard queries referencing the old names update in the same PR.
+The rewrite bridge and its round-trip tests are the compatibility boundary with
+the pinned scanner. A future scanner may emit the canonical schema directly,
+but must first pass the same reader and contract tests.
 
 ---
 
@@ -113,7 +98,7 @@ May be absent. The mover handles their absence gracefully.
 
 | Column | Arrow Type | Nullable | Definition |
 |---|---|---|---|
-| `symlink_target` | `Binary` | Yes | For symlinks, the link target as raw bytes. Allows the mover to skip a `READLINK` round-trip. Walker emits when present; mover falls back to `nfs_readlink` when absent. |
+| `symlink_target` | `Binary` | Yes | For symlinks, the link target as raw bytes. Allows the mover to skip a `READLINK` round-trip. The canonical producer emits it when present; the mover falls back to `nfs_readlink` when absent. |
 | `xattr_blob` | `Binary` | Yes | Serialized extended attributes. Format defined in "xattr_blob format". **Reserved for future walker support** — currently always null. |
 
 ---
@@ -240,7 +225,7 @@ target.
 
 ## Null attribute semantics
 
-When walker emits null for an attribute, the mover applies the
+When the canonical producer emits null for an attribute, the mover applies the
 following rules:
 
 | Null column | Mover behavior |
@@ -374,8 +359,8 @@ automatically. No mover code changes required at that time.
 
 ## Parquet file metadata (KV footer)
 
-Walker writes the following key-value pairs into every parquet file's
-footer metadata. Mover validates at `ShardReader::open`.
+The canonical index producer writes the following key-value pairs into every
+parquet file's footer metadata. The mover validates them at `ShardReader::open`.
 
 | Key | Value | Purpose |
 |---|---|---|
@@ -391,8 +376,8 @@ Future keys may be added; mover ignores keys it doesn't recognize.
 
 ## Operational rules
 
-1. **Walker emits the entire required canonical column set in every
-   shard.** Optional columns may be omitted entirely or emitted as
+1. **The canonical index producer emits the entire required canonical column
+   set in every shard.** Optional columns may be omitted entirely or emitted as
    all-null.
 
 2. **Mover validates required columns at shard open.** Missing
